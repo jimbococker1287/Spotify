@@ -12,7 +12,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup train train-classical train-deep train-elite train-everything test clean clean-all
+.PHONY: setup train train-classical train-deep train-elite train-everything benchmark-lock regression-guard predict-next test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -40,6 +40,17 @@ train-elite:
 train-everything:
 	mkdir -p outputs
 	bash scripts/run_everything.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+benchmark-lock:
+	mkdir -p outputs
+	bash scripts/run_benchmark_lock.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+regression-guard:
+	mkdir -p outputs
+	$(RUN_PY) scripts/regression_guard.py $(EXTRA_ARGS)
+
+predict-next:
+	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)
 
 test:
 	$(RUN_PY) -m pytest

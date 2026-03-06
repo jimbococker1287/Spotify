@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import csv
 import json
+import math
 import sqlite3
 
 import numpy as np
@@ -263,8 +264,16 @@ def append_experiment_history(
         "model_family",
         "val_top1",
         "val_top5",
+        "val_ndcg_at5",
+        "val_mrr_at5",
+        "val_coverage_at5",
+        "val_diversity_at5",
         "test_top1",
         "test_top5",
+        "test_ndcg_at5",
+        "test_mrr_at5",
+        "test_coverage_at5",
+        "test_diversity_at5",
         "fit_seconds",
         "epochs",
         "data_records",
@@ -288,8 +297,16 @@ def append_experiment_history(
                     "model_family": row.get("model_family", ""),
                     "val_top1": row.get("val_top1", ""),
                     "val_top5": row.get("val_top5", ""),
+                    "val_ndcg_at5": row.get("val_ndcg_at5", ""),
+                    "val_mrr_at5": row.get("val_mrr_at5", ""),
+                    "val_coverage_at5": row.get("val_coverage_at5", ""),
+                    "val_diversity_at5": row.get("val_diversity_at5", ""),
                     "test_top1": row.get("test_top1", ""),
                     "test_top5": row.get("test_top5", ""),
+                    "test_ndcg_at5": row.get("test_ndcg_at5", ""),
+                    "test_mrr_at5": row.get("test_mrr_at5", ""),
+                    "test_coverage_at5": row.get("test_coverage_at5", ""),
+                    "test_diversity_at5": row.get("test_diversity_at5", ""),
                     "fit_seconds": row.get("fit_seconds", ""),
                     "epochs": row.get("epochs", ""),
                     "data_records": data_records,
@@ -563,4 +580,136 @@ def plot_backtest_history(history_csv: Path, output_dir: Path) -> Path | None:
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+    return out_path
+
+
+def _safe_float(value) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(out):
+        return float("nan")
+    return out
+
+
+def write_run_report(
+    *,
+    run_dir: Path,
+    history_dir: Path,
+    manifest: dict[str, object],
+    results: list[dict[str, object]],
+    champion_gate: dict[str, object],
+    history_csv: Path,
+) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / "run_report.md"
+
+    sorted_results = sorted(
+        results,
+        key=lambda row: _safe_float(row.get("val_top1")),
+        reverse=True,
+    )
+    best = sorted_results[0] if sorted_results else {}
+    fit_values = [_safe_float(row.get("fit_seconds")) for row in results]
+    fit_values = [value for value in fit_values if not math.isnan(value)]
+    total_fit_seconds = float(np.sum(fit_values)) if fit_values else float("nan")
+
+    recent_best_rows: list[tuple[str, str, float]] = []
+    if history_csv.exists():
+        seen_runs: dict[str, tuple[str, float]] = {}
+        run_order: list[str] = []
+        with history_csv.open("r", encoding="utf-8") as infile:
+            for row in csv.DictReader(infile):
+                run_id = str(row.get("run_id", "")).strip()
+                if not run_id:
+                    continue
+                if run_id not in seen_runs:
+                    run_order.append(run_id)
+                    seen_runs[run_id] = ("", float("-inf"))
+                score = _safe_float(row.get("val_top1"))
+                if math.isnan(score):
+                    continue
+                model_name = str(row.get("model_name", "")).strip()
+                if score > seen_runs[run_id][1]:
+                    seen_runs[run_id] = (model_name, score)
+        for run_id in run_order[-10:]:
+            model_name, score = seen_runs[run_id]
+            if score == float("-inf"):
+                continue
+            recent_best_rows.append((run_id, model_name, score))
+
+    lines: list[str] = []
+    lines.append("# Spotify Run Report")
+    lines.append("")
+    lines.append("## Run Summary")
+    lines.append(f"- Run ID: `{manifest.get('run_id', '')}`")
+    lines.append(f"- Run Name: `{manifest.get('run_name', '')}`")
+    lines.append(f"- Profile: `{manifest.get('profile', '')}`")
+    lines.append(f"- Data records: `{manifest.get('data_records', '')}`")
+    lines.append(f"- Best model: `{best.get('model_name', '')}` ({best.get('model_type', '')})")
+    lines.append(f"- Best val Top-1: `{_safe_float(best.get('val_top1')):.4f}`")
+    if fit_values:
+        lines.append(f"- Aggregate fit time (sum): `{total_fit_seconds:.2f}s`")
+    lines.append("")
+    lines.append("## Champion Gate")
+    lines.append(f"- Status: `{champion_gate.get('status', '')}`")
+    lines.append(f"- Promoted: `{champion_gate.get('promoted', False)}`")
+    lines.append(f"- Threshold: `{_safe_float(champion_gate.get('threshold')):.6f}`")
+    lines.append(f"- Regression: `{_safe_float(champion_gate.get('regression')):.6f}`")
+    lines.append(
+        f"- Previous champion: `{champion_gate.get('champion_run_id', '')}` / "
+        f"`{champion_gate.get('champion_model_name', '')}`"
+    )
+    lines.append(
+        f"- Current challenger: `{champion_gate.get('challenger_model_name', '')}` "
+        f"(`{_safe_float(champion_gate.get('challenger_val_top1')):.4f}`)"
+    )
+    lines.append("")
+    lines.append("## Model Results")
+    lines.append(
+        "| model | type | val_top1 | val_top5 | val_ndcg@5 | val_mrr@5 | test_top1 | test_top5 | test_ndcg@5 | test_mrr@5 | fit_s |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for row in sorted_results:
+        lines.append(
+            "| "
+            + f"{row.get('model_name', '')} | {row.get('model_type', '')}"
+            + f" | {_safe_float(row.get('val_top1')):.4f}"
+            + f" | {_safe_float(row.get('val_top5')):.4f}"
+            + f" | {_safe_float(row.get('val_ndcg_at5')):.4f}"
+            + f" | {_safe_float(row.get('val_mrr_at5')):.4f}"
+            + f" | {_safe_float(row.get('test_top1')):.4f}"
+            + f" | {_safe_float(row.get('test_top5')):.4f}"
+            + f" | {_safe_float(row.get('test_ndcg_at5')):.4f}"
+            + f" | {_safe_float(row.get('test_mrr_at5')):.4f}"
+            + f" | {_safe_float(row.get('fit_seconds')):.2f} |"
+        )
+    lines.append("")
+
+    if recent_best_rows:
+        lines.append("## Historical Trend (Recent Best Runs)")
+        lines.append("| run_id | best_model | best_val_top1 |")
+        lines.append("|---|---|---:|")
+        for run_id, model_name, score in recent_best_rows:
+            lines.append(f"| {run_id} | {model_name} | {score:.4f} |")
+        lines.append("")
+
+    lines.append("## Key Artifacts")
+    for rel in (
+        "run_leaderboard.png",
+        "model_comparison.png",
+        "utilization.png",
+        "optuna/optuna_results.json",
+        "backtest/temporal_backtest.csv",
+        "../history/history_best_runs.png",
+        "../history/history_optuna_best_runs.png",
+        "../history/history_backtest_mean_top1.png",
+    ):
+        path = (run_dir / rel).resolve()
+        if path.exists():
+            lines.append(f"- [{rel}]({rel})")
+    lines.append("")
+
+    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return out_path

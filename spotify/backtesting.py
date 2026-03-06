@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import os
 import csv
 import json
 import time
@@ -12,6 +14,7 @@ from .benchmarks import (
     build_classical_estimator,
     build_full_tabular_dataset,
     evaluate_classical_estimator,
+    resolve_classical_parallelism,
     validate_classical_models,
 )
 from .data import PreparedData
@@ -57,6 +60,37 @@ def _tail_cap(X: np.ndarray, y: np.ndarray, max_rows: int) -> tuple[np.ndarray, 
     if max_rows <= 0 or len(X) <= max_rows:
         return X, y
     return X[-max_rows:], y[-max_rows:]
+
+
+def _run_backtest_job(
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+) -> BacktestFoldResult:
+    family, estimator = build_classical_estimator(
+        model_name,
+        random_seed + fold_idx,
+        estimator_n_jobs=estimator_n_jobs,
+    )
+    started = time.perf_counter()
+    estimator.fit(X_train, y_train)
+    fit_seconds = float(time.perf_counter() - started)
+    _, _, top1, top5, _, _ = evaluate_classical_estimator(estimator, X_test, y_test, X_test, y_test)
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_family=family,
+        fold=fold_idx,
+        train_rows=len(X_train),
+        test_rows=len(X_test),
+        fit_seconds=fit_seconds,
+        top1=top1,
+        top5=top5,
+    )
 
 
 def _write_backtest_csv(results: list[BacktestFoldResult], output_path: Path) -> None:
@@ -134,7 +168,24 @@ def run_temporal_backtest(
         len(X_all),
     )
 
+    workers_raw = os.getenv("SPOTIFY_BACKTEST_WORKERS", "1").strip()
+    try:
+        backtest_workers = max(1, int(workers_raw))
+    except Exception:
+        backtest_workers = 1
+    cpu_count = os.cpu_count() or 1
+    backtest_workers = min(backtest_workers, cpu_count)
+    _, estimator_n_jobs = resolve_classical_parallelism()
+    if backtest_workers > 1:
+        estimator_n_jobs = 1
+    logger.info(
+        "Backtest parallelism: workers=%d estimator_n_jobs=%d",
+        backtest_workers,
+        estimator_n_jobs,
+    )
+
     results: list[BacktestFoldResult] = []
+    jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
         X_train, y_train = X_all[:test_start], y_all[:test_start]
         X_test, y_test = X_all[test_start:test_end], y_all[test_start:test_end]
@@ -145,33 +196,71 @@ def run_temporal_backtest(
             continue
 
         for model_name in selected_models:
-            family, estimator = build_classical_estimator(model_name, random_seed + fold_idx)
-            started = time.perf_counter()
-            try:
-                estimator.fit(X_train, y_train)
-            except Exception as exc:
-                logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
-                continue
-            fit_seconds = float(time.perf_counter() - started)
+            jobs.append((fold_idx, model_name, X_train, y_train, X_test, y_test))
 
-            _, _, top1, top5 = evaluate_classical_estimator(estimator, X_test, y_test, X_test, y_test)
-            row = BacktestFoldResult(
-                model_name=model_name,
-                model_family=family,
-                fold=fold_idx,
-                train_rows=len(X_train),
-                test_rows=len(X_test),
-                fit_seconds=fit_seconds,
-                top1=top1,
-                top5=top5,
-            )
+    if backtest_workers > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=backtest_workers) as executor:
+            futures = {}
+            for fold_idx, model_name, X_train, y_train, X_test, y_test in jobs:
+                future = executor.submit(
+                    _run_backtest_job,
+                    model_name,
+                    fold_idx,
+                    random_seed,
+                    estimator_n_jobs,
+                    X_train,
+                    y_train,
+                    X_test,
+                    y_test,
+                )
+                futures[future] = (fold_idx, model_name)
+
+            collected: dict[tuple[int, str], BacktestFoldResult] = {}
+            for future in as_completed(futures):
+                fold_idx, model_name = futures[future]
+                try:
+                    row = future.result()
+                except Exception as exc:
+                    logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                    continue
+                collected[(fold_idx, model_name)] = row
+
+        for fold_idx, model_name, *_ in jobs:
+            key = (fold_idx, model_name)
+            if key not in collected:
+                continue
+            row = collected[key]
             results.append(row)
             logger.info(
                 "[BACKTEST] fold=%d model=%s top1=%.4f top5=%s",
-                fold_idx,
-                model_name,
-                top1,
-                f"{top5:.4f}" if not np.isnan(top5) else "n/a",
+                row.fold,
+                row.model_name,
+                row.top1,
+                f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+            )
+    else:
+        for fold_idx, model_name, X_train, y_train, X_test, y_test in jobs:
+            try:
+                row = _run_backtest_job(
+                    model_name=model_name,
+                    fold_idx=fold_idx,
+                    random_seed=random_seed,
+                    estimator_n_jobs=estimator_n_jobs,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_test=X_test,
+                    y_test=y_test,
+                )
+            except Exception as exc:
+                logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                continue
+            results.append(row)
+            logger.info(
+                "[BACKTEST] fold=%d model=%s top1=%.4f top5=%s",
+                row.fold,
+                row.model_name,
+                row.top1,
+                f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
             )
 
     _write_backtest_csv(results, output_dir / "temporal_backtest.csv")

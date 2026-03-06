@@ -97,3 +97,20 @@ def test_new_elite_flags_override_profile_defaults() -> None:
     assert config.enable_temporal_backtest is True
     assert config.temporal_backtest_folds == 4
     assert config.temporal_backtest_model_names == ("logreg", "random_forest")
+
+
+def test_classical_subset_becomes_default_for_optuna_and_backtest() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--profile",
+            "small",
+            "--classical-models",
+            "logreg,random_forest",
+        ]
+    )
+    config = build_config(args)
+
+    assert config.classical_model_names == ("logreg", "random_forest")
+    assert config.optuna_model_names == ("logreg", "random_forest")
+    assert config.temporal_backtest_model_names == ("logreg", "random_forest")

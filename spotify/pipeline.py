@@ -10,32 +10,9 @@ import sys
 
 import numpy as np
 
-from .backtesting import run_temporal_backtest
-from .benchmarks import run_classical_benchmarks
 from .config import PipelineConfig, configure_logging
-from .data import append_audio_features, engineer_features, load_streaming_history, prepare_training_data
-from .explainability import run_shap_analysis
-from .modeling import build_model_builders
-from .monitoring import ResourceMonitor
-from .reporting import (
-    VAL_KEY,
-    append_backtest_history,
-    append_experiment_history,
-    append_optuna_history,
-    persist_to_sqlite,
-    plot_backtest_history,
-    plot_history_best_runs,
-    plot_learning_curves,
-    plot_model_comparison,
-    plot_optuna_best_runs,
-    plot_run_leaderboard,
-    save_histories_json,
-    save_utilization_plot,
-)
 from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
 from .tracking import MlflowTracker
-from .training import compute_baselines, train_and_evaluate_models
-from .tuning import run_optuna_tuning
 
 
 def _slugify(raw: str) -> str:
@@ -50,8 +27,8 @@ def _build_run_id(config: PipelineConfig) -> str:
     return f"{stamp}_{suffix}"
 
 
-def _track_file(tracker: MlflowTracker, path: Path) -> None:
-    if path.exists():
+def _track_file(tracker: MlflowTracker | None, path: Path) -> None:
+    if tracker is not None and path.exists():
         tracker.log_artifact(path)
 
 
@@ -84,43 +61,12 @@ def run_pipeline(config: PipelineConfig) -> None:
     np.random.seed(config.random_seed)
     random.seed(config.random_seed)
 
-    tracker = MlflowTracker(
-        enabled=config.enable_mlflow,
-        run_id=run_id,
-        run_name=config.run_name,
-        tracking_uri=config.mlflow_tracking_uri,
-        experiment_name=config.mlflow_experiment,
-        default_tracking_dir=config.output_dir / "mlruns",
-        logger=logger,
-    )
-    tracker.log_params(
-        {
-            "profile": config.profile,
-            "run_name": config.run_name or "",
-            "sequence_length": config.sequence_length,
-            "max_artists": config.max_artists,
-            "batch_size": config.batch_size,
-            "epochs": config.epochs,
-            "random_seed": config.random_seed,
-            "include_video": config.include_video,
-            "enable_spotify_features": config.enable_spotify_features,
-            "enable_shap": config.enable_shap,
-            "classical_only": config.classical_only,
-            "deep_models": config.model_names,
-            "classical_models": config.classical_model_names,
-            "enable_optuna": config.enable_optuna,
-            "optuna_trials": config.optuna_trials,
-            "optuna_models": config.optuna_model_names,
-            "enable_temporal_backtest": config.enable_temporal_backtest,
-            "temporal_backtest_folds": config.temporal_backtest_folds,
-            "temporal_backtest_models": config.temporal_backtest_model_names,
-        }
-    )
-
     result_rows: list[dict[str, object]] = []
     optuna_rows: list[dict[str, object]] = []
     backtest_rows: list[dict[str, object]] = []
+    cache_info_payload: dict[str, object] = {}
     artifact_paths: list[Path] = [run_dir / "train.log"]
+    tracker: MlflowTracker | None = None
 
     try:
         run_deep_models = (not config.classical_only) and bool(config.model_names)
@@ -128,17 +74,130 @@ def run_pipeline(config: PipelineConfig) -> None:
         if config.classical_only:
             run_classical_models = True
 
-        df = load_streaming_history(config.data_dir, config.include_video, logger)
-        df = engineer_features(df, config.max_artists, logger)
-        df = append_audio_features(df, config.enable_spotify_features, logger)
+        tf = None
+        strategy = None
+        if run_deep_models:
+            # Initialize TensorFlow before heavy numpy/pandas/sklearn preprocessing.
+            # On some macOS TensorFlow builds, late initialization can deadlock in the
+            # internal prefetch pipeline at the first training batch.
+            configure_process_env()
+            tf = load_tensorflow_runtime(logger)
+            tf.random.set_seed(config.random_seed)
+            strategy = select_distribution_strategy(tf)
+            logger.info("Number of devices: %s", getattr(strategy, "num_replicas_in_sync", 1))
 
-        prepared = prepare_training_data(
-            df=df,
-            sequence_length=config.sequence_length,
-            scaler_path=run_dir / "context_scaler.joblib",
+        tracker = MlflowTracker(
+            enabled=config.enable_mlflow,
+            run_id=run_id,
+            run_name=config.run_name,
+            tracking_uri=config.mlflow_tracking_uri,
+            experiment_name=config.mlflow_experiment,
+            default_tracking_dir=config.output_dir / "mlruns",
             logger=logger,
         )
+        tracker.log_params(
+            {
+                "profile": config.profile,
+                "run_name": config.run_name or "",
+                "sequence_length": config.sequence_length,
+                "max_artists": config.max_artists,
+                "batch_size": config.batch_size,
+                "epochs": config.epochs,
+                "random_seed": config.random_seed,
+                "include_video": config.include_video,
+                "enable_spotify_features": config.enable_spotify_features,
+                "enable_shap": config.enable_shap,
+                "classical_only": config.classical_only,
+                "deep_models": config.model_names,
+                "classical_models": config.classical_model_names,
+                "enable_optuna": config.enable_optuna,
+                "optuna_trials": config.optuna_trials,
+                "optuna_models": config.optuna_model_names,
+                "enable_temporal_backtest": config.enable_temporal_backtest,
+                "temporal_backtest_folds": config.temporal_backtest_folds,
+                "temporal_backtest_models": config.temporal_backtest_model_names,
+            }
+        )
+
+        # Delay sklearn/pandas-heavy imports until after TensorFlow initialization
+        # for deep runs. Importing sklearn before TensorFlow can trigger a deadlock
+        # on some macOS TensorFlow builds at the first training batch.
+        from .backtesting import run_temporal_backtest
+        from .benchmarks import run_classical_benchmarks
+        from .data import (
+            PreparedDataCacheInfo,
+            SKEW_CONTEXT_FEATURES,
+            load_or_prepare_training_data,
+        )
+        from .governance import evaluate_champion_gate
+        from .explainability import run_shap_analysis
+        from .modeling import build_model_builders
+        from .monitoring import ResourceMonitor
+        from .reporting import (
+            VAL_KEY,
+            append_backtest_history,
+            append_experiment_history,
+            append_optuna_history,
+            persist_to_sqlite,
+            plot_backtest_history,
+            plot_history_best_runs,
+            plot_learning_curves,
+            plot_model_comparison,
+            plot_optuna_best_runs,
+            plot_run_leaderboard,
+            save_histories_json,
+            save_utilization_plot,
+            write_run_report,
+        )
+        from .training import compute_baselines, train_and_evaluate_models
+        from .tuning import run_optuna_tuning
+
+        prepared, cache_info = load_or_prepare_training_data(
+            data_dir=config.data_dir,
+            include_video=config.include_video,
+            enable_spotify_features=config.enable_spotify_features,
+            max_artists=config.max_artists,
+            sequence_length=config.sequence_length,
+            scaler_path=run_dir / "context_scaler.joblib",
+            cache_root=config.output_dir / "cache" / "prepared_data",
+            logger=logger,
+        )
+        assert isinstance(cache_info, PreparedDataCacheInfo)
+        cache_info_payload = {
+            "enabled": cache_info.enabled,
+            "hit": cache_info.hit,
+            "fingerprint": cache_info.fingerprint,
+            "cache_path": str(cache_info.cache_path) if cache_info.cache_path else "",
+            "metadata_path": str(cache_info.metadata_path) if cache_info.metadata_path else "",
+            "source_file_count": cache_info.source_file_count,
+        }
+        if cache_info.enabled:
+            logger.info(
+                "Prepared cache status: %s (fingerprint=%s)",
+                ("HIT" if cache_info.hit else "MISS"),
+                cache_info.fingerprint,
+            )
         artifact_paths.append(run_dir / "context_scaler.joblib")
+
+        artist_label_frame = (
+            prepared.df[["artist_label", "master_metadata_album_artist_name"]]
+            .drop_duplicates(subset=["artist_label"])
+            .sort_values("artist_label")
+        )
+        artist_labels = artist_label_frame["master_metadata_album_artist_name"].astype(str).tolist()
+        metadata_path = run_dir / "feature_metadata.json"
+        with metadata_path.open("w", encoding="utf-8") as out:
+            json.dump(
+                {
+                    "sequence_length": config.sequence_length,
+                    "context_features": list(prepared.context_features),
+                    "skew_context_features": list(SKEW_CONTEXT_FEATURES),
+                    "artist_labels": artist_labels,
+                },
+                out,
+                indent=2,
+            )
+        artifact_paths.append(metadata_path)
 
         baseline_metrics = compute_baselines(prepared, logger)
         tracker.log_params(
@@ -151,12 +210,6 @@ def run_pipeline(config: PipelineConfig) -> None:
         )
 
         if run_deep_models:
-            configure_process_env()
-            tf = load_tensorflow_runtime(logger)
-            tf.random.set_seed(config.random_seed)
-            strategy = select_distribution_strategy(tf)
-            logger.info("Number of devices: %s", getattr(strategy, "num_replicas_in_sync", 1))
-
             model_builders = build_model_builders(
                 sequence_length=config.sequence_length,
                 num_artists=prepared.num_artists,
@@ -225,8 +278,16 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "model_family": "neural",
                         "val_top1": float(artifacts.val_metrics.get(name, {}).get("top1", np.nan)),
                         "val_top5": float(artifacts.val_metrics.get(name, {}).get("top5", np.nan)),
+                        "val_ndcg_at5": float(artifacts.val_metrics.get(name, {}).get("ndcg_at5", np.nan)),
+                        "val_mrr_at5": float(artifacts.val_metrics.get(name, {}).get("mrr_at5", np.nan)),
+                        "val_coverage_at5": float(artifacts.val_metrics.get(name, {}).get("coverage_at5", np.nan)),
+                        "val_diversity_at5": float(artifacts.val_metrics.get(name, {}).get("diversity_at5", np.nan)),
                         "test_top1": float(artifacts.test_metrics.get(name, {}).get("top1", np.nan)),
                         "test_top5": float(artifacts.test_metrics.get(name, {}).get("top5", np.nan)),
+                        "test_ndcg_at5": float(artifacts.test_metrics.get(name, {}).get("ndcg_at5", np.nan)),
+                        "test_mrr_at5": float(artifacts.test_metrics.get(name, {}).get("mrr_at5", np.nan)),
+                        "test_coverage_at5": float(artifacts.test_metrics.get(name, {}).get("coverage_at5", np.nan)),
+                        "test_diversity_at5": float(artifacts.test_metrics.get(name, {}).get("diversity_at5", np.nan)),
                         "fit_seconds": float(artifacts.fit_seconds.get(name, np.nan)),
                         "epochs": len(history.history.get("loss", [])),
                     }
@@ -253,8 +314,16 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "model_family": row.model_family,
                         "val_top1": row.val_top1,
                         "val_top5": row.val_top5,
+                        "val_ndcg_at5": row.val_ndcg_at5,
+                        "val_mrr_at5": row.val_mrr_at5,
+                        "val_coverage_at5": row.val_coverage_at5,
+                        "val_diversity_at5": row.val_diversity_at5,
                         "test_top1": row.test_top1,
                         "test_top5": row.test_top5,
+                        "test_ndcg_at5": row.test_ndcg_at5,
+                        "test_mrr_at5": row.test_mrr_at5,
+                        "test_coverage_at5": row.test_coverage_at5,
+                        "test_diversity_at5": row.test_diversity_at5,
                         "fit_seconds": row.fit_seconds,
                         "epochs": "",
                     }
@@ -283,8 +352,16 @@ def run_pipeline(config: PipelineConfig) -> None:
                     "model_family": row.model_family,
                     "val_top1": row.val_top1,
                     "val_top5": row.val_top5,
+                    "val_ndcg_at5": row.val_ndcg_at5,
+                    "val_mrr_at5": row.val_mrr_at5,
+                    "val_coverage_at5": row.val_coverage_at5,
+                    "val_diversity_at5": row.val_diversity_at5,
                     "test_top1": row.test_top1,
                     "test_top5": row.test_top5,
+                    "test_ndcg_at5": row.test_ndcg_at5,
+                    "test_mrr_at5": row.test_mrr_at5,
+                    "test_coverage_at5": row.test_coverage_at5,
+                    "test_diversity_at5": row.test_diversity_at5,
                     "fit_seconds": row.fit_seconds,
                     "epochs": "",
                     "n_trials": row.n_trials,
@@ -347,6 +424,34 @@ def run_pipeline(config: PipelineConfig) -> None:
         if history_plot is not None:
             artifact_paths.append(history_plot)
 
+        champion_gate_threshold_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_REGRESSION", "0.005").strip()
+        try:
+            champion_gate_threshold = max(0.0, float(champion_gate_threshold_raw))
+        except Exception:
+            champion_gate_threshold = 0.005
+        champion_gate = evaluate_champion_gate(
+            history_csv=history_csv,
+            current_run_id=run_id,
+            current_results=result_rows,
+            regression_threshold=champion_gate_threshold,
+        )
+        champion_gate_path = run_dir / "champion_gate.json"
+        champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
+        artifact_paths.append(champion_gate_path)
+        logger.info(
+            "Champion gate: promoted=%s regression=%.6f threshold=%.6f",
+            bool(champion_gate.get("promoted", False)),
+            float(champion_gate.get("regression", 0.0)),
+            float(champion_gate.get("threshold", champion_gate_threshold)),
+        )
+        strict_gate_raw = os.getenv("SPOTIFY_CHAMPION_GATE_STRICT", "0").strip().lower()
+        strict_gate = strict_gate_raw in ("1", "true", "yes", "on")
+        if strict_gate and not bool(champion_gate.get("promoted", False)):
+            raise RuntimeError(
+                "Champion gate failed in strict mode: "
+                f"regression={champion_gate.get('regression')} threshold={champion_gate.get('threshold')}"
+            )
+
         if optuna_rows:
             optuna_history_csv = append_optuna_history(
                 history_csv=history_dir / "optuna_history.csv",
@@ -392,11 +497,28 @@ def run_pipeline(config: PipelineConfig) -> None:
             "temporal_backtest_folds": config.temporal_backtest_folds,
             "backtest_rows": len(backtest_rows),
             "optuna_rows": len(optuna_rows),
+            "cache": cache_info_payload,
+            "champion_gate": champion_gate,
         }
         manifest_path = run_dir / "run_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as out:
             json.dump(manifest, out, indent=2)
         artifact_paths.append(manifest_path)
+
+        run_results_path = run_dir / "run_results.json"
+        with run_results_path.open("w", encoding="utf-8") as out:
+            json.dump(result_rows, out, indent=2)
+        artifact_paths.append(run_results_path)
+
+        report_path = write_run_report(
+            run_dir=run_dir,
+            history_dir=history_dir,
+            manifest=manifest,
+            results=result_rows,
+            champion_gate=champion_gate,
+            history_csv=history_csv,
+        )
+        artifact_paths.append(report_path)
 
         result_rows_sorted = sorted(
             result_rows,
@@ -418,11 +540,13 @@ def run_pipeline(config: PipelineConfig) -> None:
                 fit_display,
             )
 
-        tracker.log_result_rows(result_rows)
-        tracker.log_backtest_rows(backtest_rows)
+        if tracker is not None:
+            tracker.log_result_rows(result_rows)
+            tracker.log_backtest_rows(backtest_rows)
         for path in artifact_paths:
             _track_file(tracker, path)
 
         logger.info("Pipeline completed successfully")
     finally:
-        tracker.end()
+        if tracker is not None:
+            tracker.end()

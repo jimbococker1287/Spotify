@@ -83,7 +83,21 @@ class MlflowTracker:
         for idx, row in enumerate(rows):
             model_name = str(row.get("model_name", f"model_{idx}"))
             prefix = _sanitize_metric_name(f"models.{model_name}")
-            for metric_name in ("val_top1", "val_top5", "test_top1", "test_top5", "fit_seconds"):
+            for metric_name in (
+                "val_top1",
+                "val_top5",
+                "val_ndcg_at5",
+                "val_mrr_at5",
+                "val_coverage_at5",
+                "val_diversity_at5",
+                "test_top1",
+                "test_top5",
+                "test_ndcg_at5",
+                "test_mrr_at5",
+                "test_coverage_at5",
+                "test_diversity_at5",
+                "fit_seconds",
+            ):
                 value = row.get(metric_name)
                 try:
                     numeric = float(value)

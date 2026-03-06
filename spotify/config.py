@@ -277,7 +277,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     optuna_model_names = (
         _split_csv_models(args.optuna_models, DEFAULT_OPTUNA_MODEL_NAMES)
         if args.optuna_models
-        else tuple(preset["optuna_model_names"])
+        else (classical_model_names if args.classical_models else tuple(preset["optuna_model_names"]))
     )
 
     if args.temporal_backtest is None:
@@ -292,7 +292,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     temporal_backtest_model_names = (
         _split_csv_models(args.backtest_models, DEFAULT_BACKTEST_MODEL_NAMES)
         if args.backtest_models
-        else tuple(preset["temporal_backtest_model_names"])
+        else (classical_model_names if args.classical_models else tuple(preset["temporal_backtest_model_names"]))
     )
 
     return PipelineConfig(

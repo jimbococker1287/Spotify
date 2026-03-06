@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
-import sys
 import time
 
 import numpy as np
 from sklearn.utils import class_weight
 
 from .data import PreparedData
+from .ranking import ranking_metrics_from_proba
 
 
 @dataclass
@@ -98,11 +98,31 @@ def train_and_evaluate_models(
     import tensorflow as tf
     from tensorflow.keras import callbacks
 
+    def _parse_pos_int(raw: str | None, fallback: int) -> int:
+        try:
+            value = int(str(raw))
+            if value > 0:
+                return value
+        except Exception:
+            pass
+        return fallback
+
+    def _extract_artist_proba(prediction) -> np.ndarray:
+        if isinstance(prediction, dict):
+            if "artist_output" in prediction:
+                return np.asarray(prediction["artist_output"])
+            first_value = next(iter(prediction.values()))
+            return np.asarray(first_value)
+        if isinstance(prediction, (list, tuple)):
+            return np.asarray(prediction[0])
+        return np.asarray(prediction)
+
     class EpochProgressLogger(callbacks.Callback):
-        def __init__(self, model_name: str, logger_obj):
+        def __init__(self, model_name: str, logger_obj, log_interval: int):
             super().__init__()
             self.model_name = model_name
             self.logger = logger_obj
+            self.log_interval = max(1, int(log_interval))
             self._epoch_started = 0.0
             self._steps_per_epoch = None
 
@@ -119,7 +139,7 @@ def train_and_evaluate_models(
 
         def on_train_batch_end(self, batch, logs=None):
             step = batch + 1
-            if step == 1 or step % 25 == 0:
+            if step == 1 or step % self.log_interval == 0:
                 loss = float((logs or {}).get("loss", float("nan")))
                 if self._steps_per_epoch is None:
                     self.logger.info("[%s] Epoch progress: step=%d loss=%.4f", self.model_name, step, loss)
@@ -164,11 +184,20 @@ def train_and_evaluate_models(
     elif eager_flag in ("0", "false", "no", "off"):
         run_eagerly = False
     else:
-        run_eagerly = (sys.platform == "darwin")
+        # Graph mode is materially faster; prefer it unless explicitly overridden.
+        run_eagerly = False
+
+    log_interval = _parse_pos_int(os.getenv("SPOTIFY_BATCH_LOG_INTERVAL"), 25)
+    steps_per_execution_raw = os.getenv("SPOTIFY_STEPS_PER_EXECUTION", "auto").strip().lower()
+    if steps_per_execution_raw == "auto":
+        steps_per_execution = 1 if run_eagerly else 16
+    else:
+        steps_per_execution = _parse_pos_int(steps_per_execution_raw, 1 if run_eagerly else 16)
 
     for name, builder in model_builders:
         logger.info("Training %s model", name)
         logger.info("[%s] run_eagerly=%s", name, run_eagerly)
+        logger.info("[%s] steps_per_execution=%d", name, steps_per_execution)
 
         with strategy.scope():
             model = builder()
@@ -183,6 +212,7 @@ def train_and_evaluate_models(
                         tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name="top_5"),
                     ],
                     run_eagerly=run_eagerly,
+                    steps_per_execution=steps_per_execution,
                 )
                 monitor_metric = "val_sparse_categorical_accuracy"
             else:
@@ -201,12 +231,13 @@ def train_and_evaluate_models(
                     },
                     loss_weights={"artist_output": 1.0, "skip_output": 0.2},
                     run_eagerly=run_eagerly,
+                    steps_per_execution=steps_per_execution,
                 )
                 monitor_metric = "val_artist_output_sparse_categorical_accuracy"
 
             checkpoint_path = output_dir / f"best_{name}.keras"
             cbs = [
-                EpochProgressLogger(name, logger),
+                EpochProgressLogger(name, logger, log_interval=log_interval),
                 callbacks.EarlyStopping(
                     monitor=monitor_metric,
                     patience=5,
@@ -296,9 +327,39 @@ def train_and_evaluate_models(
             top5 = float(eval_result.get("artist_output_top_5", np.nan))
             val_top1 = float(history.history.get("val_artist_output_sparse_categorical_accuracy", [np.nan])[-1])
             val_top5 = float(history.history.get("val_artist_output_top_5", [np.nan])[-1])
+        val_pred = model.predict((data.X_seq_val, data.X_ctx_val), batch_size=batch_size, verbose=0)
+        test_pred = model.predict((data.X_seq_test, data.X_ctx_test), batch_size=batch_size, verbose=0)
+        val_proba = _extract_artist_proba(val_pred)
+        test_proba = _extract_artist_proba(test_pred)
+        val_ranking = ranking_metrics_from_proba(
+            val_proba,
+            data.y_val,
+            num_items=data.num_artists,
+            k=5,
+        )
+        test_ranking = ranking_metrics_from_proba(
+            test_proba,
+            data.y_test,
+            num_items=data.num_artists,
+            k=5,
+        )
 
-        test_metrics[name] = {"top1": top1, "top5": top5}
-        val_metrics[name] = {"top1": val_top1, "top5": val_top5}
+        test_metrics[name] = {
+            "top1": top1,
+            "top5": top5,
+            "ndcg_at5": float(test_ranking["ndcg_at_k"]),
+            "mrr_at5": float(test_ranking["mrr_at_k"]),
+            "coverage_at5": float(test_ranking["coverage_at_k"]),
+            "diversity_at5": float(test_ranking["diversity_at_k"]),
+        }
+        val_metrics[name] = {
+            "top1": val_top1,
+            "top5": val_top5,
+            "ndcg_at5": float(val_ranking["ndcg_at_k"]),
+            "mrr_at5": float(val_ranking["mrr_at_k"]),
+            "coverage_at5": float(val_ranking["coverage_at_k"]),
+            "diversity_at5": float(val_ranking["diversity_at_k"]),
+        }
         logger.info("[TEST] %s: Top-1=%.4f | Top-5=%.4f", name, top1, top5)
 
     return TrainingArtifacts(

@@ -7,7 +7,13 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Optuna hyperparameter tuning
 - Temporal backtesting
 - MLflow tracking
+- Prepared-data fingerprint caching
+- Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
+- Champion/challenger gating
+- Per-run Markdown auto-report
 - Persistent cross-run history and charts
+- Benchmark lock runs with seed-based confidence intervals
+- Prediction CLI for serving top-k next-artist recommendations
 
 ## Project Layout
 
@@ -18,6 +24,7 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - `outputs/history/experiment_history.csv`: cumulative model leaderboard history
 - `outputs/history/optuna_history.csv`: cumulative tuned-model history
 - `outputs/history/backtest_history.csv`: cumulative temporal backtest history
+- `outputs/history/benchmark_history.csv`: benchmark-lock aggregate history with CI stats
 - `outputs/mlruns/mlflow.db`: local MLflow tracking DB (default)
 
 ## Profiles
@@ -68,10 +75,34 @@ Run everything (all deep + all classical + full Optuna + full temporal backtest 
 bash scripts/run_everything.sh
 ```
 
+Run a canonical 3-seed benchmark lock and produce confidence intervals:
+
+```bash
+bash scripts/run_benchmark_lock.sh
+```
+
+Run the regression guard (hang + artifact checks):
+
+```bash
+python scripts/regression_guard.py
+```
+
 Or via Makefile:
 
 ```bash
 make train-everything RUN_NAME=full-e2e
+```
+
+Benchmark lock via Make:
+
+```bash
+make benchmark-lock RUN_NAME=nightly-benchmark
+```
+
+Regression guard via Make:
+
+```bash
+make regression-guard
 ```
 
 Custom run:
@@ -96,12 +127,32 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `PYTHON_BIN` (override Python executable)
 - `SPOTIFY_FORCE_CPU` (default `1` in launcher; set `0` to allow GPU)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
-- `SPOTIFY_RUN_EAGER` (default `1` in launcher for macOS stability)
+- `SPOTIFY_RUN_EAGER` (default `0` in launcher for faster graph execution)
+- `SPOTIFY_STEPS_PER_EXECUTION` (default `32` in launcher)
+- `SPOTIFY_BATCH_LOG_INTERVAL` (default `50`, reduces logging overhead)
 - `SPOTIFY_DISABLE_MONITOR` (`auto` by default; monitor disabled automatically on macOS)
-- `TF_NUM_INTRAOP_THREADS` (optional manual override; default uses TensorFlow auto threading)
-- `TF_NUM_INTEROP_THREADS` (optional manual override; default uses TensorFlow auto threading)
+- `TF_NUM_INTRAOP_THREADS` (launcher defaults to logical CPU count)
+- `TF_NUM_INTEROP_THREADS` (launcher defaults based on CPU count)
+- `SPOTIFY_CLASSICAL_MODEL_WORKERS` (parallel classical model workers; launcher auto-sets)
+- `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets)
+- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers; launcher auto-sets)
+- `SPOTIFY_CACHE_PREPARED` (default `1`; reuses preprocessed arrays when raw files/config fingerprint is unchanged)
+- `SPOTIFY_OPTUNA_PRUNER` (default `median`; use `none` to disable pruning)
+- `SPOTIFY_OPTUNA_PRUNING_FIDELITIES` (default `0.25,0.60,1.0`)
+- `SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS` (default `120`; per-trial budget)
+- `SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS` (optional; override per-model tuning timeout)
+- `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (optional, e.g. `logreg=90,random_forest=300`)
+- `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in val top-1 vs previous champion)
+- `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
+
+`scripts/run_benchmark_lock.sh` supports:
+
+- `BENCHMARK_SEEDS` (default `11 42 77`)
+- `DEEP_MODELS` (default `dense,gru_artist,lstm`)
+- `CLASSICAL_MODELS` (default `logreg,random_forest,extra_trees`)
+- `EPOCHS` (default `6`)
 
 ## Elite Flags
 
@@ -122,6 +173,10 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 
 - `train.log`
 - `run_manifest.json`
+- `run_results.json`
+- `run_report.md` (auto-generated run summary with metrics, speed, and trend links)
+- `champion_gate.json` (promotion decision vs prior champion)
+- `feature_metadata.json` (artist label map + context feature schema)
 - `run_leaderboard.png`
 - `classical_results.json`
 - `histories.json` and deep-model learning curves
@@ -136,6 +191,53 @@ Global history (`outputs/history/`):
 - `experiment_history.csv` + `history_best_runs.png`
 - `optuna_history.csv` + `history_optuna_best_runs.png`
 - `backtest_history.csv` + `history_backtest_mean_top1.png`
+- `benchmark_lock_<id>_rows.csv` + `benchmark_lock_<id>_summary.csv`
+- `benchmark_lock_<id>_ci95.png`
+- `benchmark_history.csv`
+
+Prepared-data cache:
+
+- `outputs/cache/prepared_data/<fingerprint>/prepared_bundle.joblib`
+- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json`
+
+## Prediction CLI
+
+Load the best deep model from a run and print top-5 next-artist predictions:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --top-k 5
+```
+
+Use a specific model checkpoint:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --model-name gru_artist \
+  --top-k 5
+```
+
+Override sequence input with your own recent artists:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --recent-artists "Artist A|Artist B|Artist C|..."
+```
+
+## Feature Upgrades
+
+The training context now includes additional recency/frequency and session-transition features:
+
+- `artist_play_count_24h`, `artist_play_count_7d`
+- `plays_since_last_artist`
+- `artist_session_play_count`
+- `session_unique_artists_so_far`
+- `is_artist_repeat_from_prev`
+- `transition_repeat_count`
+- `artist_skip_rate_hist`
 
 ## Notes
 

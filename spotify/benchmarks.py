@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 import json
+import os
 import time
 
 import numpy as np
 
 from .data import PreparedData
+from .ranking import ranking_metrics_from_proba
 
 
 @dataclass
@@ -18,8 +21,16 @@ class ClassicalBenchmarkResult:
     fit_seconds: float
     val_top1: float
     val_top5: float
+    val_ndcg_at5: float
+    val_mrr_at5: float
+    val_coverage_at5: float
+    val_diversity_at5: float
     test_top1: float
     test_top5: float
+    test_ndcg_at5: float
+    test_mrr_at5: float
+    test_coverage_at5: float
+    test_diversity_at5: float
 
 
 def _sequence_feature_block(seq: np.ndarray) -> np.ndarray:
@@ -73,8 +84,38 @@ def sample_rows(
     return X[idx], y[idx]
 
 
+def resolve_classical_parallelism() -> tuple[int, int]:
+    cpu_count = os.cpu_count() or 1
+    workers_raw = os.getenv("SPOTIFY_CLASSICAL_MODEL_WORKERS", "1").strip()
+    estimator_jobs_raw = os.getenv("SPOTIFY_SKLEARN_NJOBS", "").strip()
+
+    workers = 1
+    try:
+        workers = max(1, min(cpu_count, int(workers_raw)))
+    except Exception:
+        workers = 1
+
+    if estimator_jobs_raw:
+        try:
+            estimator_jobs = int(estimator_jobs_raw)
+        except Exception:
+            estimator_jobs = -1
+    else:
+        if workers > 1:
+            # Split CPU resources across model workers by default.
+            estimator_jobs = max(1, cpu_count // workers)
+        else:
+            estimator_jobs = -1
+
+    if estimator_jobs == 0:
+        estimator_jobs = 1
+
+    return workers, estimator_jobs
+
+
 def get_classical_model_registry(
     random_seed: int,
+    estimator_n_jobs: int = -1,
 ) -> dict[str, tuple[str, Callable[[dict[str, object] | None], object]]]:
     from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
@@ -88,7 +129,18 @@ def get_classical_model_registry(
         params = params or {}
         c_value = float(params.get("C", 1.0))
         max_iter = int(params.get("max_iter", 500))
-        return make_pipeline(StandardScaler(), LogisticRegression(C=c_value, max_iter=max_iter, solver="lbfgs"))
+        solver = str(params.get("solver", "lbfgs"))
+        if solver not in ("lbfgs", "saga", "newton-cg", "sag", "liblinear"):
+            solver = "lbfgs"
+        use_n_jobs = estimator_n_jobs if solver in ("saga", "sag", "liblinear") else None
+        kwargs = {
+            "C": c_value,
+            "max_iter": max_iter,
+            "solver": solver,
+        }
+        if use_n_jobs is not None:
+            kwargs["n_jobs"] = use_n_jobs
+        return make_pipeline(StandardScaler(), LogisticRegression(**kwargs))
 
     def build_random_forest(params: dict[str, object] | None):
         params = params or {}
@@ -97,7 +149,7 @@ def get_classical_model_registry(
             max_depth=(int(params["max_depth"]) if "max_depth" in params and params["max_depth"] is not None else None),
             min_samples_leaf=int(params.get("min_samples_leaf", 1)),
             random_state=random_seed,
-            n_jobs=-1,
+            n_jobs=estimator_n_jobs,
             class_weight="balanced_subsample",
         )
 
@@ -108,7 +160,7 @@ def get_classical_model_registry(
             max_depth=(int(params["max_depth"]) if "max_depth" in params and params["max_depth"] is not None else None),
             min_samples_leaf=int(params.get("min_samples_leaf", 1)),
             random_state=random_seed,
-            n_jobs=-1,
+            n_jobs=estimator_n_jobs,
             class_weight="balanced_subsample",
         )
 
@@ -125,7 +177,10 @@ def get_classical_model_registry(
     def build_knn(params: dict[str, object] | None):
         params = params or {}
         n_neighbors = int(params.get("n_neighbors", 35))
-        return make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=n_neighbors, weights="distance", n_jobs=-1))
+        return make_pipeline(
+            StandardScaler(),
+            KNeighborsClassifier(n_neighbors=n_neighbors, weights="distance", n_jobs=estimator_n_jobs),
+        )
 
     def build_nb(_params: dict[str, object] | None):
         return make_pipeline(StandardScaler(), GaussianNB())
@@ -169,8 +224,9 @@ def build_classical_estimator(
     model_name: str,
     random_seed: int,
     params: dict[str, object] | None = None,
+    estimator_n_jobs: int = -1,
 ) -> tuple[str, object]:
-    registry = get_classical_model_registry(random_seed)
+    registry = get_classical_model_registry(random_seed, estimator_n_jobs=estimator_n_jobs)
     if model_name not in registry:
         known = ", ".join(sorted(registry))
         raise ValueError(f"Unknown classical model name: {model_name}. Known models: {known}")
@@ -184,7 +240,7 @@ def evaluate_classical_estimator(
     y_val: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, dict[str, float], dict[str, float]]:
     val_pred = estimator.predict(X_val)
     test_pred = estimator.predict(X_test)
     val_top1 = float(np.mean(val_pred == y_val))
@@ -192,15 +248,93 @@ def evaluate_classical_estimator(
 
     val_top5 = float("nan")
     test_top5 = float("nan")
+    val_ranking = {
+        "ndcg_at5": float("nan"),
+        "mrr_at5": float("nan"),
+        "coverage_at5": float("nan"),
+        "diversity_at5": float("nan"),
+    }
+    test_ranking = {
+        "ndcg_at5": float("nan"),
+        "mrr_at5": float("nan"),
+        "coverage_at5": float("nan"),
+        "diversity_at5": float("nan"),
+    }
     if hasattr(estimator, "predict_proba"):
         try:
             val_proba = estimator.predict_proba(X_val)
             test_proba = estimator.predict_proba(X_test)
             val_top5 = _topk_from_proba(np.asarray(val_proba), y_val, k=5)
             test_top5 = _topk_from_proba(np.asarray(test_proba), y_test, k=5)
+            val_class_count = int(np.asarray(val_proba).shape[1])
+            test_class_count = int(np.asarray(test_proba).shape[1])
+            val_extra = ranking_metrics_from_proba(np.asarray(val_proba), y_val, num_items=val_class_count, k=5)
+            test_extra = ranking_metrics_from_proba(
+                np.asarray(test_proba),
+                y_test,
+                num_items=test_class_count,
+                k=5,
+            )
+            val_ranking = {
+                "ndcg_at5": float(val_extra["ndcg_at_k"]),
+                "mrr_at5": float(val_extra["mrr_at_k"]),
+                "coverage_at5": float(val_extra["coverage_at_k"]),
+                "diversity_at5": float(val_extra["diversity_at_k"]),
+            }
+            test_ranking = {
+                "ndcg_at5": float(test_extra["ndcg_at_k"]),
+                "mrr_at5": float(test_extra["mrr_at_k"]),
+                "coverage_at5": float(test_extra["coverage_at_k"]),
+                "diversity_at5": float(test_extra["diversity_at_k"]),
+            }
         except Exception:
             pass
-    return val_top1, val_top5, test_top1, test_top5
+    return val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking
+
+
+def _fit_single_classical_model(
+    model_name: str,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+) -> ClassicalBenchmarkResult:
+    family, estimator = build_classical_estimator(
+        model_name,
+        random_seed,
+        estimator_n_jobs=estimator_n_jobs,
+    )
+    start = time.perf_counter()
+    estimator.fit(X_train, y_train)
+    fit_seconds = time.perf_counter() - start
+    val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking = evaluate_classical_estimator(
+        estimator,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+    )
+    return ClassicalBenchmarkResult(
+        model_name=model_name,
+        model_family=family,
+        fit_seconds=float(fit_seconds),
+        val_top1=val_top1,
+        val_top5=val_top5,
+        val_ndcg_at5=float(val_ranking["ndcg_at5"]),
+        val_mrr_at5=float(val_ranking["mrr_at5"]),
+        val_coverage_at5=float(val_ranking["coverage_at5"]),
+        val_diversity_at5=float(val_ranking["diversity_at5"]),
+        test_top1=test_top1,
+        test_top5=test_top5,
+        test_ndcg_at5=float(test_ranking["ndcg_at5"]),
+        test_mrr_at5=float(test_ranking["mrr_at5"]),
+        test_coverage_at5=float(test_ranking["coverage_at5"]),
+        test_diversity_at5=float(test_ranking["diversity_at5"]),
+    )
 
 
 def run_classical_benchmarks(
@@ -232,33 +366,69 @@ def run_classical_benchmarks(
         len(X_test),
     )
 
-    results: list[ClassicalBenchmarkResult] = []
-    for name in selected_models:
-        family, estimator = build_classical_estimator(name, random_seed)
-        logger.info("Training classical model %s", name)
-
-        start = time.perf_counter()
-        estimator.fit(X_train, y_train)
-        fit_seconds = time.perf_counter() - start
-
-        val_top1, val_top5, test_top1, test_top5 = evaluate_classical_estimator(estimator, X_val, y_val, X_test, y_test)
-
-        result = ClassicalBenchmarkResult(
-            model_name=name,
-            model_family=family,
-            fit_seconds=float(fit_seconds),
-            val_top1=val_top1,
-            val_top5=val_top5,
-            test_top1=test_top1,
-            test_top5=test_top5,
-        )
+    workers, estimator_n_jobs = resolve_classical_parallelism()
+    if workers > 1 and len(selected_models) > 1:
         logger.info(
-            "[CLASSICAL][TEST] %s: Top-1=%.4f | Top-5=%s",
-            name,
-            test_top1,
-            f"{test_top5:.4f}" if not np.isnan(test_top5) else "n/a",
+            "Classical model parallelism enabled: workers=%d estimator_n_jobs=%d",
+            workers,
+            estimator_n_jobs,
         )
-        results.append(result)
+    else:
+        logger.info("Classical model parallelism: workers=1 estimator_n_jobs=%d", estimator_n_jobs)
+
+    results: list[ClassicalBenchmarkResult] = []
+    if workers > 1 and len(selected_models) > 1:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for name in selected_models:
+                logger.info("Training classical model %s", name)
+                future = executor.submit(
+                    _fit_single_classical_model,
+                    name,
+                    random_seed,
+                    estimator_n_jobs,
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    X_test,
+                    y_test,
+                )
+                futures[future] = name
+
+            ordered: dict[str, ClassicalBenchmarkResult] = {}
+            for future in as_completed(futures):
+                name = futures[future]
+                result = future.result()
+                ordered[name] = result
+                logger.info(
+                    "[CLASSICAL][TEST] %s: Top-1=%.4f | Top-5=%s",
+                    name,
+                    result.test_top1,
+                    f"{result.test_top5:.4f}" if not np.isnan(result.test_top5) else "n/a",
+                )
+            results = [ordered[name] for name in selected_models if name in ordered]
+    else:
+        for name in selected_models:
+            logger.info("Training classical model %s", name)
+            result = _fit_single_classical_model(
+                model_name=name,
+                random_seed=random_seed,
+                estimator_n_jobs=estimator_n_jobs,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                X_test=X_test,
+                y_test=y_test,
+            )
+            logger.info(
+                "[CLASSICAL][TEST] %s: Top-1=%.4f | Top-5=%s",
+                name,
+                result.test_top1,
+                f"{result.test_top5:.4f}" if not np.isnan(result.test_top5) else "n/a",
+            )
+            results.append(result)
 
     payload = [asdict(r) for r in results]
     with (output_dir / "classical_results.json").open("w", encoding="utf-8") as out:
