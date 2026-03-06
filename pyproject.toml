@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spotify-extended-pipeline"
+version = "0.1.0"
+description = "End-to-end Spotify streaming history modeling pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "joblib>=1.4",
+  "matplotlib>=3.9",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "psutil>=5.9",
+  "scikit-learn>=1.5",
+  "tensorflow>=2.16",
+]
+
+[project.optional-dependencies]
+extras = [
+  "spotipy>=2.24",
+  "shap>=0.46",
+  "gputil>=1.4",
+]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spotify*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
