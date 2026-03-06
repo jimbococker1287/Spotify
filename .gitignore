@@ -12,6 +12,7 @@ __pycache__/
 # Pipeline outputs
 outputs/*
 !outputs/.gitkeep
+mlruns/
 best_*.keras
 spotify_*.keras
 spotify_*.h5

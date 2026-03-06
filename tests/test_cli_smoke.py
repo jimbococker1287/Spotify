@@ -15,3 +15,7 @@ def test_python_module_help_runs() -> None:
     assert "python -m spotify" in result.stdout
     assert "--batch" in result.stdout
     assert "--profile" in result.stdout
+    assert "--classical-only" in result.stdout
+    assert "--mlflow" in result.stdout
+    assert "--optuna-trials" in result.stdout
+    assert "--temporal-backtest" in result.stdout

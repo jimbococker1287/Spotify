@@ -266,10 +266,10 @@ def prepare_training_data(
         y_seq.append(labels[i + sequence_length])
         y_skip.append(df["skipped"].iloc[i + sequence_length])
 
-    X_seq = np.array(X_seq)
-    X_ctx = np.array(X_ctx)
-    y_seq = np.array(y_seq)
-    y_skip = np.array(y_skip)
+    X_seq = np.array(X_seq, dtype="int32")
+    X_ctx = np.array(X_ctx, dtype="float32")
+    y_seq = np.array(y_seq, dtype="int32")
+    y_skip = np.array(y_skip, dtype="float32")
 
     n = len(X_seq)
     test_start = int(n * 0.80)
@@ -302,9 +302,9 @@ def prepare_training_data(
     X_ctx_test = _log1p_cols(X_ctx_test)
 
     scaler = StandardScaler()
-    X_ctx_train = scaler.fit_transform(X_ctx_train)
-    X_ctx_val = scaler.transform(X_ctx_val)
-    X_ctx_test = scaler.transform(X_ctx_test)
+    X_ctx_train = scaler.fit_transform(X_ctx_train).astype("float32")
+    X_ctx_val = scaler.transform(X_ctx_val).astype("float32")
+    X_ctx_test = scaler.transform(X_ctx_test).astype("float32")
 
     scaler_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(scaler, scaler_path)
@@ -332,9 +332,9 @@ def prepare_training_data(
         y_train=y_train,
         y_val=y_val,
         y_test=y_test,
-        y_skip_train=y_skip_train,
-        y_skip_val=y_skip_val,
-        y_skip_test=y_skip_test,
+        y_skip_train=y_skip_train.astype("float32"),
+        y_skip_val=y_skip_val.astype("float32"),
+        y_skip_test=y_skip_test.astype("float32"),
         num_artists=num_artists,
         num_ctx=num_ctx,
     )

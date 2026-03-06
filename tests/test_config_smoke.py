@@ -15,6 +15,12 @@ def test_default_config_paths() -> None:
     assert config.profile == "full"
     assert config.sequence_length == 30
     assert config.epochs == 50
+    assert config.enable_classical_models is True
+    assert config.enable_mlflow is True
+    assert config.enable_optuna is True
+    assert config.enable_temporal_backtest is True
+    assert set(config.optuna_model_names) == set(config.classical_model_names)
+    assert set(config.temporal_backtest_model_names) == set(config.classical_model_names)
 
 
 def test_model_subset_parsing() -> None:
@@ -36,6 +42,10 @@ def test_profile_defaults_are_applied() -> None:
     assert config.batch_size == 256
     assert config.max_artists == 40
     assert config.model_names == ("dense", "lstm")
+    assert config.classical_model_names == ("logreg", "random_forest", "knn")
+    assert config.enable_mlflow is False
+    assert config.enable_optuna is False
+    assert config.enable_temporal_backtest is False
 
 
 def test_cli_overrides_profile_defaults() -> None:
@@ -47,3 +57,43 @@ def test_cli_overrides_profile_defaults() -> None:
     assert config.epochs == 3
     assert config.batch_size == 64
     assert config.include_video is False
+
+
+def test_classical_only_disables_deep_models() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--profile", "full", "--classical-only"])
+    config = build_config(args)
+
+    assert config.classical_only is True
+    assert config.enable_classical_models is True
+    assert config.model_names == ()
+
+
+def test_new_elite_flags_override_profile_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--profile",
+            "dev",
+            "--mlflow",
+            "--optuna",
+            "--optuna-trials",
+            "5",
+            "--optuna-models",
+            "logreg,hist_gbm",
+            "--temporal-backtest",
+            "--backtest-folds",
+            "4",
+            "--backtest-models",
+            "logreg,random_forest",
+        ]
+    )
+    config = build_config(args)
+
+    assert config.enable_mlflow is True
+    assert config.enable_optuna is True
+    assert config.optuna_trials == 5
+    assert config.optuna_model_names == ("logreg", "hist_gbm")
+    assert config.enable_temporal_backtest is True
+    assert config.temporal_backtest_folds == 4
+    assert config.temporal_backtest_model_names == ("logreg", "random_forest")
