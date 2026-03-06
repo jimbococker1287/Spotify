@@ -48,10 +48,15 @@ def run_pipeline(config: PipelineConfig) -> None:
     logger.info("Output root: %s", config.output_dir)
     logger.info("Run output directory: %s", run_dir)
 
-    # Keep matplotlib/font caches inside project outputs to avoid macOS
-    # permission issues in sandboxed environments.
-    mpl_config_dir = run_dir / ".mplconfig"
-    xdg_cache_dir = run_dir / ".cache"
+    # Use shared matplotlib/font caches by default so font cache is built once
+    # and reused across runs (large startup-time win on macOS).
+    isolate_mpl_cache = os.getenv("SPOTIFY_ISOLATE_MPL_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+    if isolate_mpl_cache:
+        mpl_config_dir = run_dir / ".mplconfig"
+        xdg_cache_dir = run_dir / ".cache"
+    else:
+        mpl_config_dir = config.output_dir / ".mplconfig"
+        xdg_cache_dir = config.output_dir / ".cache"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
     xdg_cache_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -83,7 +88,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             configure_process_env()
             tf = load_tensorflow_runtime(logger)
             tf.random.set_seed(config.random_seed)
-            strategy = select_distribution_strategy(tf)
+            strategy = select_distribution_strategy(tf, logger=logger)
             logger.info("Number of devices: %s", getattr(strategy, "num_replicas_in_sync", 1))
 
         tracker = MlflowTracker(

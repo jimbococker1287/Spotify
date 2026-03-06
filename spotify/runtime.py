@@ -3,14 +3,24 @@ from __future__ import annotations
 import multiprocessing
 import os
 import sys
+
+
 def configure_process_env() -> None:
     force_cpu = os.getenv("SPOTIFY_FORCE_CPU", "0").strip().lower() in ("1", "true", "yes")
     if force_cpu:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
         os.environ.setdefault("TF_METAL_ENABLE_FUSED_OPERATIONS", "0")
+    else:
+        # Let TensorFlow place GPU work on dedicated threads when available.
+        os.environ.setdefault("TF_GPU_THREAD_MODE", "gpu_private")
+        os.environ.setdefault("TF_GPU_THREAD_COUNT", "4")
+        os.environ.setdefault("TF_METAL_ENABLE_FUSED_OPERATIONS", "1")
+
+    # Avoid noisy and repeated physical-core detection in joblib/loky.
+    if os.getenv("LOKY_MAX_CPU_COUNT") is None:
+        os.environ["LOKY_MAX_CPU_COUNT"] = str(multiprocessing.cpu_count() or 1)
     os.environ.setdefault("TF_GPU_THREAD_MODE", "gpu_private")
     os.environ.setdefault("TF_GPU_THREAD_COUNT", "4")
-    os.environ.setdefault("TF_METAL_ENABLE_FUSED_OPERATIONS", "1")
 
 
 def load_tensorflow_runtime(logger):
@@ -45,6 +55,13 @@ def load_tensorflow_runtime(logger):
     else:
         logger.info("TensorFlow CPU threads: auto (logical_cpus=%d)", cpu_count)
 
+    try:
+        physical_gpus = tf.config.list_physical_devices("GPU")
+        for device in physical_gpus:
+            tf.config.experimental.set_memory_growth(device, True)
+    except Exception:
+        pass
+
     policy_override = os.getenv("SPOTIFY_MIXED_PRECISION", "auto").strip().lower()
     if policy_override in ("off", "0", "false"):
         try:
@@ -63,7 +80,17 @@ def load_tensorflow_runtime(logger):
         except Exception as exc:
             logger.warning("Failed to set mixed_float16 policy: %s", exc)
     else:
-        logger.info("Using TensorFlow default precision policy.")
+        try:
+            from tensorflow.keras import mixed_precision
+
+            logical_gpus = tf.config.list_logical_devices("GPU")
+            if logical_gpus:
+                mixed_precision.set_global_policy("mixed_float16")
+                logger.info("Mixed precision auto-enabled (GPUs detected: %d).", len(logical_gpus))
+            else:
+                logger.info("Using TensorFlow default precision policy.")
+        except Exception as exc:
+            logger.warning("Mixed precision auto policy setup failed: %s", exc)
 
     try:
         if sys.platform != "darwin":
@@ -76,6 +103,19 @@ def load_tensorflow_runtime(logger):
     return tf
 
 
-def select_distribution_strategy(tf):
-    # Default strategy is the most stable path across CPU/Metal backends.
+def select_distribution_strategy(tf, logger=None):
+    mode = os.getenv("SPOTIFY_DISTRIBUTION_STRATEGY", "auto").strip().lower()
+    if mode in ("default", "none"):
+        return tf.distribute.get_strategy()
+
+    try:
+        logical_gpus = tf.config.list_logical_devices("GPU")
+    except Exception:
+        logical_gpus = []
+
+    if mode in ("mirrored", "auto") and len(logical_gpus) > 1:
+        if logger is not None:
+            logger.info("Using MirroredStrategy across %d GPUs.", len(logical_gpus))
+        return tf.distribute.MirroredStrategy()
+
     return tf.distribute.get_strategy()

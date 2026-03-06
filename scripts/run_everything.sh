@@ -26,20 +26,35 @@ OPTUNA_TRIALS="${OPTUNA_TRIALS:-30}"
 OPTUNA_TIMEOUT_SECONDS="${OPTUNA_TIMEOUT_SECONDS:-1800}"
 BACKTEST_FOLDS="${BACKTEST_FOLDS:-5}"
 
-export SPOTIFY_FORCE_CPU="${SPOTIFY_FORCE_CPU:-1}"
+export SPOTIFY_FORCE_CPU="${SPOTIFY_FORCE_CPU:-0}"
 export SPOTIFY_RUN_EAGER="${SPOTIFY_RUN_EAGER:-0}"
-export SPOTIFY_STEPS_PER_EXECUTION="${SPOTIFY_STEPS_PER_EXECUTION:-32}"
-export SPOTIFY_BATCH_LOG_INTERVAL="${SPOTIFY_BATCH_LOG_INTERVAL:-50}"
+export SPOTIFY_STEPS_PER_EXECUTION="${SPOTIFY_STEPS_PER_EXECUTION:-64}"
+export SPOTIFY_BATCH_LOG_INTERVAL="${SPOTIFY_BATCH_LOG_INTERVAL:-100}"
 export SPOTIFY_CACHE_PREPARED="${SPOTIFY_CACHE_PREPARED:-1}"
 export SPOTIFY_OPTUNA_PRUNER="${SPOTIFY_OPTUNA_PRUNER:-median}"
 export SPOTIFY_OPTUNA_PRUNING_FIDELITIES="${SPOTIFY_OPTUNA_PRUNING_FIDELITIES:-0.25,0.60,1.0}"
 export SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS="${SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS:-120}"
 export SPOTIFY_CHAMPION_GATE_MAX_REGRESSION="${SPOTIFY_CHAMPION_GATE_MAX_REGRESSION:-0.005}"
 export SPOTIFY_CHAMPION_GATE_STRICT="${SPOTIFY_CHAMPION_GATE_STRICT:-0}"
+export SPOTIFY_TF_DATA_CACHE="${SPOTIFY_TF_DATA_CACHE:-auto}"
+export SPOTIFY_TF_PREFETCH="${SPOTIFY_TF_PREFETCH:-auto}"
+export SPOTIFY_DISTRIBUTION_STRATEGY="${SPOTIFY_DISTRIBUTION_STRATEGY:-auto}"
+export SPOTIFY_MIXED_PRECISION="${SPOTIFY_MIXED_PRECISION:-auto}"
+export SPOTIFY_ISOLATE_MPL_CACHE="${SPOTIFY_ISOLATE_MPL_CACHE:-0}"
 
 LOGICAL_CPUS="$("$PYTHON_CMD" - <<'PY'
 import os
 print(os.cpu_count() or 1)
+PY
+)"
+
+TOTAL_RAM_GB="$("$PYTHON_CMD" - <<'PY'
+try:
+    import psutil  # type: ignore
+    total = int(psutil.virtual_memory().total // (1024 ** 3))
+except Exception:
+    total = 0
+print(total)
 PY
 )"
 
@@ -57,22 +72,61 @@ if [[ -z "${TF_NUM_INTEROP_THREADS:-}" ]]; then
 fi
 
 if [[ -z "${SPOTIFY_CLASSICAL_MODEL_WORKERS:-}" ]]; then
-  if (( LOGICAL_CPUS >= 8 )); then
-    export SPOTIFY_CLASSICAL_MODEL_WORKERS="4"
+  cpu_based_workers=1
+  if (( LOGICAL_CPUS >= 12 )); then
+    cpu_based_workers=8
+  elif (( LOGICAL_CPUS >= 8 )); then
+    cpu_based_workers=6
   elif (( LOGICAL_CPUS >= 4 )); then
-    export SPOTIFY_CLASSICAL_MODEL_WORKERS="2"
+    cpu_based_workers=2
+  fi
+
+  mem_cap_workers=4
+  if (( TOTAL_RAM_GB > 0 )); then
+    if (( TOTAL_RAM_GB < 12 )); then
+      mem_cap_workers=1
+    elif (( TOTAL_RAM_GB < 18 )); then
+      mem_cap_workers=2
+    elif (( TOTAL_RAM_GB < 26 )); then
+      mem_cap_workers=3
+    else
+      mem_cap_workers=4
+    fi
+  fi
+
+  if (( cpu_based_workers < mem_cap_workers )); then
+    export SPOTIFY_CLASSICAL_MODEL_WORKERS="$cpu_based_workers"
   else
-    export SPOTIFY_CLASSICAL_MODEL_WORKERS="1"
+    export SPOTIFY_CLASSICAL_MODEL_WORKERS="$mem_cap_workers"
   fi
 fi
 
 if [[ -z "${SPOTIFY_BACKTEST_WORKERS:-}" ]]; then
-  export SPOTIFY_BACKTEST_WORKERS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
+  if (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 2 )); then
+    export SPOTIFY_BACKTEST_WORKERS="2"
+  else
+    export SPOTIFY_BACKTEST_WORKERS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
+  fi
 fi
 
 if [[ -z "${SPOTIFY_OPTUNA_JOBS:-}" ]]; then
-  export SPOTIFY_OPTUNA_JOBS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
+  if (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 2 )); then
+    export SPOTIFY_OPTUNA_JOBS="2"
+  else
+    export SPOTIFY_OPTUNA_JOBS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
+  fi
 fi
+
+# Avoid nested BLAS thread oversubscription when many sklearn jobs run in parallel.
+if (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 1 )); then
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+  export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+  export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+fi
+
+export LOKY_MAX_CPU_COUNT="${LOKY_MAX_CPU_COUNT:-$LOGICAL_CPUS}"
 
 exec "$PYTHON_CMD" -m spotify \
   --profile full \

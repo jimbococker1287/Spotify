@@ -282,10 +282,11 @@ def run_optuna_tuning(
                     X_stage = X_train
                     y_stage = y_train
                 else:
-                    stage_rng = np.random.default_rng(random_seed + (trial.number + 1) * 9973 + step_idx * 131)
-                    idx = stage_rng.choice(len(X_train), size=stage_rows, replace=False)
-                    X_stage = X_train[idx]
-                    y_stage = y_train[idx]
+                    # Use a rotating contiguous slice to avoid large per-trial copy buffers.
+                    max_offset = max(0, len(X_train) - stage_rows)
+                    offset = ((trial.number + 1) * 9973 + step_idx * 131) % (max_offset + 1)
+                    X_stage = X_train[offset : offset + stage_rows]
+                    y_stage = y_train[offset : offset + stage_rows]
 
                 _, estimator = build_classical_estimator(
                     model_name,
@@ -293,7 +294,15 @@ def run_optuna_tuning(
                     params=params,
                     estimator_n_jobs=estimator_n_jobs,
                 )
-                estimator.fit(X_stage, y_stage)
+                try:
+                    estimator.fit(X_stage, y_stage)
+                except ValueError as exc:
+                    # HistGradientBoosting can error on sampled subsets with extremely
+                    # rare classes when it attempts stratified internal splits.
+                    msg = str(exc).lower()
+                    if "least populated classes" in msg or "minimum number of groups" in msg:
+                        raise optuna.TrialPruned(f"insufficient class support in sampled stage: {exc}") from exc
+                    raise
                 val_pred = estimator.predict(X_val)
                 last_score = float(np.mean(val_pred == y_val))
                 trial.report(last_score, step=step_idx)

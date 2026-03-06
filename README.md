@@ -125,17 +125,22 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `OPTUNA_TIMEOUT_SECONDS` (default `1800`)
 - `BACKTEST_FOLDS` (default `5`)
 - `PYTHON_BIN` (override Python executable)
-- `SPOTIFY_FORCE_CPU` (default `1` in launcher; set `0` to allow GPU)
+- `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
 - `SPOTIFY_RUN_EAGER` (default `0` in launcher for faster graph execution)
-- `SPOTIFY_STEPS_PER_EXECUTION` (default `32` in launcher)
-- `SPOTIFY_BATCH_LOG_INTERVAL` (default `50`, reduces logging overhead)
+- `SPOTIFY_STEPS_PER_EXECUTION` (default `64` in launcher)
+- `SPOTIFY_BATCH_LOG_INTERVAL` (default `100`, reduces logging overhead)
 - `SPOTIFY_DISABLE_MONITOR` (`auto` by default; monitor disabled automatically on macOS)
 - `TF_NUM_INTRAOP_THREADS` (launcher defaults to logical CPU count)
 - `TF_NUM_INTEROP_THREADS` (launcher defaults based on CPU count)
-- `SPOTIFY_CLASSICAL_MODEL_WORKERS` (parallel classical model workers; launcher auto-sets)
-- `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets)
-- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers; launcher auto-sets)
+- `SPOTIFY_CLASSICAL_MODEL_WORKERS` (parallel classical model workers; launcher auto-sets with RAM-aware cap)
+- `SPOTIFY_MAX_CLASSICAL_WORKERS` (`auto` by default; set explicit hard cap)
+- `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets, capped for memory)
+- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers; launcher auto-sets, capped for memory)
+- `SPOTIFY_TF_DATA_CACHE` (default `auto`; only caches batches when memory headroom is sufficient)
+- `SPOTIFY_TF_PREFETCH` (default `auto`; TensorFlow prefetch buffer)
+- `SPOTIFY_DISTRIBUTION_STRATEGY` (`auto`, `mirrored`, `default`)
+- `SPOTIFY_ISOLATE_MPL_CACHE` (default `0`; shared matplotlib cache for faster startup)
 - `SPOTIFY_CACHE_PREPARED` (default `1`; reuses preprocessed arrays when raw files/config fingerprint is unchanged)
 - `SPOTIFY_OPTUNA_PRUNER` (default `median`; use `none` to disable pruning)
 - `SPOTIFY_OPTUNA_PRUNING_FIDELITIES` (default `0.25,0.60,1.0`)
@@ -146,6 +151,16 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
+
+For memory-constrained devices, keep the same model/training-set definitions but reduce peak RAM:
+
+```bash
+SPOTIFY_TF_DATA_CACHE=off \
+SPOTIFY_CLASSICAL_MODEL_WORKERS=1 \
+SPOTIFY_BACKTEST_WORKERS=1 \
+SPOTIFY_OPTUNA_JOBS=1 \
+bash scripts/run_everything.sh
+```
 
 `scripts/run_benchmark_lock.sh` supports:
 
@@ -243,6 +258,7 @@ The training context now includes additional recency/frequency and session-trans
 
 - Set `SPOTIPY_CLIENT_ID` and `SPOTIPY_CLIENT_SECRET` to enrich with Spotify audio features.
 - If Spotipy credentials are unavailable, audio features are zero-filled.
-- Matplotlib cache is isolated per run under the run folder for macOS sandbox compatibility.
+- `orjson` is used automatically (when installed) for faster raw JSON loading.
+- Matplotlib cache is shared under `outputs/.mplconfig` by default for faster repeat runs (`SPOTIFY_ISOLATE_MPL_CACHE=1` restores per-run isolation).
 - `make clean` keeps historical outputs.
 - `make clean-all` removes all outputs.

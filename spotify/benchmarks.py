@@ -88,12 +88,34 @@ def resolve_classical_parallelism() -> tuple[int, int]:
     cpu_count = os.cpu_count() or 1
     workers_raw = os.getenv("SPOTIFY_CLASSICAL_MODEL_WORKERS", "1").strip()
     estimator_jobs_raw = os.getenv("SPOTIFY_SKLEARN_NJOBS", "").strip()
+    max_workers_raw = os.getenv("SPOTIFY_MAX_CLASSICAL_WORKERS", "auto").strip().lower()
 
     workers = 1
     try:
         workers = max(1, min(cpu_count, int(workers_raw)))
     except Exception:
         workers = 1
+
+    if max_workers_raw == "auto":
+        try:
+            import psutil  # type: ignore
+
+            total_ram_gb = int(psutil.virtual_memory().total // (1024**3))
+            if total_ram_gb < 12:
+                workers = min(workers, 1)
+            elif total_ram_gb < 18:
+                workers = min(workers, 2)
+            elif total_ram_gb < 26:
+                workers = min(workers, 3)
+            else:
+                workers = min(workers, 4)
+        except Exception:
+            pass
+    elif max_workers_raw:
+        try:
+            workers = min(workers, max(1, int(max_workers_raw)))
+        except Exception:
+            pass
 
     if estimator_jobs_raw:
         try:
@@ -172,6 +194,9 @@ def get_classical_model_registry(
             max_depth=int(params.get("max_depth", 12)),
             min_samples_leaf=int(params.get("min_samples_leaf", 20)),
             random_state=random_seed,
+            # Avoid internal stratified validation split that can fail on rare classes
+            # in sampled training subsets used by tuning/backtesting.
+            early_stopping=False,
         )
 
     def build_knn(params: dict[str, object] | None):

@@ -107,6 +107,44 @@ def train_and_evaluate_models(
             pass
         return fallback
 
+    def _parse_bool(raw: str | None, default: bool) -> bool:
+        if raw is None:
+            return default
+        value = str(raw).strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True
+        if value in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def _resolve_dataset_cache_enabled() -> tuple[bool, str]:
+        raw = os.getenv("SPOTIFY_TF_DATA_CACHE", "auto").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True, "forced_on"
+        if raw in ("0", "false", "no", "off"):
+            return False, "forced_off"
+
+        # Auto mode: only cache if tensors are a modest fraction of available RAM.
+        approx_bytes = (
+            data.X_seq_train.nbytes
+            + data.X_ctx_train.nbytes
+            + data.y_train.nbytes
+            + data.y_skip_train.nbytes
+            + weights.artist_train.nbytes
+            + weights.skip_train.nbytes
+        )
+        try:
+            import psutil  # type: ignore
+
+            available_bytes = int(psutil.virtual_memory().available)
+            threshold_bytes = int(available_bytes * 0.30)
+            enabled = approx_bytes <= threshold_bytes
+            reason = f"auto(approx={approx_bytes // (1024**2)}MiB avail={available_bytes // (1024**2)}MiB)"
+            return enabled, reason
+        except Exception:
+            # Conservative fallback without psutil.
+            return False, "auto(no_psutil)"
+
     def _extract_artist_proba(prediction) -> np.ndarray:
         if isinstance(prediction, dict):
             if "artist_output" in prediction:
@@ -190,9 +228,58 @@ def train_and_evaluate_models(
     log_interval = _parse_pos_int(os.getenv("SPOTIFY_BATCH_LOG_INTERVAL"), 25)
     steps_per_execution_raw = os.getenv("SPOTIFY_STEPS_PER_EXECUTION", "auto").strip().lower()
     if steps_per_execution_raw == "auto":
-        steps_per_execution = 1 if run_eagerly else 16
+        steps_per_execution = 1 if run_eagerly else 64
     else:
-        steps_per_execution = _parse_pos_int(steps_per_execution_raw, 1 if run_eagerly else 16)
+        steps_per_execution = _parse_pos_int(steps_per_execution_raw, 1 if run_eagerly else 64)
+
+    dataset_cache_enabled, dataset_cache_reason = _resolve_dataset_cache_enabled()
+    shuffle_buffer = _parse_pos_int(os.getenv("SPOTIFY_SHUFFLE_BUFFER"), min(len(data.y_train), 65536))
+    tf_data_threadpool = _parse_pos_int(os.getenv("SPOTIFY_TF_DATA_THREADPOOL"), 0)
+    prefetch_raw = os.getenv("SPOTIFY_TF_PREFETCH", "auto").strip().lower()
+    if prefetch_raw == "auto":
+        prefetch_buffer = tf.data.AUTOTUNE
+    else:
+        prefetch_buffer = _parse_pos_int(prefetch_raw, 1)
+
+    logger.info(
+        "tf.data settings: cache=%s (%s) shuffle_buffer=%d prefetch=%s threadpool=%s",
+        dataset_cache_enabled,
+        dataset_cache_reason,
+        shuffle_buffer,
+        ("autotune" if prefetch_buffer == tf.data.AUTOTUNE else str(prefetch_buffer)),
+        (str(tf_data_threadpool) if tf_data_threadpool > 0 else "default"),
+    )
+
+    def _with_data_options(dataset, training: bool):
+        options = tf.data.Options()
+        if training:
+            options.experimental_deterministic = False
+            options.experimental_slack = True
+        if tf_data_threadpool > 0:
+            options.threading.private_threadpool_size = int(tf_data_threadpool)
+        return dataset.with_options(options)
+
+    def _build_weighted_dataset(features, labels, sample_weights, *, training: bool, seed: int):
+        dataset = tf.data.Dataset.from_tensor_slices((features, labels, sample_weights))
+        if dataset_cache_enabled:
+            dataset = dataset.cache()
+        if training:
+            dataset = dataset.shuffle(shuffle_buffer, seed=seed, reshuffle_each_iteration=True)
+        dataset = dataset.batch(batch_size, drop_remainder=False)
+        dataset = _with_data_options(dataset, training=training)
+        dataset = dataset.prefetch(prefetch_buffer)
+        return dataset
+
+    def _build_feature_dataset(features):
+        seq_values, ctx_values = features
+        dataset = tf.data.Dataset.from_tensor_slices({"seq_input": seq_values, "ctx_input": ctx_values})
+        dataset = dataset.batch(batch_size, drop_remainder=False)
+        dataset = _with_data_options(dataset, training=False)
+        dataset = dataset.prefetch(prefetch_buffer)
+        return dataset
+
+    single_data_bundle = None
+    multi_data_bundle = None
 
     for name, builder in model_builders:
         logger.info("Training %s model", name)
@@ -270,50 +357,97 @@ def train_and_evaluate_models(
             ]
 
         if single_head:
-            train_x = (data.X_seq_train, data.X_ctx_train)
-            train_y = data.y_train
-            train_sw = weights.artist_train
-            val_data = (
-                (data.X_seq_val, data.X_ctx_val),
-                data.y_val,
-                weights.artist_val,
-            )
-            test_x = (data.X_seq_test, data.X_ctx_test)
-            test_y = data.y_test
-            test_sw = weights.artist_test
+            if single_data_bundle is None:
+                train_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_train, data.X_ctx_train),
+                    labels=data.y_train,
+                    sample_weights=weights.artist_train,
+                    training=True,
+                    seed=1337,
+                )
+                val_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_val, data.X_ctx_val),
+                    labels=data.y_val,
+                    sample_weights=weights.artist_val,
+                    training=False,
+                    seed=0,
+                )
+                test_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_test, data.X_ctx_test),
+                    labels=data.y_test,
+                    sample_weights=weights.artist_test,
+                    training=False,
+                    seed=0,
+                )
+                val_predict_dataset = _build_feature_dataset((data.X_seq_val, data.X_ctx_val))
+                test_predict_dataset = _build_feature_dataset((data.X_seq_test, data.X_ctx_test))
+                single_data_bundle = (
+                    train_dataset,
+                    val_dataset,
+                    test_dataset,
+                    val_predict_dataset,
+                    test_predict_dataset,
+                )
+            (
+                train_dataset,
+                val_dataset,
+                test_dataset,
+                val_predict_dataset,
+                test_predict_dataset,
+            ) = single_data_bundle
         else:
-            train_x = (data.X_seq_train, data.X_ctx_train)
-            train_y = (data.y_train, data.y_skip_train)
-            train_sw = (weights.artist_train, weights.skip_train)
-            val_data = (
-                (data.X_seq_val, data.X_ctx_val),
-                (data.y_val, data.y_skip_val),
-                (weights.artist_val, weights.skip_val),
-            )
-            test_x = (data.X_seq_test, data.X_ctx_test)
-            test_y = (data.y_test, data.y_skip_test)
-            test_sw = (weights.artist_test, weights.skip_test)
+            if multi_data_bundle is None:
+                train_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_train, data.X_ctx_train),
+                    labels=(data.y_train, data.y_skip_train),
+                    sample_weights=(weights.artist_train, weights.skip_train),
+                    training=True,
+                    seed=1337,
+                )
+                val_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_val, data.X_ctx_val),
+                    labels=(data.y_val, data.y_skip_val),
+                    sample_weights=(weights.artist_val, weights.skip_val),
+                    training=False,
+                    seed=0,
+                )
+                test_dataset = _build_weighted_dataset(
+                    features=(data.X_seq_test, data.X_ctx_test),
+                    labels=(data.y_test, data.y_skip_test),
+                    sample_weights=(weights.artist_test, weights.skip_test),
+                    training=False,
+                    seed=0,
+                )
+                val_predict_dataset = _build_feature_dataset((data.X_seq_val, data.X_ctx_val))
+                test_predict_dataset = _build_feature_dataset((data.X_seq_test, data.X_ctx_test))
+                multi_data_bundle = (
+                    train_dataset,
+                    val_dataset,
+                    test_dataset,
+                    val_predict_dataset,
+                    test_predict_dataset,
+                )
+            (
+                train_dataset,
+                val_dataset,
+                test_dataset,
+                val_predict_dataset,
+                test_predict_dataset,
+            ) = multi_data_bundle
 
         started = time.perf_counter()
         history = model.fit(
-            train_x,
-            train_y,
-            sample_weight=train_sw,
-            validation_data=val_data,
-            batch_size=batch_size,
+            train_dataset,
+            validation_data=val_dataset,
             epochs=epochs,
             verbose=2,
             callbacks=cbs,
-            shuffle=True,
         )
         fit_seconds[name] = float(time.perf_counter() - started)
         histories[name] = history
 
         eval_result = model.evaluate(
-            test_x,
-            test_y,
-            sample_weight=test_sw,
-            batch_size=batch_size,
+            test_dataset,
             verbose=0,
             return_dict=True,
         )
@@ -327,8 +461,8 @@ def train_and_evaluate_models(
             top5 = float(eval_result.get("artist_output_top_5", np.nan))
             val_top1 = float(history.history.get("val_artist_output_sparse_categorical_accuracy", [np.nan])[-1])
             val_top5 = float(history.history.get("val_artist_output_top_5", [np.nan])[-1])
-        val_pred = model.predict((data.X_seq_val, data.X_ctx_val), batch_size=batch_size, verbose=0)
-        test_pred = model.predict((data.X_seq_test, data.X_ctx_test), batch_size=batch_size, verbose=0)
+        val_pred = model.predict(val_predict_dataset, verbose=0)
+        test_pred = model.predict(test_predict_dataset, verbose=0)
         val_proba = _extract_artist_proba(val_pred)
         test_proba = _extract_artist_proba(test_pred)
         val_ranking = ranking_metrics_from_proba(

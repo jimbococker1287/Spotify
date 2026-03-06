@@ -132,12 +132,21 @@ def discover_streaming_files(data_dir: Path, include_video: bool, logger) -> lis
 def load_streaming_history(data_dir: Path, include_video: bool, logger) -> pd.DataFrame:
     files = discover_streaming_files(data_dir, include_video, logger)
     all_records: list[dict] = []
+    fast_json = None
+    try:
+        import orjson as fast_json  # type: ignore
+        logger.info("Using orjson for faster streaming-history parsing.")
+    except Exception:
+        fast_json = None
 
     for path in files:
-        with path.open("r", encoding="utf-8") as infile:
-            records = json.load(infile)
-            logger.info("Loaded %s with %d records", path.name, len(records))
-            all_records.extend(records)
+        if fast_json is not None:
+            records = fast_json.loads(path.read_bytes())
+        else:
+            with path.open("r", encoding="utf-8") as infile:
+                records = json.load(infile)
+        logger.info("Loaded %s with %d records", path.name, len(records))
+        all_records.extend(records)
 
     if not all_records:
         raise RuntimeError("Streaming history files were found, but no records were loaded.")
@@ -585,8 +594,20 @@ def prepare_training_data(
     num_artists = int(np.max(y_seq)) + 1
     num_ctx = X_ctx.shape[1]
 
+    keep_cols = [
+        "ts",
+        "master_metadata_album_artist_name",
+        "artist_label",
+        "skipped",
+        *context_features,
+    ]
+    keep_cols = [col for col in keep_cols if col in df.columns]
+    slim_df = df[keep_cols].copy()
+    if "master_metadata_album_artist_name" in slim_df.columns:
+        slim_df["master_metadata_album_artist_name"] = slim_df["master_metadata_album_artist_name"].astype("category")
+
     return PreparedData(
-        df=df,
+        df=slim_df,
         context_features=context_features,
         X_seq_train=X_seq_train,
         X_seq_val=X_seq_val,
