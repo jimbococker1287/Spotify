@@ -64,12 +64,39 @@ def build_full_tabular_dataset(data: PreparedData) -> tuple[np.ndarray, np.ndarr
     return X, y
 
 
-def _topk_from_proba(proba: np.ndarray, y_true: np.ndarray, k: int) -> float:
+def _encode_labels_to_local_indices(y_true: np.ndarray, class_labels: np.ndarray | None) -> np.ndarray:
+    y_true = np.asarray(y_true).reshape(-1)
+    if class_labels is None:
+        return y_true.astype("int64", copy=False)
+    labels = np.asarray(class_labels).reshape(-1)
+    if labels.size == 0:
+        return np.full(y_true.shape[0], -1, dtype="int64")
+    lookup = {label.item() if isinstance(label, np.generic) else label: idx for idx, label in enumerate(labels)}
+    mapped = np.fromiter((lookup.get(item.item() if isinstance(item, np.generic) else item, -1) for item in y_true), dtype="int64")
+    if mapped.size != y_true.size:
+        return np.full(y_true.shape[0], -1, dtype="int64")
+    return mapped
+
+
+def _topk_from_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    k: int,
+    *,
+    class_labels: np.ndarray | None = None,
+) -> float:
     if proba.ndim != 2:
         return float("nan")
     kk = max(1, min(k, proba.shape[1]))
     topk_idx = np.argpartition(proba, -kk, axis=1)[:, -kk:]
-    return float(np.mean(np.any(topk_idx == y_true.reshape(-1, 1), axis=1)))
+    if class_labels is not None:
+        labels = np.asarray(class_labels).reshape(-1)
+        if labels.size == proba.shape[1]:
+            topk_values = labels[topk_idx]
+            y_values = np.asarray(y_true).reshape(-1, 1)
+            return float(np.mean(np.any(topk_values == y_values, axis=1)))
+    y_idx = np.asarray(y_true).reshape(-1, 1)
+    return float(np.mean(np.any(topk_idx == y_idx, axis=1)))
 
 
 def sample_rows(
@@ -289,14 +316,19 @@ def evaluate_classical_estimator(
         try:
             val_proba = estimator.predict_proba(X_val)
             test_proba = estimator.predict_proba(X_test)
-            val_top5 = _topk_from_proba(np.asarray(val_proba), y_val, k=5)
-            test_top5 = _topk_from_proba(np.asarray(test_proba), y_test, k=5)
+            classes = np.asarray(getattr(estimator, "classes_", []))
+            val_top5 = _topk_from_proba(np.asarray(val_proba), y_val, k=5, class_labels=classes)
+            test_top5 = _topk_from_proba(np.asarray(test_proba), y_test, k=5, class_labels=classes)
             val_class_count = int(np.asarray(val_proba).shape[1])
             test_class_count = int(np.asarray(test_proba).shape[1])
-            val_extra = ranking_metrics_from_proba(np.asarray(val_proba), y_val, num_items=val_class_count, k=5)
+
+            val_y_rank = _encode_labels_to_local_indices(np.asarray(y_val), classes if classes.size else None)
+            test_y_rank = _encode_labels_to_local_indices(np.asarray(y_test), classes if classes.size else None)
+
+            val_extra = ranking_metrics_from_proba(np.asarray(val_proba), val_y_rank, num_items=val_class_count, k=5)
             test_extra = ranking_metrics_from_proba(
                 np.asarray(test_proba),
-                y_test,
+                test_y_rank,
                 num_items=test_class_count,
                 k=5,
             )
