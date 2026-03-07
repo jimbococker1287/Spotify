@@ -31,40 +31,49 @@ CONTEXT_FEATURES: tuple[str, ...] = (
     "tempo",
     "time_diff",
     "session_position",
+    "session_elapsed_seconds",
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
     "artist_play_count",
     "days_since_last",
+    "hours_since_last_artist",
     "skip_streak",
     "listen_streak",
     "artist_play_count_24h",
     "artist_play_count_7d",
+    "artist_freq_smooth",
     "plays_since_last_artist",
     "artist_session_play_count",
+    "session_skip_rate_so_far",
     "session_unique_artists_so_far",
     "is_artist_repeat_from_prev",
     "transition_repeat_count",
     "artist_skip_rate_hist",
+    "artist_skip_rate_smooth",
 )
 
 SKEW_CONTEXT_FEATURES: tuple[str, ...] = (
     "time_diff",
     "session_position",
+    "session_elapsed_seconds",
     "artist_play_count",
     "days_since_last",
+    "hours_since_last_artist",
     "skip_streak",
     "listen_streak",
     "artist_play_count_24h",
     "artist_play_count_7d",
+    "artist_freq_smooth",
     "plays_since_last_artist",
     "artist_session_play_count",
+    "session_skip_rate_so_far",
     "session_unique_artists_so_far",
     "transition_repeat_count",
 )
 
-CACHE_SCHEMA_VERSION = "prepared-data-v1"
+CACHE_SCHEMA_VERSION = "prepared-data-v2"
 
 
 @dataclass
@@ -406,6 +415,8 @@ def engineer_features(
     session_threshold = 30 * 60
     df["session_id"] = (df["time_diff"] > session_threshold).cumsum()
     df["session_position"] = df.groupby("session_id").cumcount()
+    session_start = df.groupby("session_id")["ts"].transform("min")
+    df["session_elapsed_seconds"] = (df["ts"] - session_start).dt.total_seconds().fillna(0.0).astype("float32")
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
@@ -413,9 +424,11 @@ def engineer_features(
     df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
 
     df["artist_play_count"] = df.groupby("master_metadata_album_artist_name").cumcount()
-    df["days_since_last"] = (
-        (df["ts"] - df.groupby("master_metadata_album_artist_name")["ts"].shift(1)).dt.days.fillna(0)
+    previous_artist_ts = df.groupby("master_metadata_album_artist_name")["ts"].shift(1)
+    df["hours_since_last_artist"] = (
+        (df["ts"] - previous_artist_ts).dt.total_seconds().div(3600.0).fillna(0.0).clip(lower=0.0).astype("float32")
     )
+    df["days_since_last"] = (df["hours_since_last_artist"] / 24.0).astype("float32")
 
     df["skip_flag"] = df["skipped"]
     streak_grp = (df["skip_flag"] != df["skip_flag"].shift()).cumsum()
@@ -454,6 +467,16 @@ def engineer_features(
     df["artist_play_count_24h"] = _rolling_artist_counts(ts_seconds, artist_names, window_seconds=24 * 60 * 60)
     df["artist_play_count_7d"] = _rolling_artist_counts(ts_seconds, artist_names, window_seconds=7 * 24 * 60 * 60)
 
+    artist_freq_smooth = np.zeros(len(df), dtype="float32")
+    artist_running_count: dict[str, int] = {}
+    alpha = 1.0
+    vocab_size = max(1, len(top_artists))
+    for idx, artist_name in enumerate(artist_names):
+        seen = artist_running_count.get(artist_name, 0)
+        artist_freq_smooth[idx] = float((seen + alpha) / (float(idx) + alpha * float(vocab_size)))
+        artist_running_count[artist_name] = seen + 1
+    df["artist_freq_smooth"] = artist_freq_smooth
+
     plays_since_last_artist = np.zeros(len(df), dtype="float32")
     last_seen_idx: dict[str, int] = {}
     for idx, artist_name in enumerate(artist_names):
@@ -465,6 +488,20 @@ def engineer_features(
     df["artist_session_play_count"] = (
         df.groupby(["session_id", "master_metadata_album_artist_name"]).cumcount().astype("float32")
     )
+
+    session_skip_rate_so_far = np.zeros(len(df), dtype="float32")
+    session_skip_sum: dict[int, float] = {}
+    session_skip_count: dict[int, int] = {}
+    for idx, (session_id, skipped_value) in enumerate(
+        zip(df["session_id"].to_numpy(dtype="int64"), df["skipped"].to_numpy(dtype="float32"))
+    ):
+        sid = int(session_id)
+        seen = session_skip_count.get(sid, 0)
+        total = session_skip_sum.get(sid, 0.0)
+        session_skip_rate_so_far[idx] = float(total / seen) if seen > 0 else 0.0
+        session_skip_count[sid] = seen + 1
+        session_skip_sum[sid] = total + float(skipped_value)
+    df["session_skip_rate_so_far"] = session_skip_rate_so_far
 
     session_unique_artists_so_far = np.zeros(len(df), dtype="float32")
     current_session = None
@@ -499,15 +536,20 @@ def engineer_features(
     df["transition_repeat_count"] = transition_repeat_count
 
     artist_skip_rate_hist = np.zeros(len(df), dtype="float32")
+    artist_skip_rate_smooth = np.zeros(len(df), dtype="float32")
     artist_skip_sum: dict[str, float] = {}
     artist_skip_count: dict[str, int] = {}
+    alpha_skip = 1.0
+    beta_skip = 1.0
     for idx, (artist_name, skipped_value) in enumerate(zip(artist_names, df["skipped"].to_numpy(dtype="float32"))):
         seen = artist_skip_count.get(artist_name, 0)
         total = artist_skip_sum.get(artist_name, 0.0)
         artist_skip_rate_hist[idx] = float(total / seen) if seen > 0 else 0.0
+        artist_skip_rate_smooth[idx] = float((total + alpha_skip) / (seen + alpha_skip + beta_skip))
         artist_skip_count[artist_name] = seen + 1
         artist_skip_sum[artist_name] = total + float(skipped_value)
     df["artist_skip_rate_hist"] = artist_skip_rate_hist
+    df["artist_skip_rate_smooth"] = artist_skip_rate_smooth
 
     logger.info(
         "After filtering to top %d artists, training frame shape is %s",
@@ -601,7 +643,14 @@ def prepare_training_data(
         "skipped",
         *context_features,
     ]
-    keep_cols = [col for col in keep_cols if col in df.columns]
+    deduped_keep_cols: list[str] = []
+    seen_cols: set[str] = set()
+    for col in keep_cols:
+        if col in seen_cols or col not in df.columns:
+            continue
+        seen_cols.add(col)
+        deduped_keep_cols.append(col)
+    keep_cols = deduped_keep_cols
     slim_df = df[keep_cols].copy()
     if "master_metadata_album_artist_name" in slim_df.columns:
         slim_df["master_metadata_album_artist_name"] = slim_df["master_metadata_album_artist_name"].astype("category")

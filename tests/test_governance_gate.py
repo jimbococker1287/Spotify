@@ -13,6 +13,14 @@ def _write_history(path, rows: list[dict[str, object]]) -> None:
             writer.writerow(row)
 
 
+def _write_backtest_history(path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=["run_id", "model_name", "top1"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def test_champion_gate_passes_within_threshold(tmp_path) -> None:
     history_csv = tmp_path / "history.csv"
     _write_history(
@@ -27,6 +35,7 @@ def test_champion_gate_passes_within_threshold(tmp_path) -> None:
         current_run_id="run_c",
         current_results=[{"model_name": "new_model", "val_top1": 0.297}],
         regression_threshold=0.005,
+        metric_source="val_top1",
     )
 
     assert result["status"] == "pass"
@@ -47,7 +56,39 @@ def test_champion_gate_fails_when_regression_exceeds_threshold(tmp_path) -> None
         current_run_id="run_c",
         current_results=[{"model_name": "new_model", "val_top1": 0.28}],
         regression_threshold=0.005,
+        metric_source="val_top1",
     )
 
     assert result["status"] == "fail"
     assert result["promoted"] is False
+
+
+def test_champion_gate_uses_backtest_mean_top1_by_default(tmp_path) -> None:
+    history_csv = tmp_path / "history.csv"
+    _write_history(history_csv, [])
+    backtest_history_csv = tmp_path / "backtest_history.csv"
+    _write_backtest_history(
+        backtest_history_csv,
+        [
+            {"run_id": "run_a", "model_name": "logreg", "top1": 0.21},
+            {"run_id": "run_a", "model_name": "logreg", "top1": 0.19},
+            {"run_id": "run_b", "model_name": "mlp", "top1": 0.29},
+            {"run_id": "run_b", "model_name": "mlp", "top1": 0.31},
+        ],
+    )
+
+    result = evaluate_champion_gate(
+        history_csv=history_csv,
+        backtest_history_csv=backtest_history_csv,
+        current_run_id="run_c",
+        current_results=[{"model_name": "new_model", "val_top1": 0.01}],
+        current_backtest_rows=[
+            {"model_name": "new_model", "top1": 0.287},
+            {"model_name": "new_model", "top1": 0.283},
+        ],
+        regression_threshold=0.02,
+    )
+
+    assert result["metric_source"] == "backtest_top1"
+    assert result["status"] == "pass"
+    assert result["promoted"] is True

@@ -30,6 +30,7 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 ## Profiles
 
 - `dev`: fastest smoke profile (no Optuna, no backtest, no MLflow)
+- `fast`: daily iteration profile (smaller model set + Optuna + backtest + MLflow)
 - `small`: balanced profile (deep + classical + Optuna + backtest + MLflow)
 - `full`: broad profile (full model suite + deeper tuning/backtesting)
 
@@ -49,6 +50,18 @@ Run deep + classical with profile defaults:
 
 ```bash
 make train PROFILE=small
+```
+
+Run fast iteration mode:
+
+```bash
+bash scripts/run_fast.sh
+```
+
+Run full exhaustive mode:
+
+```bash
+bash scripts/run_full.sh
 ```
 
 Run classical only:
@@ -73,6 +86,12 @@ Run everything (all deep + all classical + full Optuna + full temporal backtest 
 
 ```bash
 bash scripts/run_everything.sh
+```
+
+Re-run classical + backtest only (useful after metric fixes to refresh temporal artifacts):
+
+```bash
+bash scripts/rerun_classical_backtest.sh
 ```
 
 Run a canonical 3-seed benchmark lock and produce confidence intervals:
@@ -147,7 +166,8 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS` (default `120`; per-trial budget)
 - `SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS` (optional; override per-model tuning timeout)
 - `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (optional, e.g. `logreg=90,random_forest=300`)
-- `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in val top-1 vs previous champion)
+- `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in gate metric vs previous champion)
+- `SPOTIFY_CHAMPION_GATE_METRIC` (default `backtest_top1`; alternatives: `val_top1`)
 - `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
@@ -200,6 +220,10 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `optuna/optuna_history_<model>.png`
 - `backtest/temporal_backtest.csv`
 - `backtest/temporal_backtest_top1.png`
+- `analysis/*_confidence_summary.json` (ECE/Brier/top-1 confidence summary)
+- `analysis/*_reliability.png` (calibration curves)
+- `analysis/*_segment_metrics.csv` (segment-level top-1 and confidence)
+- `analysis/*_top_errors.csv` (most frequent true/prediction confusions)
 
 Global history (`outputs/history/`):
 
@@ -242,17 +266,67 @@ python -m spotify.predict_next \
   --recent-artists "Artist A|Artist B|Artist C|..."
 ```
 
+## Prediction Service (HTTP)
+
+Serve the best deep model from a run via a lightweight HTTP API:
+
+```bash
+python -m spotify.predict_service \
+  --run-dir outputs/runs/<run_id> \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Health check:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+Prediction request:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"top_k":5,"recent_artists":["Artist A","Artist B","Artist C"]}'
+```
+
+## Scheduling + Alerts
+
+Run scheduled-style jobs (fast/full) and alert on champion-gate regression:
+
+```bash
+bash scripts/run_scheduled.sh fast
+```
+
+Check latest run gate manually:
+
+```bash
+python scripts/regression_alert.py
+```
+
+Optional webhook alerts:
+
+```bash
+SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regression_alert.py
+```
+
 ## Feature Upgrades
 
 The training context now includes additional recency/frequency and session-transition features:
 
 - `artist_play_count_24h`, `artist_play_count_7d`
+- `artist_freq_smooth` (Laplace-smoothed per-artist frequency)
 - `plays_since_last_artist`
 - `artist_session_play_count`
+- `session_elapsed_seconds`
+- `session_skip_rate_so_far`
+- `hours_since_last_artist`
 - `session_unique_artists_so_far`
 - `is_artist_repeat_from_prev`
 - `transition_repeat_count`
 - `artist_skip_rate_hist`
+- `artist_skip_rate_smooth`
 
 ## Notes
 

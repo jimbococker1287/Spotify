@@ -136,6 +136,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         )
         from .governance import evaluate_champion_gate
         from .explainability import run_shap_analysis
+        from .evaluation import run_extended_evaluation
         from .modeling import build_model_builders
         from .monitoring import ResourceMonitor
         from .reporting import (
@@ -412,6 +413,17 @@ def run_pipeline(config: PipelineConfig) -> None:
         if not result_rows:
             raise RuntimeError("No models were run. Enable deep and/or classical models.")
 
+        extended_eval_artifacts = run_extended_evaluation(
+            data=prepared,
+            results=result_rows,
+            sequence_length=config.sequence_length,
+            run_dir=run_dir,
+            random_seed=config.random_seed,
+            max_train_samples=config.classical_max_train_samples,
+            logger=logger,
+        )
+        artifact_paths.extend(extended_eval_artifacts)
+
         leaderboard_path = plot_run_leaderboard(result_rows, run_dir)
         if leaderboard_path is not None:
             artifact_paths.append(leaderboard_path)
@@ -434,17 +446,22 @@ def run_pipeline(config: PipelineConfig) -> None:
             champion_gate_threshold = max(0.0, float(champion_gate_threshold_raw))
         except Exception:
             champion_gate_threshold = 0.005
+        champion_gate_metric = os.getenv("SPOTIFY_CHAMPION_GATE_METRIC", "backtest_top1").strip().lower()
         champion_gate = evaluate_champion_gate(
             history_csv=history_csv,
             current_run_id=run_id,
             current_results=result_rows,
             regression_threshold=champion_gate_threshold,
+            backtest_history_csv=(history_dir / "backtest_history.csv"),
+            current_backtest_rows=backtest_rows,
+            metric_source=champion_gate_metric,
         )
         champion_gate_path = run_dir / "champion_gate.json"
         champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
         artifact_paths.append(champion_gate_path)
         logger.info(
-            "Champion gate: promoted=%s regression=%.6f threshold=%.6f",
+            "Champion gate: source=%s promoted=%s regression=%.6f threshold=%.6f",
+            str(champion_gate.get("metric_source", champion_gate_metric)),
             bool(champion_gate.get("promoted", False)),
             float(champion_gate.get("regression", 0.0)),
             float(champion_gate.get("threshold", champion_gate_threshold)),

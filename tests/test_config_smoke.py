@@ -48,6 +48,20 @@ def test_profile_defaults_are_applied() -> None:
     assert config.enable_temporal_backtest is False
 
 
+def test_fast_profile_defaults_are_applied() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--profile", "fast"])
+    config = build_config(args)
+
+    assert config.profile == "fast"
+    assert config.epochs == 4
+    assert config.model_names == ("dense", "gru_artist", "lstm")
+    assert config.classical_model_names == ("logreg", "extra_trees", "mlp")
+    assert config.enable_mlflow is True
+    assert config.enable_optuna is True
+    assert config.enable_temporal_backtest is True
+
+
 def test_cli_overrides_profile_defaults() -> None:
     parser = build_parser()
     args = parser.parse_args(["--profile", "small", "--epochs", "3", "--batch", "64", "--no-video"])

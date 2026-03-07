@@ -653,17 +653,33 @@ def write_run_report(
         lines.append(f"- Aggregate fit time (sum): `{total_fit_seconds:.2f}s`")
     lines.append("")
     lines.append("## Champion Gate")
+    metric_source = str(champion_gate.get("metric_source", "val_top1"))
+    champion_score = _safe_float(champion_gate.get("champion_score"))
+    challenger_score = _safe_float(champion_gate.get("challenger_score"))
+    if math.isnan(champion_score):
+        if metric_source == "backtest_top1":
+            champion_score = _safe_float(champion_gate.get("champion_backtest_top1"))
+        else:
+            champion_score = _safe_float(champion_gate.get("champion_val_top1"))
+    if math.isnan(challenger_score):
+        if metric_source == "backtest_top1":
+            challenger_score = _safe_float(champion_gate.get("challenger_backtest_top1"))
+        else:
+            challenger_score = _safe_float(champion_gate.get("challenger_val_top1"))
+
     lines.append(f"- Status: `{champion_gate.get('status', '')}`")
     lines.append(f"- Promoted: `{champion_gate.get('promoted', False)}`")
+    lines.append(f"- Metric source: `{metric_source}`")
     lines.append(f"- Threshold: `{_safe_float(champion_gate.get('threshold')):.6f}`")
     lines.append(f"- Regression: `{_safe_float(champion_gate.get('regression')):.6f}`")
     lines.append(
         f"- Previous champion: `{champion_gate.get('champion_run_id', '')}` / "
         f"`{champion_gate.get('champion_model_name', '')}`"
     )
+    lines.append(f"- Champion score: `{champion_score:.4f}`")
     lines.append(
         f"- Current challenger: `{champion_gate.get('challenger_model_name', '')}` "
-        f"(`{_safe_float(champion_gate.get('challenger_val_top1')):.4f}`)"
+        f"(`{challenger_score:.4f}`)"
     )
     lines.append("")
     lines.append("## Model Results")
@@ -709,6 +725,12 @@ def write_run_report(
         path = (run_dir / rel).resolve()
         if path.exists():
             lines.append(f"- [{rel}]({rel})")
+    analysis_dir = run_dir / "analysis"
+    if analysis_dir.exists():
+        for pattern in ("*_confidence_summary.json", "*_reliability.png", "*_segment_metrics.csv", "*_top_errors.csv"):
+            for path in sorted(analysis_dir.glob(pattern)):
+                rel = path.relative_to(run_dir).as_posix()
+                lines.append(f"- [{rel}]({rel})")
     lines.append("")
 
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

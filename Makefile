@@ -3,6 +3,7 @@ VENV ?= .venv
 VENV_PY := $(VENV)/bin/python
 VENV_PIP := $(VENV)/bin/pip
 PROFILE ?= dev
+MODE ?= fast
 RUN_NAME ?=
 EXTRA_ARGS ?=
 
@@ -12,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup train train-classical train-deep train-elite train-everything benchmark-lock regression-guard predict-next test clean clean-all
+.PHONY: setup train train-fast train-full train-classical train-deep train-elite train-everything refresh-backtest benchmark-lock regression-guard regression-alert predict-next serve-predict schedule-run test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -24,6 +25,14 @@ setup:
 train:
 	mkdir -p outputs
 	$(RUN_PY) -m spotify --profile $(PROFILE) $(EXTRA_ARGS)
+
+train-fast:
+	mkdir -p outputs
+	bash scripts/run_fast.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+train-full:
+	mkdir -p outputs
+	bash scripts/run_full.sh $(RUN_NAME) $(EXTRA_ARGS)
 
 train-classical:
 	mkdir -p outputs
@@ -41,6 +50,10 @@ train-everything:
 	mkdir -p outputs
 	bash scripts/run_everything.sh $(RUN_NAME) $(EXTRA_ARGS)
 
+refresh-backtest:
+	mkdir -p outputs
+	bash scripts/rerun_classical_backtest.sh $(RUN_NAME) $(EXTRA_ARGS)
+
 benchmark-lock:
 	mkdir -p outputs
 	bash scripts/run_benchmark_lock.sh $(RUN_NAME) $(EXTRA_ARGS)
@@ -49,8 +62,18 @@ regression-guard:
 	mkdir -p outputs
 	$(RUN_PY) scripts/regression_guard.py $(EXTRA_ARGS)
 
+regression-alert:
+	$(RUN_PY) scripts/regression_alert.py $(EXTRA_ARGS)
+
 predict-next:
 	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)
+
+serve-predict:
+	$(RUN_PY) -m spotify.predict_service $(EXTRA_ARGS)
+
+schedule-run:
+	mkdir -p outputs
+	bash scripts/run_scheduled.sh $(MODE) $(RUN_NAME) $(EXTRA_ARGS)
 
 test:
 	$(RUN_PY) -m pytest
