@@ -8,7 +8,7 @@ import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 
@@ -34,6 +34,12 @@ class RequestValidationError(Exception):
         self.code = str(code)
         self.message = str(message)
         self.details = details or {}
+
+
+class PredictRequestPayload(TypedDict):
+    top_k: int
+    include_video: bool
+    recent_artists: list[str] | None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -139,8 +145,8 @@ def _normalize_recent_artists(value: object) -> list[str] | None:
         return None
 
     if isinstance(value, str):
-        cleaned = [part.strip() for part in value.split("|") if part.strip()]
-        return cleaned or None
+        from_string = [part.strip() for part in value.split("|") if part.strip()]
+        return from_string or None
 
     if not isinstance(value, list):
         raise RequestValidationError(
@@ -196,7 +202,7 @@ def normalize_predict_payload(
     *,
     default_include_video: bool,
     max_top_k: int,
-) -> dict[str, object]:
+) -> PredictRequestPayload:
     allowed_keys = {"top_k", "include_video", "recent_artists"}
     unknown_keys = sorted(set(payload.keys()) - allowed_keys)
     if unknown_keys:
@@ -405,9 +411,9 @@ def _build_handler(service: PredictionService):
 
             try:
                 result = service.predict(
-                    top_k=int(normalized["top_k"]),
+                    top_k=normalized["top_k"],
                     recent_artists=normalized["recent_artists"],
-                    include_video=bool(normalized["include_video"]),
+                    include_video=normalized["include_video"],
                 )
                 self._send_json(200, result)
             except (RuntimeError, ValueError, FileNotFoundError) as exc:

@@ -16,9 +16,16 @@ class ChampionAlias:
 
 
 def _to_float(value: object) -> float:
-    try:
+    if isinstance(value, bool):
+        return float("nan")
+    if isinstance(value, (int, float)):
         out = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            out = float(value)
+        except ValueError:
+            return float("nan")
+    else:
         return float("nan")
     if math.isnan(out):
         return float("nan")

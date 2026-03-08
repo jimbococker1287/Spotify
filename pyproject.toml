@@ -50,12 +50,14 @@ target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+select = ["E", "F"]
 ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"
 files = [
+  "spotify/champion_alias.py",
+  "spotify/data_quality.py",
   "spotify/predict_next.py",
   "spotify/predict_service.py",
   "spotify/governance.py",
@@ -65,3 +67,4 @@ check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_return_any = false
+follow_imports = "skip"

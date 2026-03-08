@@ -10,6 +10,8 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Prepared-data fingerprint caching
 - Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
 - Champion/challenger gating
+- Pre-train data quality gate with fail-fast checks
+- Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
 - Per-run Markdown auto-report
 - Persistent cross-run history and charts
 - Benchmark lock runs with seed-based confidence intervals
@@ -42,6 +44,24 @@ CLI flags always override profile defaults.
 make setup
 make train PROFILE=dev
 make test
+make qa
+```
+
+`make test` now installs the package in editable mode first, so tests do not require manual `PYTHONPATH=.` exports.
+
+## Quality Tooling
+
+```bash
+make lint
+make typecheck
+make qa
+```
+
+Optional local hooks:
+
+```bash
+pre-commit install
+pre-commit run --all-files
 ```
 
 ## Training Commands
@@ -211,6 +231,7 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `run_manifest.json`
 - `run_results.json`
 - `run_report.md` (auto-generated run summary with metrics, speed, and trend links)
+- `data_quality_report.json` (schema/null/range gate report, generated before training)
 - `champion_gate.json` (promotion decision vs prior champion)
 - `feature_metadata.json` (artist label map + context feature schema)
 - `run_leaderboard.png`
@@ -240,9 +261,19 @@ Prepared-data cache:
 - `outputs/cache/prepared_data/<fingerprint>/prepared_bundle.joblib`
 - `outputs/cache/prepared_data/<fingerprint>/cache_meta.json`
 
+Champion alias:
+
+- `outputs/models/champion/alias.json` (latest promoted run pointer + default serving model)
+
 ## Prediction CLI
 
-Load the best deep model from a run and print top-5 next-artist predictions:
+Load the best deep model from the latest promoted champion run and print top-5 predictions:
+
+```bash
+python -m spotify.predict_next --top-k 5
+```
+
+Or target a specific run directory:
 
 ```bash
 python -m spotify.predict_next \
@@ -269,7 +300,15 @@ python -m spotify.predict_next \
 
 ## Prediction Service (HTTP)
 
-Serve the best deep model from a run via a lightweight HTTP API:
+Serve the latest promoted champion run via a lightweight HTTP API:
+
+```bash
+python -m spotify.predict_service \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Or pin a specific run:
 
 ```bash
 python -m spotify.predict_service \
@@ -291,6 +330,41 @@ curl -s -X POST http://127.0.0.1:8000/predict \
   -H "Content-Type: application/json" \
   -d '{"top_k":5,"recent_artists":["Artist A","Artist B","Artist C"]}'
 ```
+
+Optional token auth + request limits:
+
+- Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
+- Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
+- Errors return structured payloads: `{"error":{"code","message","details"}}`.
+
+## Docker (Prediction Service)
+
+Build:
+
+```bash
+docker build -t spotify-predict-service .
+```
+
+Run (mount project outputs and raw data):
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e RUN_DIR=/app/outputs/models/champion \
+  -e DATA_DIR=/app/data/raw \
+  -v "$(pwd)/outputs:/app/outputs" \
+  -v "$(pwd)/data/raw:/app/data/raw:ro" \
+  spotify-predict-service
+```
+
+The container includes a `/health` Docker healthcheck.
+
+## CI
+
+GitHub Actions CI is defined in `.github/workflows/ci.yml` and runs on push/PR:
+
+- `ruff`
+- `mypy`
+- `pytest`
 
 ## Scheduling + Alerts
 
