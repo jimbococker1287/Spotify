@@ -13,12 +13,13 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup train train-fast train-full train-classical train-deep train-elite train-everything refresh-backtest benchmark-lock regression-guard regression-alert predict-next serve-predict schedule-run test clean clean-all
+.PHONY: setup train train-fast train-full train-classical train-deep train-elite train-everything refresh-backtest benchmark-lock regression-guard regression-alert predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install --upgrade pip
 	$(VENV_PIP) install -r requirements-dev.txt
+	$(VENV_PIP) install -e . --no-deps
 	mkdir -p data/raw outputs
 	touch data/raw/.gitkeep outputs/.gitkeep
 
@@ -75,7 +76,16 @@ schedule-run:
 	mkdir -p outputs
 	bash scripts/run_scheduled.sh $(MODE) $(RUN_NAME) $(EXTRA_ARGS)
 
+lint:
+	$(RUN_PY) -m ruff check .
+
+typecheck:
+	$(RUN_PY) -m mypy
+
+qa: lint typecheck test
+
 test:
+	$(RUN_PY) -m pip install -e . --no-deps
 	$(RUN_PY) -m pytest
 
 clean:

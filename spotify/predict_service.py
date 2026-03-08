@@ -3,25 +3,67 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from .champion_alias import resolve_prediction_run_dir
+from .env import load_local_env
 from .predict_next import _prepare_inputs, _resolve_model_name
+
+MAX_REQUEST_BYTES = 1_000_000
+DEFAULT_MAX_TOP_K = 20
+
+
+class RequestValidationError(Exception):
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.code = str(code)
+        self.message = str(message)
+        self.details = details or {}
 
 
 def _parse_args() -> argparse.Namespace:
+    env_max_top_k_raw = os.getenv("SPOTIFY_PREDICT_MAX_TOP_K", str(DEFAULT_MAX_TOP_K)).strip()
+    try:
+        env_max_top_k = max(1, int(env_max_top_k_raw))
+    except ValueError:
+        env_max_top_k = DEFAULT_MAX_TOP_K
+
     parser = argparse.ArgumentParser(
         prog="python -m spotify.predict_service",
         description="Serve Spotify next-artist predictions over HTTP.",
     )
-    parser.add_argument("--run-dir", type=str, required=True, help="Path to outputs/runs/<run_id>.")
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Path to outputs/runs/<run_id> or outputs/models/champion. Defaults to champion alias.",
+    )
     parser.add_argument("--model-name", type=str, default=None, help="Optional deep model checkpoint name override.")
     parser.add_argument("--data-dir", type=str, default="data/raw", help="Path to raw Streaming_History JSON files.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8000, help="HTTP port.")
+    parser.add_argument("--max-top-k", type=int, default=env_max_top_k, help="Maximum top_k value accepted by the API.")
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        default=os.getenv("SPOTIFY_PREDICT_AUTH_TOKEN"),
+        help="Optional API token. When set, POST /predict requires Authorization: Bearer <token>.",
+    )
     parser.add_argument(
         "--include-video",
         action="store_true",
@@ -30,14 +72,201 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _error_payload(code: str, message: str, details: dict[str, object] | None = None) -> dict[str, object]:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details or {},
+        }
+    }
+
+
+def _read_json_payload(handler: BaseHTTPRequestHandler) -> dict[str, object]:
+    content_type = handler.headers.get("Content-Type", "")
+    if content_type and "application/json" not in content_type.lower():
+        raise RequestValidationError(
+            status_code=415,
+            code="unsupported_media_type",
+            message="Content-Type must be application/json.",
+        )
+
+    length_raw = handler.headers.get("Content-Length", "0")
+    try:
+        length = int(length_raw)
+    except ValueError as exc:
+        raise RequestValidationError(
+            status_code=400,
+            code="invalid_content_length",
+            message="Content-Length header must be an integer.",
+        ) from exc
+
+    if length < 0:
+        raise RequestValidationError(
+            status_code=400,
+            code="invalid_content_length",
+            message="Content-Length must be non-negative.",
+        )
+    if length > MAX_REQUEST_BYTES:
+        raise RequestValidationError(
+            status_code=413,
+            code="payload_too_large",
+            message=f"Payload exceeds limit of {MAX_REQUEST_BYTES} bytes.",
+        )
+
+    try:
+        raw = handler.rfile.read(length) if length > 0 else b"{}"
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RequestValidationError(
+            status_code=400,
+            code="invalid_json",
+            message="Request body must be valid JSON.",
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise RequestValidationError(
+            status_code=400,
+            code="invalid_payload",
+            message="JSON payload must be an object.",
+        )
+
+    return parsed
+
+
+def _normalize_recent_artists(value: object) -> list[str] | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        cleaned = [part.strip() for part in value.split("|") if part.strip()]
+        return cleaned or None
+
+    if not isinstance(value, list):
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_recent_artists",
+            message="recent_artists must be a list of strings or a pipe-separated string.",
+        )
+
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise RequestValidationError(
+                status_code=422,
+                code="invalid_recent_artists",
+                message="recent_artists list must contain only strings.",
+            )
+        text = item.strip()
+        if text:
+            cleaned.append(text)
+    return cleaned or None
+
+
+def _normalize_top_k(value: object, *, max_top_k: int) -> int:
+    if isinstance(value, bool):
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_top_k",
+            message="top_k must be an integer.",
+        )
+    if not isinstance(value, int):
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_top_k",
+            message="top_k must be an integer.",
+        )
+    if value < 1:
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_top_k",
+            message="top_k must be at least 1.",
+        )
+    if value > max_top_k:
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_top_k",
+            message=f"top_k cannot exceed {max_top_k}.",
+        )
+    return int(value)
+
+
+def normalize_predict_payload(
+    payload: dict[str, object],
+    *,
+    default_include_video: bool,
+    max_top_k: int,
+) -> dict[str, object]:
+    allowed_keys = {"top_k", "include_video", "recent_artists"}
+    unknown_keys = sorted(set(payload.keys()) - allowed_keys)
+    if unknown_keys:
+        raise RequestValidationError(
+            status_code=400,
+            code="unknown_fields",
+            message="Payload contains unknown fields.",
+            details={"fields": unknown_keys},
+        )
+
+    top_k = _normalize_top_k(payload.get("top_k", 5), max_top_k=max_top_k)
+
+    include_video_raw = payload.get("include_video", default_include_video)
+    if not isinstance(include_video_raw, bool):
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_include_video",
+            message="include_video must be a boolean.",
+        )
+    include_video = bool(include_video_raw)
+
+    recent_artists = _normalize_recent_artists(payload.get("recent_artists"))
+
+    return {
+        "top_k": top_k,
+        "include_video": include_video,
+        "recent_artists": recent_artists,
+    }
+
+
+def _extract_bearer_token(auth_header: str | None) -> str | None:
+    if not auth_header:
+        return None
+    value = auth_header.strip()
+    if not value.lower().startswith("bearer "):
+        return None
+    token = value[7:].strip()
+    return token or None
+
+
+def is_authorized_request(headers: Any, expected_token: str | None) -> bool:
+    if not expected_token:
+        return True
+    bearer = _extract_bearer_token(headers.get("Authorization"))
+    api_key = headers.get("X-API-Key")
+    provided = bearer or (str(api_key).strip() if api_key is not None else "")
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, expected_token)
+
+
 class PredictionService:
-    def __init__(self, run_dir: Path, data_dir: Path, model_name: str, include_video: bool, logger: logging.Logger):
+    def __init__(
+        self,
+        run_dir: Path,
+        data_dir: Path,
+        model_name: str,
+        include_video: bool,
+        max_top_k: int,
+        auth_token: str | None,
+        logger: logging.Logger,
+    ):
         import tensorflow as tf
 
         self.run_dir = run_dir
         self.data_dir = data_dir
         self.model_name = model_name
         self.include_video = include_video
+        self.max_top_k = max(1, int(max_top_k))
+        self.auth_token = auth_token
         self.logger = logger
         self._predict_lock = threading.Lock()
 
@@ -95,13 +324,36 @@ class PredictionService:
 
 def _build_handler(service: PredictionService):
     class Handler(BaseHTTPRequestHandler):
-        def _send_json(self, status_code: int, payload: dict[str, object]) -> None:
+        def _send_json(
+            self,
+            status_code: int,
+            payload: dict[str, object],
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_error(
+            self,
+            status_code: int,
+            *,
+            code: str,
+            message: str,
+            details: dict[str, object] | None = None,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
+            self._send_json(
+                status_code,
+                _error_payload(code=code, message=message, details=details),
+                extra_headers=extra_headers,
+            )
 
         def log_message(self, fmt: str, *args) -> None:
             service.logger.info("HTTP %s - %s", self.address_string(), fmt % args)
@@ -114,69 +366,85 @@ def _build_handler(service: PredictionService):
                         "status": "ok",
                         "model_name": service.model_name,
                         "run_dir": str(service.run_dir),
+                        "max_top_k": service.max_top_k,
+                        "requires_auth": bool(service.auth_token),
                     },
                 )
                 return
-            self._send_json(404, {"error": "not_found"})
+            self._send_error(404, code="not_found", message="Resource not found.")
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path.rstrip("/") != "/predict":
-                self._send_json(404, {"error": "not_found"})
+                self._send_error(404, code="not_found", message="Resource not found.")
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._send_json(400, {"error": "invalid_content_length"})
+
+            if not is_authorized_request(self.headers, service.auth_token):
+                self._send_error(
+                    401,
+                    code="unauthorized",
+                    message="Missing or invalid API token.",
+                    extra_headers={"WWW-Authenticate": "Bearer"},
+                )
                 return
 
             try:
-                raw = self.rfile.read(length) if length > 0 else b"{}"
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception:
-                self._send_json(400, {"error": "invalid_json"})
+                payload = _read_json_payload(self)
+                normalized = normalize_predict_payload(
+                    payload,
+                    default_include_video=service.include_video,
+                    max_top_k=service.max_top_k,
+                )
+            except RequestValidationError as exc:
+                self._send_error(
+                    exc.status_code,
+                    code=exc.code,
+                    message=exc.message,
+                    details=exc.details,
+                )
                 return
-
-            top_k = payload.get("top_k", 5)
-            include_video = payload.get("include_video", service.include_video)
-            recent_artists = payload.get("recent_artists")
-            if isinstance(recent_artists, str):
-                recent_artists = [part.strip() for part in recent_artists.split("|") if part.strip()]
-            if recent_artists is not None and not isinstance(recent_artists, list):
-                self._send_json(400, {"error": "recent_artists must be a list or pipe-separated string"})
-                return
-            if isinstance(recent_artists, list):
-                recent_artists = [str(item).strip() for item in recent_artists if str(item).strip()]
 
             try:
                 result = service.predict(
-                    top_k=int(top_k),
-                    recent_artists=recent_artists,
-                    include_video=bool(include_video),
+                    top_k=int(normalized["top_k"]),
+                    recent_artists=normalized["recent_artists"],
+                    include_video=bool(normalized["include_video"]),
                 )
                 self._send_json(200, result)
-            except Exception as exc:
-                self._send_json(500, {"error": str(exc)})
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                self._send_error(
+                    422,
+                    code="prediction_input_error",
+                    message=str(exc),
+                )
+            except Exception:
+                service.logger.exception("Unhandled prediction failure")
+                self._send_error(
+                    500,
+                    code="internal_error",
+                    message="Prediction failed due to an internal server error.",
+                )
 
     return Handler
 
 
 def main() -> int:
+    load_local_env()
     args = _parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logger = logging.getLogger("spotify.predict_service")
 
-    run_dir = Path(args.run_dir).expanduser().resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
+    run_dir, champion_alias_model_name = resolve_prediction_run_dir(args.run_dir)
     data_dir = Path(args.data_dir).expanduser().resolve()
-    model_name = _resolve_model_name(run_dir, args.model_name)
+    model_name = _resolve_model_name(run_dir, args.model_name or champion_alias_model_name)
 
     service = PredictionService(
         run_dir=run_dir,
         data_dir=data_dir,
         model_name=model_name,
         include_video=bool(args.include_video),
+        max_top_k=max(1, int(args.max_top_k)),
+        auth_token=(str(args.auth_token).strip() if args.auth_token else None),
         logger=logger,
     )
     server = ThreadingHTTPServer((str(args.host), int(args.port)), _build_handler(service))

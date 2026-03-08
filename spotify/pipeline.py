@@ -10,6 +10,7 @@ import sys
 
 import numpy as np
 
+from .champion_alias import best_deep_model_name, write_champion_alias
 from .config import PipelineConfig, configure_logging
 from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
 from .tracking import MlflowTracker
@@ -70,6 +71,14 @@ def run_pipeline(config: PipelineConfig) -> None:
     optuna_rows: list[dict[str, object]] = []
     backtest_rows: list[dict[str, object]] = []
     cache_info_payload: dict[str, object] = {}
+    champion_alias_payload: dict[str, object] = {
+        "updated": False,
+        "alias_file": "",
+        "run_id": "",
+        "run_dir": "",
+        "model_name": "",
+        "reason": "gate_not_evaluated",
+    }
     artifact_paths: list[Path] = [run_dir / "train.log"]
     tracker: MlflowTracker | None = None
 
@@ -132,8 +141,10 @@ def run_pipeline(config: PipelineConfig) -> None:
         from .data import (
             PreparedDataCacheInfo,
             SKEW_CONTEXT_FEATURES,
+            load_streaming_history,
             load_or_prepare_training_data,
         )
+        from .data_quality import run_data_quality_gate
         from .governance import evaluate_champion_gate
         from .explainability import run_shap_analysis
         from .evaluation import run_extended_evaluation
@@ -158,6 +169,15 @@ def run_pipeline(config: PipelineConfig) -> None:
         from .training import compute_baselines, train_and_evaluate_models
         from .tuning import run_optuna_tuning
 
+        raw_df = load_streaming_history(
+            config.data_dir,
+            include_video=config.include_video,
+            logger=logger,
+        )
+        data_quality_report_path = run_dir / "data_quality_report.json"
+        run_data_quality_gate(raw_df, report_path=data_quality_report_path, logger=logger)
+        artifact_paths.append(data_quality_report_path)
+
         prepared, cache_info = load_or_prepare_training_data(
             data_dir=config.data_dir,
             include_video=config.include_video,
@@ -166,6 +186,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             sequence_length=config.sequence_length,
             scaler_path=run_dir / "context_scaler.joblib",
             cache_root=config.output_dir / "cache" / "prepared_data",
+            raw_df=raw_df,
             logger=logger,
         )
         assert isinstance(cache_info, PreparedDataCacheInfo)
@@ -447,6 +468,8 @@ def run_pipeline(config: PipelineConfig) -> None:
         except Exception:
             champion_gate_threshold = 0.005
         champion_gate_metric = os.getenv("SPOTIFY_CHAMPION_GATE_METRIC", "backtest_top1").strip().lower()
+        champion_gate_match_profile_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MATCH_PROFILE", "1").strip().lower()
+        champion_gate_match_profile = champion_gate_match_profile_raw in ("1", "true", "yes", "on")
         champion_gate = evaluate_champion_gate(
             history_csv=history_csv,
             current_run_id=run_id,
@@ -455,6 +478,8 @@ def run_pipeline(config: PipelineConfig) -> None:
             backtest_history_csv=(history_dir / "backtest_history.csv"),
             current_backtest_rows=backtest_rows,
             metric_source=champion_gate_metric,
+            current_profile=config.profile,
+            require_profile_match=champion_gate_match_profile,
         )
         champion_gate_path = run_dir / "champion_gate.json"
         champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
@@ -473,6 +498,42 @@ def run_pipeline(config: PipelineConfig) -> None:
                 "Champion gate failed in strict mode: "
                 f"regression={champion_gate.get('regression')} threshold={champion_gate.get('threshold')}"
             )
+
+        if bool(champion_gate.get("promoted", False)):
+            champion_model_name = best_deep_model_name(result_rows)
+            if not champion_model_name:
+                champion_alias_payload["reason"] = "no_deep_models_in_promoted_run"
+                logger.info("Skipping champion alias update: promoted run has no deep models.")
+            else:
+                checkpoint_path = run_dir / f"best_{champion_model_name}.keras"
+                if not checkpoint_path.exists():
+                    champion_alias_payload["reason"] = "deep_model_checkpoint_missing"
+                    champion_alias_payload["model_name"] = champion_model_name
+                    logger.warning("Skipping champion alias update because checkpoint is missing: %s", checkpoint_path)
+                else:
+                    alias_file = write_champion_alias(
+                        output_dir=config.output_dir,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        model_name=champion_model_name,
+                    )
+                    champion_alias_payload = {
+                        "updated": True,
+                        "alias_file": str(alias_file),
+                        "run_id": run_id,
+                        "run_dir": str(run_dir),
+                        "model_name": champion_model_name,
+                        "reason": "promoted",
+                    }
+                    artifact_paths.append(alias_file)
+                    logger.info(
+                        "Champion alias updated: %s -> run_id=%s model=%s",
+                        alias_file,
+                        run_id,
+                        champion_model_name,
+                    )
+        else:
+            champion_alias_payload["reason"] = "gate_not_promoted"
 
         if optuna_rows:
             optuna_history_csv = append_optuna_history(
@@ -521,6 +582,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             "optuna_rows": len(optuna_rows),
             "cache": cache_info_payload,
             "champion_gate": champion_gate,
+            "champion_alias": champion_alias_payload,
         }
         manifest_path = run_dir / "run_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as out:

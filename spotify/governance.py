@@ -63,6 +63,9 @@ def _best_prior_from_experiment_history(
     history_csv: Path,
     current_run_id: str,
     metric_name: str,
+    *,
+    target_profile: str | None,
+    require_profile_match: bool,
 ) -> tuple[str, str, float]:
     champion_run_id = ""
     champion_model_name = ""
@@ -76,6 +79,10 @@ def _best_prior_from_experiment_history(
             run_id = str(row.get("run_id", "")).strip()
             if not run_id or run_id == current_run_id:
                 continue
+            if require_profile_match and target_profile:
+                profile = str(row.get("profile", "")).strip().lower()
+                if profile and profile != str(target_profile).strip().lower():
+                    continue
             model_name = str(row.get("model_name", "")).strip()
             if not model_name:
                 continue
@@ -93,6 +100,9 @@ def _best_prior_from_experiment_history(
 def _best_prior_from_backtest_history(
     history_csv: Path | None,
     current_run_id: str,
+    *,
+    target_profile: str | None,
+    require_profile_match: bool,
 ) -> tuple[str, str, float]:
     if history_csv is None or not history_csv.exists():
         return "", "", float("-inf")
@@ -104,6 +114,10 @@ def _best_prior_from_backtest_history(
             model_name = str(row.get("model_name", "")).strip()
             if not run_id or run_id == current_run_id or not model_name:
                 continue
+            if require_profile_match and target_profile:
+                profile = str(row.get("profile", "")).strip().lower()
+                if profile and profile != str(target_profile).strip().lower():
+                    continue
             score = _to_float(row.get("top1"))
             if math.isnan(score):
                 continue
@@ -124,11 +138,17 @@ def _best_prior_from_backtest_history(
     return champion_run_id, champion_model_name, champion_score
 
 
-def _no_current_result_payload(threshold: float, metric_source: str) -> dict[str, object]:
+def _no_current_result_payload(
+    threshold: float,
+    metric_source: str,
+    *,
+    profile_match: bool,
+) -> dict[str, object]:
     return {
         "status": "no_current_results",
         "promoted": False,
         "metric_source": metric_source,
+        "profile_match": bool(profile_match),
         "threshold": threshold,
         "regression": float("nan"),
         "champion_run_id": "",
@@ -152,6 +172,8 @@ def evaluate_champion_gate(
     backtest_history_csv: Path | None = None,
     current_backtest_rows: list[dict[str, object]] | None = None,
     metric_source: str = "backtest_top1",
+    current_profile: str | None = None,
+    require_profile_match: bool = True,
 ) -> dict[str, object]:
     threshold = max(0.0, float(regression_threshold))
     source = str(metric_source).strip().lower()
@@ -172,6 +194,8 @@ def evaluate_champion_gate(
         champion_run_id, champion_model_name, champion_score = _best_prior_from_backtest_history(
             backtest_history_csv,
             current_run_id,
+            target_profile=current_profile,
+            require_profile_match=require_profile_match,
         )
         if challenger_model_name == "" or challenger_score == float("-inf"):
             # Fallback to val_top1 when backtest is unavailable in the current run.
@@ -184,16 +208,23 @@ def evaluate_champion_gate(
             history_csv,
             current_run_id,
             "val_top1",
+            target_profile=current_profile,
+            require_profile_match=require_profile_match,
         )
 
     if challenger_model_name == "" or challenger_score == float("-inf"):
-        return _no_current_result_payload(threshold, effective_source)
+        return _no_current_result_payload(
+            threshold,
+            effective_source,
+            profile_match=require_profile_match,
+        )
 
     if champion_score == float("-inf"):
         return {
             "status": "no_prior_champion" + status_suffix,
             "promoted": True,
             "metric_source": effective_source,
+            "profile_match": bool(require_profile_match),
             "threshold": threshold,
             "regression": 0.0,
             "champion_run_id": "",
@@ -213,6 +244,7 @@ def evaluate_champion_gate(
         "status": ("pass" if promoted else "fail") + status_suffix,
         "promoted": promoted,
         "metric_source": effective_source,
+        "profile_match": bool(require_profile_match),
         "threshold": threshold,
         "regression": regression,
         "champion_run_id": champion_run_id,

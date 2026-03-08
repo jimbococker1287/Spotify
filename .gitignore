@@ -9,6 +9,10 @@ __pycache__/
 .DS_Store
 .vscode/
 
+# Local secrets / env
+.env
+.env.local
+
 # Pipeline outputs
 outputs/*
 !outputs/.gitkeep

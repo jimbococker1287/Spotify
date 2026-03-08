@@ -9,13 +9,21 @@ from pathlib import Path
 import joblib
 import numpy as np
 
+from .champion_alias import resolve_prediction_run_dir
+from .env import load_local_env
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m spotify.predict_next",
         description="Load a trained run and predict top-k next artist recommendations.",
     )
-    parser.add_argument("--run-dir", type=str, required=True, help="Path to outputs/runs/<run_id>.")
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Path to outputs/runs/<run_id> or outputs/models/champion. Defaults to champion alias.",
+    )
     parser.add_argument(
         "--model-name",
         type=str,
@@ -152,10 +160,9 @@ def _prepare_inputs(
 
 
 def main() -> int:
+    load_local_env()
     args = _parse_args()
-    run_dir = Path(args.run_dir).expanduser().resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
+    run_dir, champion_alias_model_name = resolve_prediction_run_dir(args.run_dir)
 
     mpl_config_dir = run_dir / ".mplconfig"
     xdg_cache_dir = run_dir / ".cache"
@@ -171,7 +178,7 @@ def main() -> int:
     logger = logging.getLogger("spotify.predict")
 
     data_dir = Path(args.data_dir)
-    model_name = _resolve_model_name(run_dir, args.model_name)
+    model_name = _resolve_model_name(run_dir, args.model_name or champion_alias_model_name)
     model_path = run_dir / f"best_{model_name}.keras"
     logger.info("Loading model checkpoint: %s", model_path)
     model = tf.keras.models.load_model(model_path, compile=False)

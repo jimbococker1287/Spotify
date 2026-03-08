@@ -168,6 +168,7 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (optional, e.g. `logreg=90,random_forest=300`)
 - `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in gate metric vs previous champion)
 - `SPOTIFY_CHAMPION_GATE_METRIC` (default `backtest_top1`; alternatives: `val_top1`)
+- `SPOTIFY_CHAMPION_GATE_MATCH_PROFILE` (default `1`; compare challengers only against prior runs of the same profile)
 - `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
@@ -310,6 +311,25 @@ Optional webhook alerts:
 ```bash
 SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regression_alert.py
 ```
+
+## Spotipy Setup
+
+Copy the env template and add your Spotify API credentials:
+
+```bash
+cp .env.example .env
+```
+
+Set:
+
+- `SPOTIPY_CLIENT_ID`
+- `SPOTIPY_CLIENT_SECRET`
+
+The project now auto-loads `.env` and `.env.local` for:
+
+- `python -m spotify`
+- `python -m spotify.predict_next`
+- `python -m spotify.predict_service`
 
 ## Feature Upgrades
 

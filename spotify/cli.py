@@ -4,6 +4,7 @@ import argparse
 from typing import Sequence
 
 from .config import add_cli_arguments, build_config
+from .env import load_local_env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    load_local_env()
     parser = build_parser()
     args = parser.parse_args(argv)
 

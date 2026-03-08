@@ -213,6 +213,7 @@ def load_or_prepare_training_data(
     sequence_length: int,
     scaler_path: Path,
     cache_root: Path,
+    raw_df: pd.DataFrame | None = None,
     logger,
 ) -> tuple[PreparedData, PreparedDataCacheInfo]:
     files = discover_streaming_files(data_dir, include_video, logger)
@@ -251,7 +252,7 @@ def load_or_prepare_training_data(
         except Exception as exc:
             logger.warning("Prepared-data cache load failed (%s). Rebuilding cache.", exc)
 
-    df = load_streaming_history(data_dir, include_video, logger)
+    df = raw_df.copy() if raw_df is not None else load_streaming_history(data_dir, include_video, logger)
     df = engineer_features(df, max_artists, logger)
     df = append_audio_features(df, enable_spotify_features, logger)
     prepared = prepare_training_data(

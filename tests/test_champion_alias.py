@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from spotify.champion_alias import (
+    best_deep_model_name,
+    read_champion_alias,
+    resolve_prediction_run_dir,
+    write_champion_alias,
+)
+
+
+def test_best_deep_model_name_uses_top1_metric() -> None:
+    result_rows = [
+        {"model_name": "logreg", "model_type": "classical", "val_top1": 0.80},
+        {"model_name": "dense", "model_type": "deep", "val_top1": 0.41},
+        {"model_name": "gru", "model_type": "deep", "val_top1": 0.46},
+    ]
+
+    assert best_deep_model_name(result_rows) == "gru"
+
+
+def test_write_and_read_champion_alias_round_trip(tmp_path) -> None:
+    output_dir = tmp_path / "outputs"
+    run_dir = output_dir / "runs" / "run_a"
+    run_dir.mkdir(parents=True)
+
+    alias_file = write_champion_alias(
+        output_dir=output_dir,
+        run_id="run_a",
+        run_dir=run_dir,
+        model_name="gru",
+    )
+    alias = read_champion_alias(alias_file)
+
+    assert alias is not None
+    assert alias.run_id == "run_a"
+    assert alias.model_name == "gru"
+    assert alias.run_dir == run_dir.resolve()
+
+
+def test_resolve_prediction_run_dir_uses_default_alias(tmp_path) -> None:
+    project_root = tmp_path
+    output_dir = project_root / "outputs"
+    run_dir = output_dir / "runs" / "run_b"
+    run_dir.mkdir(parents=True)
+
+    write_champion_alias(
+        output_dir=output_dir,
+        run_id="run_b",
+        run_dir=run_dir,
+        model_name="lstm",
+    )
+
+    resolved_run_dir, alias_model_name = resolve_prediction_run_dir(None, project_root=project_root)
+    assert resolved_run_dir == run_dir.resolve()
+    assert alias_model_name == "lstm"
