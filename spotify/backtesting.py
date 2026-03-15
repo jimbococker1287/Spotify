@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from .benchmarks import (
+    ClassicalFeatureBundle,
     build_classical_estimator,
     build_full_tabular_dataset,
     evaluate_classical_estimator,
@@ -148,6 +149,7 @@ def run_temporal_backtest(
     max_train_samples: int,
     max_eval_samples: int,
     logger,
+    feature_bundle: ClassicalFeatureBundle | None = None,
 ) -> list[BacktestFoldResult]:
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
@@ -156,7 +158,25 @@ def run_temporal_backtest(
     validate_classical_models(selected_models, random_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    X_all, y_all = build_full_tabular_dataset(data)
+    X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
+    if feature_bundle is None:
+        X_all_seq = np.concatenate(
+            [
+                data.X_seq_train.astype("int32"),
+                data.X_seq_val.astype("int32"),
+                data.X_seq_test.astype("int32"),
+            ],
+            axis=0,
+        )
+    else:
+        X_all_seq = np.concatenate(
+            [
+                feature_bundle.X_train_seq,
+                feature_bundle.X_val_seq,
+                feature_bundle.X_test_seq,
+            ],
+            axis=0,
+        )
     windows = _build_expanding_windows(len(X_all), folds)
     if not windows:
         logger.warning("Unable to build temporal backtest windows from %d rows.", len(X_all))
@@ -187,16 +207,23 @@ def run_temporal_backtest(
     results: list[BacktestFoldResult] = []
     jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
-        X_train, y_train = X_all[:test_start], y_all[:test_start]
-        X_test, y_test = X_all[test_start:test_end], y_all[test_start:test_end]
-        X_train, y_train = _tail_cap(X_train, y_train, max_train_samples)
-        X_test, y_test = _tail_cap(X_test, y_test, max_eval_samples)
+        X_train_tab, y_train = X_all[:test_start], y_all[:test_start]
+        X_test_tab, y_test = X_all[test_start:test_end], y_all[test_start:test_end]
+        X_train_seq = X_all_seq[:test_start]
+        X_test_seq = X_all_seq[test_start:test_end]
+        X_train_tab, y_train = _tail_cap(X_train_tab, y_train, max_train_samples)
+        X_test_tab, y_test = _tail_cap(X_test_tab, y_test, max_eval_samples)
+        X_train_seq, _ = _tail_cap(X_train_seq, y_all[:test_start], max_train_samples)
+        X_test_seq, _ = _tail_cap(X_test_seq, y_all[test_start:test_end], max_eval_samples)
 
-        if len(X_train) == 0 or len(X_test) == 0:
+        if len(X_train_tab) == 0 or len(X_test_tab) == 0:
             continue
 
         for model_name in selected_models:
-            jobs.append((fold_idx, model_name, X_train, y_train, X_test, y_test))
+            if model_name == "session_knn":
+                jobs.append((fold_idx, model_name, X_train_seq, y_train, X_test_seq, y_test))
+            else:
+                jobs.append((fold_idx, model_name, X_train_tab, y_train, X_test_tab, y_test))
 
     if backtest_workers > 1 and len(jobs) > 1:
         with ThreadPoolExecutor(max_workers=backtest_workers) as executor:

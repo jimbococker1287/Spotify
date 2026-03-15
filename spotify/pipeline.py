@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-from .champion_alias import best_deep_model_name, write_champion_alias
+from .champion_alias import best_serveable_model, write_champion_alias
 from .config import PipelineConfig, configure_logging
 from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
 from .tracking import MlflowTracker
@@ -81,6 +81,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     }
     artifact_paths: list[Path] = [run_dir / "train.log"]
     tracker: MlflowTracker | None = None
+    final_tracker_status = "FAILED"
 
     try:
         run_deep_models = (not config.classical_only) and bool(config.model_names)
@@ -137,7 +138,8 @@ def run_pipeline(config: PipelineConfig) -> None:
         # for deep runs. Importing sklearn before TensorFlow can trigger a deadlock
         # on some macOS TensorFlow builds at the first training batch.
         from .backtesting import run_temporal_backtest
-        from .benchmarks import run_classical_benchmarks
+        from .analytics_db import refresh_analytics_database
+        from .benchmarks import build_classical_feature_bundle, run_classical_benchmarks
         from .data import (
             PreparedDataCacheInfo,
             SKEW_CONTEXT_FEATURES,
@@ -145,6 +147,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             load_or_prepare_training_data,
         )
         from .data_quality import run_data_quality_gate
+        from .ensemble import build_probability_ensemble
         from .governance import evaluate_champion_gate
         from .explainability import run_shap_analysis
         from .evaluation import run_extended_evaluation
@@ -317,10 +320,17 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "test_diversity_at5": float(artifacts.test_metrics.get(name, {}).get("diversity_at5", np.nan)),
                         "fit_seconds": float(artifacts.fit_seconds.get(name, np.nan)),
                         "epochs": len(history.history.get("loss", [])),
+                        "prediction_bundle_path": str(artifacts.prediction_bundle_paths.get(name, "")),
                     }
                 )
+                bundle_raw = str(artifacts.prediction_bundle_paths.get(name, "")).strip()
+                bundle_path = Path(bundle_raw) if bundle_raw else None
+                if bundle_path is not None and bundle_path.exists():
+                    artifact_paths.append(bundle_path)
         else:
             logger.info("Skipping deep models for this run.")
+
+        classical_feature_bundle = build_classical_feature_bundle(prepared) if run_classical_models else None
 
         if run_classical_models:
             classical_results = run_classical_benchmarks(
@@ -331,6 +341,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 max_train_samples=config.classical_max_train_samples,
                 max_eval_samples=config.classical_max_eval_samples,
                 logger=logger,
+                feature_bundle=classical_feature_bundle,
             )
             artifact_paths.append(run_dir / "classical_results.json")
             for row in classical_results:
@@ -353,8 +364,18 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "test_diversity_at5": row.test_diversity_at5,
                         "fit_seconds": row.fit_seconds,
                         "epochs": "",
+                        "prediction_bundle_path": row.prediction_bundle_path,
+                        "estimator_artifact_path": row.estimator_artifact_path,
                     }
                 )
+                bundle_raw = str(row.prediction_bundle_path).strip()
+                bundle_path = Path(bundle_raw) if bundle_raw else None
+                if bundle_path is not None and bundle_path.exists():
+                    artifact_paths.append(bundle_path)
+                estimator_raw = str(row.estimator_artifact_path).strip()
+                estimator_path = Path(estimator_raw) if estimator_raw else None
+                if estimator_path is not None and estimator_path.exists():
+                    artifact_paths.append(estimator_path)
         else:
             logger.info("Skipping classical model benchmarks for this run.")
 
@@ -370,6 +391,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 max_train_samples=config.classical_max_train_samples,
                 max_eval_samples=config.classical_max_eval_samples,
                 logger=logger,
+                feature_bundle=classical_feature_bundle,
             )
             for row in tuned_results:
                 payload = {
@@ -393,9 +415,19 @@ def run_pipeline(config: PipelineConfig) -> None:
                     "epochs": "",
                     "n_trials": row.n_trials,
                     "best_params": row.best_params,
+                    "prediction_bundle_path": row.prediction_bundle_path,
+                    "estimator_artifact_path": row.estimator_artifact_path,
                 }
                 result_rows.append(payload)
                 optuna_rows.append(payload)
+                bundle_raw = str(row.prediction_bundle_path).strip()
+                bundle_path = Path(bundle_raw) if bundle_raw else None
+                if bundle_path is not None and bundle_path.exists():
+                    artifact_paths.append(bundle_path)
+                estimator_raw = str(row.estimator_artifact_path).strip()
+                estimator_path = Path(estimator_raw) if estimator_raw else None
+                if estimator_path is not None and estimator_path.exists():
+                    artifact_paths.append(estimator_path)
             if optuna_dir.exists():
                 artifact_paths.extend(sorted(p for p in optuna_dir.glob("*") if p.is_file()))
         elif config.enable_optuna:
@@ -412,6 +444,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 max_train_samples=config.classical_max_train_samples,
                 max_eval_samples=config.classical_max_eval_samples,
                 logger=logger,
+                feature_bundle=classical_feature_bundle,
             )
             for row in backtest_results:
                 backtest_rows.append(
@@ -434,6 +467,17 @@ def run_pipeline(config: PipelineConfig) -> None:
         if not result_rows:
             raise RuntimeError("No models were run. Enable deep and/or classical models.")
 
+        ensemble_result = build_probability_ensemble(
+            data=prepared,
+            results=result_rows,
+            sequence_length=config.sequence_length,
+            run_dir=run_dir,
+            logger=logger,
+        )
+        if ensemble_result is not None:
+            result_rows.append(dict(ensemble_result.row))
+            artifact_paths.extend(ensemble_result.artifact_paths)
+
         extended_eval_artifacts = run_extended_evaluation(
             data=prepared,
             results=result_rows,
@@ -442,6 +486,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             random_seed=config.random_seed,
             max_train_samples=config.classical_max_train_samples,
             logger=logger,
+            feature_bundle=classical_feature_bundle,
         )
         artifact_paths.extend(extended_eval_artifacts)
 
@@ -470,6 +515,13 @@ def run_pipeline(config: PipelineConfig) -> None:
         champion_gate_metric = os.getenv("SPOTIFY_CHAMPION_GATE_METRIC", "backtest_top1").strip().lower()
         champion_gate_match_profile_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MATCH_PROFILE", "1").strip().lower()
         champion_gate_match_profile = champion_gate_match_profile_raw in ("1", "true", "yes", "on")
+        champion_gate_significance_raw = os.getenv("SPOTIFY_CHAMPION_GATE_SIGNIFICANCE", "0").strip().lower()
+        champion_gate_require_significance = champion_gate_significance_raw in ("1", "true", "yes", "on")
+        champion_gate_significance_z_raw = os.getenv("SPOTIFY_CHAMPION_GATE_SIGNIFICANCE_Z", "1.96").strip()
+        try:
+            champion_gate_significance_z = max(0.0, float(champion_gate_significance_z_raw))
+        except Exception:
+            champion_gate_significance_z = 1.96
         champion_gate = evaluate_champion_gate(
             history_csv=history_csv,
             current_run_id=run_id,
@@ -480,6 +532,8 @@ def run_pipeline(config: PipelineConfig) -> None:
             metric_source=champion_gate_metric,
             current_profile=config.profile,
             require_profile_match=champion_gate_match_profile,
+            require_significant_lift=champion_gate_require_significance,
+            significance_z=champion_gate_significance_z,
         )
         champion_gate_path = run_dir / "champion_gate.json"
         champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
@@ -500,38 +554,36 @@ def run_pipeline(config: PipelineConfig) -> None:
             )
 
         if bool(champion_gate.get("promoted", False)):
-            champion_model_name = best_deep_model_name(result_rows)
-            if not champion_model_name:
-                champion_alias_payload["reason"] = "no_deep_models_in_promoted_run"
-                logger.info("Skipping champion alias update: promoted run has no deep models.")
+            champion_model = best_serveable_model(result_rows, run_dir=run_dir)
+            if not champion_model:
+                champion_alias_payload["reason"] = "no_serveable_models_in_promoted_run"
+                logger.info("Skipping champion alias update: promoted run has no serveable models.")
             else:
-                checkpoint_path = run_dir / f"best_{champion_model_name}.keras"
-                if not checkpoint_path.exists():
-                    champion_alias_payload["reason"] = "deep_model_checkpoint_missing"
-                    champion_alias_payload["model_name"] = champion_model_name
-                    logger.warning("Skipping champion alias update because checkpoint is missing: %s", checkpoint_path)
-                else:
-                    alias_file = write_champion_alias(
-                        output_dir=config.output_dir,
-                        run_id=run_id,
-                        run_dir=run_dir,
-                        model_name=champion_model_name,
-                    )
-                    champion_alias_payload = {
-                        "updated": True,
-                        "alias_file": str(alias_file),
-                        "run_id": run_id,
-                        "run_dir": str(run_dir),
-                        "model_name": champion_model_name,
-                        "reason": "promoted",
-                    }
-                    artifact_paths.append(alias_file)
-                    logger.info(
-                        "Champion alias updated: %s -> run_id=%s model=%s",
-                        alias_file,
-                        run_id,
-                        champion_model_name,
-                    )
+                champion_model_name, champion_model_type = champion_model
+                alias_file = write_champion_alias(
+                    output_dir=config.output_dir,
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    model_name=champion_model_name,
+                    model_type=champion_model_type,
+                )
+                champion_alias_payload = {
+                    "updated": True,
+                    "alias_file": str(alias_file),
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "model_name": champion_model_name,
+                    "model_type": champion_model_type,
+                    "reason": "promoted",
+                }
+                artifact_paths.append(alias_file)
+                logger.info(
+                    "Champion alias updated: %s -> run_id=%s model=%s type=%s",
+                    alias_file,
+                    run_id,
+                    champion_model_name,
+                    champion_model_type,
+                )
         else:
             champion_alias_payload["reason"] = "gate_not_promoted"
 
@@ -594,6 +646,19 @@ def run_pipeline(config: PipelineConfig) -> None:
             json.dump(result_rows, out, indent=2)
         artifact_paths.append(run_results_path)
 
+        refresh_analytics_raw = os.getenv("SPOTIFY_REFRESH_ANALYTICS_DB", "1").strip().lower()
+        refresh_analytics = refresh_analytics_raw not in ("0", "false", "no", "off")
+        if refresh_analytics:
+            analytics_db_path = refresh_analytics_database(
+                data_dir=config.data_dir,
+                output_dir=config.output_dir,
+                include_video=config.include_video,
+                logger=logger,
+                raw_df=raw_df,
+            )
+            if analytics_db_path is not None and analytics_db_path.exists():
+                artifact_paths.append(analytics_db_path)
+
         report_path = write_run_report(
             run_dir=run_dir,
             history_dir=history_dir,
@@ -631,6 +696,13 @@ def run_pipeline(config: PipelineConfig) -> None:
             _track_file(tracker, path)
 
         logger.info("Pipeline completed successfully")
+        final_tracker_status = "FINISHED"
+    except KeyboardInterrupt:
+        final_tracker_status = "KILLED"
+        raise
+    except Exception:
+        final_tracker_status = "FAILED"
+        raise
     finally:
         if tracker is not None:
-            tracker.end()
+            tracker.end(status=final_tracker_status)

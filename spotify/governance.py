@@ -59,6 +59,19 @@ def _best_row_from_backtest_rows(
     return best_model, best_score
 
 
+def _scores_from_backtest_rows(rows: list[dict[str, object]]) -> dict[str, list[float]]:
+    by_model: dict[str, list[float]] = {}
+    for row in rows:
+        model_name = str(row.get("model_name", "")).strip()
+        if not model_name:
+            continue
+        score = _to_float(row.get("top1"))
+        if math.isnan(score):
+            continue
+        by_model.setdefault(model_name, []).append(score)
+    return by_model
+
+
 def _best_prior_from_experiment_history(
     history_csv: Path,
     current_run_id: str,
@@ -138,17 +151,65 @@ def _best_prior_from_backtest_history(
     return champion_run_id, champion_model_name, champion_score
 
 
+def _scores_for_backtest_run_model(
+    history_csv: Path | None,
+    *,
+    run_id: str,
+    model_name: str,
+    target_profile: str | None,
+    require_profile_match: bool,
+) -> list[float]:
+    if history_csv is None or not history_csv.exists() or not run_id or not model_name:
+        return []
+
+    scores: list[float] = []
+    with history_csv.open("r", encoding="utf-8") as infile:
+        for row in csv.DictReader(infile):
+            row_run_id = str(row.get("run_id", "")).strip()
+            row_model_name = str(row.get("model_name", "")).strip()
+            if row_run_id != run_id or row_model_name != model_name:
+                continue
+            if require_profile_match and target_profile:
+                profile = str(row.get("profile", "")).strip().lower()
+                if profile and profile != str(target_profile).strip().lower():
+                    continue
+            score = _to_float(row.get("top1"))
+            if not math.isnan(score):
+                scores.append(score)
+    return scores
+
+
+def _sample_stats(scores: list[float]) -> dict[str, float]:
+    if not scores:
+        return {"mean": float("nan"), "std": float("nan"), "count": 0.0, "stderr": float("nan")}
+    count = float(len(scores))
+    mean = float(sum(scores) / count)
+    if len(scores) < 2:
+        std = 0.0
+    else:
+        variance = sum((score - mean) ** 2 for score in scores) / float(len(scores) - 1)
+        std = math.sqrt(max(0.0, variance))
+    stderr = float(std / math.sqrt(count)) if count > 0 else float("nan")
+    return {"mean": mean, "std": float(std), "count": count, "stderr": stderr}
+
+
 def _no_current_result_payload(
     threshold: float,
     metric_source: str,
     *,
     profile_match: bool,
+    require_significant_lift: bool = False,
+    significance_z: float = 1.96,
 ) -> dict[str, object]:
     return {
         "status": "no_current_results",
         "promoted": False,
         "metric_source": metric_source,
         "profile_match": bool(profile_match),
+        "require_significant_lift": bool(require_significant_lift),
+        "significance_z": float(significance_z),
+        "significance_margin": float("nan"),
+        "significant_lift": None,
         "threshold": threshold,
         "regression": float("nan"),
         "champion_run_id": "",
@@ -160,6 +221,10 @@ def _no_current_result_payload(
         "challenger_val_top1": float("nan"),
         "champion_backtest_top1": float("nan"),
         "challenger_backtest_top1": float("nan"),
+        "champion_backtest_std": float("nan"),
+        "challenger_backtest_std": float("nan"),
+        "champion_backtest_count": 0.0,
+        "challenger_backtest_count": 0.0,
     }
 
 
@@ -174,6 +239,8 @@ def evaluate_champion_gate(
     metric_source: str = "backtest_top1",
     current_profile: str | None = None,
     require_profile_match: bool = True,
+    require_significant_lift: bool = False,
+    significance_z: float = 1.96,
 ) -> dict[str, object]:
     threshold = max(0.0, float(regression_threshold))
     source = str(metric_source).strip().lower()
@@ -190,6 +257,7 @@ def evaluate_champion_gate(
 
     if source == "backtest_top1":
         backtest_rows = current_backtest_rows or []
+        current_score_map = _scores_from_backtest_rows(backtest_rows)
         challenger_model_name, challenger_score = _best_row_from_backtest_rows(backtest_rows)
         champion_run_id, champion_model_name, champion_score = _best_prior_from_backtest_history(
             backtest_history_csv,
@@ -217,6 +285,8 @@ def evaluate_champion_gate(
             threshold,
             effective_source,
             profile_match=require_profile_match,
+            require_significant_lift=require_significant_lift,
+            significance_z=significance_z,
         )
 
     if champion_score == float("-inf"):
@@ -225,6 +295,10 @@ def evaluate_champion_gate(
             "promoted": True,
             "metric_source": effective_source,
             "profile_match": bool(require_profile_match),
+            "require_significant_lift": bool(require_significant_lift),
+            "significance_z": float(significance_z),
+            "significance_margin": float("nan"),
+            "significant_lift": None,
             "threshold": threshold,
             "regression": 0.0,
             "champion_run_id": "",
@@ -236,15 +310,51 @@ def evaluate_champion_gate(
             "challenger_val_top1": (challenger_score if effective_source == "val_top1" else float("nan")),
             "champion_backtest_top1": (float("nan") if effective_source != "backtest_top1" else float("nan")),
             "challenger_backtest_top1": (challenger_score if effective_source == "backtest_top1" else float("nan")),
+            "champion_backtest_std": float("nan"),
+            "challenger_backtest_std": float("nan"),
+            "champion_backtest_count": 0.0,
+            "challenger_backtest_count": 0.0,
         }
 
     regression = float(champion_score - challenger_score)
     promoted = regression <= threshold
+    challenger_stats = {"mean": float("nan"), "std": float("nan"), "count": 0.0, "stderr": float("nan")}
+    champion_stats = {"mean": float("nan"), "std": float("nan"), "count": 0.0, "stderr": float("nan")}
+    significance_margin = float("nan")
+    significant_lift = None
+    status = ("pass" if promoted else "fail") + status_suffix
+
+    if effective_source == "backtest_top1":
+        challenger_scores = current_score_map.get(challenger_model_name, []) if "current_score_map" in locals() else []
+        champion_scores = _scores_for_backtest_run_model(
+            backtest_history_csv,
+            run_id=champion_run_id,
+            model_name=champion_model_name,
+            target_profile=current_profile,
+            require_profile_match=require_profile_match,
+        )
+        challenger_stats = _sample_stats(challenger_scores)
+        champion_stats = _sample_stats(champion_scores)
+        if require_significant_lift and not math.isnan(challenger_stats["stderr"]) and not math.isnan(champion_stats["stderr"]):
+            combined_stderr = math.sqrt(
+                max(0.0, (challenger_stats["stderr"] ** 2) + (champion_stats["stderr"] ** 2))
+            )
+            significance_margin = float(max(0.0, significance_z) * combined_stderr)
+            lift = challenger_score - champion_score
+            significant_lift = bool(lift > significance_margin)
+            if promoted and lift > 0 and not significant_lift:
+                promoted = False
+                status = "fail_not_significant" + status_suffix
+
     return {
-        "status": ("pass" if promoted else "fail") + status_suffix,
+        "status": status,
         "promoted": promoted,
         "metric_source": effective_source,
         "profile_match": bool(require_profile_match),
+        "require_significant_lift": bool(require_significant_lift),
+        "significance_z": float(significance_z),
+        "significance_margin": significance_margin,
+        "significant_lift": significant_lift,
         "threshold": threshold,
         "regression": regression,
         "champion_run_id": champion_run_id,
@@ -256,4 +366,8 @@ def evaluate_champion_gate(
         "challenger_val_top1": (challenger_score if effective_source == "val_top1" else float("nan")),
         "champion_backtest_top1": (champion_score if effective_source == "backtest_top1" else float("nan")),
         "challenger_backtest_top1": (challenger_score if effective_source == "backtest_top1" else float("nan")),
+        "champion_backtest_std": champion_stats["std"],
+        "challenger_backtest_std": challenger_stats["std"],
+        "champion_backtest_count": champion_stats["count"],
+        "challenger_backtest_count": challenger_stats["count"],
     }

@@ -23,6 +23,17 @@ DEFAULT_MODEL_NAMES: tuple[str, ...] = (
     "graph_seq",
 )
 
+CORE_DEEP_MODEL_NAMES: tuple[str, ...] = (
+    "dense",
+    "gru_artist",
+    "gru",
+    "memory_net",
+    "lstm",
+)
+EXPERIMENTAL_DEEP_MODEL_NAMES: tuple[str, ...] = tuple(
+    name for name in DEFAULT_MODEL_NAMES if name not in CORE_DEEP_MODEL_NAMES
+)
+
 CANONICAL_AUDIO_FILES: tuple[str, ...] = (
     "Streaming_History_Audio_2014-2022_0.json",
     "Streaming_History_Audio_2022_1.json",
@@ -41,14 +52,22 @@ DEFAULT_EPOCHS = 50
 DEFAULT_SEQUENCE_LENGTH = 30
 DEFAULT_MAX_ARTISTS = 200
 DEFAULT_SEED = 42
-DEFAULT_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
+CORE_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "logreg",
     "random_forest",
     "extra_trees",
+    "mlp",
+    "session_knn",
+    "catboost",
+)
+EXPERIMENTAL_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "hist_gbm",
     "knn",
     "gaussian_nb",
-    "mlp",
+)
+DEFAULT_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
+    *CORE_CLASSICAL_MODEL_NAMES,
+    *EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
 )
 DEFAULT_OPTUNA_MODEL_NAMES: tuple[str, ...] = DEFAULT_CLASSICAL_MODEL_NAMES
 DEFAULT_BACKTEST_MODEL_NAMES: tuple[str, ...] = DEFAULT_CLASSICAL_MODEL_NAMES
@@ -90,7 +109,7 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "enable_shap": False,
         "enable_classical_models": True,
         "model_names": ("dense", "gru_artist", "lstm"),
-        "classical_model_names": ("logreg", "extra_trees", "mlp"),
+        "classical_model_names": ("logreg", "extra_trees", "mlp", "session_knn"),
         "classical_max_train_samples": 20_000,
         "classical_max_eval_samples": 12_000,
         "enable_mlflow": True,
@@ -129,6 +148,56 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "temporal_backtest_folds": 3,
         "temporal_backtest_model_names": DEFAULT_BACKTEST_MODEL_NAMES,
     },
+    "core": {
+        "batch_size": 768,
+        "epochs": 12,
+        "sequence_length": DEFAULT_SEQUENCE_LENGTH,
+        "max_artists": 160,
+        "random_seed": DEFAULT_SEED,
+        "include_video": True,
+        "enable_spotify_features": False,
+        "enable_shap": False,
+        "enable_classical_models": True,
+        "model_names": CORE_DEEP_MODEL_NAMES,
+        "classical_model_names": CORE_CLASSICAL_MODEL_NAMES,
+        "classical_max_train_samples": 40_000,
+        "classical_max_eval_samples": 20_000,
+        "enable_mlflow": True,
+        "mlflow_tracking_uri": None,
+        "mlflow_experiment": "spotify-experiment-lab",
+        "enable_optuna": True,
+        "optuna_trials": 14,
+        "optuna_timeout_seconds": 900,
+        "optuna_model_names": CORE_CLASSICAL_MODEL_NAMES,
+        "enable_temporal_backtest": True,
+        "temporal_backtest_folds": 4,
+        "temporal_backtest_model_names": CORE_CLASSICAL_MODEL_NAMES,
+    },
+    "experimental": {
+        "batch_size": DEFAULT_BATCH_SIZE,
+        "epochs": 18,
+        "sequence_length": DEFAULT_SEQUENCE_LENGTH,
+        "max_artists": DEFAULT_MAX_ARTISTS,
+        "random_seed": DEFAULT_SEED,
+        "include_video": True,
+        "enable_spotify_features": False,
+        "enable_shap": False,
+        "enable_classical_models": True,
+        "model_names": EXPERIMENTAL_DEEP_MODEL_NAMES,
+        "classical_model_names": EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
+        "classical_max_train_samples": 35_000,
+        "classical_max_eval_samples": 20_000,
+        "enable_mlflow": True,
+        "mlflow_tracking_uri": None,
+        "mlflow_experiment": "spotify-experiment-lab",
+        "enable_optuna": True,
+        "optuna_trials": 10,
+        "optuna_timeout_seconds": 900,
+        "optuna_model_names": EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
+        "enable_temporal_backtest": True,
+        "temporal_backtest_folds": 3,
+        "temporal_backtest_model_names": EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
+    },
     "full": {
         "batch_size": DEFAULT_BATCH_SIZE,
         "epochs": DEFAULT_EPOCHS,
@@ -136,7 +205,7 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "max_artists": DEFAULT_MAX_ARTISTS,
         "random_seed": DEFAULT_SEED,
         "include_video": True,
-        "enable_spotify_features": True,
+        "enable_spotify_features": False,
         "enable_shap": True,
         "enable_classical_models": True,
         "model_names": DEFAULT_MODEL_NAMES,
@@ -173,7 +242,7 @@ class PipelineConfig:
     epochs: int = DEFAULT_EPOCHS
     random_seed: int = DEFAULT_SEED
     include_video: bool = True
-    enable_spotify_features: bool = True
+    enable_spotify_features: bool = False
     enable_shap: bool = True
     enable_classical_models: bool = True
     classical_only: bool = False
@@ -389,7 +458,7 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile",
         type=str,
-        choices=("dev", "fast", "small", "full"),
+        choices=("dev", "fast", "small", "core", "experimental", "full"),
         default="full",
         help="Preset run profile. CLI flags override profile values.",
     )
@@ -470,5 +539,9 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help="Comma-separated classical model names for temporal backtesting.",
     )
     parser.add_argument("--no-video", action="store_true", help="Exclude Streaming_History_Video files.")
-    parser.add_argument("--no-spotify-features", action="store_true", help="Skip Spotipy audio feature fetch.")
+    parser.add_argument(
+        "--no-spotify-features",
+        action="store_true",
+        help="Deprecated compatibility flag. Spotify audio feature fetch remains disabled.",
+    )
     parser.add_argument("--no-shap", action="store_true", help="Skip SHAP explainability step.")

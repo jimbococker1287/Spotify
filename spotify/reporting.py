@@ -120,12 +120,20 @@ def persist_to_sqlite(df, histories: dict[str, object], cpu_usage: list[float], 
 
     conn = sqlite3.connect(db_path)
     try:
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=MEMORY")
+            cur.execute("PRAGMA synchronous=OFF")
+            cur.execute("PRAGMA temp_store=MEMORY")
+            cur.execute("PRAGMA cache_size=-65536")
+        except Exception:
+            pass
+
         try:
             df.to_sql("spotify_history", conn, if_exists="replace", index=False)
         except Exception:
             pass
 
-        cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS final_accuracy")
         cur.execute("DROP TABLE IF EXISTS learning_curves")
         cur.execute("DROP TABLE IF EXISTS utilization")
@@ -165,29 +173,26 @@ def persist_to_sqlite(df, histories: dict[str, object], cpu_usage: list[float], 
             """
         )
 
-        for model_name, history in histories.items():
-            val_key = VAL_KEY if VAL_KEY in history.history else "val_sparse_categorical_accuracy"
-            final_top1 = history.history[val_key][-1]
-            final_top5 = history.history.get("val_artist_output_top_5", history.history.get("val_top_5", [np.nan]))[-1]
-            cur.execute(
-                "INSERT OR REPLACE INTO final_accuracy(model, val_top1, val_top5) VALUES (?, ?, ?)",
-                (model_name, float(final_top1), float(final_top5) if not np.isnan(final_top5) else None),
-            )
-
+        final_accuracy_rows: list[tuple[object, ...]] = []
+        learning_curve_rows: list[tuple[object, ...]] = []
         for model_name, history in histories.items():
             trn_key = TRN_KEY if TRN_KEY in history.history else "sparse_categorical_accuracy"
             val_key = VAL_KEY if VAL_KEY in history.history else "val_sparse_categorical_accuracy"
+            final_top1 = history.history[val_key][-1]
+            final_top5 = history.history.get("val_artist_output_top_5", history.history.get("val_top_5", [np.nan]))[-1]
+            final_accuracy_rows.append(
+                (
+                    model_name,
+                    float(final_top1),
+                    float(final_top5) if not np.isnan(final_top5) else None,
+                )
+            )
             val_top5_series = history.history.get(
                 "val_artist_output_top_5",
                 history.history.get("val_top_5", [np.nan] * len(history.history[val_key])),
             )
             for epoch_idx in range(len(history.history[trn_key])):
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO learning_curves(
-                        model, epoch, train_artist_acc, val_artist_acc, val_artist_top5, train_loss, val_loss
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
+                learning_curve_rows.append(
                     (
                         model_name,
                         epoch_idx + 1,
@@ -196,15 +201,34 @@ def persist_to_sqlite(df, histories: dict[str, object], cpu_usage: list[float], 
                         float(val_top5_series[epoch_idx]) if not np.isnan(val_top5_series[epoch_idx]) else None,
                         float(history.history["loss"][epoch_idx]),
                         float(history.history["val_loss"][epoch_idx]),
-                    ),
+                    )
                 )
 
-        for idx, cpu_value in enumerate(cpu_usage):
-            gpu_value = gpu_usage[idx] if idx < len(gpu_usage) else None
-            cur.execute(
-                "INSERT INTO utilization(timestamp, cpu_usage, gpu_usage) VALUES (?, ?, ?)",
-                (idx, float(cpu_value), float(gpu_value) if gpu_value is not None else None),
+        cur.executemany(
+            "INSERT OR REPLACE INTO final_accuracy(model, val_top1, val_top5) VALUES (?, ?, ?)",
+            final_accuracy_rows,
+        )
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO learning_curves(
+                model, epoch, train_artist_acc, val_artist_acc, val_artist_top5, train_loss, val_loss
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            learning_curve_rows,
+        )
+
+        utilization_rows = [
+            (
+                idx,
+                float(cpu_value),
+                float(gpu_usage[idx]) if idx < len(gpu_usage) else None,
             )
+            for idx, cpu_value in enumerate(cpu_usage)
+        ]
+        cur.executemany(
+            "INSERT INTO utilization(timestamp, cpu_usage, gpu_usage) VALUES (?, ?, ?)",
+            utilization_rows,
+        )
 
         conn.commit()
     finally:
@@ -727,7 +751,13 @@ def write_run_report(
             lines.append(f"- [{rel}]({rel})")
     analysis_dir = run_dir / "analysis"
     if analysis_dir.exists():
-        for pattern in ("*_confidence_summary.json", "*_reliability.png", "*_segment_metrics.csv", "*_top_errors.csv"):
+        for pattern in (
+            "ensemble_*_summary.json",
+            "*_confidence_summary.json",
+            "*_reliability.png",
+            "*_segment_metrics.csv",
+            "*_top_errors.csv",
+        ):
             for path in sorted(analysis_dir.glob(pattern)):
                 rel = path.relative_to(run_dir).as_posix()
                 lines.append(f"- [{rel}]({rel})")

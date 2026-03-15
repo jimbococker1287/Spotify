@@ -9,8 +9,9 @@ import re
 import numpy as np
 import pandas as pd
 
-from .benchmarks import build_classical_estimator, build_tabular_features, sample_rows
+from .benchmarks import ClassicalFeatureBundle, build_classical_estimator, build_classical_feature_bundle, sample_rows
 from .data import PreparedData
+from .probability_bundles import load_prediction_bundle
 
 
 def _slugify(raw: str) -> str:
@@ -482,6 +483,7 @@ def run_extended_evaluation(
     random_seed: int,
     max_train_samples: int,
     logger,
+    feature_bundle: ClassicalFeatureBundle | None = None,
 ) -> list[Path]:
     analysis_dir = run_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -495,20 +497,29 @@ def run_extended_evaluation(
         best_deep = max(deep_rows, key=lambda row: _to_float(row.get("val_top1")))
         deep_name = str(best_deep.get("model_name", "")).strip()
         if deep_name:
-            model_path = run_dir / f"best_{deep_name}.keras"
-            if model_path.exists():
-                try:
+            prediction_bundle_raw = str(best_deep.get("prediction_bundle_path", "")).strip()
+            prediction_bundle_path = Path(prediction_bundle_raw) if prediction_bundle_raw else None
+            try:
+                if prediction_bundle_path is not None and prediction_bundle_path.exists():
+                    val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
+                else:
+                    model_path = run_dir / f"best_{deep_name}.keras"
+                    if not model_path.exists():
+                        raise FileNotFoundError(f"Deep model checkpoint not found: {model_path}")
                     import tensorflow as tf
 
                     model = tf.keras.models.load_model(model_path, compile=False)
                     val_pred = model.predict((data.X_seq_val, data.X_ctx_val), verbose=0)
                     test_pred = model.predict((data.X_seq_test, data.X_ctx_test), verbose=0)
+                    val_proba = _extract_artist_proba(val_pred)
+                    test_proba = _extract_artist_proba(test_pred)
+                try:
                     artifacts.extend(
                         _save_prediction_diagnostics(
                             tag=f"deep_{deep_name}",
-                            val_proba=_extract_artist_proba(val_pred),
+                            val_proba=val_proba,
                             val_y=data.y_val.astype("int64"),
-                            test_proba=_extract_artist_proba(test_pred),
+                            test_proba=test_proba,
                             test_y=data.y_test.astype("int64"),
                             val_frame=val_frame,
                             test_frame=test_frame,
@@ -519,6 +530,8 @@ def run_extended_evaluation(
                     logger.info("Saved extended diagnostics for deep model: %s", deep_name)
                 except Exception as exc:
                     logger.warning("Deep diagnostics skipped for %s due to error: %s", deep_name, exc)
+            except Exception as exc:
+                logger.warning("Deep diagnostics skipped for %s due to error: %s", deep_name, exc)
 
     classical_rows = [
         row
@@ -536,42 +549,88 @@ def run_extended_evaluation(
         params = best_params if isinstance(best_params, dict) and row_type == "classical_tuned" else None
 
         if base_name:
+            prediction_bundle_raw = str(best_classical.get("prediction_bundle_path", "")).strip()
+            prediction_bundle_path = Path(prediction_bundle_raw) if prediction_bundle_raw else None
             try:
-                X_train, X_val, X_test = build_tabular_features(data)
-                y_train = data.y_train.astype("int64")
-                y_val = data.y_val.astype("int64")
-                y_test = data.y_test.astype("int64")
-                rng = np.random.default_rng(random_seed)
-                X_fit, y_fit = sample_rows(X_train, y_train, max_train_samples, rng)
-                _, estimator = build_classical_estimator(
-                    base_name,
-                    random_seed,
-                    params=params,
-                    estimator_n_jobs=-1,
-                )
-                estimator.fit(X_fit, y_fit)
-                if not hasattr(estimator, "predict_proba"):
-                    logger.info("Skipping classical diagnostics for %s: estimator has no predict_proba.", model_name)
-                else:
-                    val_proba = np.asarray(estimator.predict_proba(X_val))
-                    test_proba = np.asarray(estimator.predict_proba(X_test))
-                    classes = np.asarray(getattr(estimator, "classes_", []))
+                if prediction_bundle_path is not None and prediction_bundle_path.exists():
+                    val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
                     artifacts.extend(
                         _save_prediction_diagnostics(
                             tag=f"classical_{model_name}",
                             val_proba=val_proba,
-                            val_y=y_val,
+                            val_y=data.y_val.astype("int64"),
                             test_proba=test_proba,
-                            test_y=y_test,
+                            test_y=data.y_test.astype("int64"),
                             val_frame=val_frame,
                             test_frame=test_frame,
                             output_dir=analysis_dir,
                             label_lookup=label_lookup,
-                            class_labels=(classes if classes.size else None),
+                            class_labels=None,
                         )
                     )
                     logger.info("Saved extended diagnostics for classical model: %s", model_name)
+                else:
+                    bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
+                    X_train, X_val, X_test = bundle.X_train, bundle.X_val, bundle.X_test
+                    y_train, y_val, y_test = bundle.y_train, bundle.y_val, bundle.y_test
+                    rng = np.random.default_rng(random_seed)
+                    X_fit, y_fit = sample_rows(X_train, y_train, max_train_samples, rng)
+                    _, estimator = build_classical_estimator(
+                        base_name,
+                        random_seed,
+                        params=params,
+                        estimator_n_jobs=-1,
+                    )
+                    estimator.fit(X_fit, y_fit)
+                    if not hasattr(estimator, "predict_proba"):
+                        logger.info("Skipping classical diagnostics for %s: estimator has no predict_proba.", model_name)
+                    else:
+                        val_proba = np.asarray(estimator.predict_proba(X_val))
+                        test_proba = np.asarray(estimator.predict_proba(X_test))
+                        classes = np.asarray(getattr(estimator, "classes_", []))
+                        artifacts.extend(
+                            _save_prediction_diagnostics(
+                                tag=f"classical_{model_name}",
+                                val_proba=val_proba,
+                                val_y=y_val,
+                                test_proba=test_proba,
+                                test_y=y_test,
+                                val_frame=val_frame,
+                                test_frame=test_frame,
+                                output_dir=analysis_dir,
+                                label_lookup=label_lookup,
+                                class_labels=(classes if classes.size else None),
+                            )
+                        )
+                        logger.info("Saved extended diagnostics for classical model: %s", model_name)
             except Exception as exc:
                 logger.warning("Classical diagnostics skipped for %s due to error: %s", model_name, exc)
+
+    ensemble_rows = [row for row in results if str(row.get("model_type", "")).strip() == "ensemble"]
+    if ensemble_rows:
+        best_ensemble = max(ensemble_rows, key=lambda row: _to_float(row.get("val_top1")))
+        ensemble_name = str(best_ensemble.get("model_name", "")).strip()
+        prediction_bundle_raw = str(best_ensemble.get("prediction_bundle_path", "")).strip()
+        prediction_bundle_path = Path(prediction_bundle_raw) if prediction_bundle_raw else None
+        if ensemble_name and prediction_bundle_path is not None and prediction_bundle_path.exists():
+            try:
+                val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
+                artifacts.extend(
+                    _save_prediction_diagnostics(
+                        tag=f"ensemble_{ensemble_name}",
+                        val_proba=val_proba,
+                        val_y=data.y_val.astype("int64"),
+                        test_proba=test_proba,
+                        test_y=data.y_test.astype("int64"),
+                        val_frame=val_frame,
+                        test_frame=test_frame,
+                        output_dir=analysis_dir,
+                        label_lookup=label_lookup,
+                        class_labels=None,
+                    )
+                )
+                logger.info("Saved extended diagnostics for ensemble model: %s", ensemble_name)
+            except Exception as exc:
+                logger.warning("Ensemble diagnostics skipped for %s due to error: %s", ensemble_name, exc)
 
     return artifacts

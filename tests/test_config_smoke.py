@@ -15,6 +15,7 @@ def test_default_config_paths() -> None:
     assert config.profile == "full"
     assert config.sequence_length == 30
     assert config.epochs == 50
+    assert config.enable_spotify_features is False
     assert config.enable_classical_models is True
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
@@ -56,7 +57,7 @@ def test_fast_profile_defaults_are_applied() -> None:
     assert config.profile == "fast"
     assert config.epochs == 4
     assert config.model_names == ("dense", "gru_artist", "lstm")
-    assert config.classical_model_names == ("logreg", "extra_trees", "mlp")
+    assert config.classical_model_names == ("logreg", "extra_trees", "mlp", "session_knn")
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
     assert config.enable_temporal_backtest is True

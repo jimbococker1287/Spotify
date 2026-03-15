@@ -10,14 +10,17 @@ import time
 import numpy as np
 
 from .benchmarks import (
+    ClassicalFeatureBundle,
     build_classical_estimator,
-    build_tabular_features,
+    build_classical_feature_bundle,
+    sample_indices,
+    collect_aligned_probabilities,
     evaluate_classical_estimator,
     resolve_classical_parallelism,
-    sample_rows,
     validate_classical_models,
 )
 from .data import PreparedData
+from .probability_bundles import save_prediction_bundle
 
 
 @dataclass
@@ -40,6 +43,8 @@ class OptunaTuningResult:
     test_diversity_at5: float
     n_trials: int
     best_params: dict[str, object]
+    prediction_bundle_path: str = ""
+    estimator_artifact_path: str = ""
 
 
 def _load_optuna():
@@ -62,6 +67,13 @@ def _suggest_params(trial, model_name: str) -> dict[str, object]:
             "max_depth": trial.suggest_int("max_depth", 4, 24),
             "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
         }
+    if model_name == "catboost":
+        return {
+            "iterations": trial.suggest_int("iterations", 120, 420, step=20),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
+        }
     if model_name == "hist_gbm":
         return {
             "max_iter": trial.suggest_int("max_iter", 80, 400, step=20),
@@ -73,12 +85,20 @@ def _suggest_params(trial, model_name: str) -> dict[str, object]:
         return {
             "n_neighbors": trial.suggest_int("n_neighbors", 5, 60),
         }
+    if model_name == "session_knn":
+        return {
+            "n_neighbors": trial.suggest_int("n_neighbors", 24, 120, step=8),
+            "candidate_cap": trial.suggest_int("candidate_cap", 128, 1024, step=128),
+            "smoothing": trial.suggest_float("smoothing", 0.0, 3.0),
+        }
     if model_name == "mlp":
         return {
             "hidden_1": trial.suggest_int("hidden_1", 64, 384, step=32),
             "hidden_2": trial.suggest_int("hidden_2", 32, 256, step=32),
             "alpha": trial.suggest_float("alpha", 1e-6, 1e-2, log=True),
-            "max_iter": trial.suggest_int("max_iter", 40, 140, step=10),
+            "learning_rate_init": trial.suggest_float("learning_rate_init", 1e-4, 3e-2, log=True),
+            "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
+            "max_iter": trial.suggest_int("max_iter", 60, 180, step=10),
         }
     return {}
 
@@ -196,6 +216,7 @@ def run_optuna_tuning(
     max_train_samples: int,
     max_eval_samples: int,
     logger,
+    feature_bundle: ClassicalFeatureBundle | None = None,
 ) -> list[OptunaTuningResult]:
     if trials <= 0:
         logger.info("Skipping Optuna tuning because trials <= 0.")
@@ -209,15 +230,31 @@ def run_optuna_tuning(
     validate_classical_models(selected_models, random_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    X_train, X_val, X_test = build_tabular_features(data)
-    y_train = data.y_train.astype(int)
-    y_val = data.y_val.astype(int)
-    y_test = data.y_test.astype(int)
+    bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
+    X_train, X_val, X_test = bundle.X_train, bundle.X_val, bundle.X_test
+    y_train, y_val, y_test = bundle.y_train, bundle.y_val, bundle.y_test
+    X_val_full = X_val
+    X_test_full = X_test
+    X_train_seq = bundle.X_train_seq
+    X_val_seq = bundle.X_val_seq
+    X_test_seq = bundle.X_test_seq
+    X_val_seq_full = X_val_seq
+    X_test_seq_full = X_test_seq
 
     rng = np.random.default_rng(random_seed)
-    X_train, y_train = sample_rows(X_train, y_train, max_train_samples, rng)
-    X_val, y_val = sample_rows(X_val, y_val, max_eval_samples, rng)
-    X_test, y_test = sample_rows(X_test, y_test, max_eval_samples, rng)
+    train_idx = sample_indices(len(X_train), max_train_samples, rng)
+    val_idx = sample_indices(len(X_val), max_eval_samples, rng)
+    test_idx = sample_indices(len(X_test), max_eval_samples, rng)
+
+    X_train = X_train[train_idx]
+    y_train = y_train[train_idx]
+    X_val = X_val[val_idx]
+    y_val = y_val[val_idx]
+    X_test = X_test[test_idx]
+    y_test = y_test[test_idx]
+    X_train_seq = X_train_seq[train_idx]
+    X_val_seq = X_val_seq[val_idx]
+    X_test_seq = X_test_seq[test_idx]
 
     logger.info(
         "Optuna tuning dataset sizes: train=%d, val=%d, test=%d",
@@ -228,6 +265,10 @@ def run_optuna_tuning(
 
     results: list[OptunaTuningResult] = []
     summary_payload: list[dict[str, object]] = []
+    prediction_output_dir = output_dir / "prediction_bundles"
+    prediction_output_dir.mkdir(parents=True, exist_ok=True)
+    estimator_output_dir = output_dir / "estimators"
+    estimator_output_dir.mkdir(parents=True, exist_ok=True)
     workers, estimator_n_jobs = resolve_classical_parallelism()
     optuna_jobs = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_JOBS"), 1)
     if optuna_jobs > 1:
@@ -271,21 +312,23 @@ def run_optuna_tuning(
             params = _suggest_params(trial, model_name)
             trial_started = time.perf_counter()
             last_score = float("nan")
+            X_train_model = X_train_seq if model_name == "session_knn" else X_train
+            X_val_model = X_val_seq if model_name == "session_knn" else X_val
             for step_idx, fraction in enumerate(fidelity_schedule, start=1):
                 if per_trial_timeout_seconds > 0:
                     elapsed = time.perf_counter() - trial_started
                     if elapsed > float(per_trial_timeout_seconds):
                         raise optuna.TrialPruned(f"trial timeout exceeded ({elapsed:.1f}s)")
 
-                stage_rows = max(512, min(len(X_train), int(round(len(X_train) * fraction))))
-                if stage_rows >= len(X_train):
-                    X_stage = X_train
+                stage_rows = max(512, min(len(X_train_model), int(round(len(X_train_model) * fraction))))
+                if stage_rows >= len(X_train_model):
+                    X_stage = X_train_model
                     y_stage = y_train
                 else:
                     # Use a rotating contiguous slice to avoid large per-trial copy buffers.
-                    max_offset = max(0, len(X_train) - stage_rows)
+                    max_offset = max(0, len(X_train_model) - stage_rows)
                     offset = ((trial.number + 1) * 9973 + step_idx * 131) % (max_offset + 1)
-                    X_stage = X_train[offset : offset + stage_rows]
+                    X_stage = X_train_model[offset : offset + stage_rows]
                     y_stage = y_train[offset : offset + stage_rows]
 
                 _, estimator = build_classical_estimator(
@@ -303,7 +346,7 @@ def run_optuna_tuning(
                     if "least populated classes" in msg or "minimum number of groups" in msg:
                         raise optuna.TrialPruned(f"insufficient class support in sampled stage: {exc}") from exc
                     raise
-                val_pred = estimator.predict(X_val)
+                val_pred = estimator.predict(X_val_model)
                 last_score = float(np.mean(val_pred == y_val))
                 trial.report(last_score, step=step_idx)
                 if step_idx < len(fidelity_schedule) and trial.should_prune():
@@ -339,15 +382,44 @@ def run_optuna_tuning(
             estimator_n_jobs=estimator_n_jobs,
         )
         started = time.perf_counter()
-        estimator.fit(X_train, y_train)
+        X_train_model = X_train_seq if model_name == "session_knn" else X_train
+        X_val_model = X_val_seq if model_name == "session_knn" else X_val
+        X_test_model = X_test_seq if model_name == "session_knn" else X_test
+        X_val_full_model = X_val_seq_full if model_name == "session_knn" else X_val_full
+        X_test_full_model = X_test_seq_full if model_name == "session_knn" else X_test_full
+        estimator.fit(X_train_model, y_train)
         fit_seconds = float(time.perf_counter() - started)
+        estimator_artifact_path = ""
+        try:
+            import joblib
+
+            estimator_path = estimator_output_dir / f"classical_tuned_{model_name}.joblib"
+            joblib.dump(estimator, estimator_path, compress=3)
+            estimator_artifact_path = str(estimator_path)
+        except Exception:
+            estimator_artifact_path = ""
         val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking = evaluate_classical_estimator(
             estimator,
-            X_val,
+            X_val_model,
             y_val,
-            X_test,
+            X_test_model,
             y_test,
         )
+        prediction_bundle_path = ""
+        aligned_probs = collect_aligned_probabilities(
+            estimator,
+            X_val_full_model,
+            X_test_full_model,
+            num_classes=data.num_artists,
+        )
+        if aligned_probs is not None:
+            val_proba, test_proba = aligned_probs
+            bundle_path = save_prediction_bundle(
+                prediction_output_dir / f"classical_tuned_{model_name}.npz",
+                val_proba=val_proba,
+                test_proba=test_proba,
+            )
+            prediction_bundle_path = str(bundle_path)
 
         tuned_name = f"{model_name}_optuna"
         result = OptunaTuningResult(
@@ -369,6 +441,8 @@ def run_optuna_tuning(
             test_diversity_at5=float(test_ranking["diversity_at5"]),
             n_trials=len(study.trials),
             best_params=best_params,
+            prediction_bundle_path=prediction_bundle_path,
+            estimator_artifact_path=estimator_artifact_path,
         )
         results.append(result)
         summary_payload.append(asdict(result))

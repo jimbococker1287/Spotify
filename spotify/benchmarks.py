@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from .data import PreparedData
+from .probability_bundles import align_proba_to_num_classes, save_prediction_bundle
 from .ranking import ranking_metrics_from_proba
 
 
@@ -31,36 +32,109 @@ class ClassicalBenchmarkResult:
     test_mrr_at5: float
     test_coverage_at5: float
     test_diversity_at5: float
+    prediction_bundle_path: str = ""
+    estimator_artifact_path: str = ""
+
+
+@dataclass(frozen=True)
+class ClassicalFeatureBundle:
+    X_train: np.ndarray
+    X_val: np.ndarray
+    X_test: np.ndarray
+    X_train_seq: np.ndarray
+    X_val_seq: np.ndarray
+    X_test_seq: np.ndarray
+    y_train: np.ndarray
+    y_val: np.ndarray
+    y_test: np.ndarray
 
 
 def _sequence_feature_block(seq: np.ndarray) -> np.ndarray:
-    seq = seq.astype("float32")
-    last_artist = seq[:, -1:]
-    first_artist = seq[:, :1]
-    seq_mean = seq.mean(axis=1, keepdims=True)
-    seq_std = seq.std(axis=1, keepdims=True)
-    unique_ratio = np.array([len(np.unique(row)) / float(len(row)) for row in seq], dtype="float32").reshape(-1, 1)
-    return np.concatenate([last_artist, first_artist, seq_mean, seq_std, unique_ratio], axis=1)
+    seq = np.asarray(seq)
+    if seq.ndim != 2 or seq.shape[1] <= 0:
+        raise ValueError("Expected a 2D non-empty sequence matrix.")
+
+    row_count, seq_len = seq.shape
+    seq_float = seq.astype("float32", copy=False)
+    features = np.empty((row_count, 9), dtype="float32")
+
+    features[:, 0] = seq_float[:, -1]
+    if seq_len > 1:
+        features[:, 1] = seq_float[:, -2]
+        features[:, 7] = (seq[:, -1] == seq[:, -2]).astype("float32")
+    else:
+        features[:, 1] = seq_float[:, -1]
+        features[:, 7].fill(1.0)
+    features[:, 2] = seq_float[:, 0]
+    features[:, 3] = seq_float.mean(axis=1, dtype="float32")
+    features[:, 4] = seq_float.std(axis=1, dtype="float32")
+
+    # Vectorize the previously row-wise uniqueness work so every downstream
+    # classical stage can reuse a much faster feature path.
+    sorted_seq = np.sort(seq, axis=1)
+    unique_counts = np.ones(row_count, dtype="float32")
+    if seq_len > 1:
+        unique_counts += np.count_nonzero(sorted_seq[:, 1:] != sorted_seq[:, :-1], axis=1).astype("float32")
+    features[:, 5] = unique_counts / float(seq_len)
+
+    reversed_matches = seq[:, ::-1] == seq[:, -1:]
+    all_same = reversed_matches.all(axis=1)
+    first_diff = np.argmax(~reversed_matches, axis=1) + 1
+    features[:, 6] = np.where(all_same, seq_len, first_diff).astype("float32")
+
+    recent_width = min(5, seq_len)
+    recent_sorted = np.sort(seq[:, -recent_width:], axis=1)
+    recent_unique_counts = np.ones(row_count, dtype="float32")
+    if recent_width > 1:
+        recent_unique_counts += np.count_nonzero(
+            recent_sorted[:, 1:] != recent_sorted[:, :-1],
+            axis=1,
+        ).astype("float32")
+    features[:, 8] = recent_unique_counts / float(recent_width)
+
+    return features
 
 
 def build_tabular_features(data: PreparedData) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    X_train = np.concatenate([_sequence_feature_block(data.X_seq_train), data.X_ctx_train.astype("float32")], axis=1)
-    X_val = np.concatenate([_sequence_feature_block(data.X_seq_val), data.X_ctx_val.astype("float32")], axis=1)
-    X_test = np.concatenate([_sequence_feature_block(data.X_seq_test), data.X_ctx_test.astype("float32")], axis=1)
+    X_train = np.concatenate([_sequence_feature_block(data.X_seq_train), data.X_ctx_train.astype("float32", copy=False)], axis=1)
+    X_val = np.concatenate([_sequence_feature_block(data.X_seq_val), data.X_ctx_val.astype("float32", copy=False)], axis=1)
+    X_test = np.concatenate([_sequence_feature_block(data.X_seq_test), data.X_ctx_test.astype("float32", copy=False)], axis=1)
     return X_train, X_val, X_test
 
 
-def build_full_tabular_dataset(data: PreparedData) -> tuple[np.ndarray, np.ndarray]:
+def build_classical_feature_bundle(data: PreparedData) -> ClassicalFeatureBundle:
     X_train, X_val, X_test = build_tabular_features(data)
-    X = np.concatenate([X_train, X_val, X_test], axis=0)
-    y = np.concatenate(
-        [
-            data.y_train.astype(int),
-            data.y_val.astype(int),
-            data.y_test.astype(int),
-        ],
-        axis=0,
+    return ClassicalFeatureBundle(
+        X_train=X_train,
+        X_val=X_val,
+        X_test=X_test,
+        X_train_seq=data.X_seq_train.astype("int32", copy=False),
+        X_val_seq=data.X_seq_val.astype("int32", copy=False),
+        X_test_seq=data.X_seq_test.astype("int32", copy=False),
+        y_train=np.asarray(data.y_train),
+        y_val=np.asarray(data.y_val),
+        y_test=np.asarray(data.y_test),
     )
+
+
+def build_serving_tabular_features(X_seq: np.ndarray, X_ctx: np.ndarray) -> np.ndarray:
+    return np.concatenate(
+        [
+            _sequence_feature_block(np.asarray(X_seq)),
+            np.asarray(X_ctx).astype("float32", copy=False),
+        ],
+        axis=1,
+    )
+
+
+def build_full_tabular_dataset(
+    data: PreparedData,
+    *,
+    feature_bundle: ClassicalFeatureBundle | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
+    X = np.concatenate([bundle.X_train, bundle.X_val, bundle.X_test], axis=0)
+    y = np.concatenate([bundle.y_train, bundle.y_val, bundle.y_test], axis=0)
     return X, y
 
 
@@ -109,6 +183,12 @@ def sample_rows(
         return X, y
     idx = rng.choice(len(X), size=max_rows, replace=False)
     return X[idx], y[idx]
+
+
+def sample_indices(n_rows: int, max_rows: int, rng: np.random.Generator) -> np.ndarray:
+    if max_rows <= 0 or n_rows <= max_rows:
+        return np.arange(n_rows, dtype="int64")
+    return np.asarray(rng.choice(n_rows, size=max_rows, replace=False), dtype="int64")
 
 
 def resolve_classical_parallelism() -> tuple[int, int]:
@@ -173,6 +253,7 @@ def get_classical_model_registry(
     from sklearn.neural_network import MLPClassifier
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
+    from .session_knn import SessionKNNClassifier
 
     def build_logreg(params: dict[str, object] | None):
         params = params or {}
@@ -242,15 +323,51 @@ def get_classical_model_registry(
         h1 = int(params.get("hidden_1", 256))
         h2 = int(params.get("hidden_2", 128))
         alpha = float(params.get("alpha", 1e-4))
+        learning_rate_init = float(params.get("learning_rate_init", 1e-3))
+        batch_size = int(params.get("batch_size", 256))
         return make_pipeline(
             StandardScaler(),
             MLPClassifier(
                 hidden_layer_sizes=(h1, h2),
                 alpha=alpha,
-                max_iter=int(params.get("max_iter", 60)),
+                learning_rate_init=learning_rate_init,
+                batch_size=batch_size,
+                max_iter=int(params.get("max_iter", 80)),
                 early_stopping=True,
                 random_state=random_seed,
             ),
+        )
+
+    def build_session_knn(params: dict[str, object] | None):
+        params = params or {}
+        return SessionKNNClassifier(
+            n_neighbors=int(params.get("n_neighbors", 64)),
+            candidate_cap=int(params.get("candidate_cap", 512)),
+            smoothing=float(params.get("smoothing", 1.0)),
+        )
+
+    def build_catboost(params: dict[str, object] | None):
+        params = params or {}
+        try:
+            from catboost import CatBoostClassifier
+        except Exception as exc:
+            raise ImportError(
+                "catboost is not installed. Install the project dependencies again or run "
+                "'.venv/bin/pip install catboost'."
+            ) from exc
+
+        thread_count = estimator_n_jobs if estimator_n_jobs > 0 else -1
+        return CatBoostClassifier(
+            loss_function="MultiClass",
+            iterations=int(params.get("iterations", 180)),
+            depth=int(params.get("depth", 6)),
+            learning_rate=float(params.get("learning_rate", 0.10)),
+            l2_leaf_reg=float(params.get("l2_leaf_reg", 5.0)),
+            random_seed=random_seed,
+            verbose=False,
+            allow_writing_files=False,
+            auto_class_weights="Balanced",
+            thread_count=thread_count,
         )
 
     return {
@@ -261,6 +378,8 @@ def get_classical_model_registry(
         "knn": ("instance_based", build_knn),
         "gaussian_nb": ("probabilistic", build_nb),
         "mlp": ("shallow_neural", build_mlp),
+        "session_knn": ("session_memory", build_session_knn),
+        "catboost": ("boosting", build_catboost),
     }
 
 
@@ -293,11 +412,8 @@ def evaluate_classical_estimator(
     X_test: np.ndarray,
     y_test: np.ndarray,
 ) -> tuple[float, float, float, float, dict[str, float], dict[str, float]]:
-    val_pred = estimator.predict(X_val)
-    test_pred = estimator.predict(X_test)
-    val_top1 = float(np.mean(val_pred == y_val))
-    test_top1 = float(np.mean(test_pred == y_test))
-
+    val_top1 = float("nan")
+    test_top1 = float("nan")
     val_top5 = float("nan")
     test_top5 = float("nan")
     val_ranking = {
@@ -314,20 +430,30 @@ def evaluate_classical_estimator(
     }
     if hasattr(estimator, "predict_proba"):
         try:
-            val_proba = estimator.predict_proba(X_val)
-            test_proba = estimator.predict_proba(X_test)
+            val_proba = np.asarray(estimator.predict_proba(X_val))
+            test_proba = np.asarray(estimator.predict_proba(X_test))
             classes = np.asarray(getattr(estimator, "classes_", []))
-            val_top5 = _topk_from_proba(np.asarray(val_proba), y_val, k=5, class_labels=classes)
-            test_top5 = _topk_from_proba(np.asarray(test_proba), y_test, k=5, class_labels=classes)
-            val_class_count = int(np.asarray(val_proba).shape[1])
-            test_class_count = int(np.asarray(test_proba).shape[1])
+            if classes.size == val_proba.shape[1]:
+                val_pred = classes[np.argmax(val_proba, axis=1)]
+            else:
+                val_pred = np.argmax(val_proba, axis=1)
+            if classes.size == test_proba.shape[1]:
+                test_pred = classes[np.argmax(test_proba, axis=1)]
+            else:
+                test_pred = np.argmax(test_proba, axis=1)
+            val_top1 = float(np.mean(val_pred == y_val))
+            test_top1 = float(np.mean(test_pred == y_test))
+            val_top5 = _topk_from_proba(val_proba, y_val, k=5, class_labels=classes)
+            test_top5 = _topk_from_proba(test_proba, y_test, k=5, class_labels=classes)
+            val_class_count = int(val_proba.shape[1])
+            test_class_count = int(test_proba.shape[1])
 
             val_y_rank = _encode_labels_to_local_indices(np.asarray(y_val), classes if classes.size else None)
             test_y_rank = _encode_labels_to_local_indices(np.asarray(y_test), classes if classes.size else None)
 
-            val_extra = ranking_metrics_from_proba(np.asarray(val_proba), val_y_rank, num_items=val_class_count, k=5)
+            val_extra = ranking_metrics_from_proba(val_proba, val_y_rank, num_items=val_class_count, k=5)
             test_extra = ranking_metrics_from_proba(
-                np.asarray(test_proba),
+                test_proba,
                 test_y_rank,
                 num_items=test_class_count,
                 k=5,
@@ -346,7 +472,32 @@ def evaluate_classical_estimator(
             }
         except Exception:
             pass
+    if np.isnan(val_top1) or np.isnan(test_top1):
+        val_pred = estimator.predict(X_val)
+        test_pred = estimator.predict(X_test)
+        val_top1 = float(np.mean(val_pred == y_val))
+        test_top1 = float(np.mean(test_pred == y_test))
     return val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking
+
+
+def collect_aligned_probabilities(
+    estimator,
+    X_val: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    num_classes: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not hasattr(estimator, "predict_proba"):
+        return None
+    try:
+        val_proba = np.asarray(estimator.predict_proba(X_val))
+        test_proba = np.asarray(estimator.predict_proba(X_test))
+    except Exception:
+        return None
+    classes = np.asarray(getattr(estimator, "classes_", []))
+    aligned_val = align_proba_to_num_classes(val_proba, classes if classes.size else None, num_classes)
+    aligned_test = align_proba_to_num_classes(test_proba, classes if classes.size else None, num_classes)
+    return aligned_val, aligned_test
 
 
 def _fit_single_classical_model(
@@ -359,6 +510,11 @@ def _fit_single_classical_model(
     y_val: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
+    X_val_full: np.ndarray,
+    X_test_full: np.ndarray,
+    num_classes: int,
+    prediction_output_dir: Path,
+    estimator_output_dir: Path,
 ) -> ClassicalBenchmarkResult:
     family, estimator = build_classical_estimator(
         model_name,
@@ -368,6 +524,16 @@ def _fit_single_classical_model(
     start = time.perf_counter()
     estimator.fit(X_train, y_train)
     fit_seconds = time.perf_counter() - start
+    estimator_artifact_path = ""
+    try:
+        import joblib
+
+        estimator_path = estimator_output_dir / f"classical_{model_name}.joblib"
+        estimator_output_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(estimator, estimator_path, compress=3)
+        estimator_artifact_path = str(estimator_path)
+    except Exception:
+        estimator_artifact_path = ""
     val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking = evaluate_classical_estimator(
         estimator,
         X_val,
@@ -375,6 +541,16 @@ def _fit_single_classical_model(
         X_test,
         y_test,
     )
+    prediction_bundle_path = ""
+    aligned_probs = collect_aligned_probabilities(estimator, X_val_full, X_test_full, num_classes=num_classes)
+    if aligned_probs is not None:
+        val_proba, test_proba = aligned_probs
+        bundle_path = save_prediction_bundle(
+            prediction_output_dir / f"classical_{model_name}.npz",
+            val_proba=val_proba,
+            test_proba=test_proba,
+        )
+        prediction_bundle_path = str(bundle_path)
     return ClassicalBenchmarkResult(
         model_name=model_name,
         model_family=family,
@@ -391,6 +567,8 @@ def _fit_single_classical_model(
         test_mrr_at5=float(test_ranking["mrr_at5"]),
         test_coverage_at5=float(test_ranking["coverage_at5"]),
         test_diversity_at5=float(test_ranking["diversity_at5"]),
+        prediction_bundle_path=prediction_bundle_path,
+        estimator_artifact_path=estimator_artifact_path,
     )
 
 
@@ -402,19 +580,36 @@ def run_classical_benchmarks(
     max_train_samples: int,
     max_eval_samples: int,
     logger,
+    feature_bundle: ClassicalFeatureBundle | None = None,
 ) -> list[ClassicalBenchmarkResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     validate_classical_models(selected_models, random_seed)
 
-    X_train, X_val, X_test = build_tabular_features(data)
-    y_train = data.y_train.astype(int)
-    y_val = data.y_val.astype(int)
-    y_test = data.y_test.astype(int)
+    bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
+    X_train, X_val, X_test = bundle.X_train, bundle.X_val, bundle.X_test
+    y_train, y_val, y_test = bundle.y_train, bundle.y_val, bundle.y_test
+    X_val_full = X_val
+    X_test_full = X_test
+    X_train_seq = bundle.X_train_seq
+    X_val_seq = bundle.X_val_seq
+    X_test_seq = bundle.X_test_seq
+    X_val_seq_full = X_val_seq
+    X_test_seq_full = X_test_seq
 
     rng = np.random.default_rng(random_seed)
-    X_train, y_train = sample_rows(X_train, y_train, max_train_samples, rng)
-    X_val, y_val = sample_rows(X_val, y_val, max_eval_samples, rng)
-    X_test, y_test = sample_rows(X_test, y_test, max_eval_samples, rng)
+    train_idx = sample_indices(len(X_train), max_train_samples, rng)
+    val_idx = sample_indices(len(X_val), max_eval_samples, rng)
+    test_idx = sample_indices(len(X_test), max_eval_samples, rng)
+
+    X_train = X_train[train_idx]
+    y_train = y_train[train_idx]
+    X_val = X_val[val_idx]
+    y_val = y_val[val_idx]
+    X_test = X_test[test_idx]
+    y_test = y_test[test_idx]
+    X_train_seq = X_train_seq[train_idx]
+    X_val_seq = X_val_seq[val_idx]
+    X_test_seq = X_test_seq[test_idx]
 
     logger.info(
         "Classical benchmark dataset sizes: train=%d, val=%d, test=%d",
@@ -422,6 +617,10 @@ def run_classical_benchmarks(
         len(X_val),
         len(X_test),
     )
+    prediction_output_dir = output_dir / "prediction_bundles"
+    prediction_output_dir.mkdir(parents=True, exist_ok=True)
+    estimator_output_dir = output_dir / "estimators"
+    estimator_output_dir.mkdir(parents=True, exist_ok=True)
 
     workers, estimator_n_jobs = resolve_classical_parallelism()
     if workers > 1 and len(selected_models) > 1:
@@ -444,12 +643,17 @@ def run_classical_benchmarks(
                     name,
                     random_seed,
                     estimator_n_jobs,
-                    X_train,
+                    X_train_seq if name == "session_knn" else X_train,
                     y_train,
-                    X_val,
+                    X_val_seq if name == "session_knn" else X_val,
                     y_val,
-                    X_test,
+                    X_test_seq if name == "session_knn" else X_test,
                     y_test,
+                    X_val_seq_full if name == "session_knn" else X_val_full,
+                    X_test_seq_full if name == "session_knn" else X_test_full,
+                    data.num_artists,
+                    prediction_output_dir,
+                    estimator_output_dir,
                 )
                 futures[future] = name
 
@@ -472,12 +676,17 @@ def run_classical_benchmarks(
                 model_name=name,
                 random_seed=random_seed,
                 estimator_n_jobs=estimator_n_jobs,
-                X_train=X_train,
+                X_train=(X_train_seq if name == "session_knn" else X_train),
                 y_train=y_train,
-                X_val=X_val,
+                X_val=(X_val_seq if name == "session_knn" else X_val),
                 y_val=y_val,
-                X_test=X_test,
+                X_test=(X_test_seq if name == "session_knn" else X_test),
                 y_test=y_test,
+                X_val_full=(X_val_seq_full if name == "session_knn" else X_val_full),
+                X_test_full=(X_test_seq_full if name == "session_knn" else X_test_full),
+                num_classes=data.num_artists,
+                prediction_output_dir=prediction_output_dir,
+                estimator_output_dir=estimator_output_dir,
             )
             logger.info(
                 "[CLASSICAL][TEST] %s: Top-1=%.4f | Top-5=%s",

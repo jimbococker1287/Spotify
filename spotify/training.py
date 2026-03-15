@@ -9,6 +9,7 @@ import numpy as np
 from sklearn.utils import class_weight
 
 from .data import PreparedData
+from .probability_bundles import save_prediction_bundle
 from .ranking import ranking_metrics_from_proba
 
 
@@ -28,25 +29,73 @@ class TrainingArtifacts:
     test_metrics: dict[str, dict[str, float]]
     val_metrics: dict[str, dict[str, float]]
     fit_seconds: dict[str, float]
+    prediction_bundle_paths: dict[str, str]
+
+
+def _weighted_mean(values: np.ndarray, sample_weights: np.ndarray) -> float:
+    values_arr = np.asarray(values, dtype="float64").reshape(-1)
+    weights_arr = np.asarray(sample_weights, dtype="float64").reshape(-1)
+    if values_arr.size == 0 or values_arr.size != weights_arr.size:
+        return float("nan")
+    total_weight = float(np.sum(weights_arr))
+    if total_weight <= 0.0:
+        return float(np.mean(values_arr))
+    return float(np.dot(values_arr, weights_arr) / total_weight)
+
+
+def _weighted_top1_accuracy_from_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    sample_weights: np.ndarray,
+) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    pred = np.argmax(proba_arr, axis=1)
+    correct = (pred == y_arr).astype("float32")
+    return _weighted_mean(correct, sample_weights)
+
+
+def _weighted_topk_accuracy_from_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    sample_weights: np.ndarray,
+    *,
+    k: int,
+) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    kk = max(1, min(int(k), int(proba_arr.shape[1])))
+    topk_idx = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+    hits = np.any(topk_idx == y_arr.reshape(-1, 1), axis=1).astype("float32")
+    return _weighted_mean(hits, sample_weights)
 
 
 def compute_baselines(data: PreparedData, logger) -> dict[str, float]:
     majority_artist = int(np.bincount(data.y_train.astype(int)).argmax())
     majority_top1 = float(np.mean(data.y_val == majority_artist))
 
-    last_artist_pred = data.X_seq_val[:, -1]
+    y_train = np.asarray(data.y_train, dtype="int32")
+    y_val = np.asarray(data.y_val, dtype="int32")
+    X_seq_train = np.asarray(data.X_seq_train, dtype="int32")
+    last_artist_pred = np.asarray(data.X_seq_val[:, -1], dtype="int32")
     last_top1 = float(np.mean(last_artist_pred == data.y_val))
 
     num_states = int(data.num_artists)
-    transitions = np.ones((num_states, num_states), dtype=np.float64)
-    for row in data.X_seq_train:
-        for prev, nxt in zip(row[:-1], row[1:]):
-            transitions[prev, nxt] += 1.0
-    for prev, nxt in zip(data.X_seq_train[:, -1], data.y_train):
-        transitions[prev, nxt] += 1.0
+    transitions = np.ones((num_states, num_states), dtype=np.int32)
+    if X_seq_train.shape[1] > 1:
+        np.add.at(
+            transitions,
+            (X_seq_train[:, :-1].reshape(-1), X_seq_train[:, 1:].reshape(-1)),
+            1,
+        )
+    np.add.at(transitions, (X_seq_train[:, -1], y_train), 1)
 
     markov_pred = np.argmax(transitions[last_artist_pred], axis=1)
-    markov_top1 = float(np.mean(markov_pred == data.y_val))
+    markov_top1 = float(np.mean(markov_pred == y_val))
 
     logger.info("Baseline (majority artist) Top-1 Val Acc: %.4f", majority_top1)
     logger.info("Baseline (last artist) Top-1 Val Acc: %.4f", last_top1)
@@ -60,29 +109,45 @@ def compute_baselines(data: PreparedData, logger) -> dict[str, float]:
 
 
 def compute_sample_weights(data: PreparedData) -> SampleWeights:
-    artist_classes = np.unique(data.y_train.astype(int))
+    artist_y_train = np.asarray(data.y_train, dtype="int64")
+    artist_y_val = np.asarray(data.y_val, dtype="int64")
+    artist_y_test = np.asarray(data.y_test, dtype="int64")
+    skip_y_train = np.asarray(data.y_skip_train, dtype="int64")
+    skip_y_val = np.asarray(data.y_skip_val, dtype="int64")
+    skip_y_test = np.asarray(data.y_skip_test, dtype="int64")
+
+    artist_classes = np.unique(artist_y_train)
     artist_weights = class_weight.compute_class_weight(
         class_weight="balanced",
         classes=artist_classes,
-        y=data.y_train.astype(int),
+        y=artist_y_train,
     )
-    artist_weight_map = dict(zip(artist_classes, artist_weights))
 
-    skip_classes = np.unique(data.y_skip_train.astype(int))
+    skip_classes = np.unique(skip_y_train)
     skip_weights = class_weight.compute_class_weight(
         class_weight="balanced",
         classes=skip_classes,
-        y=data.y_skip_train.astype(int),
+        y=skip_y_train,
     )
-    skip_weight_map = dict(zip(skip_classes, skip_weights))
+
+    def _lookup_weights(y: np.ndarray, classes: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        indices = np.searchsorted(classes, y)
+        out = np.ones(y.shape, dtype="float32")
+        valid = indices < len(classes)
+        if np.any(valid):
+            matched = classes[indices[valid]] == y[valid]
+            if np.any(matched):
+                valid_indices = np.flatnonzero(valid)[matched]
+                out[valid_indices] = weights[indices[valid_indices]].astype("float32", copy=False)
+        return out
 
     return SampleWeights(
-        artist_train=np.array([artist_weight_map.get(int(y), 1.0) for y in data.y_train], dtype="float32"),
-        artist_val=np.array([artist_weight_map.get(int(y), 1.0) for y in data.y_val], dtype="float32"),
-        artist_test=np.array([artist_weight_map.get(int(y), 1.0) for y in data.y_test], dtype="float32"),
-        skip_train=np.array([skip_weight_map.get(int(y), 1.0) for y in data.y_skip_train], dtype="float32"),
-        skip_val=np.array([skip_weight_map.get(int(y), 1.0) for y in data.y_skip_val], dtype="float32"),
-        skip_test=np.array([skip_weight_map.get(int(y), 1.0) for y in data.y_skip_test], dtype="float32"),
+        artist_train=_lookup_weights(artist_y_train, artist_classes, artist_weights),
+        artist_val=_lookup_weights(artist_y_val, artist_classes, artist_weights),
+        artist_test=_lookup_weights(artist_y_test, artist_classes, artist_weights),
+        skip_train=_lookup_weights(skip_y_train, skip_classes, skip_weights),
+        skip_val=_lookup_weights(skip_y_val, skip_classes, skip_weights),
+        skip_test=_lookup_weights(skip_y_test, skip_classes, skip_weights),
     )
 
 
@@ -137,9 +202,18 @@ def train_and_evaluate_models(
             import psutil  # type: ignore
 
             available_bytes = int(psutil.virtual_memory().available)
-            threshold_bytes = int(available_bytes * 0.30)
+            cache_fraction_raw = os.getenv("SPOTIFY_TF_DATA_CACHE_FRACTION", "0.40").strip()
+            try:
+                cache_fraction = float(cache_fraction_raw)
+            except Exception:
+                cache_fraction = 0.40
+            cache_fraction = min(0.75, max(0.05, cache_fraction))
+            threshold_bytes = int(available_bytes * cache_fraction)
             enabled = approx_bytes <= threshold_bytes
-            reason = f"auto(approx={approx_bytes // (1024**2)}MiB avail={available_bytes // (1024**2)}MiB)"
+            reason = (
+                f"auto(approx={approx_bytes // (1024**2)}MiB "
+                f"avail={available_bytes // (1024**2)}MiB fraction={cache_fraction:.2f})"
+            )
             return enabled, reason
         except Exception:
             # Conservative fallback without psutil.
@@ -215,6 +289,9 @@ def train_and_evaluate_models(
     test_metrics: dict[str, dict[str, float]] = {}
     val_metrics: dict[str, dict[str, float]] = {}
     fit_seconds: dict[str, float] = {}
+    prediction_bundle_paths: dict[str, str] = {}
+    prediction_output_dir = output_dir / "prediction_bundles"
+    prediction_output_dir.mkdir(parents=True, exist_ok=True)
 
     eager_flag = os.getenv("SPOTIFY_RUN_EAGER", "auto").strip().lower()
     if eager_flag in ("1", "true", "yes", "on"):
@@ -372,26 +449,17 @@ def train_and_evaluate_models(
                     training=False,
                     seed=0,
                 )
-                test_dataset = _build_weighted_dataset(
-                    features=(data.X_seq_test, data.X_ctx_test),
-                    labels=data.y_test,
-                    sample_weights=weights.artist_test,
-                    training=False,
-                    seed=0,
-                )
                 val_predict_dataset = _build_feature_dataset((data.X_seq_val, data.X_ctx_val))
                 test_predict_dataset = _build_feature_dataset((data.X_seq_test, data.X_ctx_test))
                 single_data_bundle = (
                     train_dataset,
                     val_dataset,
-                    test_dataset,
                     val_predict_dataset,
                     test_predict_dataset,
                 )
             (
                 train_dataset,
                 val_dataset,
-                test_dataset,
                 val_predict_dataset,
                 test_predict_dataset,
             ) = single_data_bundle
@@ -411,26 +479,17 @@ def train_and_evaluate_models(
                     training=False,
                     seed=0,
                 )
-                test_dataset = _build_weighted_dataset(
-                    features=(data.X_seq_test, data.X_ctx_test),
-                    labels=(data.y_test, data.y_skip_test),
-                    sample_weights=(weights.artist_test, weights.skip_test),
-                    training=False,
-                    seed=0,
-                )
                 val_predict_dataset = _build_feature_dataset((data.X_seq_val, data.X_ctx_val))
                 test_predict_dataset = _build_feature_dataset((data.X_seq_test, data.X_ctx_test))
                 multi_data_bundle = (
                     train_dataset,
                     val_dataset,
-                    test_dataset,
                     val_predict_dataset,
                     test_predict_dataset,
                 )
             (
                 train_dataset,
                 val_dataset,
-                test_dataset,
                 val_predict_dataset,
                 test_predict_dataset,
             ) = multi_data_bundle
@@ -446,25 +505,20 @@ def train_and_evaluate_models(
         fit_seconds[name] = float(time.perf_counter() - started)
         histories[name] = history
 
-        eval_result = model.evaluate(
-            test_dataset,
-            verbose=0,
-            return_dict=True,
-        )
-        if single_head:
-            top1 = float(eval_result.get("sparse_categorical_accuracy", np.nan))
-            top5 = float(eval_result.get("top_5", np.nan))
-            val_top1 = float(history.history.get("val_sparse_categorical_accuracy", [np.nan])[-1])
-            val_top5 = float(history.history.get("val_top_5", [np.nan])[-1])
-        else:
-            top1 = float(eval_result.get("artist_output_sparse_categorical_accuracy", np.nan))
-            top5 = float(eval_result.get("artist_output_top_5", np.nan))
-            val_top1 = float(history.history.get("val_artist_output_sparse_categorical_accuracy", [np.nan])[-1])
-            val_top5 = float(history.history.get("val_artist_output_top_5", [np.nan])[-1])
         val_pred = model.predict(val_predict_dataset, verbose=0)
         test_pred = model.predict(test_predict_dataset, verbose=0)
         val_proba = _extract_artist_proba(val_pred)
         test_proba = _extract_artist_proba(test_pred)
+        val_top1 = _weighted_top1_accuracy_from_proba(val_proba, data.y_val, weights.artist_val)
+        val_top5 = _weighted_topk_accuracy_from_proba(val_proba, data.y_val, weights.artist_val, k=5)
+        top1 = _weighted_top1_accuracy_from_proba(test_proba, data.y_test, weights.artist_test)
+        top5 = _weighted_topk_accuracy_from_proba(test_proba, data.y_test, weights.artist_test, k=5)
+        bundle_path = save_prediction_bundle(
+            prediction_output_dir / f"deep_{name}.npz",
+            val_proba=val_proba,
+            test_proba=test_proba,
+        )
+        prediction_bundle_paths[name] = str(bundle_path)
         val_ranking = ranking_metrics_from_proba(
             val_proba,
             data.y_val,
@@ -501,4 +555,5 @@ def train_and_evaluate_models(
         test_metrics=test_metrics,
         val_metrics=val_metrics,
         fit_seconds=fit_seconds,
+        prediction_bundle_paths=prediction_bundle_paths,
     )

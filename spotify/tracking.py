@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import time
 import re
 
 import numpy as np
@@ -27,6 +29,7 @@ class MlflowTracker:
         self._mlflow = None
         self._active_run = None
         self._logger = logger
+        self._closed = False
 
         if not enabled:
             return
@@ -47,6 +50,7 @@ class MlflowTracker:
         try:
             mlflow.set_tracking_uri(resolved_tracking_uri)
             mlflow.set_experiment(experiment_name)
+            self._cleanup_stale_runs(mlflow=mlflow, experiment_name=experiment_name)
             self._active_run = mlflow.start_run(run_name=(run_name or run_id))
             mlflow.set_tags({"run_id": run_id, "pipeline": "spotify"})
         except Exception as exc:
@@ -56,6 +60,39 @@ class MlflowTracker:
 
         self.enabled = True
         logger.info("MLflow tracking enabled: experiment=%s uri=%s", experiment_name, resolved_tracking_uri)
+
+    def _cleanup_stale_runs(self, *, mlflow, experiment_name: str) -> None:
+        stale_hours_raw = str(os.getenv("SPOTIFY_MLFLOW_STALE_RUN_HOURS", "12")).strip()
+        try:
+            stale_hours = max(1.0, float(stale_hours_raw))
+        except ValueError:
+            stale_hours = 12.0
+
+        try:
+            client = mlflow.tracking.MlflowClient()
+            experiment = client.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                return
+            now_ms = int(time.time() * 1000)
+            stale_ms = int(stale_hours * 3600 * 1000)
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                filter_string="attributes.status = 'RUNNING'",
+                max_results=200,
+            )
+            cleaned = 0
+            for run in runs:
+                if run.info.end_time is not None:
+                    continue
+                start_time = int(run.info.start_time or 0)
+                if start_time <= 0 or (now_ms - start_time) < stale_ms:
+                    continue
+                client.set_terminated(run.info.run_id, status="KILLED")
+                cleaned += 1
+            if cleaned > 0:
+                self._logger.info("MLflow stale-run cleanup marked %d run(s) as KILLED.", cleaned)
+        except Exception as exc:
+            self._logger.warning("MLflow stale-run cleanup failed: %s", exc)
 
     def log_params(self, params: dict[str, object]) -> None:
         if not self.enabled or self._mlflow is None:
@@ -142,10 +179,14 @@ class MlflowTracker:
         except Exception as exc:
             self._logger.warning("MLflow log_artifact failed for %s: %s", path, exc)
 
-    def end(self) -> None:
-        if not self.enabled or self._mlflow is None:
+    def end(self, status: str | None = None) -> None:
+        if not self.enabled or self._mlflow is None or self._closed:
             return
         try:
-            self._mlflow.end_run()
+            if status:
+                self._mlflow.end_run(status=str(status).upper())
+            else:
+                self._mlflow.end_run()
+            self._closed = True
         except Exception as exc:
             self._logger.warning("MLflow end_run failed: %s", exc)

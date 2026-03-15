@@ -21,7 +21,7 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 
 - `spotify/`: pipeline source code
 - `tests/`: smoke/config tests
-- `data/raw/`: Spotify `Streaming_History_*.json`
+- `data/raw/`: Spotify `Streaming_History_*.json` files, either flat or inside the exported `Spotify Extended Streaming History/` folder
 - `outputs/runs/<run_id>/`: per-run artifacts, logs, charts, model files
 - `outputs/history/experiment_history.csv`: cumulative model leaderboard history
 - `outputs/history/optuna_history.csv`: cumulative tuned-model history
@@ -177,6 +177,7 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets, capped for memory)
 - `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers; launcher auto-sets, capped for memory)
 - `SPOTIFY_TF_DATA_CACHE` (default `auto`; only caches batches when memory headroom is sufficient)
+- `SPOTIFY_TF_DATA_CACHE_FRACTION` (default `0.40`; auto-cache headroom fraction of currently available RAM)
 - `SPOTIFY_TF_PREFETCH` (default `auto`; TensorFlow prefetch buffer)
 - `SPOTIFY_DISTRIBUTION_STRATEGY` (`auto`, `mirrored`, `default`)
 - `SPOTIFY_ISOLATE_MPL_CACHE` (default `0`; shared matplotlib cache for faster startup)
@@ -386,24 +387,11 @@ Optional webhook alerts:
 SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regression_alert.py
 ```
 
-## Spotipy Setup
+## Spotify API Credentials
 
-Copy the env template and add your Spotify API credentials:
+The training pipeline no longer fetches Spotify audio features. Spotify's `audio-features` Web API endpoint is deprecated, and Spotify's current developer policy does not allow Spotify content to train ML/AI models.
 
-```bash
-cp .env.example .env
-```
-
-Set:
-
-- `SPOTIPY_CLIENT_ID`
-- `SPOTIPY_CLIENT_SECRET`
-
-The project now auto-loads `.env` and `.env.local` for:
-
-- `python -m spotify`
-- `python -m spotify.predict_next`
-- `python -m spotify.predict_service`
+Existing `.env` and `.env.local` loading remains in place for compatibility, but training now zero-fills `danceability`, `energy`, and `tempo` instead of calling Spotify.
 
 ## Feature Upgrades
 
@@ -424,8 +412,7 @@ The training context now includes additional recency/frequency and session-trans
 
 ## Notes
 
-- Set `SPOTIPY_CLIENT_ID` and `SPOTIPY_CLIENT_SECRET` to enrich with Spotify audio features.
-- If Spotipy credentials are unavailable, audio features are zero-filled.
+- Spotify audio feature columns are zero-filled during training.
 - `orjson` is used automatically (when installed) for faster raw JSON loading.
 - Matplotlib cache is shared under `outputs/.mplconfig` by default for faster repeat runs (`SPOTIFY_ISOLATE_MPL_CACHE=1` restores per-run isolation).
 - `make clean` keeps historical outputs.

@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup train train-fast train-full train-classical train-deep train-elite train-everything refresh-backtest benchmark-lock regression-guard regression-alert predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything refresh-backtest benchmark-lock regression-guard regression-alert analytics-db predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -34,6 +34,14 @@ train-fast:
 train-full:
 	mkdir -p outputs
 	bash scripts/run_full.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+train-core:
+	mkdir -p outputs
+	bash scripts/run_core.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+train-experimental:
+	mkdir -p outputs
+	bash scripts/run_experimental.sh $(RUN_NAME) $(EXTRA_ARGS)
 
 train-classical:
 	mkdir -p outputs
@@ -65,6 +73,9 @@ regression-guard:
 
 regression-alert:
 	$(RUN_PY) scripts/regression_alert.py $(EXTRA_ARGS)
+
+analytics-db:
+	$(RUN_PY) scripts/build_analytics_db.py $(EXTRA_ARGS)
 
 predict-next:
 	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)

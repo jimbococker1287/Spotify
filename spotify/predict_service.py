@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -14,10 +15,17 @@ import numpy as np
 
 from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
-from .predict_next import _prepare_inputs, _resolve_model_name
+from .predict_next import PredictionInputContext, _prepare_inputs, load_prediction_input_context
+from .serving import load_predictor, resolve_model_row
 
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_MAX_TOP_K = 20
+
+
+@dataclass(frozen=True)
+class _PredictionContextCacheEntry:
+    signature: tuple[tuple[str, int, int], ...]
+    context: PredictionInputContext
 
 
 class RequestValidationError(Exception):
@@ -59,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Path to outputs/runs/<run_id> or outputs/models/champion. Defaults to champion alias.",
     )
-    parser.add_argument("--model-name", type=str, default=None, help="Optional deep model checkpoint name override.")
+    parser.add_argument("--model-name", type=str, default=None, help="Optional serveable model name override.")
     parser.add_argument("--data-dir", type=str, default="data/raw", help="Path to raw Streaming_History JSON files.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8000, help="HTTP port.")
@@ -265,42 +273,92 @@ class PredictionService:
         auth_token: str | None,
         logger: logging.Logger,
     ):
-        import tensorflow as tf
-
         self.run_dir = run_dir
         self.data_dir = data_dir
-        self.model_name = model_name
         self.include_video = include_video
         self.max_top_k = max(1, int(max_top_k))
         self.auth_token = auth_token
         self.logger = logger
+        self._context_lock = threading.Lock()
         self._predict_lock = threading.Lock()
-
-        self.model_path = run_dir / f"best_{model_name}.keras"
-        logger.info("Loading model checkpoint: %s", self.model_path)
-        self.model = tf.keras.models.load_model(self.model_path, compile=False)
+        self._context_cache: dict[bool, _PredictionContextCacheEntry] = {}
 
         metadata_path = run_dir / "feature_metadata.json"
         with metadata_path.open("r", encoding="utf-8") as infile:
             metadata = json.load(infile)
         self.artist_labels = list(metadata.get("artist_labels", []))
+        model_row = resolve_model_row(
+            run_dir,
+            explicit_model_name=model_name,
+            alias_model_name=model_name,
+        )
+        self.predictor = load_predictor(
+            run_dir=run_dir,
+            row=model_row,
+            artist_labels=self.artist_labels,
+        )
+        self.model_name = self.predictor.model_name
+        self.model_type = self.predictor.model_type
+        try:
+            self._get_prediction_context(include_video=self.include_video)
+        except Exception as exc:
+            logger.info("Prediction context warm-up skipped: %s", exc)
+        logger.info("Loaded serveable predictor: model=%s type=%s", self.model_name, self.model_type)
+
+    def _prediction_source_signature(self, *, include_video: bool) -> tuple[tuple[str, int, int], ...]:
+        root = self.data_dir.expanduser().resolve()
+        files = sorted(path for path in root.rglob("Streaming_History_Audio_*.json") if path.is_file())
+        if include_video:
+            files.extend(sorted(path for path in root.rglob("Streaming_History_Video_*.json") if path.is_file()))
+
+        signature: list[tuple[str, int, int]] = []
+        for path in files:
+            stat = path.stat()
+            signature.append(
+                (
+                    str(path.resolve()),
+                    int(stat.st_size),
+                    int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+                )
+            )
+        return tuple(signature)
+
+    def _get_prediction_context(self, *, include_video: bool) -> PredictionInputContext:
+        signature = self._prediction_source_signature(include_video=include_video)
+        cached = self._context_cache.get(include_video)
+        if cached is not None and cached.signature == signature:
+            return cached.context
+
+        with self._context_lock:
+            cached = self._context_cache.get(include_video)
+            if cached is not None and cached.signature == signature:
+                return cached.context
+
+            context = load_prediction_input_context(
+                run_dir=self.run_dir,
+                data_dir=self.data_dir,
+                include_video=include_video,
+                logger=self.logger,
+            )
+            self._context_cache[include_video] = _PredictionContextCacheEntry(
+                signature=signature,
+                context=context,
+            )
+            return context
 
     def predict(self, *, top_k: int, recent_artists: list[str] | None, include_video: bool) -> dict[str, object]:
+        context = self._get_prediction_context(include_video=include_video)
         seq_batch, ctx_batch, sequence_names = _prepare_inputs(
             run_dir=self.run_dir,
             data_dir=self.data_dir,
             recent_artists=recent_artists,
             include_video=include_video,
             logger=self.logger,
+            context=context,
         )
 
         with self._predict_lock:
-            preds = self.model.predict((seq_batch, ctx_batch), verbose=0)
-
-        if isinstance(preds, (tuple, list)):
-            artist_probs = np.asarray(preds[0])[0]
-        else:
-            artist_probs = np.asarray(preds)[0]
+            artist_probs = self.predictor.predict_proba(seq_batch, ctx_batch)[0]
 
         top_k = max(1, int(top_k))
         top_indices = np.argsort(artist_probs)[::-1][:top_k]
@@ -323,6 +381,7 @@ class PredictionService:
 
         return {
             "model_name": self.model_name,
+            "model_type": self.model_type,
             "sequence_tail": sequence_names,
             "predictions": predictions,
         }
@@ -371,6 +430,7 @@ def _build_handler(service: PredictionService):
                     {
                         "status": "ok",
                         "model_name": service.model_name,
+                        "model_type": service.model_type,
                         "run_dir": str(service.run_dir),
                         "max_top_k": service.max_top_k,
                         "requires_auth": bool(service.auth_token),
@@ -442,7 +502,12 @@ def main() -> int:
 
     run_dir, champion_alias_model_name = resolve_prediction_run_dir(args.run_dir)
     data_dir = Path(args.data_dir).expanduser().resolve()
-    model_name = _resolve_model_name(run_dir, args.model_name or champion_alias_model_name)
+    model_row = resolve_model_row(
+        run_dir,
+        explicit_model_name=args.model_name,
+        alias_model_name=champion_alias_model_name,
+    )
+    model_name = str(model_row.get("model_name", "")).strip()
 
     service = PredictionService(
         run_dir=run_dir,

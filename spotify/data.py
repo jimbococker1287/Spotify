@@ -12,8 +12,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-
-from .config import CANONICAL_AUDIO_FILES, CANONICAL_VIDEO_FILE
+from numpy.lib.stride_tricks import sliding_window_view
 
 CONTEXT_FEATURES: tuple[str, ...] = (
     "hour",
@@ -48,8 +47,16 @@ CONTEXT_FEATURES: tuple[str, ...] = (
     "artist_session_play_count",
     "session_skip_rate_so_far",
     "session_unique_artists_so_far",
+    "session_repeat_ratio_so_far",
     "is_artist_repeat_from_prev",
     "transition_repeat_count",
+    "recent_skip_rate_5",
+    "recent_skip_rate_20",
+    "recent_artist_unique_ratio_5",
+    "recent_artist_unique_ratio_20",
+    "artist_hour_rate_smooth",
+    "artist_dow_rate_smooth",
+    "prev_artist_transition_rate_smooth",
     "artist_skip_rate_hist",
     "artist_skip_rate_smooth",
 )
@@ -73,7 +80,7 @@ SKEW_CONTEXT_FEATURES: tuple[str, ...] = (
     "transition_repeat_count",
 )
 
-CACHE_SCHEMA_VERSION = "prepared-data-v2"
+CACHE_SCHEMA_VERSION = "prepared-data-v3"
 
 
 @dataclass
@@ -114,27 +121,41 @@ class PreparedDataCacheInfo:
 def discover_streaming_files(data_dir: Path, include_video: bool, logger) -> list[Path]:
     data_dir = data_dir.expanduser().resolve()
 
-    canonical_files = [data_dir / name for name in CANONICAL_AUDIO_FILES]
-    if include_video:
-        canonical_files.append(data_dir / CANONICAL_VIDEO_FILE)
+    grouped_audio_files: dict[Path, list[Path]] = {}
+    for path in sorted(candidate for candidate in data_dir.rglob("Streaming_History_Audio_*.json") if candidate.is_file()):
+        grouped_audio_files.setdefault(path.parent, []).append(path)
 
-    if all(path.exists() for path in canonical_files):
-        return canonical_files
-
-    discovered = sorted(data_dir.glob("Streaming_History_Audio_*.json"))
-    if include_video:
-        discovered.extend(sorted(data_dir.glob("Streaming_History_Video_*.json")))
-
-    if discovered:
-        logger.warning(
-            "Using discovered history files because canonical filenames were missing. Found %d files.",
-            len(discovered),
+    if grouped_audio_files:
+        preferred_dir = max(
+            grouped_audio_files,
+            key=lambda parent: (
+                len(grouped_audio_files[parent]),
+                parent == data_dir,
+                parent.name.lower() == "spotify extended streaming history",
+                str(parent),
+            ),
         )
+        if len(grouped_audio_files) > 1:
+            logger.warning(
+                "Found streaming history files in multiple directories under %s. Using %s (%d audio files).",
+                data_dir,
+                preferred_dir,
+                len(grouped_audio_files[preferred_dir]),
+            )
+        elif preferred_dir != data_dir:
+            logger.info("Using nested streaming history export folder: %s", preferred_dir)
+
+        discovered = list(grouped_audio_files[preferred_dir])
+        if include_video:
+            discovered.extend(
+                sorted(candidate for candidate in preferred_dir.glob("Streaming_History_Video_*.json") if candidate.is_file())
+            )
         return discovered
 
     raise FileNotFoundError(
         f"No streaming history JSON files found in {data_dir}. "
-        "Expected files named Streaming_History_Audio_*.json."
+        "Expected files named Streaming_History_Audio_*.json directly in that directory "
+        "or inside a nested Spotify export folder."
     )
 
 
@@ -303,89 +324,61 @@ def _rolling_artist_counts(
     artists: np.ndarray,
     window_seconds: int,
 ) -> np.ndarray:
-    counts = np.zeros(len(artists), dtype="float32")
-    buffers: dict[str, deque[int]] = {}
+    return _rolling_artist_counts_multi(ts_seconds, artists, window_seconds=(window_seconds,))[0]
 
-    for idx, (ts_value, artist_name) in enumerate(zip(ts_seconds, artists)):
-        bucket = buffers.get(str(artist_name))
-        if bucket is None:
-            bucket = deque()
-            buffers[str(artist_name)] = bucket
 
-        threshold = int(ts_value) - window_seconds
-        while bucket and bucket[0] < threshold:
-            bucket.popleft()
-        counts[idx] = float(len(bucket))
-        bucket.append(int(ts_value))
+def _rolling_artist_counts_multi(
+    ts_seconds: np.ndarray,
+    artists: np.ndarray,
+    *,
+    window_seconds: tuple[int, ...],
+) -> tuple[np.ndarray, ...]:
+    normalized_windows = tuple(max(1, int(window)) for window in window_seconds)
+    counts = tuple(np.zeros(len(artists), dtype="float32") for _ in normalized_windows)
+    buffers: dict[object, list[deque[int]]] = {}
+
+    for idx, (ts_value, artist_key) in enumerate(zip(ts_seconds, artists)):
+        artist_buffers = buffers.get(artist_key)
+        if artist_buffers is None:
+            artist_buffers = [deque() for _ in normalized_windows]
+            buffers[artist_key] = artist_buffers
+
+        ts_int = int(ts_value)
+        for out, bucket, window in zip(counts, artist_buffers, normalized_windows):
+            threshold = ts_int - window
+            while bucket and bucket[0] < threshold:
+                bucket.popleft()
+            out[idx] = float(len(bucket))
+            bucket.append(ts_int)
 
     return counts
 
 
+def _ensure_time_sorted(df: pd.DataFrame) -> pd.DataFrame:
+    if "ts" not in df.columns:
+        return df.reset_index(drop=True)
+    ts_values = df["ts"]
+    if ts_values.is_monotonic_increasing:
+        if isinstance(df.index, pd.RangeIndex) and df.index.start == 0 and df.index.step == 1:
+            return df
+        return df.reset_index(drop=True)
+    return df.sort_values("ts").reset_index(drop=True)
+
+
 def append_audio_features(df: pd.DataFrame, enable_spotify_features: bool, logger) -> pd.DataFrame:
+    for column in ("danceability", "energy", "tempo"):
+        df[column] = 0.0
+
     if not enable_spotify_features:
-        logger.info("Spotipy feature fetch disabled via CLI flag.")
-        df["danceability"] = 0.0
-        df["energy"] = 0.0
-        df["tempo"] = 0.0
+        logger.info("Spotify audio feature fetch disabled; filling audio feature columns with 0.0.")
         return df
 
-    try:
-        import spotipy
-        from spotipy.oauth2 import SpotifyClientCredentials
-    except ImportError:
-        logger.warning("spotipy not installed. Skipping audio feature fetch.")
-        df["danceability"] = 0.0
-        df["energy"] = 0.0
-        df["tempo"] = 0.0
-        return df
-
-    try:
-        cid = os.getenv("SPOTIPY_CLIENT_ID")
-        secret = os.getenv("SPOTIPY_CLIENT_SECRET")
-        if not cid or not secret:
-            raise RuntimeError("SPOTIPY_CLIENT_ID/SECRET not set")
-
-        if "spotify_track_uri" not in df.columns:
-            raise RuntimeError("spotify_track_uri column is missing")
-
-        client_credentials_manager = SpotifyClientCredentials()
-        sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
-
-        uris = df["spotify_track_uri"].dropna().unique().tolist()
-        features_list: list[dict] = []
-
-        for i in range(0, len(uris), 100):
-            chunk = uris[i : i + 100]
-            try:
-                feats_batch = sp.audio_features(chunk)
-                for uri, feats in zip(chunk, feats_batch):
-                    if feats is None:
-                        continue
-                    features_list.append(
-                        {
-                            "spotify_track_uri": uri,
-                            "danceability": feats.get("danceability", 0.0),
-                            "energy": feats.get("energy", 0.0),
-                            "tempo": feats.get("tempo", 0.0),
-                        }
-                    )
-            except Exception:
-                time.sleep(0.2)
-                continue
-
-        audio_feats = pd.DataFrame(features_list)
-        if not audio_feats.empty:
-            df = df.merge(audio_feats, on="spotify_track_uri", how="left")
-
-        df[["danceability", "energy", "tempo"]] = df[["danceability", "energy", "tempo"]].fillna(0.0)
-        logger.info("Added Spotify audio features for %d tracks", len(audio_feats))
-        return df
-    except Exception as exc:
-        logger.warning("Spotipy audio feature fetch skipped: %s", exc)
-        df["danceability"] = 0.0
-        df["energy"] = 0.0
-        df["tempo"] = 0.0
-        return df
+    logger.warning(
+        "Spotify audio feature fetch is disabled. Spotify's audio-features endpoint is deprecated and "
+        "Spotify's Developer Policy does not allow Spotify content to train ML/AI models. "
+        "Filling audio feature columns with 0.0 instead."
+    )
+    return df
 
 
 def engineer_features(
@@ -411,12 +404,13 @@ def engineer_features(
     df["dayofweek"] = df["ts"].dt.dayofweek
     df["month"] = df["ts"].dt.month
 
-    df = df.sort_values("ts").reset_index(drop=True)
+    df = _ensure_time_sorted(df)
     df["time_diff"] = df["ts"].diff().dt.total_seconds().fillna(0)
     session_threshold = 30 * 60
     df["session_id"] = (df["time_diff"] > session_threshold).cumsum()
-    df["session_position"] = df.groupby("session_id").cumcount()
-    session_start = df.groupby("session_id")["ts"].transform("min")
+    session_group = df.groupby("session_id", sort=False)
+    df["session_position"] = session_group.cumcount()
+    session_start = session_group["ts"].transform("min")
     df["session_elapsed_seconds"] = (df["ts"] - session_start).dt.total_seconds().fillna(0.0).astype("float32")
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
@@ -424,8 +418,9 @@ def engineer_features(
     df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
     df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
 
-    df["artist_play_count"] = df.groupby("master_metadata_album_artist_name").cumcount()
-    previous_artist_ts = df.groupby("master_metadata_album_artist_name")["ts"].shift(1)
+    artist_name_group = df.groupby("master_metadata_album_artist_name", sort=False)
+    df["artist_play_count"] = artist_name_group.cumcount()
+    previous_artist_ts = artist_name_group["ts"].shift(1)
     df["hours_since_last_artist"] = (
         (df["ts"] - previous_artist_ts).dt.total_seconds().div(3600.0).fillna(0.0).clip(lower=0.0).astype("float32")
     )
@@ -433,8 +428,9 @@ def engineer_features(
 
     df["skip_flag"] = df["skipped"]
     streak_grp = (df["skip_flag"] != df["skip_flag"].shift()).cumsum()
-    df["skip_streak"] = df.groupby(streak_grp)["skip_flag"].cumcount().where(df["skip_flag"] == 1, 0)
-    df["listen_streak"] = df.groupby(streak_grp)["skip_flag"].cumcount().where(df["skip_flag"] == 0, 0)
+    streak_counts = df.groupby(streak_grp, sort=False)["skip_flag"].cumcount()
+    df["skip_streak"] = streak_counts.where(df["skip_flag"] == 1, 0)
+    df["listen_streak"] = streak_counts.where(df["skip_flag"] == 0, 0)
 
     df["platform_code"] = df["platform"].astype("category").cat.codes
     df["reason_start_code"] = df["reason_start"].astype("category").cat.codes
@@ -460,60 +456,65 @@ def engineer_features(
         df = df[df["master_metadata_album_artist_name"].isin(top_artists)].copy()
         df["artist_label"] = df["master_metadata_album_artist_name"].map(label_map).astype("int32")
 
-    df = df.sort_values("ts").reset_index(drop=True)
+    df = df.reset_index(drop=True)
 
-    artist_names = df["master_metadata_album_artist_name"].astype(str).to_numpy()
+    artist_labels = df["artist_label"].to_numpy(dtype="int32", copy=False)
     ts_seconds = (df["ts"].astype("int64") // 10**9).to_numpy(dtype="int64")
 
-    df["artist_play_count_24h"] = _rolling_artist_counts(ts_seconds, artist_names, window_seconds=24 * 60 * 60)
-    df["artist_play_count_7d"] = _rolling_artist_counts(ts_seconds, artist_names, window_seconds=7 * 24 * 60 * 60)
+    artist_play_count_24h, artist_play_count_7d = _rolling_artist_counts_multi(
+        ts_seconds,
+        artist_labels,
+        window_seconds=(24 * 60 * 60, 7 * 24 * 60 * 60),
+    )
+    df["artist_play_count_24h"] = artist_play_count_24h
+    df["artist_play_count_7d"] = artist_play_count_7d
 
-    artist_freq_smooth = np.zeros(len(df), dtype="float32")
-    artist_running_count: dict[str, int] = {}
     alpha = 1.0
     vocab_size = max(1, len(top_artists))
-    for idx, artist_name in enumerate(artist_names):
-        seen = artist_running_count.get(artist_name, 0)
-        artist_freq_smooth[idx] = float((seen + alpha) / (float(idx) + alpha * float(vocab_size)))
-        artist_running_count[artist_name] = seen + 1
+    row_index = np.arange(len(df), dtype="float32")
+    artist_seen = df["artist_play_count"].to_numpy(dtype="float32", copy=False)
+    artist_freq_smooth = (artist_seen + alpha) / (row_index + alpha * float(vocab_size))
     df["artist_freq_smooth"] = artist_freq_smooth
 
-    plays_since_last_artist = np.zeros(len(df), dtype="float32")
-    last_seen_idx: dict[str, int] = {}
-    for idx, artist_name in enumerate(artist_names):
-        prev_idx = last_seen_idx.get(artist_name)
-        plays_since_last_artist[idx] = float(idx - prev_idx) if prev_idx is not None else float(idx + 1)
-        last_seen_idx[artist_name] = idx
+    session_group = df.groupby("session_id", sort=False)
+    artist_group = df.groupby("artist_label", sort=False)
+    session_artist_group = df.groupby(["session_id", "artist_label"], sort=False)
+
+    prev_seen_idx = pd.Series(np.arange(len(df), dtype="float32"), index=df.index).groupby(df["artist_label"], sort=False).shift(1)
+    prev_seen_vals = prev_seen_idx.to_numpy(dtype="float32", copy=False)
+    plays_since_last_artist = np.where(
+        np.isnan(prev_seen_vals),
+        row_index + 1.0,
+        row_index - prev_seen_vals,
+    ).astype("float32")
     df["plays_since_last_artist"] = plays_since_last_artist
 
-    df["artist_session_play_count"] = (
-        df.groupby(["session_id", "master_metadata_album_artist_name"]).cumcount().astype("float32")
-    )
+    df["artist_session_play_count"] = session_artist_group.cumcount().astype("float32")
 
-    session_skip_rate_so_far = np.zeros(len(df), dtype="float32")
-    session_skip_sum: dict[int, float] = {}
-    session_skip_count: dict[int, int] = {}
-    for idx, (session_id, skipped_value) in enumerate(
-        zip(df["session_id"].to_numpy(dtype="int64"), df["skipped"].to_numpy(dtype="float32"))
-    ):
-        sid = int(session_id)
-        seen = session_skip_count.get(sid, 0)
-        total = session_skip_sum.get(sid, 0.0)
-        session_skip_rate_so_far[idx] = float(total / seen) if seen > 0 else 0.0
-        session_skip_count[sid] = seen + 1
-        session_skip_sum[sid] = total + float(skipped_value)
+    skip_values = df["skipped"].to_numpy(dtype="float32", copy=False)
+    session_position = df["session_position"].to_numpy(dtype="float32", copy=False)
+    session_skip_cumsum = session_group["skipped"].cumsum().to_numpy(dtype="float32", copy=False)
+    prior_session_skip = session_skip_cumsum - skip_values
+    session_skip_rate_so_far = np.divide(
+        prior_session_skip,
+        session_position,
+        out=np.zeros(len(df), dtype="float32"),
+        where=session_position > 0,
+    )
     df["session_skip_rate_so_far"] = session_skip_rate_so_far
 
-    session_unique_artists_so_far = np.zeros(len(df), dtype="float32")
-    current_session = None
-    session_seen: set[str] = set()
-    for idx, (session_id, artist_name) in enumerate(zip(df["session_id"].to_numpy(), artist_names)):
-        if current_session != session_id:
-            current_session = session_id
-            session_seen = set()
-        session_unique_artists_so_far[idx] = float(len(session_seen))
-        session_seen.add(artist_name)
+    first_in_session_artist = (~df.duplicated(["session_id", "artist_label"])).astype("int8")
+    first_in_session_vals = first_in_session_artist.to_numpy(dtype="int8", copy=False)
+    session_unique_cumsum = first_in_session_artist.groupby(df["session_id"], sort=False).cumsum().to_numpy(dtype="int32", copy=False)
+    session_unique_artists_so_far = (session_unique_cumsum - first_in_session_vals).astype("float32")
+    session_repeat_ratio_so_far = np.divide(
+        session_position - session_unique_artists_so_far,
+        session_position,
+        out=np.zeros(len(df), dtype="float32"),
+        where=session_position > 0,
+    )
     df["session_unique_artists_so_far"] = session_unique_artists_so_far
+    df["session_repeat_ratio_so_far"] = session_repeat_ratio_so_far
 
     repeat_from_prev = (
         (df["master_metadata_album_artist_name"] == df["master_metadata_album_artist_name"].shift(1))
@@ -522,33 +523,99 @@ def engineer_features(
     df["is_artist_repeat_from_prev"] = repeat_from_prev.fillna(False).astype("int8")
 
     transition_repeat_count = np.zeros(len(df), dtype="float32")
-    transition_counts: dict[tuple[int, int], int] = {}
-    prev_session_id = None
-    prev_artist_label = None
-    for idx, (session_id, artist_label) in enumerate(zip(df["session_id"].to_numpy(), df["artist_label"].to_numpy())):
-        if prev_artist_label is None or prev_session_id != session_id:
-            transition_repeat_count[idx] = 0.0
-        else:
-            transition = (int(prev_artist_label), int(artist_label))
-            transition_repeat_count[idx] = float(transition_counts.get(transition, 0))
-            transition_counts[transition] = transition_counts.get(transition, 0) + 1
-        prev_session_id = session_id
-        prev_artist_label = int(artist_label)
+    prev_artist_transition_rate_smooth = np.zeros(len(df), dtype="float32")
+    session_ids = df["session_id"]
+    valid_transition_mask = session_ids.eq(session_ids.shift(1)).to_numpy(dtype=bool, copy=False)
+    if np.any(valid_transition_mask):
+        valid_prev = df["artist_label"].shift(1)[valid_transition_mask].astype("int32")
+        valid_curr = df.loc[valid_transition_mask, "artist_label"].astype("int32")
+        pair_frame = pd.DataFrame(
+            {
+                "prev_artist_label": valid_prev.to_numpy(copy=False),
+                "artist_label": valid_curr.to_numpy(copy=False),
+            }
+        )
+        pair_counts = pair_frame.groupby(["prev_artist_label", "artist_label"], sort=False).cumcount().to_numpy(dtype="float32", copy=False)
+        transition_repeat_count[valid_transition_mask] = pair_counts
+
+        outgoing_counts = valid_prev.groupby(valid_prev, sort=False).cumcount().to_numpy(dtype="float32", copy=False)
+        prev_artist_transition_rate_smooth[valid_transition_mask] = (
+            (pair_counts + 1.0) / (outgoing_counts + float(vocab_size))
+        ).astype("float32", copy=False)
     df["transition_repeat_count"] = transition_repeat_count
 
-    artist_skip_rate_hist = np.zeros(len(df), dtype="float32")
-    artist_skip_rate_smooth = np.zeros(len(df), dtype="float32")
-    artist_skip_sum: dict[str, float] = {}
-    artist_skip_count: dict[str, int] = {}
+    artist_hour_seen = df.groupby(["artist_label", "hour"], sort=False).cumcount().to_numpy(dtype="float32", copy=False)
+    artist_dow_seen = df.groupby(["artist_label", "dayofweek"], sort=False).cumcount().to_numpy(dtype="float32", copy=False)
+    artist_hour_rate_smooth = ((artist_hour_seen + 1.0) / (artist_seen + 24.0)).astype("float32", copy=False)
+    artist_dow_rate_smooth = ((artist_dow_seen + 1.0) / (artist_seen + 7.0)).astype("float32", copy=False)
+
+    def _trailing_mean_before(values: np.ndarray, width: int) -> np.ndarray:
+        cumulative = np.concatenate(([0.0], np.cumsum(values, dtype="float64")))
+        idx = np.arange(len(values), dtype="int64")
+        starts = np.maximum(0, idx - width)
+        totals = cumulative[idx] - cumulative[starts]
+        counts = idx - starts
+        out = np.zeros(len(values), dtype="float32")
+        valid = counts > 0
+        out[valid] = (totals[valid] / counts[valid]).astype("float32", copy=False)
+        return out
+
+    recent_skip_rate_5 = _trailing_mean_before(skip_values, 5)
+    recent_skip_rate_20 = _trailing_mean_before(skip_values, 20)
+    recent_artist_unique_ratio_5 = np.zeros(len(df), dtype="float32")
+    recent_artist_unique_ratio_20 = np.zeros(len(df), dtype="float32")
+    recent_artist_window_5: deque[int] = deque(maxlen=5)
+    recent_artist_window_20: deque[int] = deque(maxlen=20)
+    recent_artist_counts_5: dict[int, int] = {}
+    recent_artist_counts_20: dict[int, int] = {}
+    for idx, artist_label in enumerate(artist_labels):
+        artist_key = int(artist_label)
+        recent_artist_unique_ratio_5[idx] = (
+            float(len(recent_artist_counts_5) / len(recent_artist_window_5)) if recent_artist_window_5 else 0.0
+        )
+        recent_artist_unique_ratio_20[idx] = (
+            float(len(recent_artist_counts_20) / len(recent_artist_window_20)) if recent_artist_window_20 else 0.0
+        )
+
+        if len(recent_artist_window_5) == recent_artist_window_5.maxlen:
+            evicted_5 = recent_artist_window_5.popleft()
+            next_count_5 = recent_artist_counts_5[evicted_5] - 1
+            if next_count_5 <= 0:
+                del recent_artist_counts_5[evicted_5]
+            else:
+                recent_artist_counts_5[evicted_5] = next_count_5
+        recent_artist_window_5.append(artist_key)
+        recent_artist_counts_5[artist_key] = recent_artist_counts_5.get(artist_key, 0) + 1
+
+        if len(recent_artist_window_20) == recent_artist_window_20.maxlen:
+            evicted_20 = recent_artist_window_20.popleft()
+            next_count_20 = recent_artist_counts_20[evicted_20] - 1
+            if next_count_20 <= 0:
+                del recent_artist_counts_20[evicted_20]
+            else:
+                recent_artist_counts_20[evicted_20] = next_count_20
+        recent_artist_window_20.append(artist_key)
+        recent_artist_counts_20[artist_key] = recent_artist_counts_20.get(artist_key, 0) + 1
+
+    df["recent_skip_rate_5"] = recent_skip_rate_5
+    df["recent_skip_rate_20"] = recent_skip_rate_20
+    df["recent_artist_unique_ratio_5"] = recent_artist_unique_ratio_5
+    df["recent_artist_unique_ratio_20"] = recent_artist_unique_ratio_20
+    df["artist_hour_rate_smooth"] = artist_hour_rate_smooth
+    df["artist_dow_rate_smooth"] = artist_dow_rate_smooth
+    df["prev_artist_transition_rate_smooth"] = prev_artist_transition_rate_smooth
+
     alpha_skip = 1.0
     beta_skip = 1.0
-    for idx, (artist_name, skipped_value) in enumerate(zip(artist_names, df["skipped"].to_numpy(dtype="float32"))):
-        seen = artist_skip_count.get(artist_name, 0)
-        total = artist_skip_sum.get(artist_name, 0.0)
-        artist_skip_rate_hist[idx] = float(total / seen) if seen > 0 else 0.0
-        artist_skip_rate_smooth[idx] = float((total + alpha_skip) / (seen + alpha_skip + beta_skip))
-        artist_skip_count[artist_name] = seen + 1
-        artist_skip_sum[artist_name] = total + float(skipped_value)
+    artist_skip_cumsum = artist_group["skipped"].cumsum().to_numpy(dtype="float32", copy=False)
+    prior_artist_skip = artist_skip_cumsum - skip_values
+    artist_skip_rate_hist = np.divide(
+        prior_artist_skip,
+        artist_seen,
+        out=np.zeros(len(df), dtype="float32"),
+        where=artist_seen > 0,
+    )
+    artist_skip_rate_smooth = ((prior_artist_skip + alpha_skip) / (artist_seen + alpha_skip + beta_skip)).astype("float32", copy=False)
     df["artist_skip_rate_hist"] = artist_skip_rate_hist
     df["artist_skip_rate_smooth"] = artist_skip_rate_smooth
 
@@ -569,13 +636,14 @@ def prepare_training_data(
 ) -> PreparedData:
     context_features = list(CONTEXT_FEATURES)
 
-    df = df.sort_values("ts").reset_index(drop=True)
+    df = _ensure_time_sorted(df)
     missing_context = [key for key in context_features if key not in df.columns]
     if missing_context:
         raise RuntimeError(f"Missing engineered context features: {', '.join(missing_context)}")
 
-    labels = df["artist_label"].tolist()
-    context_vals = df[context_features].values
+    labels = df["artist_label"].to_numpy(dtype="int32", copy=False)
+    context_vals = df[context_features].to_numpy(dtype="float32", copy=False)
+    skipped_vals = df["skipped"].to_numpy(dtype="float32", copy=False)
 
     if len(labels) <= sequence_length + 1:
         raise RuntimeError(
@@ -583,17 +651,12 @@ def prepare_training_data(
             f"Need > {sequence_length + 1}, found {len(labels)}."
         )
 
-    X_seq, X_ctx, y_seq, y_skip = [], [], [], []
-    for i in range(len(labels) - sequence_length - 1):
-        X_seq.append(labels[i : i + sequence_length])
-        X_ctx.append(context_vals[i + sequence_length])
-        y_seq.append(labels[i + sequence_length])
-        y_skip.append(df["skipped"].iloc[i + sequence_length])
-
-    X_seq = np.array(X_seq, dtype="int32")
-    X_ctx = np.array(X_ctx, dtype="float32")
-    y_seq = np.array(y_seq, dtype="int32")
-    y_skip = np.array(y_skip, dtype="float32")
+    sample_count = len(labels) - sequence_length - 1
+    X_seq = np.ascontiguousarray(sliding_window_view(labels, sequence_length)[:sample_count])
+    target_slice = slice(sequence_length, sequence_length + sample_count)
+    X_ctx = context_vals[target_slice]
+    y_seq = labels[target_slice]
+    y_skip = skipped_vals[target_slice]
 
     n = len(X_seq)
     test_start = int(n * 0.80)
@@ -610,8 +673,9 @@ def prepare_training_data(
 
     def _log1p_cols(arr: np.ndarray) -> np.ndarray:
         out = arr.astype("float32", copy=True)
-        for idx in skew_idx:
-            out[:, idx] = np.log1p(np.maximum(out[:, idx], 0.0))
+        if skew_idx:
+            skew_block = np.maximum(out[:, skew_idx], 0.0)
+            out[:, skew_idx] = np.log1p(skew_block).astype("float32", copy=False)
         return out
 
     X_ctx_train = _log1p_cols(X_ctx_train)
