@@ -1,8 +1,68 @@
 from __future__ import annotations
 
+import importlib.metadata
 import multiprocessing
 import os
+import platform
 import sys
+
+
+def _installed_dist_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _parse_python_version(raw: str) -> tuple[int, int]:
+    parts = str(raw).split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        return (0, 0)
+    return (major, minor)
+
+
+def detect_acceleration_environment() -> dict[str, object]:
+    return {
+        "platform": sys.platform,
+        "machine": platform.machine().lower(),
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "force_cpu": os.getenv("SPOTIFY_FORCE_CPU", "0").strip().lower() in ("1", "true", "yes"),
+        "tensorflow_version": _installed_dist_version("tensorflow"),
+        "tensorflow_metal_version": _installed_dist_version("tensorflow-metal"),
+        "tensorflow_macos_version": _installed_dist_version("tensorflow-macos"),
+    }
+
+
+def build_acceleration_hint(summary: dict[str, object], *, logical_gpu_count: int) -> str | None:
+    if bool(summary.get("force_cpu")):
+        return "SPOTIFY_FORCE_CPU is enabled, so TensorFlow will stay on CPU."
+
+    if summary.get("platform") == "darwin" and summary.get("machine") == "arm64" and logical_gpu_count <= 0:
+        python_version = str(summary.get("python_version", "unknown"))
+        metal_version = summary.get("tensorflow_metal_version")
+        if metal_version:
+            return (
+                "No TensorFlow GPU devices were detected on Apple Silicon even though "
+                f"tensorflow-metal={metal_version} is installed. Run `python scripts/check_acceleration.py` "
+                "to inspect plugin conflicts and environment state."
+            )
+        if _parse_python_version(python_version) >= (3, 13):
+            return (
+                "No TensorFlow GPU devices were detected on Apple Silicon. This environment is using "
+                f"Python {python_version} without tensorflow-metal. Prefer a separate Python 3.11 Metal venv "
+                "and run `python scripts/check_acceleration.py` for setup guidance."
+            )
+        return (
+            "No TensorFlow GPU devices were detected on Apple Silicon and tensorflow-metal is not installed. "
+            "Run `python scripts/check_acceleration.py` for setup guidance."
+        )
+
+    return None
 
 
 def configure_process_env() -> None:
@@ -55,12 +115,13 @@ def load_tensorflow_runtime(logger):
     else:
         logger.info("TensorFlow CPU threads: auto (logical_cpus=%d)", cpu_count)
 
+    logical_gpu_count = 0
     try:
         physical_gpus = tf.config.list_physical_devices("GPU")
         for device in physical_gpus:
             tf.config.experimental.set_memory_growth(device, True)
     except Exception:
-        pass
+        physical_gpus = []
 
     policy_override = os.getenv("SPOTIFY_MIXED_PRECISION", "auto").strip().lower()
     if policy_override in ("off", "0", "false"):
@@ -84,6 +145,7 @@ def load_tensorflow_runtime(logger):
             from tensorflow.keras import mixed_precision
 
             logical_gpus = tf.config.list_logical_devices("GPU")
+            logical_gpu_count = len(logical_gpus)
             if logical_gpus:
                 mixed_precision.set_global_policy("mixed_float16")
                 logger.info("Mixed precision auto-enabled (GPUs detected: %d).", len(logical_gpus))
@@ -91,6 +153,23 @@ def load_tensorflow_runtime(logger):
                 logger.info("Using TensorFlow default precision policy.")
         except Exception as exc:
             logger.warning("Mixed precision auto policy setup failed: %s", exc)
+            logical_gpus = []
+
+    if not logical_gpu_count:
+        try:
+            logical_gpu_count = len(tf.config.list_logical_devices("GPU"))
+        except Exception:
+            logical_gpu_count = 0
+
+    logger.info(
+        "TensorFlow GPU devices: physical=%d logical=%d",
+        len(physical_gpus),
+        logical_gpu_count,
+    )
+    summary = detect_acceleration_environment()
+    hint = build_acceleration_hint(summary, logical_gpu_count=logical_gpu_count)
+    if hint:
+        logger.warning(hint)
 
     try:
         if sys.platform != "darwin":

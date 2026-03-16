@@ -108,6 +108,12 @@ Run everything (all deep + all classical + full Optuna + full temporal backtest 
 bash scripts/run_everything.sh
 ```
 
+Run everything with more aggressive CPU parallelism for the classical / Optuna / backtest stages:
+
+```bash
+bash scripts/run_everything_cpu_boost.sh
+```
+
 Re-run classical + backtest only (useful after metric fixes to refresh temporal artifacts):
 
 ```bash
@@ -124,6 +130,12 @@ Run the regression guard (hang + artifact checks):
 
 ```bash
 python scripts/regression_guard.py
+```
+
+Inspect the current environment's CPU / GPU acceleration state:
+
+```bash
+python scripts/check_acceleration.py
 ```
 
 Or via Makefile:
@@ -160,9 +172,11 @@ python -m spotify \
 The `scripts/run_everything.sh` launcher also supports environment overrides:
 
 - `EPOCHS` (default `12`)
-- `OPTUNA_TRIALS` (default `30`)
-- `OPTUNA_TIMEOUT_SECONDS` (default `1800`)
-- `BACKTEST_FOLDS` (default `5`)
+- `OPTUNA_TRIALS` (default `18`)
+- `OPTUNA_TIMEOUT_SECONDS` (default `1200`)
+- `BACKTEST_FOLDS` (default `4`)
+- `CLASSICAL_MAX_TRAIN_SAMPLES` (default `50000`)
+- `CLASSICAL_MAX_EVAL_SAMPLES` (default `25000`)
 - `PYTHON_BIN` (override Python executable)
 - `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
@@ -175,9 +189,11 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_CLASSICAL_MODEL_WORKERS` (parallel classical model workers; launcher auto-sets with RAM-aware cap)
 - `SPOTIFY_MAX_CLASSICAL_WORKERS` (`auto` by default; set explicit hard cap)
 - `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets, capped for memory)
-- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers; launcher auto-sets, capped for memory)
+- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers inside a study; launcher auto-sets)
+- `SPOTIFY_OPTUNA_MODEL_WORKERS` (parallel Optuna studies across model families; launcher auto-sets to `2` on roomier machines)
 - `SPOTIFY_TF_DATA_CACHE` (default `auto`; only caches batches when memory headroom is sufficient)
 - `SPOTIFY_TF_DATA_CACHE_FRACTION` (default `0.40`; auto-cache headroom fraction of currently available RAM)
+- `SPOTIFY_TF_DATA_THREADPOOL` (optional private `tf.data` threadpool size)
 - `SPOTIFY_TF_PREFETCH` (default `auto`; TensorFlow prefetch buffer)
 - `SPOTIFY_DISTRIBUTION_STRATEGY` (`auto`, `mirrored`, `default`)
 - `SPOTIFY_ISOLATE_MPL_CACHE` (default `0`; shared matplotlib cache for faster startup)
@@ -186,7 +202,7 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_OPTUNA_PRUNING_FIDELITIES` (default `0.25,0.60,1.0`)
 - `SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS` (default `120`; per-trial budget)
 - `SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS` (optional; override per-model tuning timeout)
-- `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (optional, e.g. `logreg=90,random_forest=300`)
+- `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (launcher default `logreg=300,random_forest=900,extra_trees=600,hist_gbm=900,knn=180,gaussian_nb=120,mlp=600`)
 - `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in gate metric vs previous champion)
 - `SPOTIFY_CHAMPION_GATE_METRIC` (default `backtest_top1`; alternatives: `val_top1`)
 - `SPOTIFY_CHAMPION_GATE_MATCH_PROFILE` (default `1`; compare challengers only against prior runs of the same profile)
@@ -202,6 +218,33 @@ SPOTIFY_CLASSICAL_MODEL_WORKERS=1 \
 SPOTIFY_BACKTEST_WORKERS=1 \
 SPOTIFY_OPTUNA_JOBS=1 \
 bash scripts/run_everything.sh
+```
+
+For machines where the classical / Optuna / backtest stages are underusing CPU, try:
+
+```bash
+bash scripts/run_everything_cpu_boost.sh
+```
+
+That launcher raises the classical worker cap, gives Optuna and temporal backtesting more parallelism, and allows a slightly larger `tf.data` cache / threadpool budget.
+
+## Acceleration
+
+The default `.venv` on this machine is currently `Python 3.13` with `tensorflow 2.20.0`, and TensorFlow is not seeing any GPU devices. On Apple Silicon, `python scripts/check_acceleration.py` will print the active TensorFlow packages, visible GPU devices, and setup guidance.
+
+Local verification on this repo showed:
+
+- the current Python `3.13` environment could not install `tensorflow-metal`
+- a separate `Python 3.11` test environment could install `tensorflow-metal`, which is the better path for trying Metal acceleration on macOS
+- stale user-site TensorFlow Metal plugins under `~/Library/Python/<version>/.../tensorflow-plugins` can interfere with isolated virtualenv checks
+
+If you want to probe a fresh Apple Silicon GPU environment manually, the recommended starting point is:
+
+```bash
+/opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv-metal
+PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install --upgrade pip setuptools wheel
+PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install tensorflow==2.20.0 tensorflow-metal==1.2.0
+PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
 ```
 
 `scripts/run_benchmark_lock.sh` supports:

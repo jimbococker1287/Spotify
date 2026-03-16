@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import csv
@@ -166,6 +167,18 @@ def _build_pruner(optuna):
     )
 
 
+def _resolve_optuna_worker_plan(
+    model_count: int,
+    requested_trial_jobs: int,
+    requested_model_workers: int,
+) -> tuple[int, int]:
+    trial_jobs = max(1, requested_trial_jobs)
+    model_workers = max(1, min(max(1, model_count), requested_model_workers))
+    if model_workers <= 1:
+        return 1, trial_jobs
+    return model_workers, max(1, trial_jobs // model_workers)
+
+
 def _plot_study_history(values: list[float], output_path: Path, title: str) -> None:
     if not values:
         return
@@ -264,14 +277,19 @@ def run_optuna_tuning(
     )
 
     results: list[OptunaTuningResult] = []
-    summary_payload: list[dict[str, object]] = []
     prediction_output_dir = output_dir / "prediction_bundles"
     prediction_output_dir.mkdir(parents=True, exist_ok=True)
     estimator_output_dir = output_dir / "estimators"
     estimator_output_dir.mkdir(parents=True, exist_ok=True)
     workers, estimator_n_jobs = resolve_classical_parallelism()
-    optuna_jobs = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_JOBS"), 1)
-    if optuna_jobs > 1:
+    requested_optuna_jobs = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_JOBS"), 1)
+    requested_model_workers = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_MODEL_WORKERS"), 1)
+    model_workers, optuna_jobs = _resolve_optuna_worker_plan(
+        len(selected_models),
+        requested_optuna_jobs,
+        requested_model_workers,
+    )
+    if optuna_jobs > 1 or model_workers > 1:
         estimator_n_jobs = 1
     per_trial_timeout_seconds = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS"), 0)
     model_timeout_default = timeout_seconds if timeout_seconds > 0 else 0
@@ -284,8 +302,10 @@ def run_optuna_tuning(
     pruner, pruner_name = _build_pruner(optuna)
 
     logger.info(
-        "Optuna parallelism: jobs=%d estimator_n_jobs=%d (classical_workers=%d) pruner=%s fidelity=%s trial_timeout_s=%d",
+        "Optuna parallelism: model_workers=%d trial_jobs=%d requested_trial_jobs=%d estimator_n_jobs=%d (classical_workers=%d) pruner=%s fidelity=%s trial_timeout_s=%d",
+        model_workers,
         optuna_jobs,
+        requested_optuna_jobs,
         estimator_n_jobs,
         workers,
         pruner_name,
@@ -293,7 +313,7 @@ def run_optuna_tuning(
         per_trial_timeout_seconds,
     )
 
-    for model_name in selected_models:
+    def run_model_study(model_name: str) -> OptunaTuningResult | None:
         model_timeout = model_timeout_overrides.get(model_name, model_timeout_default)
         logger.info(
             "Running Optuna tuning for %s (%d trials, timeout_s=%s)",
@@ -372,7 +392,7 @@ def run_optuna_tuning(
                 "No completed Optuna trials for %s (all pruned/failed). Skipping tuned fit.",
                 model_name,
             )
-            continue
+            return None
 
         best_params = dict(study.best_trial.params)
         family, estimator = build_classical_estimator(
@@ -444,9 +464,6 @@ def run_optuna_tuning(
             prediction_bundle_path=prediction_bundle_path,
             estimator_artifact_path=estimator_artifact_path,
         )
-        results.append(result)
-        summary_payload.append(asdict(result))
-
         _write_trial_log(study, output_dir / f"optuna_trials_{model_name}.csv")
         values = [float(t.value) for t in study.trials if t.value is not None and t.state == optuna.trial.TrialState.COMPLETE]
         _plot_study_history(
@@ -460,6 +477,29 @@ def run_optuna_tuning(
             val_top1,
             test_top1,
         )
+        return result
+
+    if model_workers > 1 and len(selected_models) > 1:
+        ordered_results: list[OptunaTuningResult | None] = [None] * len(selected_models)
+        with ThreadPoolExecutor(max_workers=model_workers) as executor:
+            futures = {
+                executor.submit(run_model_study, model_name): (idx, model_name)
+                for idx, model_name in enumerate(selected_models)
+            }
+            for future in as_completed(futures):
+                idx, model_name = futures[future]
+                try:
+                    ordered_results[idx] = future.result()
+                except Exception as exc:
+                    logger.warning("Optuna tuning failed for %s: %s", model_name, exc)
+        results = [result for result in ordered_results if result is not None]
+    else:
+        for model_name in selected_models:
+            result = run_model_study(model_name)
+            if result is not None:
+                results.append(result)
+
+    summary_payload = [asdict(result) for result in results]
 
     with (output_dir / "optuna_results.json").open("w", encoding="utf-8") as out:
         json.dump(summary_payload, out, indent=2)

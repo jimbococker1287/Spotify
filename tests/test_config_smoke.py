@@ -19,7 +19,12 @@ def test_default_config_paths() -> None:
     assert config.enable_classical_models is True
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
+    assert config.optuna_trials == 18
+    assert config.optuna_timeout_seconds == 1_200
     assert config.enable_temporal_backtest is True
+    assert config.temporal_backtest_folds == 4
+    assert config.classical_max_train_samples == 50_000
+    assert config.classical_max_eval_samples == 25_000
     assert set(config.optuna_model_names) == set(config.classical_model_names)
     assert set(config.temporal_backtest_model_names) == set(config.classical_model_names)
 
