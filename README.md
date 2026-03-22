@@ -10,12 +10,14 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Prepared-data fingerprint caching
 - Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
 - Champion/challenger gating
+- Drift diagnostics across train/validation/test regimes
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
 - Per-run Markdown auto-report
 - Persistent cross-run history and charts
 - Benchmark lock runs with seed-based confidence intervals
 - Prediction CLI for serving top-k next-artist recommendations
+- Conformal uncertainty diagnostics with abstaining prediction support
 
 ## Project Layout
 
@@ -114,6 +116,19 @@ Run everything with more aggressive CPU parallelism for the classical / Optuna /
 bash scripts/run_everything_cpu_boost.sh
 ```
 
+Run everything with the Apple Silicon Metal GPU environment and the more aggressive CPU profile for classical / Optuna / backtest work:
+
+```bash
+bash scripts/run_everything_gpu.sh
+```
+
+That launcher is tuned for fastest wall-clock runs on Apple Silicon: it skips SHAP by default, keeps Metal enabled for deep models, and uses slightly safer classical parallelism on 16-18 GB unified-memory machines. To re-enable SHAP on that path, run `SPOTIFY_ENABLE_SHAP=1 bash scripts/run_everything_gpu.sh`.
+
+Temporal backtesting can now include deep model names in `--backtest-models` alongside classical ones. For lightweight rolling deep evaluation, the main knobs are:
+
+- `SPOTIFY_DEEP_BACKTEST_EPOCHS` (default `3`)
+- `SPOTIFY_DEEP_BACKTEST_BATCH_SIZE` (default `256`)
+
 Re-run classical + backtest only (useful after metric fixes to refresh temporal artifacts):
 
 ```bash
@@ -138,10 +153,23 @@ Inspect the current environment's CPU / GPU acceleration state:
 python scripts/check_acceleration.py
 ```
 
+Build the dedicated Apple Silicon Metal environment:
+
+```bash
+bash scripts/setup_metal_venv.sh
+```
+
 Or via Makefile:
 
 ```bash
 make train-everything RUN_NAME=full-e2e
+```
+
+GPU setup / run via Make:
+
+```bash
+make setup-metal
+make train-everything-gpu RUN_NAME=metal-e2e
 ```
 
 Benchmark lock via Make:
@@ -228,6 +256,8 @@ bash scripts/run_everything_cpu_boost.sh
 
 That launcher raises the classical worker cap, gives Optuna and temporal backtesting more parallelism, and allows a slightly larger `tf.data` cache / threadpool budget.
 
+`bash scripts/run_everything_gpu.sh` now layers the Metal Python 3.11 environment on top of that same CPU-boost profile, skips SHAP by default, and adds a bit more memory headroom for unified-memory Macs, so it is the fastest full-run entrypoint on Apple Silicon when `.venv-metal` is available.
+
 ## Acceleration
 
 The default `.venv` on this machine is currently `Python 3.13` with `tensorflow 2.20.0`, and TensorFlow is not seeing any GPU devices. On Apple Silicon, `python scripts/check_acceleration.py` will print the active TensorFlow packages, visible GPU devices, and setup guidance.
@@ -235,15 +265,23 @@ The default `.venv` on this machine is currently `Python 3.13` with `tensorflow 
 Local verification on this repo showed:
 
 - the current Python `3.13` environment could not install `tensorflow-metal`
-- a separate `Python 3.11` test environment could install `tensorflow-metal`, which is the better path for trying Metal acceleration on macOS
-- stale user-site TensorFlow Metal plugins under `~/Library/Python/<version>/.../tensorflow-plugins` can interfere with isolated virtualenv checks
+- a dedicated `Python 3.11` environment with `tensorflow-macos==2.16.2` and `tensorflow-metal==1.2.0` can see `GPU:0` on this Apple Silicon Mac
+- stale user-site TensorFlow Metal plugins under `~/Library/Python/<version>/.../tensorflow-plugins` can interfere with isolated virtualenv checks, so the setup script backs that folder up before creating `.venv-metal`
 
-If you want to probe a fresh Apple Silicon GPU environment manually, the recommended starting point is:
+The easiest repo-local path is:
+
+```bash
+bash scripts/setup_metal_venv.sh
+PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
+bash scripts/run_everything_gpu.sh
+```
+
+If you want to build it manually, the working stack from local verification was:
 
 ```bash
 /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv-metal
 PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install --upgrade pip setuptools wheel
-PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install tensorflow==2.20.0 tensorflow-metal==1.2.0
+PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install tensorflow-macos==2.16.2 tensorflow-metal==1.2.0
 PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
 ```
 
@@ -259,6 +297,8 @@ PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
 - `--mlflow` / `--no-mlflow`
 - `--mlflow-tracking-uri <uri>`
 - `--mlflow-experiment <name>`
+- `--conformal-alpha <float>`
+- `--no-conformal`
 - `--optuna` / `--no-optuna`
 - `--optuna-trials <n>`
 - `--optuna-timeout-seconds <n>`
@@ -287,6 +327,10 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `backtest/temporal_backtest.csv`
 - `backtest/temporal_backtest_top1.png`
 - `analysis/*_confidence_summary.json` (ECE/Brier/top-1 confidence summary)
+- `analysis/*_conformal_summary.json` (split-conformal threshold, coverage, abstention stats)
+- `analysis/data_drift_summary.json` (target drift and largest context/segment shifts)
+- `analysis/context_feature_drift.csv` + `analysis/segment_drift.csv`
+- `analysis/context_feature_drift.png` + `analysis/segment_drift.png`
 - `analysis/*_reliability.png` (calibration curves)
 - `analysis/*_segment_metrics.csv` (segment-level top-1 and confidence)
 - `analysis/*_top_errors.csv` (most frequent true/prediction confusions)
@@ -380,6 +424,11 @@ Optional token auth + request limits:
 - Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
 - Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
 - Errors return structured payloads: `{"error":{"code","message","details"}}`.
+- When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
+
+## Research Roadmap
+
+See `docs/doctorate_roadmap.md` for the dissertation-scale build plan and experiment sequence.
 
 ## Docker (Prediction Service)
 
@@ -452,6 +501,8 @@ The training context now includes additional recency/frequency and session-trans
 - `transition_repeat_count`
 - `artist_skip_rate_hist`
 - `artist_skip_rate_smooth`
+
+If `data/raw/Spotify Technical Log Information/` is present, preprocessing also joins recent device/network/playback-health context from the export, including connection churn, playback errors, stutters, track-not-played events, cloud-playback stalls, and the latest known bitrate / downgrade settings for the current device family.
 
 ## Notes
 

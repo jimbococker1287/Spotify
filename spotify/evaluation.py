@@ -12,6 +12,7 @@ import pandas as pd
 from .benchmarks import ClassicalFeatureBundle, build_classical_estimator, build_classical_feature_bundle, sample_rows
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
+from .uncertainty import fit_split_conformal_classifier, summarize_prediction_sets
 
 
 def _slugify(raw: str) -> str:
@@ -370,6 +371,8 @@ def _save_prediction_diagnostics(
     output_dir: Path,
     label_lookup: dict[int, str],
     class_labels: np.ndarray | None = None,
+    enable_conformal: bool = True,
+    conformal_alpha: float = 0.10,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_tag = _slugify(tag)
@@ -418,10 +421,40 @@ def _save_prediction_diagnostics(
         "test_brier": _to_float(test_stats["brier"]),
         "val_mean_confidence": _to_float(val_stats["mean_confidence"]),
         "test_mean_confidence": _to_float(test_stats["mean_confidence"]),
+        "conformal_enabled": bool(enable_conformal),
     }
 
     summary_path = output_dir / f"{safe_tag}_confidence_summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    artifacts = [summary_path]
+
+    if enable_conformal:
+        val_y_local = _encode_labels_to_local_indices(np.asarray(val_y), class_labels)
+        test_y_local = _encode_labels_to_local_indices(np.asarray(test_y), class_labels)
+        calibration = fit_split_conformal_classifier(val_proba, val_y_local, alpha=conformal_alpha)
+        if calibration is not None:
+            val_conformal = summarize_prediction_sets(val_proba, val_y_local, calibration=calibration)
+            test_conformal = summarize_prediction_sets(test_proba, test_y_local, calibration=calibration)
+            conformal_payload = {
+                "tag": safe_tag,
+                "calibration": calibration.to_dict(),
+                "val": val_conformal,
+                "test": test_conformal,
+            }
+            conformal_summary_path = output_dir / f"{safe_tag}_conformal_summary.json"
+            conformal_summary_path.write_text(json.dumps(conformal_payload, indent=2), encoding="utf-8")
+            artifacts.append(conformal_summary_path)
+            summary_payload.update(
+                {
+                    "conformal_threshold": float(calibration.threshold),
+                    "conformal_alpha": float(calibration.alpha),
+                    "val_conformal_coverage": _to_float(val_conformal["coverage"]),
+                    "test_conformal_coverage": _to_float(test_conformal["coverage"]),
+                    "val_abstention_rate": _to_float(val_conformal["abstention_rate"]),
+                    "test_abstention_rate": _to_float(test_conformal["abstention_rate"]),
+                }
+            )
+            summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 
     reliability_csv = output_dir / f"{safe_tag}_reliability.csv"
     _write_csv(
@@ -460,7 +493,8 @@ def _save_prediction_diagnostics(
         title=f"{tag} Confidence Distribution (Test)",
     )
 
-    return [summary_path, reliability_csv, segment_csv, top_errors_csv, reliability_plot, confidence_hist]
+    artifacts.extend([reliability_csv, segment_csv, top_errors_csv, reliability_plot, confidence_hist])
+    return artifacts
 
 
 def _extract_artist_proba(prediction) -> np.ndarray:
@@ -482,6 +516,8 @@ def run_extended_evaluation(
     run_dir: Path,
     random_seed: int,
     max_train_samples: int,
+    enable_conformal: bool,
+    conformal_alpha: float,
     logger,
     feature_bundle: ClassicalFeatureBundle | None = None,
 ) -> list[Path]:
@@ -525,6 +561,8 @@ def run_extended_evaluation(
                             test_frame=test_frame,
                             output_dir=analysis_dir,
                             label_lookup=label_lookup,
+                            enable_conformal=enable_conformal,
+                            conformal_alpha=conformal_alpha,
                         )
                     )
                     logger.info("Saved extended diagnostics for deep model: %s", deep_name)
@@ -566,6 +604,8 @@ def run_extended_evaluation(
                             output_dir=analysis_dir,
                             label_lookup=label_lookup,
                             class_labels=None,
+                            enable_conformal=enable_conformal,
+                            conformal_alpha=conformal_alpha,
                         )
                     )
                     logger.info("Saved extended diagnostics for classical model: %s", model_name)
@@ -600,6 +640,8 @@ def run_extended_evaluation(
                                 output_dir=analysis_dir,
                                 label_lookup=label_lookup,
                                 class_labels=(classes if classes.size else None),
+                                enable_conformal=enable_conformal,
+                                conformal_alpha=conformal_alpha,
                             )
                         )
                         logger.info("Saved extended diagnostics for classical model: %s", model_name)
@@ -627,6 +669,8 @@ def run_extended_evaluation(
                         output_dir=analysis_dir,
                         label_lookup=label_lookup,
                         class_labels=None,
+                        enable_conformal=enable_conformal,
+                        conformal_alpha=conformal_alpha,
                     )
                 )
                 logger.info("Saved extended diagnostics for ensemble model: %s", ensemble_name)

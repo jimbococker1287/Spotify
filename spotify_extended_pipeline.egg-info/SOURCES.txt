@@ -3,6 +3,7 @@ pyproject.toml
 spotify/__init__.py
 spotify/__main__.py
 spotify/analytics_db.py
+spotify/artifact_cleanup.py
 spotify/backtesting.py
 spotify/benchmarks.py
 spotify/champion_alias.py
@@ -26,6 +27,7 @@ spotify/reporting.py
 spotify/runtime.py
 spotify/serving.py
 spotify/session_knn.py
+spotify/storage_report.py
 spotify/tracking.py
 spotify/training.py
 spotify/tuning.py
@@ -34,6 +36,7 @@ spotify_extended_pipeline.egg-info/SOURCES.txt
 spotify_extended_pipeline.egg-info/dependency_links.txt
 spotify_extended_pipeline.egg-info/requires.txt
 spotify_extended_pipeline.egg-info/top_level.txt
+tests/test_artifact_cleanup.py
 tests/test_audio_features.py
 tests/test_benchmarks_features.py
 tests/test_champion_alias.py
@@ -53,5 +56,6 @@ tests/test_profiles_and_ensemble.py
 tests/test_ranking_metrics.py
 tests/test_runtime_acceleration.py
 tests/test_serving_analytics_and_session_knn.py
+tests/test_storage_report.py
 tests/test_training_helpers.py
 tests/test_tuning_helpers.py

@@ -82,7 +82,7 @@ def load_prediction_input_context(
     logger: logging.Logger,
 ) -> PredictionInputContext:
     # Import data pipeline lazily so TensorFlow can initialize first on macOS.
-    from .data import append_audio_features, engineer_features, load_streaming_history
+    from .data import append_audio_features, append_technical_log_features, engineer_features, load_streaming_history
 
     metadata_path = run_dir / "feature_metadata.json"
     if not metadata_path.exists():
@@ -102,6 +102,7 @@ def load_prediction_input_context(
         logger=logger,
         artist_classes=artist_labels,
     )
+    df = append_technical_log_features(df, data_dir=data_dir.expanduser().resolve(), logger=logger)
     df = append_audio_features(df, enable_spotify_features=False, logger=logger)
     df = df.sort_values("ts").reset_index(drop=True)
 

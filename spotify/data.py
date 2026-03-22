@@ -59,6 +59,22 @@ CONTEXT_FEATURES: tuple[str, ...] = (
     "prev_artist_transition_rate_smooth",
     "artist_skip_rate_hist",
     "artist_skip_rate_smooth",
+    "tech_connection_events_1h",
+    "tech_connection_none_24h",
+    "tech_ipv6_failures_24h",
+    "tech_playback_errors_24h",
+    "tech_playback_fatal_errors_24h",
+    "tech_stutter_events_24h",
+    "tech_track_not_played_24h",
+    "tech_cloud_stats_events_24h",
+    "tech_cloud_stalls_24h",
+    "tech_last_reachability_wifi",
+    "tech_last_reachability_cellular",
+    "tech_last_reachability_offline",
+    "tech_last_ipv6_failed",
+    "tech_allow_downgrade",
+    "tech_bitrate_wifi_kbps",
+    "tech_bitrate_cellular_kbps",
 )
 
 SKEW_CONTEXT_FEATURES: tuple[str, ...] = (
@@ -78,9 +94,26 @@ SKEW_CONTEXT_FEATURES: tuple[str, ...] = (
     "session_skip_rate_so_far",
     "session_unique_artists_so_far",
     "transition_repeat_count",
+    "tech_connection_events_1h",
+    "tech_connection_none_24h",
+    "tech_ipv6_failures_24h",
+    "tech_playback_errors_24h",
+    "tech_playback_fatal_errors_24h",
+    "tech_stutter_events_24h",
+    "tech_track_not_played_24h",
+    "tech_cloud_stats_events_24h",
+    "tech_cloud_stalls_24h",
 )
 
-CACHE_SCHEMA_VERSION = "prepared-data-v3"
+CACHE_SCHEMA_VERSION = "prepared-data-v4"
+TECHNICAL_LOG_FILENAMES: tuple[str, ...] = (
+    "ConnectionInfo.json",
+    "AudioStreamingSettingsReport.json",
+    "PlaybackError.json",
+    "Stutter.json",
+    "TrackNotPlayed.json",
+    "CloudPlaybackPlaybackStats.json",
+)
 
 
 @dataclass
@@ -159,6 +192,46 @@ def discover_streaming_files(data_dir: Path, include_video: bool, logger) -> lis
     )
 
 
+def discover_technical_log_files(data_dir: Path, logger) -> list[Path]:
+    data_dir = data_dir.expanduser().resolve()
+
+    grouped_files: dict[Path, list[Path]] = {}
+    target_names = set(TECHNICAL_LOG_FILENAMES)
+    for path in sorted(candidate for candidate in data_dir.rglob("*.json") if candidate.is_file() and candidate.name in target_names):
+        parent_name = path.parent.name.lower()
+        if "technical log information" not in parent_name:
+            continue
+        grouped_files.setdefault(path.parent, []).append(path)
+
+    if not grouped_files:
+        logger.info("No Spotify technical-log export found under %s; using zero-filled technical context features.", data_dir)
+        return []
+
+    preferred_dir = max(
+        grouped_files,
+        key=lambda parent: (
+            len(grouped_files[parent]),
+            parent == data_dir,
+            parent.name.lower() == "spotify technical log information",
+            str(parent),
+        ),
+    )
+    if len(grouped_files) > 1:
+        logger.warning(
+            "Found technical log files in multiple directories under %s. Using %s (%d files).",
+            data_dir,
+            preferred_dir,
+            len(grouped_files[preferred_dir]),
+        )
+    elif preferred_dir != data_dir:
+        logger.info("Using nested technical log export folder: %s", preferred_dir)
+
+    discovered_by_name = {path.name: path for path in grouped_files[preferred_dir]}
+    discovered = [discovered_by_name[name] for name in TECHNICAL_LOG_FILENAMES if name in discovered_by_name]
+    logger.info("Discovered %d technical log files for feature augmentation.", len(discovered))
+    return discovered
+
+
 def load_streaming_history(data_dir: Path, include_video: bool, logger) -> pd.DataFrame:
     files = discover_streaming_files(data_dir, include_video, logger)
     all_records: list[dict] = []
@@ -193,6 +266,7 @@ def _cache_enabled_from_env() -> bool:
 
 def _build_prepared_cache_fingerprint(
     files: list[Path],
+    technical_files: list[Path],
     include_video: bool,
     enable_spotify_features: bool,
     max_artists: int,
@@ -202,6 +276,17 @@ def _build_prepared_cache_fingerprint(
     for path in sorted(files, key=lambda item: str(item.resolve())):
         stat = path.stat()
         payload_files.append(
+            {
+                "path": str(path.resolve()),
+                "name": path.name,
+                "size": int(stat.st_size),
+                "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            }
+        )
+    payload_technical_files: list[dict[str, object]] = []
+    for path in sorted(technical_files, key=lambda item: str(item.resolve())):
+        stat = path.stat()
+        payload_technical_files.append(
             {
                 "path": str(path.resolve()),
                 "name": path.name,
@@ -219,6 +304,7 @@ def _build_prepared_cache_fingerprint(
         "context_features": list(CONTEXT_FEATURES),
         "skew_context_features": list(SKEW_CONTEXT_FEATURES),
         "files": payload_files,
+        "technical_files": payload_technical_files,
     }
     serialized = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
@@ -238,8 +324,10 @@ def load_or_prepare_training_data(
     logger,
 ) -> tuple[PreparedData, PreparedDataCacheInfo]:
     files = discover_streaming_files(data_dir, include_video, logger)
+    technical_files = discover_technical_log_files(data_dir, logger)
     fingerprint, fingerprint_payload = _build_prepared_cache_fingerprint(
         files=files,
+        technical_files=technical_files,
         include_video=include_video,
         enable_spotify_features=enable_spotify_features,
         max_artists=max_artists,
@@ -268,13 +356,14 @@ def load_or_prepare_training_data(
                 fingerprint=fingerprint,
                 cache_path=bundle_path,
                 metadata_path=(metadata_path if metadata_path.exists() else None),
-                source_file_count=len(files),
+                source_file_count=len(files) + len(technical_files),
             )
         except Exception as exc:
             logger.warning("Prepared-data cache load failed (%s). Rebuilding cache.", exc)
 
     df = raw_df.copy() if raw_df is not None else load_streaming_history(data_dir, include_video, logger)
     df = engineer_features(df, max_artists, logger)
+    df = append_technical_log_features(df, data_dir=data_dir, logger=logger, technical_files=technical_files)
     df = append_audio_features(df, enable_spotify_features, logger)
     prepared = prepare_training_data(
         df=df,
@@ -310,7 +399,7 @@ def load_or_prepare_training_data(
         fingerprint=fingerprint,
         cache_path=(bundle_path if cache_enabled else None),
         metadata_path=(metadata_path if cache_enabled else None),
-        source_file_count=len(files),
+        source_file_count=len(files) + len(technical_files),
     )
 
 
@@ -363,6 +452,393 @@ def _ensure_time_sorted(df: pd.DataFrame) -> pd.DataFrame:
             return df
         return df.reset_index(drop=True)
     return df.sort_values("ts").reset_index(drop=True)
+
+
+def _load_json_records(path: Path, fast_json) -> list[dict]:
+    if fast_json is not None:
+        payload = fast_json.loads(path.read_bytes())
+    else:
+        with path.open("r", encoding="utf-8") as infile:
+            payload = json.load(infile)
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _coerce_epoch_ms(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        epoch = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if abs(epoch) < 10_000_000_000:
+        epoch *= 1000
+    return epoch
+
+
+def _normalize_device_family(value) -> str:
+    text = str(value or "").strip().lower()
+    if not text or text in {"nan", "none", "null", "unknown", "not_applicable"}:
+        return "other"
+    if any(token in text for token in ("ios", "iphone", "ipad", "android", "mobile")):
+        return "mobile"
+    if any(token in text for token in ("osx", "os x", "mac", "desktop", "windows", "linux", "web_player", "web player")):
+        return "desktop"
+    return "other"
+
+
+def _parse_bool_flag(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    text = str(value).strip().lower()
+    return 1.0 if text in {"1", "true", "yes", "y", "on"} else 0.0
+
+
+def _windowed_sums_for_all_rows(
+    row_ts_ms: np.ndarray,
+    event_ts_ms: np.ndarray,
+    event_values: np.ndarray,
+    *,
+    window_ms: int,
+) -> np.ndarray:
+    if len(row_ts_ms) == 0 or len(event_ts_ms) == 0:
+        return np.zeros(len(row_ts_ms), dtype="float32")
+
+    order = np.argsort(event_ts_ms, kind="mergesort")
+    sorted_ts = event_ts_ms[order]
+    sorted_values = event_values[order]
+    cumulative = np.concatenate(([0.0], np.cumsum(sorted_values, dtype="float64")))
+    right = np.searchsorted(sorted_ts, row_ts_ms, side="right")
+    left = np.searchsorted(sorted_ts, row_ts_ms - window_ms, side="left")
+    return (cumulative[right] - cumulative[left]).astype("float32", copy=False)
+
+
+def _windowed_sums_by_family(
+    row_ts_ms: np.ndarray,
+    row_families: np.ndarray,
+    event_ts_ms: np.ndarray,
+    event_families: np.ndarray | None,
+    event_values: np.ndarray,
+    *,
+    window_ms: int,
+) -> np.ndarray:
+    if event_families is None:
+        return _windowed_sums_for_all_rows(row_ts_ms, event_ts_ms, event_values, window_ms=window_ms)
+
+    out = np.zeros(len(row_ts_ms), dtype="float32")
+    for family in np.unique(row_families):
+        row_mask = row_families == family
+        family_events = event_families == family
+        if not np.any(family_events):
+            continue
+        out[row_mask] = _windowed_sums_for_all_rows(
+            row_ts_ms[row_mask],
+            event_ts_ms[family_events],
+            event_values[family_events],
+            window_ms=window_ms,
+        )
+    return out
+
+
+def _latest_values_for_all_rows(
+    row_ts_ms: np.ndarray,
+    event_ts_ms: np.ndarray,
+    event_values: np.ndarray,
+    *,
+    default_value: float = 0.0,
+) -> np.ndarray:
+    out = np.full(len(row_ts_ms), float(default_value), dtype="float32")
+    if len(row_ts_ms) == 0 or len(event_ts_ms) == 0:
+        return out
+
+    order = np.argsort(event_ts_ms, kind="mergesort")
+    sorted_ts = event_ts_ms[order]
+    sorted_values = event_values[order]
+    positions = np.searchsorted(sorted_ts, row_ts_ms, side="right") - 1
+    valid = positions >= 0
+    if np.any(valid):
+        out[valid] = sorted_values[positions[valid]].astype("float32", copy=False)
+    return out
+
+
+def _latest_values_by_family(
+    row_ts_ms: np.ndarray,
+    row_families: np.ndarray,
+    event_ts_ms: np.ndarray,
+    event_families: np.ndarray | None,
+    event_values: np.ndarray,
+    *,
+    default_value: float = 0.0,
+) -> np.ndarray:
+    if event_families is None:
+        return _latest_values_for_all_rows(row_ts_ms, event_ts_ms, event_values, default_value=default_value)
+
+    out = np.full(len(row_ts_ms), float(default_value), dtype="float32")
+    for family in np.unique(row_families):
+        row_mask = row_families == family
+        family_events = event_families == family
+        if not np.any(family_events):
+            continue
+        out[row_mask] = _latest_values_for_all_rows(
+            row_ts_ms[row_mask],
+            event_ts_ms[family_events],
+            event_values[family_events],
+            default_value=default_value,
+        )
+    return out
+
+
+def append_technical_log_features(
+    df: pd.DataFrame,
+    *,
+    data_dir: Path,
+    logger,
+    technical_files: list[Path] | None = None,
+) -> pd.DataFrame:
+    defaults = {
+        "tech_connection_events_1h": 0.0,
+        "tech_connection_none_24h": 0.0,
+        "tech_ipv6_failures_24h": 0.0,
+        "tech_playback_errors_24h": 0.0,
+        "tech_playback_fatal_errors_24h": 0.0,
+        "tech_stutter_events_24h": 0.0,
+        "tech_track_not_played_24h": 0.0,
+        "tech_cloud_stats_events_24h": 0.0,
+        "tech_cloud_stalls_24h": 0.0,
+        "tech_last_reachability_wifi": 0.0,
+        "tech_last_reachability_cellular": 0.0,
+        "tech_last_reachability_offline": 0.0,
+        "tech_last_ipv6_failed": 0.0,
+        "tech_allow_downgrade": 0.0,
+        "tech_bitrate_wifi_kbps": 0.0,
+        "tech_bitrate_cellular_kbps": 0.0,
+    }
+    for column, default_value in defaults.items():
+        df[column] = default_value
+
+    if technical_files is None:
+        technical_files = discover_technical_log_files(data_dir, logger)
+    if not technical_files:
+        return df
+
+    try:
+        import orjson as fast_json  # type: ignore
+        logger.info("Using orjson for faster technical-log parsing.")
+    except Exception:
+        fast_json = None
+
+    files_by_name = {path.name: path for path in technical_files}
+    if "ts" not in df.columns or "platform" not in df.columns or df.empty:
+        return df
+
+    row_ts_ms = (pd.to_datetime(df["ts"], errors="coerce").astype("int64") // 10**6).to_numpy(dtype="int64", copy=False)
+    row_families = np.array([_normalize_device_family(value) for value in df["platform"].tolist()], dtype=object)
+    rows = len(df)
+    day_ms = 24 * 60 * 60 * 1000
+    hour_ms = 60 * 60 * 1000
+
+    connection_path = files_by_name.get("ConnectionInfo.json")
+    if connection_path is not None:
+        connection_records = _load_json_records(connection_path, fast_json)
+        logger.info("Loaded %s with %d technical records", connection_path.name, len(connection_records))
+        connection_rows: list[tuple[int, str, float, float, float, float, float, float]] = []
+        for record in connection_records:
+            ts_ms = _coerce_epoch_ms(record.get("context_time") or record.get("timestamp_utc"))
+            if ts_ms is None:
+                continue
+            family = _normalize_device_family(record.get("context_device_type") or record.get("context_os_name") or record.get("context_device_model"))
+            reachability = str(record.get("message_reachability_type") or "").strip().lower()
+            wifi = 1.0 if ("wlan" in reachability or "wifi" in reachability) else 0.0
+            cellular = 1.0 if any(token in reachability for token in ("2g", "3g", "4g", "5g", "cell")) else 0.0
+            offline = 1.0 if reachability in {"none", "offline", "unreachable"} else 0.0
+            ipv6_failed = _parse_bool_flag(record.get("message_ipv6_failed"))
+            connection_rows.append((ts_ms, family, 1.0, offline, ipv6_failed, wifi, cellular, offline))
+
+        if connection_rows:
+            connection_frame = pd.DataFrame(
+                connection_rows,
+                columns=[
+                    "ts_ms",
+                    "device_family",
+                    "event_count",
+                    "none_count",
+                    "ipv6_failed_count",
+                    "reachability_wifi",
+                    "reachability_cellular",
+                    "reachability_offline",
+                ],
+            )
+            event_ts = connection_frame["ts_ms"].to_numpy(dtype="int64", copy=False)
+            event_families = connection_frame["device_family"].to_numpy(dtype=object, copy=False)
+            df["tech_connection_events_1h"] = _windowed_sums_by_family(
+                row_ts_ms, row_families, event_ts, event_families, connection_frame["event_count"].to_numpy(dtype="float32", copy=False), window_ms=hour_ms
+            )
+            df["tech_connection_none_24h"] = _windowed_sums_by_family(
+                row_ts_ms, row_families, event_ts, event_families, connection_frame["none_count"].to_numpy(dtype="float32", copy=False), window_ms=day_ms
+            )
+            df["tech_ipv6_failures_24h"] = _windowed_sums_by_family(
+                row_ts_ms, row_families, event_ts, event_families, connection_frame["ipv6_failed_count"].to_numpy(dtype="float32", copy=False), window_ms=day_ms
+            )
+            df["tech_last_reachability_wifi"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                connection_frame["reachability_wifi"].to_numpy(dtype="float32", copy=False),
+            )
+            df["tech_last_reachability_cellular"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                connection_frame["reachability_cellular"].to_numpy(dtype="float32", copy=False),
+            )
+            df["tech_last_reachability_offline"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                connection_frame["reachability_offline"].to_numpy(dtype="float32", copy=False),
+            )
+            df["tech_last_ipv6_failed"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                connection_frame["ipv6_failed_count"].to_numpy(dtype="float32", copy=False),
+            )
+
+    settings_path = files_by_name.get("AudioStreamingSettingsReport.json")
+    if settings_path is not None:
+        settings_records = _load_json_records(settings_path, fast_json)
+        logger.info("Loaded %s with %d technical records", settings_path.name, len(settings_records))
+        settings_rows: list[tuple[int, str, float, float, float]] = []
+        for record in settings_records:
+            ts_ms = _coerce_epoch_ms(record.get("context_time") or record.get("timestamp_utc"))
+            if ts_ms is None:
+                continue
+            family = _normalize_device_family(record.get("context_device_type") or record.get("context_os_name") or record.get("context_device_model"))
+            wifi_bitrate = record.get("message_user_selected_play_bitrate_wifi")
+            if wifi_bitrate is None:
+                wifi_bitrate = record.get("message_play_bitrate_wifi")
+            cellular_bitrate = record.get("message_user_selected_play_bitrate_cellular")
+            if cellular_bitrate is None:
+                cellular_bitrate = record.get("message_play_bitrate_cellular")
+            settings_rows.append(
+                (
+                    ts_ms,
+                    family,
+                    _parse_bool_flag(record.get("message_allow_downgrade")),
+                    float(wifi_bitrate or 0.0) / 1000.0,
+                    float(cellular_bitrate or 0.0) / 1000.0,
+                )
+            )
+
+        if settings_rows:
+            settings_frame = pd.DataFrame(
+                settings_rows,
+                columns=["ts_ms", "device_family", "allow_downgrade", "bitrate_wifi_kbps", "bitrate_cellular_kbps"],
+            )
+            event_ts = settings_frame["ts_ms"].to_numpy(dtype="int64", copy=False)
+            event_families = settings_frame["device_family"].to_numpy(dtype=object, copy=False)
+            df["tech_allow_downgrade"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                settings_frame["allow_downgrade"].to_numpy(dtype="float32", copy=False),
+            )
+            df["tech_bitrate_wifi_kbps"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                settings_frame["bitrate_wifi_kbps"].to_numpy(dtype="float32", copy=False),
+            )
+            df["tech_bitrate_cellular_kbps"] = _latest_values_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                settings_frame["bitrate_cellular_kbps"].to_numpy(dtype="float32", copy=False),
+            )
+
+    for filename, output_name, fatal_name in (
+        ("PlaybackError.json", "tech_playback_errors_24h", "tech_playback_fatal_errors_24h"),
+        ("Stutter.json", "tech_stutter_events_24h", None),
+        ("TrackNotPlayed.json", "tech_track_not_played_24h", None),
+    ):
+        path = files_by_name.get(filename)
+        if path is None:
+            continue
+        records = _load_json_records(path, fast_json)
+        logger.info("Loaded %s with %d technical records", path.name, len(records))
+        rows_payload: list[tuple[int, str, float, float]] = []
+        for record in records:
+            ts_ms = _coerce_epoch_ms(record.get("context_time") or record.get("timestamp_utc"))
+            if ts_ms is None:
+                continue
+            family = _normalize_device_family(record.get("context_device_type") or record.get("context_os_name") or record.get("context_device_model"))
+            fatal_value = _parse_bool_flag(record.get("message_fatal")) if fatal_name else 0.0
+            rows_payload.append((ts_ms, family, 1.0, fatal_value))
+        if not rows_payload:
+            continue
+
+        event_frame = pd.DataFrame(rows_payload, columns=["ts_ms", "device_family", "event_count", "fatal_count"])
+        event_ts = event_frame["ts_ms"].to_numpy(dtype="int64", copy=False)
+        event_families = event_frame["device_family"].to_numpy(dtype=object, copy=False)
+        df[output_name] = _windowed_sums_by_family(
+            row_ts_ms,
+            row_families,
+            event_ts,
+            event_families,
+            event_frame["event_count"].to_numpy(dtype="float32", copy=False),
+            window_ms=day_ms,
+        )
+        if fatal_name:
+            df[fatal_name] = _windowed_sums_by_family(
+                row_ts_ms,
+                row_families,
+                event_ts,
+                event_families,
+                event_frame["fatal_count"].to_numpy(dtype="float32", copy=False),
+                window_ms=day_ms,
+            )
+
+    cloud_path = files_by_name.get("CloudPlaybackPlaybackStats.json")
+    if cloud_path is not None:
+        cloud_records = _load_json_records(cloud_path, fast_json)
+        logger.info("Loaded %s with %d technical records", cloud_path.name, len(cloud_records))
+        cloud_rows: list[tuple[int, float, float]] = []
+        for record in cloud_records:
+            ts_ms = _coerce_epoch_ms(record.get("context_time") or record.get("timestamp_utc") or record.get("message_client_timestamp"))
+            if ts_ms is None:
+                continue
+            cloud_rows.append((ts_ms, 1.0, float(record.get("message_num_stalls") or 0.0)))
+        if cloud_rows:
+            cloud_frame = pd.DataFrame(cloud_rows, columns=["ts_ms", "event_count", "stall_count"])
+            event_ts = cloud_frame["ts_ms"].to_numpy(dtype="int64", copy=False)
+            df["tech_cloud_stats_events_24h"] = _windowed_sums_for_all_rows(
+                row_ts_ms,
+                event_ts,
+                cloud_frame["event_count"].to_numpy(dtype="float32", copy=False),
+                window_ms=day_ms,
+            )
+            df["tech_cloud_stalls_24h"] = _windowed_sums_for_all_rows(
+                row_ts_ms,
+                event_ts,
+                cloud_frame["stall_count"].to_numpy(dtype="float32", copy=False),
+                window_ms=day_ms,
+            )
+
+    for column in defaults:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0).astype("float32")
+
+    logger.info("Added %d technical context columns to %d listening rows.", len(defaults), rows)
+    return df
 
 
 def append_audio_features(df: pd.DataFrame, enable_spotify_features: bool, logger) -> pd.DataFrame:

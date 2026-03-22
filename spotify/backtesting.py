@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import gc
 import os
 import csv
 import json
@@ -15,8 +16,8 @@ from .benchmarks import (
     build_classical_estimator,
     build_full_tabular_dataset,
     evaluate_classical_estimator,
+    get_classical_model_registry,
     resolve_classical_parallelism,
-    validate_classical_models,
 )
 from .data import PreparedData
 
@@ -24,6 +25,7 @@ from .data import PreparedData
 @dataclass
 class BacktestFoldResult:
     model_name: str
+    model_type: str
     model_family: str
     fold: int
     train_rows: int
@@ -84,6 +86,7 @@ def _run_backtest_job(
     _, _, top1, top5, _, _ = evaluate_classical_estimator(estimator, X_test, y_test, X_test, y_test)
     return BacktestFoldResult(
         model_name=model_name,
+        model_type="classical",
         model_family=family,
         fold=fold_idx,
         train_rows=len(X_train),
@@ -94,12 +97,227 @@ def _run_backtest_job(
     )
 
 
+def _extract_artist_predictions(prediction) -> np.ndarray:
+    if isinstance(prediction, dict):
+        if "artist_output" in prediction:
+            return np.asarray(prediction["artist_output"])
+        first_value = next(iter(prediction.values()))
+        return np.asarray(first_value)
+    if isinstance(prediction, (list, tuple)):
+        return np.asarray(prediction[0])
+    return np.asarray(prediction)
+
+
+def _topk_accuracy_from_proba(proba: np.ndarray, y_true: np.ndarray, *, k: int) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    kk = max(1, min(int(k), int(proba_arr.shape[1])))
+    topk_idx = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+    hits = np.any(topk_idx == y_arr.reshape(-1, 1), axis=1)
+    return float(np.mean(hits))
+
+
+def _tail_slice(n_rows: int, max_rows: int) -> slice:
+    if max_rows <= 0 or n_rows <= max_rows:
+        return slice(0, n_rows)
+    return slice(n_rows - max_rows, n_rows)
+
+
+def _deep_train_validation_split(n_rows: int, reference_rows: int) -> tuple[slice, slice] | None:
+    if n_rows <= 1:
+        return None
+    val_rows = min(n_rows - 1, max(1, min(reference_rows, max(1, n_rows // 5))))
+    split_idx = n_rows - val_rows
+    if split_idx <= 0:
+        return None
+    return slice(0, split_idx), slice(split_idx, n_rows)
+
+
+def _resolve_backtest_model_groups(selected_models: tuple[str, ...], random_seed: int) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    from .config import DEFAULT_MODEL_NAMES
+
+    classical_registry = get_classical_model_registry(random_seed)
+    deep_registry = set(DEFAULT_MODEL_NAMES)
+    classical: list[str] = []
+    deep: list[str] = []
+    unknown: list[str] = []
+
+    for model_name in selected_models:
+        if model_name in classical_registry:
+            classical.append(model_name)
+        elif model_name in deep_registry:
+            deep.append(model_name)
+        else:
+            unknown.append(model_name)
+
+    if unknown:
+        known = ", ".join(sorted(set(classical_registry) | deep_registry))
+        raise ValueError(f"Unknown temporal backtest model names: {', '.join(unknown)}. Known models: {known}")
+
+    return tuple(classical), tuple(deep)
+
+
+def _resolve_deep_builders(
+    *,
+    data: PreparedData,
+    selected_models: tuple[str, ...],
+    deep_model_builders,
+) -> dict[str, object]:
+    if not selected_models:
+        return {}
+
+    if deep_model_builders is None:
+        from .modeling import build_model_builders
+
+        built = build_model_builders(
+            sequence_length=int(data.X_seq_train.shape[1]),
+            num_artists=int(data.num_artists),
+            num_ctx=int(data.num_ctx),
+            selected_names=selected_models,
+        )
+        return {name: builder for name, builder in built}
+
+    if isinstance(deep_model_builders, dict):
+        resolved = dict(deep_model_builders)
+    else:
+        resolved = {name: builder for name, builder in deep_model_builders}
+
+    missing = [name for name in selected_models if name not in resolved]
+    if missing:
+        raise ValueError(f"Missing deep temporal backtest builders for: {', '.join(missing)}")
+    return resolved
+
+
+def _resolve_deep_strategy(strategy, logger):
+    if strategy is not None:
+        return strategy
+
+    from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
+
+    configure_process_env()
+    tf = load_tensorflow_runtime(logger)
+    return select_distribution_strategy(tf, logger=logger)
+
+
+def _run_deep_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    model_builder,
+    strategy,
+    batch_size: int,
+    epochs: int,
+    X_seq_fit: np.ndarray,
+    X_ctx_fit: np.ndarray,
+    y_fit: np.ndarray,
+    y_skip_fit: np.ndarray,
+    X_seq_val: np.ndarray,
+    X_ctx_val: np.ndarray,
+    y_val: np.ndarray,
+    y_skip_val: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+) -> BacktestFoldResult:
+    import tensorflow as tf
+
+    tf.keras.backend.clear_session()
+    try:
+        try:
+            tf.keras.utils.set_random_seed(int(random_seed))
+        except Exception:
+            tf.random.set_seed(int(random_seed))
+        started = time.perf_counter()
+        with strategy.scope():
+            model = model_builder()
+            single_head = len(model.outputs) == 1
+            if single_head:
+                model.compile(
+                    optimizer="adam",
+                    loss="sparse_categorical_crossentropy",
+                    metrics=[
+                        "sparse_categorical_accuracy",
+                        tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name="top_5"),
+                    ],
+                )
+                fit_targets = y_fit
+                val_targets = y_val
+                monitor_metric = "val_sparse_categorical_accuracy"
+            else:
+                model.compile(
+                    optimizer="adam",
+                    loss={
+                        "artist_output": "sparse_categorical_crossentropy",
+                        "skip_output": "binary_crossentropy",
+                    },
+                    metrics={
+                        "artist_output": [
+                            "sparse_categorical_accuracy",
+                            tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name="top_5"),
+                        ],
+                        "skip_output": ["accuracy"],
+                    },
+                    loss_weights={"artist_output": 1.0, "skip_output": 0.2},
+                )
+                fit_targets = {
+                    "artist_output": y_fit,
+                    "skip_output": y_skip_fit,
+                }
+                val_targets = {
+                    "artist_output": y_val,
+                    "skip_output": y_skip_val,
+                }
+                monitor_metric = "val_artist_output_sparse_categorical_accuracy"
+
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor=monitor_metric,
+                patience=1,
+                mode="max",
+                restore_best_weights=True,
+            )
+        ]
+        effective_batch = max(1, min(int(batch_size), len(X_seq_fit)))
+        model.fit(
+            (X_seq_fit, X_ctx_fit),
+            fit_targets,
+            validation_data=((X_seq_val, X_ctx_val), val_targets),
+            epochs=max(1, int(epochs)),
+            batch_size=effective_batch,
+            verbose=0,
+            callbacks=callbacks,
+        )
+        fit_seconds = float(time.perf_counter() - started)
+        prediction = model.predict((X_seq_test, X_ctx_test), verbose=0)
+        artist_proba = _extract_artist_predictions(prediction)
+        top1 = float(np.mean(np.argmax(artist_proba, axis=1) == np.asarray(y_test).reshape(-1)))
+        top5 = _topk_accuracy_from_proba(artist_proba, y_test, k=5)
+        return BacktestFoldResult(
+            model_name=model_name,
+            model_type="deep",
+            model_family="neural",
+            fold=fold_idx,
+            train_rows=len(X_seq_fit),
+            test_rows=len(X_seq_test),
+            fit_seconds=fit_seconds,
+            top1=top1,
+            top5=top5,
+        )
+    finally:
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+
 def _write_backtest_csv(results: list[BacktestFoldResult], output_path: Path) -> None:
     with output_path.open("w", newline="", encoding="utf-8") as outfile:
         writer = csv.DictWriter(
             outfile,
             fieldnames=[
                 "model_name",
+                "model_type",
                 "model_family",
                 "fold",
                 "train_rows",
@@ -150,15 +368,25 @@ def run_temporal_backtest(
     max_eval_samples: int,
     logger,
     feature_bundle: ClassicalFeatureBundle | None = None,
+    deep_model_builders=None,
+    strategy=None,
 ) -> list[BacktestFoldResult]:
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
         return []
 
-    validate_classical_models(selected_models, random_seed)
+    classical_models, deep_models = _resolve_backtest_model_groups(selected_models, random_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
+    X_all_ctx = np.concatenate(
+        [
+            data.X_ctx_train.astype("float32", copy=False),
+            data.X_ctx_val.astype("float32", copy=False),
+            data.X_ctx_test.astype("float32", copy=False),
+        ],
+        axis=0,
+    )
     if feature_bundle is None:
         X_all_seq = np.concatenate(
             [
@@ -177,6 +405,14 @@ def run_temporal_backtest(
             ],
             axis=0,
         )
+    y_skip_all = np.concatenate(
+        [
+            np.asarray(data.y_skip_train),
+            np.asarray(data.y_skip_val),
+            np.asarray(data.y_skip_test),
+        ],
+        axis=0,
+    )
     windows = _build_expanding_windows(len(X_all), folds)
     if not windows:
         logger.warning("Unable to build temporal backtest windows from %d rows.", len(X_all))
@@ -219,7 +455,7 @@ def run_temporal_backtest(
         if len(X_train_tab) == 0 or len(X_test_tab) == 0:
             continue
 
-        for model_name in selected_models:
+        for model_name in classical_models:
             if model_name == "session_knn":
                 jobs.append((fold_idx, model_name, X_train_seq, y_train, X_test_seq, y_test))
             else:
@@ -289,6 +525,87 @@ def run_temporal_backtest(
                 row.top1,
                 f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
             )
+
+    if deep_models:
+        deep_epochs_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_EPOCHS", "3").strip()
+        deep_batch_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_BATCH_SIZE", "256").strip()
+        try:
+            deep_epochs = max(1, int(deep_epochs_raw))
+        except Exception:
+            deep_epochs = 3
+        try:
+            deep_batch_size = max(1, int(deep_batch_raw))
+        except Exception:
+            deep_batch_size = 256
+
+        resolved_strategy = _resolve_deep_strategy(strategy, logger)
+        deep_builders = _resolve_deep_builders(
+            data=data,
+            selected_models=deep_models,
+            deep_model_builders=deep_model_builders,
+        )
+        logger.info(
+            "Deep temporal backtesting: models=%s epochs=%d batch_size=%d",
+            ",".join(deep_models),
+            deep_epochs,
+            deep_batch_size,
+        )
+
+        for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
+            train_slice = _tail_slice(test_start, max_train_samples)
+            test_slice = _tail_slice(test_end - test_start, max_eval_samples)
+
+            X_train_seq = X_all_seq[:test_start][train_slice]
+            X_train_ctx = X_all_ctx[:test_start][train_slice]
+            y_train = y_all[:test_start][train_slice]
+            y_skip_train = y_skip_all[:test_start][train_slice]
+
+            X_test_seq = X_all_seq[test_start:test_end][test_slice]
+            X_test_ctx = X_all_ctx[test_start:test_end][test_slice]
+            y_test = y_all[test_start:test_end][test_slice]
+
+            if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
+                continue
+
+            split_slices = _deep_train_validation_split(len(X_train_seq), len(X_test_seq))
+            if split_slices is None:
+                continue
+            fit_slice, val_slice = split_slices
+
+            for model_name in deep_models:
+                try:
+                    row = _run_deep_backtest_job(
+                        model_name=model_name,
+                        fold_idx=fold_idx,
+                        random_seed=random_seed + fold_idx,
+                        model_builder=deep_builders[model_name],
+                        strategy=resolved_strategy,
+                        batch_size=deep_batch_size,
+                        epochs=deep_epochs,
+                        X_seq_fit=X_train_seq[fit_slice],
+                        X_ctx_fit=X_train_ctx[fit_slice],
+                        y_fit=y_train[fit_slice],
+                        y_skip_fit=y_skip_train[fit_slice],
+                        X_seq_val=X_train_seq[val_slice],
+                        X_ctx_val=X_train_ctx[val_slice],
+                        y_val=y_train[val_slice],
+                        y_skip_val=y_skip_train[val_slice],
+                        X_seq_test=X_test_seq,
+                        X_ctx_test=X_test_ctx,
+                        y_test=y_test,
+                    )
+                except Exception as exc:
+                    logger.warning("Deep backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                    continue
+                results.append(row)
+                logger.info(
+                    "[BACKTEST] fold=%d model=%s type=%s top1=%.4f top5=%s",
+                    row.fold,
+                    row.model_name,
+                    row.model_type,
+                    row.top1,
+                    f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+                )
 
     _write_backtest_csv(results, output_dir / "temporal_backtest.csv")
     _plot_backtest(results, output_dir / "temporal_backtest_top1.png")

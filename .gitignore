@@ -4,6 +4,7 @@ __pycache__/
 
 # Virtual envs
 .venv/
+.venv-metal/
 
 # OS/editor noise
 .DS_Store

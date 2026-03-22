@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,7 @@ from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
 from .predict_next import PredictionInputContext, _prepare_inputs, load_prediction_input_context
 from .serving import load_predictor, resolve_model_row
+from .uncertainty import SplitConformalCalibration, calibration_from_payload, conformal_prediction_sets
 
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_MAX_TOP_K = 20
@@ -48,6 +50,14 @@ class PredictRequestPayload(TypedDict):
     top_k: int
     include_video: bool
     recent_artists: list[str] | None
+    allow_abstain: bool
+    return_prediction_set: bool
+
+
+def _slugify(raw: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", str(raw).strip())
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    return value or "model"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -205,13 +215,25 @@ def _normalize_top_k(value: object, *, max_top_k: int) -> int:
     return int(value)
 
 
+def _normalize_optional_bool(value: object, *, default: bool, field_name: str) -> bool:
+    if value is None:
+        return bool(default)
+    if not isinstance(value, bool):
+        raise RequestValidationError(
+            status_code=422,
+            code=f"invalid_{field_name}",
+            message=f"{field_name} must be a boolean.",
+        )
+    return bool(value)
+
+
 def normalize_predict_payload(
     payload: dict[str, object],
     *,
     default_include_video: bool,
     max_top_k: int,
 ) -> PredictRequestPayload:
-    allowed_keys = {"top_k", "include_video", "recent_artists"}
+    allowed_keys = {"top_k", "include_video", "recent_artists", "allow_abstain", "return_prediction_set"}
     unknown_keys = sorted(set(payload.keys()) - allowed_keys)
     if unknown_keys:
         raise RequestValidationError(
@@ -233,11 +255,23 @@ def normalize_predict_payload(
     include_video = bool(include_video_raw)
 
     recent_artists = _normalize_recent_artists(payload.get("recent_artists"))
+    allow_abstain = _normalize_optional_bool(
+        payload.get("allow_abstain"),
+        default=False,
+        field_name="allow_abstain",
+    )
+    return_prediction_set = _normalize_optional_bool(
+        payload.get("return_prediction_set"),
+        default=False,
+        field_name="return_prediction_set",
+    )
 
     return {
         "top_k": top_k,
         "include_video": include_video,
         "recent_artists": recent_artists,
+        "allow_abstain": allow_abstain,
+        "return_prediction_set": return_prediction_set,
     }
 
 
@@ -282,6 +316,7 @@ class PredictionService:
         self._context_lock = threading.Lock()
         self._predict_lock = threading.Lock()
         self._context_cache: dict[bool, _PredictionContextCacheEntry] = {}
+        self._conformal_calibration: SplitConformalCalibration | None = None
 
         metadata_path = run_dir / "feature_metadata.json"
         with metadata_path.open("r", encoding="utf-8") as infile:
@@ -299,11 +334,44 @@ class PredictionService:
         )
         self.model_name = self.predictor.model_name
         self.model_type = self.predictor.model_type
+        self._conformal_calibration = self._load_conformal_calibration(model_row)
         try:
             self._get_prediction_context(include_video=self.include_video)
         except Exception as exc:
             logger.info("Prediction context warm-up skipped: %s", exc)
-        logger.info("Loaded serveable predictor: model=%s type=%s", self.model_name, self.model_type)
+        logger.info(
+            "Loaded serveable predictor: model=%s type=%s conformal=%s",
+            self.model_name,
+            self.model_type,
+            bool(self._conformal_calibration),
+        )
+
+    def _load_conformal_calibration(self, model_row: dict[str, object]) -> SplitConformalCalibration | None:
+        model_name = str(model_row.get("model_name", "")).strip()
+        model_type = str(model_row.get("model_type", "")).strip().lower()
+        if not model_name:
+            return None
+
+        if model_type == "deep":
+            prefix = "deep"
+        elif model_type in ("classical", "classical_tuned"):
+            prefix = "classical"
+        elif model_type == "ensemble":
+            prefix = "ensemble"
+        else:
+            return None
+
+        summary_path = self.run_dir / "analysis" / f"{_slugify(f'{prefix}_{model_name}')}_conformal_summary.json"
+        if not summary_path.exists():
+            return None
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        calibration = calibration_from_payload(payload.get("calibration"))
+        if calibration is None:
+            return None
+        return calibration
 
     def _prediction_source_signature(self, *, include_video: bool) -> tuple[tuple[str, int, int], ...]:
         root = self.data_dir.expanduser().resolve()
@@ -346,7 +414,15 @@ class PredictionService:
             )
             return context
 
-    def predict(self, *, top_k: int, recent_artists: list[str] | None, include_video: bool) -> dict[str, object]:
+    def predict(
+        self,
+        *,
+        top_k: int,
+        recent_artists: list[str] | None,
+        include_video: bool,
+        allow_abstain: bool = False,
+        return_prediction_set: bool = False,
+    ) -> dict[str, object]:
         context = self._get_prediction_context(include_video=include_video)
         seq_batch, ctx_batch, sequence_names = _prepare_inputs(
             run_dir=self.run_dir,
@@ -379,12 +455,51 @@ class PredictionService:
                 }
             )
 
-        return {
+        result: dict[str, object] = {
             "model_name": self.model_name,
             "model_type": self.model_type,
             "sequence_tail": sequence_names,
             "predictions": predictions,
         }
+        decision = "predict"
+        if self._conformal_calibration is not None:
+            prediction_set = conformal_prediction_sets(
+                artist_probs.reshape(1, -1),
+                calibration=self._conformal_calibration,
+            )[0]
+            prediction_set_total = int(prediction_set.size)
+            top1_confidence = float(np.max(artist_probs)) if artist_probs.size else float("nan")
+            would_abstain = bool(top1_confidence < (float(self._conformal_calibration.threshold) - 1e-12))
+            if allow_abstain and would_abstain:
+                decision = "abstain"
+
+            uncertainty_payload: dict[str, object] = {
+                "conformal_enabled": True,
+                "method": self._conformal_calibration.method,
+                "alpha": float(self._conformal_calibration.alpha),
+                "threshold": float(self._conformal_calibration.threshold),
+                "top1_confidence": top1_confidence,
+                "would_abstain": would_abstain,
+                "abstained": bool(allow_abstain and would_abstain),
+                "prediction_set_size": prediction_set_total,
+                "prediction_set_truncated": bool(prediction_set_total > self.max_top_k),
+            }
+            if return_prediction_set:
+                limited_indices = prediction_set[: self.max_top_k]
+                uncertainty_payload["prediction_set"] = [
+                    {
+                        "artist_label": int(idx),
+                        "artist_name": self.artist_labels[int(idx)] if 0 <= int(idx) < len(self.artist_labels) else str(int(idx)),
+                        "probability": float(artist_probs[int(idx)]),
+                    }
+                    for idx in limited_indices.tolist()
+                ]
+            result["uncertainty"] = uncertainty_payload
+        else:
+            result["uncertainty"] = {"conformal_enabled": False}
+
+        result["decision"] = decision
+        return result
 
 
 def _build_handler(service: PredictionService):
@@ -434,6 +549,7 @@ def _build_handler(service: PredictionService):
                         "run_dir": str(service.run_dir),
                         "max_top_k": service.max_top_k,
                         "requires_auth": bool(service.auth_token),
+                        "conformal_enabled": bool(service._conformal_calibration),
                     },
                 )
                 return
@@ -474,6 +590,8 @@ def _build_handler(service: PredictionService):
                     top_k=normalized["top_k"],
                     recent_artists=normalized["recent_artists"],
                     include_video=normalized["include_video"],
+                    allow_abstain=normalized["allow_abstain"],
+                    return_prediction_set=normalized["return_prediction_set"],
                 )
                 self._send_json(200, result)
             except (RuntimeError, ValueError, FileNotFoundError) as exc:

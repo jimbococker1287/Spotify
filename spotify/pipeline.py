@@ -10,8 +10,9 @@ import sys
 
 import numpy as np
 
+from .artifact_cleanup import prune_old_auxiliary_artifacts, prune_run_artifacts
 from .champion_alias import best_serveable_model, write_champion_alias
-from .config import PipelineConfig, configure_logging
+from .config import DEFAULT_MODEL_NAMES, PipelineConfig, configure_logging
 from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
 from .tracking import MlflowTracker
 
@@ -31,6 +32,22 @@ def _build_run_id(config: PipelineConfig) -> str:
 def _track_file(tracker: MlflowTracker | None, path: Path) -> None:
     if tracker is not None and path.exists():
         tracker.log_artifact(path)
+
+
+def _release_deep_runtime_resources(tf_module, logger) -> None:
+    import gc
+
+    gc.collect()
+    if tf_module is None:
+        logger.info("Released Python memory after deep-model stage.")
+        return
+
+    try:
+        tf_module.keras.backend.clear_session()
+    except Exception as exc:
+        logger.warning("TensorFlow session cleanup encountered a non-fatal error: %s", exc)
+    gc.collect()
+    logger.info("Released TensorFlow and Python memory after deep-model stage.")
 
 
 def run_pipeline(config: PipelineConfig) -> None:
@@ -88,10 +105,13 @@ def run_pipeline(config: PipelineConfig) -> None:
         run_classical_models = bool(config.enable_classical_models)
         if config.classical_only:
             run_classical_models = True
+        run_deep_backtest = bool(config.enable_temporal_backtest) and any(
+            model_name in DEFAULT_MODEL_NAMES for model_name in config.temporal_backtest_model_names
+        )
 
         tf = None
         strategy = None
-        if run_deep_models:
+        if run_deep_models or run_deep_backtest:
             # Initialize TensorFlow before heavy numpy/pandas/sklearn preprocessing.
             # On some macOS TensorFlow builds, late initialization can deadlock in the
             # internal prefetch pipeline at the first training batch.
@@ -149,6 +169,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         from .data_quality import run_data_quality_gate
         from .ensemble import build_probability_ensemble
         from .governance import evaluate_champion_gate
+        from .drift import run_drift_diagnostics
         from .explainability import run_shap_analysis
         from .evaluation import run_extended_evaluation
         from .modeling import build_model_builders
@@ -239,6 +260,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             }
         )
 
+        model_builders = None
         if run_deep_models:
             model_builders = build_model_builders(
                 sequence_length=config.sequence_length,
@@ -433,8 +455,20 @@ def run_pipeline(config: PipelineConfig) -> None:
         elif config.enable_optuna:
             logger.info("Skipping Optuna tuning because classical models are disabled.")
 
-        if run_classical_models and config.enable_temporal_backtest:
+        if config.enable_temporal_backtest:
             backtest_dir = run_dir / "backtest"
+            deep_backtest_builders = model_builders
+            if run_deep_backtest and deep_backtest_builders is None:
+                deep_backtest_names = tuple(
+                    model_name for model_name in config.temporal_backtest_model_names if model_name in DEFAULT_MODEL_NAMES
+                )
+                if deep_backtest_names:
+                    deep_backtest_builders = build_model_builders(
+                        sequence_length=config.sequence_length,
+                        num_artists=prepared.num_artists,
+                        num_ctx=prepared.num_ctx,
+                        selected_names=deep_backtest_names,
+                    )
             backtest_results = run_temporal_backtest(
                 data=prepared,
                 output_dir=backtest_dir,
@@ -445,11 +479,14 @@ def run_pipeline(config: PipelineConfig) -> None:
                 max_eval_samples=config.classical_max_eval_samples,
                 logger=logger,
                 feature_bundle=classical_feature_bundle,
+                deep_model_builders=deep_backtest_builders,
+                strategy=strategy,
             )
             for row in backtest_results:
                 backtest_rows.append(
                     {
                         "model_name": row.model_name,
+                        "model_type": row.model_type,
                         "model_family": row.model_family,
                         "fold": row.fold,
                         "train_rows": row.train_rows,
@@ -461,8 +498,9 @@ def run_pipeline(config: PipelineConfig) -> None:
                 )
             if backtest_dir.exists():
                 artifact_paths.extend(sorted(p for p in backtest_dir.glob("*") if p.is_file()))
-        elif config.enable_temporal_backtest:
-            logger.info("Skipping temporal backtesting because classical models are disabled.")
+
+        if tf is not None:
+            _release_deep_runtime_resources(tf, logger)
 
         if not result_rows:
             raise RuntimeError("No models were run. Enable deep and/or classical models.")
@@ -485,10 +523,20 @@ def run_pipeline(config: PipelineConfig) -> None:
             run_dir=run_dir,
             random_seed=config.random_seed,
             max_train_samples=config.classical_max_train_samples,
+            enable_conformal=config.enable_conformal,
+            conformal_alpha=config.conformal_alpha,
             logger=logger,
             feature_bundle=classical_feature_bundle,
         )
         artifact_paths.extend(extended_eval_artifacts)
+        artifact_paths.extend(
+            run_drift_diagnostics(
+                data=prepared,
+                sequence_length=config.sequence_length,
+                output_dir=run_dir / "analysis",
+                logger=logger,
+            )
+        )
 
         leaderboard_path = plot_run_leaderboard(result_rows, run_dir)
         if leaderboard_path is not None:
@@ -547,12 +595,14 @@ def run_pipeline(config: PipelineConfig) -> None:
         )
         strict_gate_raw = os.getenv("SPOTIFY_CHAMPION_GATE_STRICT", "0").strip().lower()
         strict_gate = strict_gate_raw in ("1", "true", "yes", "on")
+        strict_gate_error: str | None = None
         if strict_gate and not bool(champion_gate.get("promoted", False)):
-            raise RuntimeError(
+            strict_gate_error = (
                 "Champion gate failed in strict mode: "
                 f"regression={champion_gate.get('regression')} threshold={champion_gate.get('threshold')}"
             )
 
+        champion_model: tuple[str, str] | None = None
         if bool(champion_gate.get("promoted", False)):
             champion_model = best_serveable_model(result_rows, run_dir=run_dir)
             if not champion_model:
@@ -586,6 +636,45 @@ def run_pipeline(config: PipelineConfig) -> None:
                 )
         else:
             champion_alias_payload["reason"] = "gate_not_promoted"
+
+        artifact_cleanup_mode = os.getenv("SPOTIFY_ARTIFACT_CLEANUP", "light")
+        artifact_cleanup_min_mb_raw = os.getenv("SPOTIFY_ARTIFACT_CLEANUP_MIN_MB", "100").strip()
+        try:
+            artifact_cleanup_min_mb = max(0.0, float(artifact_cleanup_min_mb_raw))
+        except Exception:
+            artifact_cleanup_min_mb = 100.0
+        cleanup_summary = prune_run_artifacts(
+            run_dir=run_dir,
+            result_rows=result_rows,
+            selected_model=champion_model,
+            logger=logger,
+            cleanup_mode=artifact_cleanup_mode,
+            min_size_mb=artifact_cleanup_min_mb,
+        )
+        cleanup_path = run_dir / "artifact_cleanup.json"
+        cleanup_path.write_text(json.dumps(cleanup_summary, indent=2), encoding="utf-8")
+        artifact_paths.append(cleanup_path)
+
+        prune_old_prediction_bundles_raw = os.getenv("SPOTIFY_PRUNE_OLD_PREDICTION_BUNDLES", "1").strip().lower()
+        prune_old_prediction_bundles = prune_old_prediction_bundles_raw in ("1", "true", "yes", "on")
+        prune_old_run_dbs_raw = os.getenv("SPOTIFY_PRUNE_OLD_RUN_DATABASES", "1").strip().lower()
+        prune_old_run_dbs = prune_old_run_dbs_raw in ("1", "true", "yes", "on")
+        keep_full_runs_raw = os.getenv("SPOTIFY_KEEP_FULL_RUNS", "2").strip()
+        try:
+            keep_full_runs = max(0, int(keep_full_runs_raw))
+        except Exception:
+            keep_full_runs = 2
+        retention_summary = prune_old_auxiliary_artifacts(
+            output_dir=config.output_dir,
+            current_run_dir=run_dir,
+            logger=logger,
+            keep_last_full_runs=keep_full_runs,
+            prune_prediction_bundles=prune_old_prediction_bundles,
+            prune_run_databases=prune_old_run_dbs,
+        )
+        retention_path = run_dir / "artifact_retention.json"
+        retention_path.write_text(json.dumps(retention_summary, indent=2), encoding="utf-8")
+        artifact_paths.append(retention_path)
 
         if optuna_rows:
             optuna_history_csv = append_optuna_history(
@@ -635,6 +724,8 @@ def run_pipeline(config: PipelineConfig) -> None:
             "cache": cache_info_payload,
             "champion_gate": champion_gate,
             "champion_alias": champion_alias_payload,
+            "artifact_cleanup": cleanup_summary,
+            "artifact_retention": retention_summary,
         }
         manifest_path = run_dir / "run_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as out:
@@ -649,15 +740,19 @@ def run_pipeline(config: PipelineConfig) -> None:
         refresh_analytics_raw = os.getenv("SPOTIFY_REFRESH_ANALYTICS_DB", "1").strip().lower()
         refresh_analytics = refresh_analytics_raw not in ("0", "false", "no", "off")
         if refresh_analytics:
-            analytics_db_path = refresh_analytics_database(
-                data_dir=config.data_dir,
-                output_dir=config.output_dir,
-                include_video=config.include_video,
-                logger=logger,
-                raw_df=raw_df,
-            )
-            if analytics_db_path is not None and analytics_db_path.exists():
-                artifact_paths.append(analytics_db_path)
+            try:
+                analytics_db_path = refresh_analytics_database(
+                    data_dir=config.data_dir,
+                    output_dir=config.output_dir,
+                    include_video=config.include_video,
+                    logger=logger,
+                    raw_df=raw_df,
+                )
+            except Exception as exc:
+                logger.warning("Analytics database refresh failed but the run will continue: %s", exc)
+            else:
+                if analytics_db_path is not None and analytics_db_path.exists():
+                    artifact_paths.append(analytics_db_path)
 
         report_path = write_run_report(
             run_dir=run_dir,
@@ -694,6 +789,9 @@ def run_pipeline(config: PipelineConfig) -> None:
             tracker.log_backtest_rows(backtest_rows)
         for path in artifact_paths:
             _track_file(tracker, path)
+
+        if strict_gate_error is not None:
+            raise RuntimeError(strict_gate_error)
 
         logger.info("Pipeline completed successfully")
         final_tracker_status = "FINISHED"

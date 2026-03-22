@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
+import time
 
 import joblib
 import numpy as np
@@ -217,3 +221,100 @@ def test_analytics_db_refresh_can_reuse_preloaded_raw_df(tmp_path: Path) -> None
 
     assert db_path is not None
     assert Path(db_path).exists()
+
+
+def test_analytics_db_refresh_returns_none_when_duckdb_connect_fails(tmp_path: Path, monkeypatch) -> None:
+    logger = logging.getLogger("spotify.test.analytics.locked")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    class _LockedDuckDbModule:
+        @staticmethod
+        def connect(path: str):
+            raise RuntimeError(f"locked: {path}")
+
+    monkeypatch.setitem(__import__("sys").modules, "duckdb", _LockedDuckDbModule())
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir(parents=True)
+
+    db_path = refresh_analytics_database(
+        data_dir=tmp_path / "data" / "raw",
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+        raw_df=pd.DataFrame(),
+    )
+
+    assert db_path is None
+
+
+def test_analytics_db_refresh_returns_none_when_duckdb_locked_by_other_process(tmp_path: Path) -> None:
+    logger = logging.getLogger("spotify.test.analytics.external_lock")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    output_dir = tmp_path / "outputs"
+    analytics_dir = output_dir / "analytics"
+    analytics_dir.mkdir(parents=True)
+    db_path = analytics_dir / "spotify_analytics.duckdb"
+    ready_path = tmp_path / "duckdb_lock.ready"
+    locker_script = tmp_path / "hold_duckdb_lock.py"
+    locker_script.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            import time
+
+            import duckdb
+
+            db_path = Path(r"{db_path}")
+            ready_path = Path(r"{ready_path}")
+
+            con = duckdb.connect(str(db_path))
+            con.execute("CREATE TABLE IF NOT EXISTS heartbeat AS SELECT 1 AS value")
+            ready_path.write_text("locked", encoding="utf-8")
+            try:
+                time.sleep(30)
+            finally:
+                con.close()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, str(locker_script)],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(50):
+            if ready_path.exists():
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        error_output = ""
+        if proc.poll() is not None and proc.stderr is not None:
+            error_output = proc.stderr.read()
+        assert ready_path.exists(), f"locker process did not acquire DuckDB lock: {error_output}"
+
+        refreshed_path = refresh_analytics_database(
+            data_dir=tmp_path / "data" / "raw",
+            output_dir=output_dir,
+            include_video=False,
+            logger=logger,
+            raw_df=pd.DataFrame(),
+        )
+
+        assert refreshed_path is None
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)

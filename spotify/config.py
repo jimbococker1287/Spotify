@@ -52,6 +52,7 @@ DEFAULT_EPOCHS = 50
 DEFAULT_SEQUENCE_LENGTH = 30
 DEFAULT_MAX_ARTISTS = 200
 DEFAULT_SEED = 42
+DEFAULT_CONFORMAL_ALPHA = 0.10
 CORE_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "logreg",
     "random_forest",
@@ -244,6 +245,8 @@ class PipelineConfig:
     include_video: bool = True
     enable_spotify_features: bool = False
     enable_shap: bool = True
+    enable_conformal: bool = True
+    conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA
     enable_classical_models: bool = True
     classical_only: bool = False
     model_names: tuple[str, ...] = DEFAULT_MODEL_NAMES
@@ -319,6 +322,16 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     enable_shap = bool(preset["enable_shap"])
     if args.no_shap:
         enable_shap = False
+
+    enable_conformal = bool(preset.get("enable_conformal", True))
+    if args.no_conformal:
+        enable_conformal = False
+    conformal_alpha = (
+        float(args.conformal_alpha)
+        if args.conformal_alpha is not None
+        else float(preset.get("conformal_alpha", DEFAULT_CONFORMAL_ALPHA))
+    )
+    conformal_alpha = min(0.99, max(1e-6, conformal_alpha))
 
     enable_classical_models = bool(preset["enable_classical_models"])
     if args.no_classical_models:
@@ -406,6 +419,8 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         include_video=include_video,
         enable_spotify_features=enable_spotify_features,
         enable_shap=enable_shap,
+        enable_conformal=enable_conformal,
+        conformal_alpha=conformal_alpha,
         enable_classical_models=enable_classical_models,
         classical_only=classical_only,
         model_names=model_names,
@@ -545,3 +560,10 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help="Deprecated compatibility flag. Spotify audio feature fetch remains disabled.",
     )
     parser.add_argument("--no-shap", action="store_true", help="Skip SHAP explainability step.")
+    parser.add_argument("--no-conformal", action="store_true", help="Skip conformal uncertainty diagnostics.")
+    parser.add_argument(
+        "--conformal-alpha",
+        type=float,
+        default=None,
+        help="Target conformal risk level for uncertainty diagnostics and abstention thresholds.",
+    )

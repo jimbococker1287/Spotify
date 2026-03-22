@@ -16,6 +16,8 @@ def test_default_config_paths() -> None:
     assert config.sequence_length == 30
     assert config.epochs == 50
     assert config.enable_spotify_features is False
+    assert config.enable_conformal is True
+    assert config.conformal_alpha == 0.10
     assert config.enable_classical_models is True
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
@@ -119,6 +121,15 @@ def test_new_elite_flags_override_profile_defaults() -> None:
     assert config.temporal_backtest_model_names == ("logreg", "random_forest")
 
 
+def test_conformal_flags_override_profile_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--profile", "full", "--no-conformal", "--conformal-alpha", "0.2"])
+    config = build_config(args)
+
+    assert config.enable_conformal is False
+    assert config.conformal_alpha == 0.2
+
+
 def test_classical_subset_becomes_default_for_optuna_and_backtest() -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -134,3 +145,11 @@ def test_classical_subset_becomes_default_for_optuna_and_backtest() -> None:
     assert config.classical_model_names == ("logreg", "random_forest")
     assert config.optuna_model_names == ("logreg", "random_forest")
     assert config.temporal_backtest_model_names == ("logreg", "random_forest")
+
+
+def test_backtest_models_can_mix_deep_and_classical_names() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--backtest-models", "gru_artist,logreg"])
+    config = build_config(args)
+
+    assert config.temporal_backtest_model_names == ("gru_artist", "logreg")

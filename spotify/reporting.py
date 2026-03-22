@@ -512,6 +512,7 @@ def append_backtest_history(
         "run_name",
         "profile",
         "model_name",
+        "model_type",
         "model_family",
         "fold",
         "train_rows",
@@ -520,29 +521,39 @@ def append_backtest_history(
         "top1",
         "top5",
     ]
+    active_fieldnames = list(fieldnames)
+    if file_exists:
+        try:
+            with history_csv.open("r", encoding="utf-8", newline="") as infile:
+                reader = csv.reader(infile)
+                existing_header = next(reader, [])
+            if existing_header and "model_type" not in existing_header:
+                active_fieldnames = [name for name in fieldnames if name != "model_type"]
+        except Exception:
+            active_fieldnames = list(fieldnames)
 
     with history_csv.open("a", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer = csv.DictWriter(outfile, fieldnames=active_fieldnames)
         if not file_exists:
             writer.writeheader()
         timestamp = datetime.now().isoformat(timespec="seconds")
         for row in rows:
-            writer.writerow(
-                {
-                    "timestamp": timestamp,
-                    "run_id": run_id,
-                    "run_name": run_name or "",
-                    "profile": profile,
-                    "model_name": row.get("model_name", ""),
-                    "model_family": row.get("model_family", ""),
-                    "fold": row.get("fold", ""),
-                    "train_rows": row.get("train_rows", ""),
-                    "test_rows": row.get("test_rows", ""),
-                    "fit_seconds": row.get("fit_seconds", ""),
-                    "top1": row.get("top1", ""),
-                    "top5": row.get("top5", ""),
-                }
-            )
+            payload = {
+                "timestamp": timestamp,
+                "run_id": run_id,
+                "run_name": run_name or "",
+                "profile": profile,
+                "model_name": row.get("model_name", ""),
+                "model_type": row.get("model_type", ""),
+                "model_family": row.get("model_family", ""),
+                "fold": row.get("fold", ""),
+                "train_rows": row.get("train_rows", ""),
+                "test_rows": row.get("test_rows", ""),
+                "fit_seconds": row.get("fit_seconds", ""),
+                "top1": row.get("top1", ""),
+                "top5": row.get("top5", ""),
+            }
+            writer.writerow({key: payload.get(key, "") for key in active_fieldnames})
     return history_csv
 
 
@@ -754,6 +765,10 @@ def write_run_report(
         for pattern in (
             "ensemble_*_summary.json",
             "*_confidence_summary.json",
+            "*_conformal_summary.json",
+            "*drift*.json",
+            "*drift*.csv",
+            "*drift*.png",
             "*_reliability.png",
             "*_segment_metrics.csv",
             "*_top_errors.csv",

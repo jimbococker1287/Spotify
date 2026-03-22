@@ -84,7 +84,11 @@ def refresh_analytics_database(
     run_manifests = _collect_run_manifests(output_dir)
     run_results = _collect_run_results(output_dir)
 
-    con = duckdb.connect(str(db_path))
+    try:
+        con = duckdb.connect(str(db_path))
+    except Exception as exc:
+        logger.warning("DuckDB analytics refresh skipped because the database is busy or unavailable: %s", exc)
+        return None
     try:
         _replace_table(con, "raw_streaming_history", raw_df)
         _replace_table(con, "experiment_history", experiment_history)
@@ -124,7 +128,23 @@ def refresh_analytics_database(
                 ORDER BY profile, mean_val_top1 DESC
                 """
             )
-        if {"profile", "model_name", "top1"}.issubset(set(backtest_history.columns)):
+        if {"profile", "model_name", "top1", "model_type"}.issubset(set(backtest_history.columns)):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW backtest_model_summary AS
+                SELECT
+                  profile,
+                  model_name,
+                  model_type,
+                  AVG(CAST(top1 AS DOUBLE)) AS mean_backtest_top1,
+                  STDDEV_SAMP(CAST(top1 AS DOUBLE)) AS std_backtest_top1,
+                  COUNT(*) AS folds
+                FROM backtest_history
+                GROUP BY profile, model_name, model_type
+                ORDER BY profile, mean_backtest_top1 DESC
+                """
+            )
+        elif {"profile", "model_name", "top1"}.issubset(set(backtest_history.columns)):
             con.execute(
                 """
                 CREATE OR REPLACE VIEW backtest_model_summary AS
@@ -163,6 +183,9 @@ def refresh_analytics_database(
                 WHERE COALESCE(CAST("champion_gate.promoted" AS BOOLEAN), FALSE)
                 """
             )
+    except Exception as exc:
+        logger.warning("DuckDB analytics refresh did not complete: %s", exc)
+        return None
     finally:
         con.close()
 
