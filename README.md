@@ -1,6 +1,15 @@
-# Spotify Experiment Lab
+# Spotify Personal Taste OS
 
-This project is an end-to-end experiment system for Spotify extended streaming history with:
+This repository packages a Personal Taste OS on top of Spotify extended streaming history. The central idea is to turn raw listening logs into session-aware recommendations, explanations, and policy-safe public insights that can eventually power product modes like focus sessions, workout arcs, commute mode, discovery mode, "why this next", and adaptive playlist steering.
+
+The repo is broad, but the parts fit together around four clear surfaces:
+
+- Taste engine: training, benchmarking, retrieval, uncertainty, and champion gating
+- Session planner: digital twin, causal friction, journey planning, safe policy routing, and stress tests
+- Personal insights CLI: policy-safe explainers, release tracking, playlist diffing, and catalog exploration
+- Serving layer: prediction CLI, HTTP service, and promoted-model aliases
+
+The current system already includes:
 
 - Deep model training
 - Classical model benchmarking
@@ -10,6 +19,7 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Prepared-data fingerprint caching
 - Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
 - Champion/challenger gating
+- Recommender safety platform primitives for governance, drift, backtesting, and conformal abstention across arbitrary sequence recommenders
 - Drift diagnostics across train/validation/test regimes
 - Self-supervised sequence pretraining for artist embeddings
 - Two-stage retrieval plus reranking recommenders
@@ -18,7 +28,7 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Robustness slice evaluation across friction, repeat, platform, and session regimes
 - Semi-synthetic policy simulation for offline policy comparison
 - Benchmark protocol, experiment registry, ablation, and significance artifacts
-- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, and stress tests
+- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, group Auto-DJ planning, and stress tests
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
 - Per-run Markdown auto-report
@@ -26,6 +36,21 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Benchmark lock runs with seed-based confidence intervals
 - Prediction CLI for serving top-k next-artist recommendations
 - Conformal uncertainty diagnostics with abstaining prediction support
+
+## Product Direction
+
+The strongest big-scope bet in this codebase is `Personal Taste OS`: use the digital twin, journey planner, safe policy layer, and public metadata surface to actively shape listening sessions instead of only scoring the next artist. A short product framing and build map lives in `docs/personal_taste_os.md`.
+
+## Recommender Safety Platform
+
+`spotify/recommender_safety.py` now exposes the reusable safety surface behind the Spotify pipeline:
+
+- Generic temporal backtest windows, callback-driven backtest benchmarking, and artifact writers
+- Split drift utilities over arbitrary sequence/context/target snapshots plus pluggable segment extractors
+- Promotion gating for arbitrary leaderboard metrics and history tables, including selective-risk and abstention caps
+- Conformal abstention summary builders that can be reused by any sequence recommender with class-probability outputs
+
+The Spotify-specific modules (`spotify/backtesting.py`, `spotify/drift.py`, `spotify/governance.py`, and the conformal path in `spotify/evaluation.py`) sit on top of that shared layer, so the same safety logic can be reused as a B2B-style recommender safety SDK.
 
 ## Project Layout
 
@@ -58,6 +83,19 @@ make qa
 ```
 
 `make test` now installs the package in editable mode first, so tests do not require manual `PYTHONPATH=.` exports.
+
+If you activate `.venv`, the package also installs named entry points for the main public-facing surfaces:
+
+```bash
+source .venv/bin/activate
+spotify-lab --help
+spotify-predict --help
+spotify-serve --help
+spotify-public-insights --help
+spotify-compare-public --help
+```
+
+The existing `python -m spotify...` module entry points still work too.
 
 ## Quality Tooling
 
@@ -348,6 +386,7 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `optuna/optuna_history_<model>.png`
 - `backtest/temporal_backtest.csv`
 - `backtest/temporal_backtest_top1.png`
+- `backtest/temporal_backtest_summary.csv` + `backtest/temporal_backtest_summary.json`
 - `analysis/*_confidence_summary.json` (ECE/Brier/top-1 confidence summary)
 - `analysis/*_conformal_summary.json` (split-conformal threshold, coverage, abstention stats)
 - `analysis/data_drift_summary.json` (target drift and largest context/segment shifts)
@@ -364,6 +403,7 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `analysis/digital_twin/*` (listener digital twin artifact and end-of-session diagnostics)
 - `analysis/journey_planner/*` (multi-step listening journey plans)
 - `analysis/safe_policy/*` (safe bandit policy candidates and selected routing map)
+- `analysis/group_auto_dj/*` (shared-space cohort plans for household, party, car, and ambient listening)
 - `analysis/stress_test/*` (policy stress scenarios across friction and drift regimes)
 - `retrieval/retrieval_summary.json` + retrieval model artifacts
 - `analysis/*_reliability.png` (calibration curves)
@@ -387,6 +427,17 @@ Prepared-data cache:
 Champion alias:
 
 - `outputs/models/champion/alias.json` (latest promoted run pointer + default serving model)
+
+Control room:
+
+- `outputs/analytics/control_room.json`
+- `outputs/analytics/control_room.md`
+
+Generate the control-room summary:
+
+```bash
+make control-room
+```
 
 ## Prediction CLI
 
@@ -558,6 +609,12 @@ Artist graph:
 python -m spotify.public_insights artist-graph --top-n 5 --related-limit 10
 ```
 
+Creator / label intelligence graph:
+
+```bash
+python -m spotify.public_insights creator-label-intelligence --top-n 8 --lookback-days 365 --neighbor-k 5
+```
+
 Release inbox:
 
 ```bash
@@ -594,6 +651,12 @@ Podcast / audiobook explorer:
 python -m spotify.public_insights media-explorer --media-type show --query "indie music"
 ```
 
+Cross-media taste graph:
+
+```bash
+python -m spotify.public_insights cross-media-taste-graph --lookback-days 180 --bridge-limit 6
+```
+
 Or use the Make target:
 
 ```bash
@@ -602,9 +665,9 @@ make public-insights EXTRA_ARGS='explain-artists --top-n 5'
 
 Artifacts are written under `outputs/analysis/public_spotify/`.
 
-## Research Roadmap
+## Roadmaps
 
-See `docs/doctorate_roadmap.md` for the dissertation-scale build plan and experiment sequence.
+See `docs/personal_taste_os.md` for the product thesis and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
 ## Docker (Prediction Service)
 

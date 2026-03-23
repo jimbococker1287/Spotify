@@ -6,7 +6,6 @@ from pathlib import Path
 import gc
 import os
 import csv
-import json
 import time
 
 import numpy as np
@@ -20,6 +19,7 @@ from .benchmarks import (
     resolve_classical_parallelism,
 )
 from .data import PreparedData
+from .recommender_safety import build_temporal_backtest_windows, write_temporal_backtest_artifacts
 
 
 @dataclass
@@ -37,27 +37,7 @@ class BacktestFoldResult:
 
 
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
-    if folds <= 0 or n_rows <= 0:
-        return []
-
-    base_train = max(100, n_rows // (folds + 1))
-    if base_train >= n_rows:
-        return []
-    test_size = max(1, (n_rows - base_train) // folds)
-    windows: list[tuple[int, int]] = []
-
-    train_end = base_train
-    for _ in range(folds):
-        test_start = train_end
-        test_end = min(n_rows, test_start + test_size)
-        if test_end <= test_start:
-            break
-        windows.append((test_start, test_end))
-        train_end = test_end
-        if train_end >= n_rows:
-            break
-
-    return windows
+    return [(window.test_start, window.test_end) for window in build_temporal_backtest_windows(n_rows, folds)]
 
 
 def _tail_cap(X: np.ndarray, y: np.ndarray, max_rows: int) -> tuple[np.ndarray, np.ndarray]:
@@ -658,9 +638,6 @@ def run_temporal_backtest(
                 )
             previous_test_end = test_end
 
-    _write_backtest_csv(results, output_dir / "temporal_backtest.csv")
-    _plot_backtest(results, output_dir / "temporal_backtest_top1.png")
-    with (output_dir / "temporal_backtest.json").open("w", encoding="utf-8") as out:
-        json.dump([asdict(row) for row in results], out, indent=2)
+    write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
 
     return results

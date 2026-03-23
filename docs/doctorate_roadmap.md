@@ -18,6 +18,44 @@ The doctorate-level version of this project should aim to deliver five contribut
 4. Uncertainty-aware evaluation and serving with calibrated abstention.
 5. Longitudinal robustness evaluation under drift, regime change, and continual retraining.
 
+## Completion Snapshot
+
+As of the current repository state, the roadmap requirements below are implemented in code and covered by focused tests.
+
+- Phase 0 is complete: roadmap, experiment registry, uncertainty-aware serving, drift diagnostics, and standardized artifacts are present.
+- Phase 1 is complete: deep temporal backtests, repeated-seed / significance artifacts, and robustness slices are present.
+- Phase 2 is complete: retrieval, ANN validation, and reranking are present.
+- Phase 3 is complete: self-supervised pretraining objectives and transfer into the retrieval stack are present.
+- Phase 4 is complete: friction-aware proxy / counterfactual analyses and policy-style simulation artifacts are present.
+- Phase 5 is complete: benchmark protocol, experiment registry, ablations, significance outputs, and reproducibility artifacts are present.
+
+Immediate-build-order status:
+
+1. Calibrated uncertainty artifacts and abstaining predictions: complete.
+2. Drift diagnostics over train, validation, and test regimes: complete.
+3. Deep rolling backtests with lightweight profiles: complete.
+4. Dual-encoder retrieval baseline plus ANN candidate generation: complete.
+5. Contextual reranker comparison against the current stack: complete.
+6. Self-supervised pretraining experiments: complete.
+7. Friction-aware causal analysis package: complete.
+
+Primary implementation anchors:
+
+- `spotify/uncertainty.py`, `spotify/evaluation.py`, `spotify/predict_service.py`
+- `spotify/drift.py`, `spotify/backtesting.py`, `spotify/robustness.py`
+- `spotify/retrieval.py`
+- `spotify/friction.py`, `spotify/policy_eval.py`, `spotify/causal_friction.py`, `spotify/digital_twin.py`
+- `spotify/research_artifacts.py`, `spotify/analytics_db.py`
+
+Primary verification anchors:
+
+- `tests/test_uncertainty.py`
+- `tests/test_drift_and_backtesting.py`
+- `tests/test_retrieval_and_friction.py`
+- `tests/test_research_platform.py`
+- `tests/test_governance_gate.py`
+- `tests/test_predict_service_validation.py`
+
 ## Research Tracks
 
 ### Track A: Representation Learning
@@ -50,6 +88,13 @@ The doctorate-level version of this project should aim to deliver five contribut
 - Add conformal prediction sets, abstention, and risk-aware promotion criteria.
 - Promote models on calibrated utility rather than raw top-1 alone.
 - Measure failure concentration, selective risk, and out-of-distribution fragility.
+
+### Moonshot Product Extension: Group Listening / Auto-DJ
+
+- Expand from single-user session prediction to shared-space recommendation for household, party, car, and ambient listening contexts.
+- Treat this as a multi-objective coordination problem: maximize group utility while protecting the least-satisfied listener from being consistently ignored.
+- Route between policy templates and safe fallback policies when disagreement, technical friction, or session-end risk spikes.
+- Evaluate with group-specific metrics such as minimum member satisfaction, fairness over turns, safe-route rate, and session continuity.
 
 ## Execution Phases
 
@@ -112,6 +157,8 @@ The doctorate-level version of this project should aim to deliver five contribut
   Add exposure/friction labels, temporal regime metadata, and simulator-ready exports.
 - `spotify/analytics_db.py`
   Add benchmark views for uncertainty, drift, and robustness slices.
+- `spotify/group_auto_dj.py`
+  Add shared-space cohort planning, fairness-aware aggregation, and safe policy routing for Auto-DJ scenarios.
 
 ## Experiment Matrix
 

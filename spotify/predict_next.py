@@ -244,8 +244,8 @@ def main() -> int:
         explicit_model_name=args.model_name,
         alias_model_name=champion_alias_model_name,
     )
-    metadata = _load_json(run_dir / "feature_metadata.json")
-    artist_labels = list(metadata["artist_labels"])
+    feature_metadata = _load_json(run_dir / "feature_metadata.json")
+    artist_labels = list(feature_metadata["artist_labels"])
     predictor = load_predictor(
         run_dir=run_dir,
         row=model_row,
@@ -277,14 +277,14 @@ def main() -> int:
     for rank, label_idx in enumerate(top_indices, start=1):
         artist_name = artist_labels[int(label_idx)]
         prob = float(artist_probs[int(label_idx)])
-        metadata: SpotifyArtistMetadata | None = None
+        artist_metadata: SpotifyArtistMetadata | None = None
         if public_catalog_client is not None:
             try:
-                metadata = public_catalog_client.search_artist(artist_name)
+                artist_metadata = public_catalog_client.search_artist(artist_name)
             except SpotifyPublicCatalogError as exc:
                 logger.warning("Spotify public metadata lookup failed for %s: %s", artist_name, exc)
                 public_catalog_client = None
-        print(f"{rank}. {artist_name} ({prob:.4f}){_metadata_suffix(metadata)}")
+        print(f"{rank}. {artist_name} ({prob:.4f}){_metadata_suffix(artist_metadata)}")
 
     return 0
 

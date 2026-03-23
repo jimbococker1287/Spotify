@@ -6,6 +6,7 @@ import math
 
 from .causal_friction import fit_causal_skip_decomposition
 from .digital_twin import fit_listener_digital_twin
+from .group_auto_dj import build_group_auto_dj_plans
 from .journey_planner import build_journey_plans
 from .multimodal import build_multimodal_artist_space
 from .safe_policy import learn_safe_bandit_policy
@@ -53,6 +54,7 @@ def run_moonshot_lab(
     digital_twin_dir = analysis_dir / "digital_twin"
     journey_dir = analysis_dir / "journey_planner"
     safe_policy_dir = analysis_dir / "safe_policy"
+    group_auto_dj_dir = analysis_dir / "group_auto_dj"
     stress_dir = analysis_dir / "stress_test"
 
     multimodal_space, multimodal_paths = build_multimodal_artist_space(
@@ -102,6 +104,17 @@ def run_moonshot_lab(
     )
     artifact_paths.extend(safe_policy_paths)
 
+    group_auto_dj_paths = build_group_auto_dj_plans(
+        data=data,
+        artist_labels=artist_labels,
+        multimodal_space=multimodal_space,
+        digital_twin=digital_twin,
+        safe_policy=safe_policy,
+        output_dir=group_auto_dj_dir,
+        logger=logger,
+    )
+    artifact_paths.extend(group_auto_dj_paths)
+
     stress_paths = run_stress_test_lab(
         data=data,
         digital_twin=digital_twin,
@@ -117,11 +130,21 @@ def run_moonshot_lab(
     causal_summary = _read_json(causal_dir / "causal_skip_summary.json")
     twin_summary = _read_json(digital_twin_dir / "listener_digital_twin_summary.json")
     journey_summary = _read_json(journey_dir / "journey_plans_summary.json")
+    group_auto_dj_summary = _read_json(group_auto_dj_dir / "group_auto_dj_summary.json")
     stress_summary = _read_json(stress_dir / "stress_test_summary.json")
 
     journey_rows = journey_summary if isinstance(journey_summary, list) else []
     journey_horizons = [_safe_float(row.get("planned_horizon")) for row in journey_rows if isinstance(row, dict)]
     journey_scores = [_safe_float(row.get("plan_score")) for row in journey_rows if isinstance(row, dict)]
+
+    group_rows = group_auto_dj_summary if isinstance(group_auto_dj_summary, list) else []
+    group_safe_route_rates = [_safe_float(row.get("safe_route_rate")) for row in group_rows if isinstance(row, dict)]
+    group_fairness = [_safe_float(row.get("mean_fairness")) for row in group_rows if isinstance(row, dict)]
+    worst_group_row = min(
+        group_rows,
+        key=lambda row: _safe_float(row.get("min_member_satisfaction")),
+        default={},
+    )
 
     stress_rows = stress_summary if isinstance(stress_summary, list) else []
     safe_stress_rows = [
@@ -156,6 +179,13 @@ def run_moonshot_lab(
         "safe_policy_global_continuity_weight": _safe_float(safe_policy.global_policy.get("continuity")),
         "safe_policy_global_novelty_weight": _safe_float(safe_policy.global_policy.get("novelty")),
         "safe_policy_global_repeat_weight": _safe_float(safe_policy.global_policy.get("repeat")),
+        "group_auto_dj_scenario_count": int(len(group_rows)),
+        "group_auto_dj_mean_safe_route_rate": _safe_mean(group_safe_route_rates),
+        "group_auto_dj_mean_fairness": _safe_mean(group_fairness),
+        "group_auto_dj_worst_scenario": str(worst_group_row.get("scenario", "")),
+        "group_auto_dj_worst_min_member_satisfaction": _safe_float(
+            worst_group_row.get("min_member_satisfaction")
+        ),
         "stress_scenario_count": int(
             len({str(row.get("scenario", "")).strip() for row in stress_rows if isinstance(row, dict)})
         ),

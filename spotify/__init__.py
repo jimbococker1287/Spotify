@@ -1,4 +1,4 @@
-"""Spotify streaming history modeling pipeline."""
+"""Personal Taste OS for Spotify streaming history."""
 
 from .cli import main
 

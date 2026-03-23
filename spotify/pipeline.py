@@ -211,6 +211,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         from .backtesting import run_temporal_backtest
         from .analytics_db import refresh_analytics_database
         from .benchmarks import build_classical_feature_bundle, run_classical_benchmarks
+        from .control_room import write_control_room_report
         from .data import (
             PreparedDataCacheInfo,
             SKEW_CONTEXT_FEATURES,
@@ -933,6 +934,13 @@ def run_pipeline(config: PipelineConfig) -> None:
             history_csv=history_csv,
         )
         artifact_paths.append(report_path)
+
+        try:
+            control_room_json, control_room_md = write_control_room_report(config.output_dir, top_n=5)
+        except Exception as exc:
+            logger.warning("Control room report generation failed but the run will continue: %s", exc)
+        else:
+            artifact_paths.extend([control_room_json, control_room_md])
 
         result_rows_sorted = sorted(
             result_rows,

@@ -44,7 +44,6 @@ def _aligned_frames(data: PreparedData, sequence_length: int) -> tuple[np.ndarra
     n_total = n_train + n_val + n_test
     aligned = ordered.iloc[sequence_length : sequence_length + n_total].reset_index(drop=True)
     if len(aligned) < n_total:
-        pad = n_total - len(aligned)
         aligned = aligned.reindex(range(n_total)).fillna(0.0)
     train = aligned.iloc[:n_train].reset_index(drop=True)
     val = aligned.iloc[n_train : n_train + n_val].reset_index(drop=True)

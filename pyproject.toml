@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spotify-extended-pipeline"
 version = "0.1.0"
-description = "End-to-end Spotify streaming history modeling pipeline"
+description = "Personal Taste OS for Spotify streaming history: experimentation, session planning, public insights, and serving"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -35,6 +35,13 @@ dev = [
   "mypy>=1.11",
   "pre-commit>=3.8",
 ]
+
+[project.scripts]
+spotify-lab = "spotify.cli:main"
+spotify-predict = "spotify.predict_next:main"
+spotify-serve = "spotify.predict_service:main"
+spotify-public-insights = "spotify.public_insights:main"
+spotify-compare-public = "spotify.compare_public:main"
 
 [tool.setuptools]
 include-package-data = true

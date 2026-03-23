@@ -35,13 +35,11 @@ def main() -> int:
     except Exception as exc:
         summary["tensorflow_import_error"] = repr(exc)
         logical_gpu_count = 0
-        physical_gpu_count = 0
     else:
         summary["tensorflow_import_error"] = ""
         summary["tensorflow_runtime_version"] = tf.__version__
         physical_gpus = tf.config.list_physical_devices("GPU")
         logical_gpus = tf.config.list_logical_devices("GPU")
-        physical_gpu_count = len(physical_gpus)
         logical_gpu_count = len(logical_gpus)
         summary["physical_gpus"] = [repr(device) for device in physical_gpus]
         summary["logical_gpus"] = [repr(device) for device in logical_gpus]

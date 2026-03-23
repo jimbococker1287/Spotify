@@ -797,6 +797,8 @@ def write_run_report(
             "*journey*.csv",
             "*safe_bandit*.json",
             "*safe_bandit*.csv",
+            "*group_auto_dj*.json",
+            "*group_auto_dj*.csv",
             "*stress_test*.json",
             "*stress_test*.csv",
             "*_reliability.png",

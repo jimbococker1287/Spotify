@@ -95,6 +95,7 @@ def test_moonshot_lab_writes_component_artifacts_and_root_summary(tmp_path: Path
     assert (run_dir / "analysis" / "digital_twin" / "listener_digital_twin_summary.json").exists()
     assert (run_dir / "analysis" / "journey_planner" / "journey_plans_summary.json").exists()
     assert (run_dir / "analysis" / "safe_policy" / "safe_bandit_policy_summary.json").exists()
+    assert (run_dir / "analysis" / "group_auto_dj" / "group_auto_dj_summary.json").exists()
     assert (run_dir / "analysis" / "stress_test" / "stress_test_summary.json").exists()
 
     payload = json.loads(moonshot_summary.read_text(encoding="utf-8"))
@@ -102,6 +103,9 @@ def test_moonshot_lab_writes_component_artifacts_and_root_summary(tmp_path: Path
     assert payload["multimodal_embedding_dim"] >= 2
     assert payload["journey_seed_count"] >= 1
     assert payload["safe_policy_bucket_count"] >= 1
+    assert payload["group_auto_dj_scenario_count"] == 4
+    assert 0.0 <= payload["group_auto_dj_mean_safe_route_rate"] <= 1.0
+    assert payload["group_auto_dj_mean_fairness"] > 0.0
     assert payload["stress_scenario_count"] == 5
 
 
@@ -113,9 +117,14 @@ def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:
     history_csv.write_text("run_id,model_name,val_top1\n", encoding="utf-8")
 
     (run_dir / "analysis" / "multimodal").mkdir(parents=True, exist_ok=True)
+    (run_dir / "analysis" / "group_auto_dj").mkdir(parents=True, exist_ok=True)
     (run_dir / "analysis" / "moonshot_summary.json").write_text(json.dumps({"journey_seed_count": 2}), encoding="utf-8")
     (run_dir / "analysis" / "multimodal" / "multimodal_artist_space_summary.json").write_text(
         json.dumps({"embedding_dim": 8}),
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "group_auto_dj" / "group_auto_dj_summary.json").write_text(
+        json.dumps([{"scenario": "party", "safe_route_rate": 0.5}]),
         encoding="utf-8",
     )
 
@@ -131,3 +140,4 @@ def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:
     content = report_path.read_text(encoding="utf-8")
     assert "analysis/moonshot_summary.json" in content
     assert "analysis/multimodal/multimodal_artist_space_summary.json" in content
+    assert "analysis/group_auto_dj/group_auto_dj_summary.json" in content

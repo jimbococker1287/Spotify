@@ -6,7 +6,6 @@ import json
 
 import numpy as np
 
-from .causal_friction import CausalSkipDecompositionArtifact
 from .data import PreparedData
 from .digital_twin import ListenerDigitalTwinArtifact
 from .multimodal import MultimodalArtistSpace
@@ -36,7 +35,6 @@ def build_journey_plans(
     beam_width = max(2, int(__import__("os").environ.get("SPOTIFY_MOONSHOT_PLAN_BEAM", "4")))
 
     seed_sequences = np.asarray(data.X_seq_test, dtype="int32")
-    seed_contexts = np.asarray(data.X_ctx_test, dtype="float32")
     if len(seed_sequences) == 0:
         return []
 
@@ -52,8 +50,7 @@ def build_journey_plans(
                 "expected_end": 0.0,
             }
         ]
-        context = seed_contexts[seed_idx]
-        for step in range(horizon):
+        for _ in range(horizon):
             next_beams: list[dict[str, object]] = []
             for beam in beams:
                 last_artist = int(beam["sequence"][-1])

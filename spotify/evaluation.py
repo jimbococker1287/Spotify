@@ -12,7 +12,7 @@ import pandas as pd
 from .benchmarks import ClassicalFeatureBundle, build_classical_estimator, build_classical_feature_bundle, sample_rows
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
-from .uncertainty import fit_split_conformal_classifier, summarize_prediction_sets
+from .recommender_safety import build_conformal_abstention_summary
 
 
 def _slugify(raw: str) -> str:
@@ -431,23 +431,25 @@ def _save_prediction_diagnostics(
     if enable_conformal:
         val_y_local = _encode_labels_to_local_indices(np.asarray(val_y), class_labels)
         test_y_local = _encode_labels_to_local_indices(np.asarray(test_y), class_labels)
-        calibration = fit_split_conformal_classifier(val_proba, val_y_local, alpha=conformal_alpha)
-        if calibration is not None:
-            val_conformal = summarize_prediction_sets(val_proba, val_y_local, calibration=calibration)
-            test_conformal = summarize_prediction_sets(test_proba, test_y_local, calibration=calibration)
-            conformal_payload = {
-                "tag": safe_tag,
-                "calibration": calibration.to_dict(),
-                "val": val_conformal,
-                "test": test_conformal,
-            }
+        conformal_payload = build_conformal_abstention_summary(
+            tag=safe_tag,
+            val_proba=val_proba,
+            val_y=val_y_local,
+            test_proba=test_proba,
+            test_y=test_y_local,
+            alpha=conformal_alpha,
+        )
+        if conformal_payload is not None:
+            calibration = dict(conformal_payload.get("calibration", {}))
+            val_conformal = dict(conformal_payload.get("val", {}))
+            test_conformal = dict(conformal_payload.get("test", {}))
             conformal_summary_path = output_dir / f"{safe_tag}_conformal_summary.json"
             conformal_summary_path.write_text(json.dumps(conformal_payload, indent=2), encoding="utf-8")
             artifacts.append(conformal_summary_path)
             summary_payload.update(
                 {
-                    "conformal_threshold": float(calibration.threshold),
-                    "conformal_alpha": float(calibration.alpha),
+                    "conformal_threshold": _to_float(calibration.get("threshold")),
+                    "conformal_alpha": _to_float(calibration.get("alpha")),
                     "val_conformal_coverage": _to_float(val_conformal["coverage"]),
                     "test_conformal_coverage": _to_float(test_conformal["coverage"]),
                     "val_abstention_rate": _to_float(val_conformal["abstention_rate"]),

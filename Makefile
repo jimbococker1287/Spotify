@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert analytics-db compare-public public-insights prune-artifacts storage-report predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert analytics-db compare-public public-insights prune-artifacts storage-report control-room predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -102,6 +102,9 @@ prune-artifacts:
 
 storage-report:
 	PYTHONPATH=. $(RUN_PY) scripts/storage_report.py $(EXTRA_ARGS)
+
+control-room:
+	$(RUN_PY) -m spotify.control_room $(EXTRA_ARGS)
 
 predict-next:
 	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)

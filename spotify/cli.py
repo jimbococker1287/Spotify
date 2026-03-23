@@ -10,7 +10,7 @@ from .env import load_local_env
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m spotify",
-        description="Train and compare deep models on Spotify extended streaming history.",
+        description="Train and evaluate the Personal Taste OS stack on Spotify extended streaming history.",
     )
     add_cli_arguments(parser)
     return parser

@@ -124,7 +124,6 @@ def fit_causal_skip_decomposition(
         friction_logit = _decision_scores(friction_estimator, X_full[:, friction_keep])
         meta_features = np.column_stack([pref_logit, friction_logit]).astype("float32")
         total_risk = np.asarray(meta_estimator.predict_proba(meta_features), dtype="float32")[:, 1]
-        meta_inner = meta_estimator.named_steps["logisticregression"]
         pref_only_features = np.column_stack([pref_logit, np.zeros_like(friction_logit)])
         pref_only_risk = np.asarray(meta_estimator.predict_proba(pref_only_features), dtype="float32")[:, 1]
         friction_only_features = np.column_stack([np.zeros_like(pref_logit), friction_logit])

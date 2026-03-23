@@ -149,15 +149,12 @@ def _top_neighbors(space: MultimodalArtistSpace, top_k: int = 5) -> list[dict[st
     return rows
 
 
-def build_multimodal_artist_space(
+def compute_multimodal_artist_space(
     *,
     df: pd.DataFrame,
     artist_labels: list[str],
     results: list[dict[str, object]],
-    output_dir: Path,
-    logger,
-) -> tuple[MultimodalArtistSpace, list[Path]]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+) -> MultimodalArtistSpace:
     artist_frame = _artist_frame(df, artist_labels=artist_labels)
     transition_features = _transition_features(df, num_artists=len(artist_labels))
 
@@ -218,6 +215,23 @@ def build_multimodal_artist_space(
         danceability=artist_frame["avg_danceability"].to_numpy(dtype="float32", copy=False),
         tempo=artist_frame["avg_tempo"].to_numpy(dtype="float32", copy=False),
     )
+    return space
+
+
+def build_multimodal_artist_space(
+    *,
+    df: pd.DataFrame,
+    artist_labels: list[str],
+    results: list[dict[str, object]],
+    output_dir: Path,
+    logger,
+) -> tuple[MultimodalArtistSpace, list[Path]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    space = compute_multimodal_artist_space(
+        df=df,
+        artist_labels=artist_labels,
+        results=results,
+    )
 
     artifact_path = output_dir / "multimodal_artist_space.joblib"
     joblib.dump(space, artifact_path, compress=3)
@@ -226,9 +240,12 @@ def build_multimodal_artist_space(
         json.dumps(
             {
                 "artist_count": len(artist_labels),
-                "feature_count": len(feature_names),
+                "feature_count": len(space.feature_names),
                 "embedding_dim": int(space.embeddings.shape[1]),
-                "retrieval_fusion_enabled": bool(retrieval_embeddings is not None),
+                "retrieval_fusion_enabled": any(
+                    str(feature_name).startswith("retrieval_embed_")
+                    for feature_name in space.feature_names
+                ),
                 "mean_popularity": float(np.mean(space.popularity)) if len(space.popularity) else float("nan"),
                 "mean_energy": float(np.mean(space.energy)) if len(space.energy) else float("nan"),
                 "mean_danceability": float(np.mean(space.danceability)) if len(space.danceability) else float("nan"),
@@ -247,6 +264,6 @@ def build_multimodal_artist_space(
         "Built multimodal artist space: artists=%d dim=%d retrieval_fused=%s",
         len(artist_labels),
         int(space.embeddings.shape[1]),
-        bool(retrieval_embeddings is not None),
+        any(str(feature_name).startswith("retrieval_embed_") for feature_name in space.feature_names),
     )
     return space, [artifact_path, summary_path, neighbors_path]

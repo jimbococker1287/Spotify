@@ -1,0 +1,6 @@
+[console_scripts]
+spotify-compare-public = spotify.compare_public:main
+spotify-lab = spotify.cli:main
+spotify-predict = spotify.predict_next:main
+spotify-public-insights = spotify.public_insights:main
+spotify-serve = spotify.predict_service:main
