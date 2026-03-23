@@ -11,6 +11,8 @@ spotify/champion_alias.py
 spotify/cli.py
 spotify/compare_public.py
 spotify/config.py
+spotify/control_room.py
+spotify/creator_label_intelligence.py
 spotify/data.py
 spotify/data_quality.py
 spotify/digital_twin.py
@@ -21,6 +23,7 @@ spotify/evaluation.py
 spotify/explainability.py
 spotify/friction.py
 spotify/governance.py
+spotify/group_auto_dj.py
 spotify/journey_planner.py
 spotify/lastfm.py
 spotify/modeling.py
@@ -35,6 +38,7 @@ spotify/probability_bundles.py
 spotify/public_catalog.py
 spotify/public_insights.py
 spotify/ranking.py
+spotify/recommender_safety.py
 spotify/reporting.py
 spotify/research_artifacts.py
 spotify/retrieval.py
@@ -64,6 +68,9 @@ tests/test_cli_smoke.py
 tests/test_compare_public.py
 tests/test_compare_public_cli_smoke.py
 tests/test_config_smoke.py
+tests/test_control_room.py
+tests/test_control_room_cli_smoke.py
+tests/test_creator_label_intelligence.py
 tests/test_data_discovery.py
 tests/test_data_quality_gate.py
 tests/test_drift_and_backtesting.py
@@ -82,6 +89,7 @@ tests/test_public_catalog.py
 tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
 tests/test_ranking_metrics.py
+tests/test_recommender_safety_platform.py
 tests/test_research_platform.py
 tests/test_retrieval_and_friction.py
 tests/test_runtime_acceleration.py

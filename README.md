@@ -52,6 +52,26 @@ The strongest big-scope bet in this codebase is `Personal Taste OS`: use the dig
 
 The Spotify-specific modules (`spotify/backtesting.py`, `spotify/drift.py`, `spotify/governance.py`, and the conformal path in `spotify/evaluation.py`) sit on top of that shared layer, so the same safety logic can be reused as a B2B-style recommender safety SDK.
 
+## Project Threads
+
+The six new project threads added in the latest scope expansion now clear the same requirement bar:
+
+- a clear thesis
+- implementation anchors in code
+- verification anchors in tests or integration coverage
+- a user-facing surface or an intentional integration-only role
+- named artifacts or outputs
+- top-level documentation
+
+All six threads meet that bar today. The detailed audit and expansion map lives in `docs/project_threads.md`, and the short version is:
+
+- Personal Taste OS: the umbrella product thesis tying training, planning, explanation, and safe delivery into one system.
+- Recommender Safety Platform: the reusable safety SDK layer behind drift, backtesting, governance, and abstention.
+- Control Room: the operator-facing summary that turns run artifacts into a portfolio dashboard.
+- Creator Label Intelligence: the public-insights graph for adjacency, migration, scenes, and release whitespace.
+- Group Auto-DJ: the shared-session planner for household, party, car, and ambient group listening.
+- Doctorate-Level Roadmap: the research program that turns the repository into publication-grade work.
+
 ## Project Layout
 
 - `spotify/`: pipeline source code
@@ -93,6 +113,7 @@ spotify-predict --help
 spotify-serve --help
 spotify-public-insights --help
 spotify-compare-public --help
+spotify-control-room --help
 ```
 
 The existing `python -m spotify...` module entry points still work too.
@@ -667,7 +688,7 @@ Artifacts are written under `outputs/analysis/public_spotify/`.
 
 ## Roadmaps
 
-See `docs/personal_taste_os.md` for the product thesis and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
+See `docs/personal_taste_os.md` for the product thesis, `docs/project_threads.md` for the six-thread audit and expansion map, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
 ## Docker (Prediction Service)
 

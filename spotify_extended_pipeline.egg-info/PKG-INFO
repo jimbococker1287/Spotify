@@ -47,6 +47,7 @@ The current system already includes:
 - Prepared-data fingerprint caching
 - Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
 - Champion/challenger gating
+- Recommender safety platform primitives for governance, drift, backtesting, and conformal abstention across arbitrary sequence recommenders
 - Drift diagnostics across train/validation/test regimes
 - Self-supervised sequence pretraining for artist embeddings
 - Two-stage retrieval plus reranking recommenders
@@ -55,7 +56,7 @@ The current system already includes:
 - Robustness slice evaluation across friction, repeat, platform, and session regimes
 - Semi-synthetic policy simulation for offline policy comparison
 - Benchmark protocol, experiment registry, ablation, and significance artifacts
-- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, and stress tests
+- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, group Auto-DJ planning, and stress tests
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
 - Per-run Markdown auto-report
@@ -67,6 +68,37 @@ The current system already includes:
 ## Product Direction
 
 The strongest big-scope bet in this codebase is `Personal Taste OS`: use the digital twin, journey planner, safe policy layer, and public metadata surface to actively shape listening sessions instead of only scoring the next artist. A short product framing and build map lives in `docs/personal_taste_os.md`.
+
+## Recommender Safety Platform
+
+`spotify/recommender_safety.py` now exposes the reusable safety surface behind the Spotify pipeline:
+
+- Generic temporal backtest windows, callback-driven backtest benchmarking, and artifact writers
+- Split drift utilities over arbitrary sequence/context/target snapshots plus pluggable segment extractors
+- Promotion gating for arbitrary leaderboard metrics and history tables, including selective-risk and abstention caps
+- Conformal abstention summary builders that can be reused by any sequence recommender with class-probability outputs
+
+The Spotify-specific modules (`spotify/backtesting.py`, `spotify/drift.py`, `spotify/governance.py`, and the conformal path in `spotify/evaluation.py`) sit on top of that shared layer, so the same safety logic can be reused as a B2B-style recommender safety SDK.
+
+## Project Threads
+
+The six new project threads added in the latest scope expansion now clear the same requirement bar:
+
+- a clear thesis
+- implementation anchors in code
+- verification anchors in tests or integration coverage
+- a user-facing surface or an intentional integration-only role
+- named artifacts or outputs
+- top-level documentation
+
+All six threads meet that bar today. The detailed audit and expansion map lives in `docs/project_threads.md`, and the short version is:
+
+- Personal Taste OS: the umbrella product thesis tying training, planning, explanation, and safe delivery into one system.
+- Recommender Safety Platform: the reusable safety SDK layer behind drift, backtesting, governance, and abstention.
+- Control Room: the operator-facing summary that turns run artifacts into a portfolio dashboard.
+- Creator Label Intelligence: the public-insights graph for adjacency, migration, scenes, and release whitespace.
+- Group Auto-DJ: the shared-session planner for household, party, car, and ambient group listening.
+- Doctorate-Level Roadmap: the research program that turns the repository into publication-grade work.
 
 ## Project Layout
 
@@ -109,6 +141,7 @@ spotify-predict --help
 spotify-serve --help
 spotify-public-insights --help
 spotify-compare-public --help
+spotify-control-room --help
 ```
 
 The existing `python -m spotify...` module entry points still work too.
@@ -402,6 +435,7 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `optuna/optuna_history_<model>.png`
 - `backtest/temporal_backtest.csv`
 - `backtest/temporal_backtest_top1.png`
+- `backtest/temporal_backtest_summary.csv` + `backtest/temporal_backtest_summary.json`
 - `analysis/*_confidence_summary.json` (ECE/Brier/top-1 confidence summary)
 - `analysis/*_conformal_summary.json` (split-conformal threshold, coverage, abstention stats)
 - `analysis/data_drift_summary.json` (target drift and largest context/segment shifts)
@@ -418,6 +452,7 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `analysis/digital_twin/*` (listener digital twin artifact and end-of-session diagnostics)
 - `analysis/journey_planner/*` (multi-step listening journey plans)
 - `analysis/safe_policy/*` (safe bandit policy candidates and selected routing map)
+- `analysis/group_auto_dj/*` (shared-space cohort plans for household, party, car, and ambient listening)
 - `analysis/stress_test/*` (policy stress scenarios across friction and drift regimes)
 - `retrieval/retrieval_summary.json` + retrieval model artifacts
 - `analysis/*_reliability.png` (calibration curves)
@@ -441,6 +476,17 @@ Prepared-data cache:
 Champion alias:
 
 - `outputs/models/champion/alias.json` (latest promoted run pointer + default serving model)
+
+Control room:
+
+- `outputs/analytics/control_room.json`
+- `outputs/analytics/control_room.md`
+
+Generate the control-room summary:
+
+```bash
+make control-room
+```
 
 ## Prediction CLI
 
@@ -612,6 +658,12 @@ Artist graph:
 python -m spotify.public_insights artist-graph --top-n 5 --related-limit 10
 ```
 
+Creator / label intelligence graph:
+
+```bash
+python -m spotify.public_insights creator-label-intelligence --top-n 8 --lookback-days 365 --neighbor-k 5
+```
+
 Release inbox:
 
 ```bash
@@ -648,6 +700,12 @@ Podcast / audiobook explorer:
 python -m spotify.public_insights media-explorer --media-type show --query "indie music"
 ```
 
+Cross-media taste graph:
+
+```bash
+python -m spotify.public_insights cross-media-taste-graph --lookback-days 180 --bridge-limit 6
+```
+
 Or use the Make target:
 
 ```bash
@@ -658,7 +716,7 @@ Artifacts are written under `outputs/analysis/public_spotify/`.
 
 ## Roadmaps
 
-See `docs/personal_taste_os.md` for the product thesis and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
+See `docs/personal_taste_os.md` for the product thesis, `docs/project_threads.md` for the six-thread audit and expansion map, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
 ## Docker (Prediction Service)
 
