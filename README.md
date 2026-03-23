@@ -11,6 +11,14 @@ This project is an end-to-end experiment system for Spotify extended streaming h
 - Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
 - Champion/challenger gating
 - Drift diagnostics across train/validation/test regimes
+- Self-supervised sequence pretraining for artist embeddings
+- Two-stage retrieval plus reranking recommenders
+- Friction proxy analysis for skip-risk counterfactuals
+- ANN candidate retrieval diagnostics with latency/recall reporting
+- Robustness slice evaluation across friction, repeat, platform, and session regimes
+- Semi-synthetic policy simulation for offline policy comparison
+- Benchmark protocol, experiment registry, ablation, and significance artifacts
+- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, and stress tests
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
 - Per-run Markdown auto-report
@@ -235,6 +243,13 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_CHAMPION_GATE_METRIC` (default `backtest_top1`; alternatives: `val_top1`)
 - `SPOTIFY_CHAMPION_GATE_MATCH_PROFILE` (default `1`; compare challengers only against prior runs of the same profile)
 - `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
+- `SPOTIFY_BACKTEST_ADAPTATION_MODE` (`cold`, `warm`, `continual`; default `cold`)
+- `SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK` (optional absolute ceiling for conformal selective risk)
+- `SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE` (optional absolute ceiling for abstention rate)
+- `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail,contrastive_session`)
+- `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
+- `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
+- `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
 
@@ -306,6 +321,11 @@ PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
 - `--temporal-backtest` / `--no-temporal-backtest`
 - `--backtest-folds <n>`
 - `--backtest-models logreg,random_forest,...`
+- `--retrieval-stack` / `--no-retrieval-stack`
+- `--self-supervised-pretrain` / `--no-self-supervised-pretrain`
+- `--friction-analysis` / `--no-friction-analysis`
+- `--moonshot-lab` / `--no-moonshot-lab`
+- `--retrieval-candidates <n>`
 
 ## Outputs
 
@@ -313,6 +333,8 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 
 - `train.log`
 - `run_manifest.json`
+- `benchmark_protocol.json` + `benchmark_protocol.md`
+- `experiment_registry.json`
 - `run_results.json`
 - `run_report.md` (auto-generated run summary with metrics, speed, and trend links)
 - `data_quality_report.json` (schema/null/range gate report, generated before training)
@@ -331,6 +353,19 @@ Per run (`outputs/runs/<run_id>/`), typical files include:
 - `analysis/data_drift_summary.json` (target drift and largest context/segment shifts)
 - `analysis/context_feature_drift.csv` + `analysis/segment_drift.csv`
 - `analysis/context_feature_drift.png` + `analysis/segment_drift.png`
+- `analysis/friction_proxy_summary.json` (proxy counterfactual gap between observed and healthier technical context)
+- `analysis/friction_feature_coefficients.csv` + `analysis/friction_counterfactual_delta.csv`
+- `analysis/robustness_slices.csv` + `analysis/robustness_summary.json`
+- `analysis/policy_simulation_summary.csv` + `analysis/policy_simulation_summary.json`
+- `analysis/ablation_summary.csv` + `analysis/backtest_significance.csv`
+- `analysis/moonshot_summary.json`
+- `analysis/multimodal/*` (artist-space summary, neighbors, and embedding artifact)
+- `analysis/causal/*` (causal skip decomposition summary and per-row uplift estimates)
+- `analysis/digital_twin/*` (listener digital twin artifact and end-of-session diagnostics)
+- `analysis/journey_planner/*` (multi-step listening journey plans)
+- `analysis/safe_policy/*` (safe bandit policy candidates and selected routing map)
+- `analysis/stress_test/*` (policy stress scenarios across friction and drift regimes)
+- `retrieval/retrieval_summary.json` + retrieval model artifacts
 - `analysis/*_reliability.png` (calibration curves)
 - `analysis/*_segment_metrics.csv` (segment-level top-1 and confidence)
 - `analysis/*_top_errors.csv` (most frequent true/prediction confusions)
@@ -386,6 +421,16 @@ python -m spotify.predict_next \
   --recent-artists "Artist A|Artist B|Artist C|..."
 ```
 
+Optionally enrich printed predictions with Spotify public artist metadata:
+
+```bash
+SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... \
+python -m spotify.predict_next \
+  --top-k 5 \
+  --spotify-public-metadata \
+  --spotify-market US
+```
+
 ## Prediction Service (HTTP)
 
 Serve the latest promoted champion run via a lightweight HTTP API:
@@ -425,6 +470,137 @@ Optional token auth + request limits:
 - Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
 - Errors return structured payloads: `{"error":{"code","message","details"}}`.
 - When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
+
+## Public Comparison
+
+Spotify's developer policy does not allow building derived listenership metrics or benchmarking from Spotify public content, so the "compare my habits to the public" workflow uses Last.fm public charts instead.
+
+Compare your recent listening to public artist charts:
+
+```bash
+LASTFM_API_KEY=... \
+python -m spotify.compare_public \
+  --scope country \
+  --country "United States" \
+  --lookback-days 180 \
+  --top-n 50
+```
+
+Or use the Make target:
+
+```bash
+make compare-public EXTRA_ARGS='--scope global --lookback-days 90 --top-n 50'
+```
+
+Outputs are written under `outputs/analysis/public_compare/` as both JSON and Markdown summaries. The report highlights:
+
+- shared artists between your recent top artists and the public chart
+- how much of your recent listening is concentrated on public-top artists
+- your most distinctive recent artists
+- public-chart artists that are new to you
+
+## Spotify Public Insights
+
+You can also use Spotify's public Web API for policy-safe metadata workflows that do not benchmark users or train models on Spotify content.
+
+All commands below require:
+
+```bash
+export SPOTIFY_CLIENT_ID=...
+export SPOTIFY_CLIENT_SECRET=...
+```
+
+Artist explainer for your recent top artists:
+
+```bash
+python -m spotify.public_insights explain-artists --top-n 5 --lookback-days 180
+```
+
+Release tracker for favorite artists:
+
+```bash
+python -m spotify.public_insights release-tracker --top-n 10 --since-days 120
+```
+
+Market availability check for your recent top tracks:
+
+```bash
+python -m spotify.public_insights market-check --markets US,GB,IN --top-n 20
+```
+
+Discography timeline:
+
+```bash
+python -m spotify.public_insights discography --top-n 5 --album-limit 20
+```
+
+Public playlist viewer:
+
+```bash
+python -m spotify.public_insights playlist-view --playlist https://open.spotify.com/playlist/<id>
+```
+
+Discovery console:
+
+```bash
+python -m spotify.public_insights discovery-search --query "genre:indie year:2024-2026 tag:hipster" --types artist,album,track
+```
+
+Catalog link-outs:
+
+```bash
+python -m spotify.public_insights catalog-linkouts --top-artists 10 --top-tracks 20
+```
+
+Artist graph:
+
+```bash
+python -m spotify.public_insights artist-graph --top-n 5 --related-limit 10
+```
+
+Release inbox:
+
+```bash
+python -m spotify.public_insights release-inbox --top-n 10 --since-days 120
+```
+
+Playlist diff tracker:
+
+```bash
+python -m spotify.public_insights playlist-diff --playlist https://open.spotify.com/playlist/<id>
+```
+
+Market gap finder:
+
+```bash
+python -m spotify.public_insights market-gap --top-n 20
+```
+
+Playlist archive:
+
+```bash
+python -m spotify.public_insights playlist-archive --playlist https://open.spotify.com/playlist/<id>
+```
+
+ISRC / UPC / EAN crosswalk:
+
+```bash
+python -m spotify.public_insights catalog-crosswalk --top-n 20
+```
+
+Podcast / audiobook explorer:
+
+```bash
+python -m spotify.public_insights media-explorer --media-type show --query "indie music"
+```
+
+Or use the Make target:
+
+```bash
+make public-insights EXTRA_ARGS='explain-artists --top-n 5'
+```
+
+Artifacts are written under `outputs/analysis/public_spotify/`.
 
 ## Research Roadmap
 
@@ -484,6 +660,8 @@ SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regressio
 The training pipeline no longer fetches Spotify audio features. Spotify's `audio-features` Web API endpoint is deprecated, and Spotify's current developer policy does not allow Spotify content to train ML/AI models.
 
 Existing `.env` and `.env.local` loading remains in place for compatibility, but training now zero-fills `danceability`, `energy`, and `tempo` instead of calling Spotify.
+
+You can still use `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for opt-in prediction-time enrichment via `python -m spotify.predict_next --spotify-public-metadata`. That lookup only fetches public artist metadata for display and does not feed Spotify content into training.
 
 ## Feature Upgrades
 

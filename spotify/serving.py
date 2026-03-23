@@ -9,6 +9,7 @@ import numpy as np
 
 from .benchmarks import build_serving_tabular_features
 from .probability_bundles import align_proba_to_num_classes
+from .retrieval import RetrievalServingArtifact
 
 
 def _safe_float(value) -> float:
@@ -81,6 +82,10 @@ def _row_is_serveable(
     if model_type in ("classical", "classical_tuned"):
         estimator_artifact_path = str(row.get("estimator_artifact_path", "")).strip()
         return bool(estimator_artifact_path) and Path(estimator_artifact_path).exists()
+
+    if model_type in ("retrieval", "retrieval_reranker"):
+        retrieval_artifact_path = str(row.get("retrieval_artifact_path", "")).strip()
+        return bool(retrieval_artifact_path) and Path(retrieval_artifact_path).exists()
 
     if model_type == "ensemble":
         members = row.get("ensemble_members", [])
@@ -221,6 +226,18 @@ class _EnsemblePredictorImpl:
         return _apply_temperature(normalized, self.temperature)
 
 
+class _RetrievalPredictorImpl:
+    def __init__(self, row: dict[str, object]):
+        artifact_path = Path(str(row.get("retrieval_artifact_path", "")).strip())
+        payload = joblib.load(artifact_path)
+        if not isinstance(payload, RetrievalServingArtifact):
+            raise RuntimeError(f"Retrieval artifact has unexpected type: {artifact_path}")
+        self.artifact = payload
+
+    def predict_proba(self, seq_batch: np.ndarray, ctx_batch: np.ndarray) -> np.ndarray:
+        return np.asarray(self.artifact.predict_proba(seq_batch, ctx_batch), dtype="float32")
+
+
 def load_predictor(
     *,
     run_dir: Path,
@@ -243,6 +260,8 @@ def load_predictor(
         impl = _DeepPredictorImpl(run_dir=run_dir, model_name=model_name)
     elif model_type in ("classical", "classical_tuned"):
         impl = _ClassicalPredictorImpl(row=row, num_classes=len(artist_labels))
+    elif model_type in ("retrieval", "retrieval_reranker"):
+        impl = _RetrievalPredictorImpl(row=row)
     elif model_type == "ensemble":
         impl = _EnsemblePredictorImpl(
             row=row,

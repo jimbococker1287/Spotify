@@ -53,6 +53,7 @@ DEFAULT_SEQUENCE_LENGTH = 30
 DEFAULT_MAX_ARTISTS = 200
 DEFAULT_SEED = 42
 DEFAULT_CONFORMAL_ALPHA = 0.10
+DEFAULT_RETRIEVAL_CANDIDATE_K = 30
 CORE_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "logreg",
     "random_forest",
@@ -88,6 +89,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": ("logreg", "random_forest", "knn"),
         "classical_max_train_samples": 10_000,
         "classical_max_eval_samples": 8_000,
+        "enable_self_supervised_pretraining": False,
+        "enable_retrieval_stack": False,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": False,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": False,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -113,6 +119,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": ("logreg", "extra_trees", "mlp", "session_knn"),
         "classical_max_train_samples": 20_000,
         "classical_max_eval_samples": 12_000,
+        "enable_self_supervised_pretraining": False,
+        "enable_retrieval_stack": False,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": False,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": True,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -138,6 +149,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": ("logreg", "random_forest", "extra_trees", "knn", "mlp"),
         "classical_max_train_samples": 25_000,
         "classical_max_eval_samples": 15_000,
+        "enable_self_supervised_pretraining": False,
+        "enable_retrieval_stack": False,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": False,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": True,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -163,6 +179,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": CORE_CLASSICAL_MODEL_NAMES,
         "classical_max_train_samples": 40_000,
         "classical_max_eval_samples": 20_000,
+        "enable_self_supervised_pretraining": False,
+        "enable_retrieval_stack": False,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": False,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": True,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -188,6 +209,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
         "classical_max_train_samples": 35_000,
         "classical_max_eval_samples": 20_000,
+        "enable_self_supervised_pretraining": True,
+        "enable_retrieval_stack": True,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": True,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": True,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -213,6 +239,11 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "classical_model_names": DEFAULT_CLASSICAL_MODEL_NAMES,
         "classical_max_train_samples": 50_000,
         "classical_max_eval_samples": 25_000,
+        "enable_self_supervised_pretraining": True,
+        "enable_retrieval_stack": True,
+        "enable_friction_analysis": True,
+        "enable_moonshot_lab": True,
+        "retrieval_candidate_k": DEFAULT_RETRIEVAL_CANDIDATE_K,
         "enable_mlflow": True,
         "mlflow_tracking_uri": None,
         "mlflow_experiment": "spotify-experiment-lab",
@@ -253,6 +284,11 @@ class PipelineConfig:
     classical_model_names: tuple[str, ...] = DEFAULT_CLASSICAL_MODEL_NAMES
     classical_max_train_samples: int = 60_000
     classical_max_eval_samples: int = 30_000
+    enable_self_supervised_pretraining: bool = True
+    enable_retrieval_stack: bool = False
+    enable_friction_analysis: bool = True
+    enable_moonshot_lab: bool = False
+    retrieval_candidate_k: int = DEFAULT_RETRIEVAL_CANDIDATE_K
     enable_mlflow: bool = False
     mlflow_tracking_uri: str | None = None
     mlflow_experiment: str = "spotify-experiment-lab"
@@ -362,6 +398,33 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         else int(preset["classical_max_eval_samples"])
     )
 
+    if args.self_supervised_pretrain is None:
+        enable_self_supervised_pretraining = bool(preset.get("enable_self_supervised_pretraining", True))
+    else:
+        enable_self_supervised_pretraining = bool(args.self_supervised_pretrain)
+
+    if args.retrieval_stack is None:
+        enable_retrieval_stack = bool(preset.get("enable_retrieval_stack", False))
+    else:
+        enable_retrieval_stack = bool(args.retrieval_stack)
+
+    if args.friction_analysis is None:
+        enable_friction_analysis = bool(preset.get("enable_friction_analysis", True))
+    else:
+        enable_friction_analysis = bool(args.friction_analysis)
+
+    if args.moonshot_lab is None:
+        enable_moonshot_lab = bool(preset.get("enable_moonshot_lab", False))
+    else:
+        enable_moonshot_lab = bool(args.moonshot_lab)
+
+    retrieval_candidate_k = (
+        int(args.retrieval_candidates)
+        if args.retrieval_candidates is not None
+        else int(preset.get("retrieval_candidate_k", DEFAULT_RETRIEVAL_CANDIDATE_K))
+    )
+    retrieval_candidate_k = max(2, retrieval_candidate_k)
+
     if args.mlflow is None:
         enable_mlflow = bool(preset["enable_mlflow"])
     else:
@@ -427,6 +490,11 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         classical_model_names=classical_model_names,
         classical_max_train_samples=classical_max_train_samples,
         classical_max_eval_samples=classical_max_eval_samples,
+        enable_self_supervised_pretraining=enable_self_supervised_pretraining,
+        enable_retrieval_stack=enable_retrieval_stack,
+        enable_friction_analysis=enable_friction_analysis,
+        enable_moonshot_lab=enable_moonshot_lab,
+        retrieval_candidate_k=retrieval_candidate_k,
         enable_mlflow=enable_mlflow,
         mlflow_tracking_uri=mlflow_tracking_uri,
         mlflow_experiment=mlflow_experiment,
@@ -462,7 +530,15 @@ def configure_logging(log_path: Path) -> logging.Logger:
 
 
 def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.set_defaults(mlflow=None, optuna=None, temporal_backtest=None)
+    parser.set_defaults(
+        mlflow=None,
+        optuna=None,
+        temporal_backtest=None,
+        retrieval_stack=None,
+        self_supervised_pretrain=None,
+        friction_analysis=None,
+        moonshot_lab=None,
+    )
 
     parser.add_argument("--data-dir", type=str, default=None, help="Directory containing Streaming_History_*.json files.")
     parser.add_argument("--output-dir", type=str, default=None, help="Directory where models/charts/histories are written.")
@@ -505,6 +581,60 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--no-classical-models", action="store_true", help="Disable classical ML model benchmarking.")
     parser.add_argument("--classical-only", action="store_true", help="Run only classical ML benchmarks (skip deep models).")
+    parser.add_argument(
+        "--retrieval-stack",
+        dest="retrieval_stack",
+        action="store_true",
+        help="Train the two-stage retrieval plus reranking stack.",
+    )
+    parser.add_argument(
+        "--no-retrieval-stack",
+        dest="retrieval_stack",
+        action="store_false",
+        help="Disable the two-stage retrieval plus reranking stack.",
+    )
+    parser.add_argument(
+        "--self-supervised-pretrain",
+        dest="self_supervised_pretrain",
+        action="store_true",
+        help="Enable self-supervised sequence pretraining for retrieval embeddings.",
+    )
+    parser.add_argument(
+        "--no-self-supervised-pretrain",
+        dest="self_supervised_pretrain",
+        action="store_false",
+        help="Disable self-supervised sequence pretraining for retrieval embeddings.",
+    )
+    parser.add_argument(
+        "--friction-analysis",
+        dest="friction_analysis",
+        action="store_true",
+        help="Enable proxy friction analysis on skip behavior.",
+    )
+    parser.add_argument(
+        "--no-friction-analysis",
+        dest="friction_analysis",
+        action="store_false",
+        help="Disable proxy friction analysis on skip behavior.",
+    )
+    parser.add_argument(
+        "--retrieval-candidates",
+        type=int,
+        default=None,
+        help="Candidate set size used by the retrieval and reranking stack.",
+    )
+    parser.add_argument(
+        "--moonshot-lab",
+        dest="moonshot_lab",
+        action="store_true",
+        help="Run the moonshot lab: multimodal embeddings, digital twin, causal decomposition, journey planning, safe policy, and stress tests.",
+    )
+    parser.add_argument(
+        "--no-moonshot-lab",
+        dest="moonshot_lab",
+        action="store_false",
+        help="Disable the moonshot lab analyses.",
+    )
     parser.add_argument("--mlflow", dest="mlflow", action="store_true", help="Enable MLflow run tracking.")
     parser.add_argument("--no-mlflow", dest="mlflow", action="store_false", help="Disable MLflow run tracking.")
     parser.add_argument(

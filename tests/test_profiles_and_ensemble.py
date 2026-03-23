@@ -26,6 +26,7 @@ def test_core_and_experimental_profiles_are_available() -> None:
     assert experimental_config.profile == "experimental"
     assert "hist_gbm" in experimental_config.classical_model_names
     assert "transformer_xl" in experimental_config.model_names
+    assert experimental_config.enable_moonshot_lab is True
 
 
 def test_align_proba_to_num_classes_places_sparse_class_columns_correctly() -> None:

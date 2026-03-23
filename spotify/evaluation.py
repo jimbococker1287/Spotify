@@ -452,6 +452,12 @@ def _save_prediction_diagnostics(
                     "test_conformal_coverage": _to_float(test_conformal["coverage"]),
                     "val_abstention_rate": _to_float(val_conformal["abstention_rate"]),
                     "test_abstention_rate": _to_float(test_conformal["abstention_rate"]),
+                    "val_accepted_rate": _to_float(val_conformal.get("accepted_rate")),
+                    "test_accepted_rate": _to_float(test_conformal.get("accepted_rate")),
+                    "val_selective_accuracy": _to_float(val_conformal.get("selective_accuracy")),
+                    "test_selective_accuracy": _to_float(test_conformal.get("selective_accuracy")),
+                    "val_selective_risk": _to_float(val_conformal.get("selective_risk")),
+                    "test_selective_risk": _to_float(test_conformal.get("selective_risk")),
                 }
             )
             summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
@@ -647,6 +653,40 @@ def run_extended_evaluation(
                         logger.info("Saved extended diagnostics for classical model: %s", model_name)
             except Exception as exc:
                 logger.warning("Classical diagnostics skipped for %s due to error: %s", model_name, exc)
+
+    retrieval_rows = [
+        row
+        for row in results
+        if str(row.get("model_type", "")).strip() in ("retrieval", "retrieval_reranker")
+    ]
+    for row in retrieval_rows:
+        model_name = str(row.get("model_name", "")).strip()
+        model_type = str(row.get("model_type", "")).strip()
+        prediction_bundle_raw = str(row.get("prediction_bundle_path", "")).strip()
+        prediction_bundle_path = Path(prediction_bundle_raw) if prediction_bundle_raw else None
+        if not model_name or prediction_bundle_path is None or not prediction_bundle_path.exists():
+            continue
+        try:
+            val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
+            artifacts.extend(
+                _save_prediction_diagnostics(
+                    tag=f"{model_type}_{model_name}",
+                    val_proba=val_proba,
+                    val_y=data.y_val.astype("int64"),
+                    test_proba=test_proba,
+                    test_y=data.y_test.astype("int64"),
+                    val_frame=val_frame,
+                    test_frame=test_frame,
+                    output_dir=analysis_dir,
+                    label_lookup=label_lookup,
+                    class_labels=None,
+                    enable_conformal=enable_conformal,
+                    conformal_alpha=conformal_alpha,
+                )
+            )
+            logger.info("Saved extended diagnostics for retrieval model: %s", model_name)
+        except Exception as exc:
+            logger.warning("Retrieval diagnostics skipped for %s due to error: %s", model_name, exc)
 
     ensemble_rows = [row for row in results if str(row.get("model_type", "")).strip() == "ensemble"]
     if ensemble_rows:

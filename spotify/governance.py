@@ -200,6 +200,8 @@ def _no_current_result_payload(
     profile_match: bool,
     require_significant_lift: bool = False,
     significance_z: float = 1.96,
+    max_selective_risk: float | None = None,
+    max_abstention_rate: float | None = None,
 ) -> dict[str, object]:
     return {
         "status": "no_current_results",
@@ -225,6 +227,10 @@ def _no_current_result_payload(
         "challenger_backtest_std": float("nan"),
         "champion_backtest_count": 0.0,
         "challenger_backtest_count": 0.0,
+        "max_selective_risk": (float(max_selective_risk) if max_selective_risk is not None else float("nan")),
+        "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
+        "challenger_selective_risk": float("nan"),
+        "challenger_abstention_rate": float("nan"),
     }
 
 
@@ -241,6 +247,9 @@ def evaluate_champion_gate(
     require_profile_match: bool = True,
     require_significant_lift: bool = False,
     significance_z: float = 1.96,
+    current_risk_metrics: dict[str, dict[str, float]] | None = None,
+    max_selective_risk: float | None = None,
+    max_abstention_rate: float | None = None,
 ) -> dict[str, object]:
     threshold = max(0.0, float(regression_threshold))
     source = str(metric_source).strip().lower()
@@ -287,12 +296,26 @@ def evaluate_champion_gate(
             profile_match=require_profile_match,
             require_significant_lift=require_significant_lift,
             significance_z=significance_z,
+            max_selective_risk=max_selective_risk,
+            max_abstention_rate=max_abstention_rate,
         )
 
+    challenger_risk = (current_risk_metrics or {}).get(challenger_model_name, {})
+    challenger_selective_risk = _to_float(challenger_risk.get("val_selective_risk"))
+    challenger_abstention_rate = _to_float(challenger_risk.get("val_abstention_rate"))
+
     if champion_score == float("-inf"):
+        status = "no_prior_champion" + status_suffix
+        promoted = True
+        if max_selective_risk is not None and not math.isnan(challenger_selective_risk) and challenger_selective_risk > float(max_selective_risk):
+            promoted = False
+            status = "fail_selective_risk" + status_suffix
+        if max_abstention_rate is not None and not math.isnan(challenger_abstention_rate) and challenger_abstention_rate > float(max_abstention_rate):
+            promoted = False
+            status = "fail_abstention_rate" + status_suffix
         return {
-            "status": "no_prior_champion" + status_suffix,
-            "promoted": True,
+            "status": status,
+            "promoted": promoted,
             "metric_source": effective_source,
             "profile_match": bool(require_profile_match),
             "require_significant_lift": bool(require_significant_lift),
@@ -314,6 +337,10 @@ def evaluate_champion_gate(
             "challenger_backtest_std": float("nan"),
             "champion_backtest_count": 0.0,
             "challenger_backtest_count": 0.0,
+            "max_selective_risk": (float(max_selective_risk) if max_selective_risk is not None else float("nan")),
+            "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
+            "challenger_selective_risk": challenger_selective_risk,
+            "challenger_abstention_rate": challenger_abstention_rate,
         }
 
     regression = float(champion_score - challenger_score)
@@ -346,6 +373,15 @@ def evaluate_champion_gate(
                 promoted = False
                 status = "fail_not_significant" + status_suffix
 
+    if promoted and max_selective_risk is not None and not math.isnan(challenger_selective_risk):
+        if challenger_selective_risk > float(max_selective_risk):
+            promoted = False
+            status = "fail_selective_risk" + status_suffix
+    if promoted and max_abstention_rate is not None and not math.isnan(challenger_abstention_rate):
+        if challenger_abstention_rate > float(max_abstention_rate):
+            promoted = False
+            status = "fail_abstention_rate" + status_suffix
+
     return {
         "status": status,
         "promoted": promoted,
@@ -370,4 +406,8 @@ def evaluate_champion_gate(
         "challenger_backtest_std": challenger_stats["std"],
         "champion_backtest_count": champion_stats["count"],
         "challenger_backtest_count": challenger_stats["count"],
+        "max_selective_risk": (float(max_selective_risk) if max_selective_risk is not None else float("nan")),
+        "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
+        "challenger_selective_risk": challenger_selective_risk,
+        "challenger_abstention_rate": challenger_abstention_rate,
     }

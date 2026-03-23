@@ -56,6 +56,27 @@ def _collect_run_results(output_dir: Path) -> pd.DataFrame:
     return pd.json_normalize(rows) if rows else pd.DataFrame()
 
 
+def _collect_run_analysis_summaries(output_dir: Path, filename: str) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for path in sorted((output_dir / "runs").glob(f"*/analysis/{filename}")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        run_id = path.parent.parent.name
+        if isinstance(payload, list):
+            for row in payload:
+                if isinstance(row, dict):
+                    flat = dict(row)
+                    flat["run_id"] = run_id
+                    rows.append(flat)
+        elif isinstance(payload, dict):
+            flat = dict(payload)
+            flat["run_id"] = run_id
+            rows.append(flat)
+    return pd.json_normalize(rows) if rows else pd.DataFrame()
+
+
 def refresh_analytics_database(
     *,
     data_dir: Path,
@@ -80,9 +101,13 @@ def refresh_analytics_database(
         raw_df = load_streaming_history(data_dir, include_video=include_video, logger=logger)
     experiment_history = _safe_read_csv(output_dir / "history" / "experiment_history.csv")
     backtest_history = _safe_read_csv(output_dir / "history" / "backtest_history.csv")
+    benchmark_history = _safe_read_csv(output_dir / "history" / "benchmark_history.csv")
     optuna_history = _safe_read_csv(output_dir / "history" / "optuna_history.csv")
     run_manifests = _collect_run_manifests(output_dir)
     run_results = _collect_run_results(output_dir)
+    robustness_summary = _collect_run_analysis_summaries(output_dir, "robustness_summary.json")
+    policy_summary = _collect_run_analysis_summaries(output_dir, "policy_simulation_summary.json")
+    moonshot_summary = _collect_run_analysis_summaries(output_dir, "moonshot_summary.json")
 
     try:
         con = duckdb.connect(str(db_path))
@@ -93,9 +118,13 @@ def refresh_analytics_database(
         _replace_table(con, "raw_streaming_history", raw_df)
         _replace_table(con, "experiment_history", experiment_history)
         _replace_table(con, "backtest_history", backtest_history)
+        _replace_table(con, "benchmark_history", benchmark_history)
         _replace_table(con, "optuna_history", optuna_history)
         _replace_table(con, "run_manifests", run_manifests)
         _replace_table(con, "run_results", run_results)
+        _replace_table(con, "robustness_summary", robustness_summary)
+        _replace_table(con, "policy_summary", policy_summary)
+        _replace_table(con, "moonshot_summary", moonshot_summary)
 
         if {"run_id", "timestamp"}.issubset(set(run_manifests.columns)) and {"run_id"}.issubset(set(run_results.columns)):
             con.execute(
@@ -181,6 +210,79 @@ def refresh_analytics_database(
                   "champion_alias.model_type" AS alias_model_type
                 FROM run_manifests
                 WHERE COALESCE(CAST("champion_gate.promoted" AS BOOLEAN), FALSE)
+                """
+            )
+        if {"model_name", "max_top1_gap", "worst_segment", "worst_bucket", "run_id"}.issubset(set(robustness_summary.columns)):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW robustness_model_summary AS
+                SELECT
+                  model_name,
+                  AVG(CAST(max_top1_gap AS DOUBLE)) AS mean_max_top1_gap,
+                  MAX(CAST(max_top1_gap AS DOUBLE)) AS worst_observed_gap,
+                  COUNT(*) AS runs
+                FROM robustness_summary
+                GROUP BY model_name
+                ORDER BY mean_max_top1_gap DESC
+                """
+            )
+        if {"model_name", "model_type", "test_discounted_reward", "test_hit_at_k", "run_id"}.issubset(set(policy_summary.columns)):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW policy_model_summary AS
+                SELECT
+                  model_name,
+                  model_type,
+                  AVG(CAST(test_discounted_reward AS DOUBLE)) AS mean_test_discounted_reward,
+                  AVG(CAST(test_hit_at_k AS DOUBLE)) AS mean_test_hit_at_k,
+                  COUNT(*) AS runs
+                FROM policy_summary
+                GROUP BY model_name, model_type
+                ORDER BY mean_test_discounted_reward DESC
+                """
+            )
+        if {"benchmark_id", "model_name", "val_top1_mean", "test_top1_mean"}.issubset(set(benchmark_history.columns)):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW benchmark_model_summary AS
+                SELECT
+                  benchmark_id,
+                  model_name,
+                  AVG(CAST(val_top1_mean AS DOUBLE)) AS mean_val_top1,
+                  AVG(CAST(test_top1_mean AS DOUBLE)) AS mean_test_top1,
+                  COUNT(*) AS rows
+                FROM benchmark_history
+                GROUP BY benchmark_id, model_name
+                ORDER BY benchmark_id, mean_val_top1 DESC
+                """
+            )
+        if {
+            "run_id",
+            "multimodal_embedding_dim",
+            "digital_twin_test_auc",
+            "causal_test_auc_total",
+            "stress_worst_skip_scenario",
+            "stress_worst_skip_risk",
+        }.issubset(set(moonshot_summary.columns)):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW moonshot_run_summary AS
+                SELECT
+                  ms.run_id,
+                  rm.profile,
+                  CAST(ms.multimodal_embedding_dim AS INTEGER) AS multimodal_embedding_dim,
+                  CAST(ms.multimodal_feature_count AS INTEGER) AS multimodal_feature_count,
+                  CAST(ms.multimodal_retrieval_fusion_enabled AS BOOLEAN) AS multimodal_retrieval_fusion_enabled,
+                  CAST(ms.digital_twin_test_auc AS DOUBLE) AS digital_twin_test_auc,
+                  CAST(ms.causal_test_auc_total AS DOUBLE) AS causal_test_auc_total,
+                  CAST(ms.journey_mean_horizon AS DOUBLE) AS journey_mean_horizon,
+                  CAST(ms.safe_policy_bucket_count AS INTEGER) AS safe_policy_bucket_count,
+                  ms.stress_worst_skip_scenario AS stress_worst_skip_scenario,
+                  CAST(ms.stress_worst_skip_risk AS DOUBLE) AS stress_worst_skip_risk
+                FROM moonshot_summary ms
+                LEFT JOIN run_manifests rm
+                  ON ms.run_id = rm.run_id
+                ORDER BY digital_twin_test_auc DESC NULLS LAST, causal_test_auc_total DESC NULLS LAST
                 """
             )
     except Exception as exc:

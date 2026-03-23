@@ -33,6 +33,7 @@ class BacktestFoldResult:
     fit_seconds: float
     top1: float
     top5: float
+    adaptation_mode: str = "cold"
 
 
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
@@ -88,6 +89,7 @@ def _run_backtest_job(
         model_name=model_name,
         model_type="classical",
         model_family=family,
+        adaptation_mode="cold",
         fold=fold_idx,
         train_rows=len(X_train),
         test_rows=len(X_test),
@@ -201,6 +203,13 @@ def _resolve_deep_strategy(strategy, logger):
     return select_distribution_strategy(tf, logger=logger)
 
 
+def _resolve_backtest_adaptation_mode(raw: str | None) -> str:
+    value = str(raw or os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold")).strip().lower()
+    if value not in ("cold", "warm", "continual"):
+        return "cold"
+    return value
+
+
 def _run_deep_backtest_job(
     *,
     model_name: str,
@@ -221,6 +230,9 @@ def _run_deep_backtest_job(
     X_seq_test: np.ndarray,
     X_ctx_test: np.ndarray,
     y_test: np.ndarray,
+    initial_weights=None,
+    weight_sink: dict[str, object] | None = None,
+    adaptation_mode: str = "cold",
 ) -> BacktestFoldResult:
     import tensorflow as tf
 
@@ -271,6 +283,11 @@ def _run_deep_backtest_job(
                     "skip_output": y_skip_val,
                 }
                 monitor_metric = "val_artist_output_sparse_categorical_accuracy"
+            if initial_weights:
+                try:
+                    model.set_weights(initial_weights)
+                except Exception:
+                    pass
 
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
@@ -293,12 +310,18 @@ def _run_deep_backtest_job(
         fit_seconds = float(time.perf_counter() - started)
         prediction = model.predict((X_seq_test, X_ctx_test), verbose=0)
         artist_proba = _extract_artist_predictions(prediction)
+        if weight_sink is not None:
+            try:
+                weight_sink["weights"] = model.get_weights()
+            except Exception:
+                pass
         top1 = float(np.mean(np.argmax(artist_proba, axis=1) == np.asarray(y_test).reshape(-1)))
         top5 = _topk_accuracy_from_proba(artist_proba, y_test, k=5)
         return BacktestFoldResult(
             model_name=model_name,
             model_type="deep",
             model_family="neural",
+            adaptation_mode=adaptation_mode,
             fold=fold_idx,
             train_rows=len(X_seq_fit),
             test_rows=len(X_seq_test),
@@ -319,6 +342,7 @@ def _write_backtest_csv(results: list[BacktestFoldResult], output_path: Path) ->
                 "model_name",
                 "model_type",
                 "model_family",
+                "adaptation_mode",
                 "fold",
                 "train_rows",
                 "test_rows",
@@ -370,12 +394,14 @@ def run_temporal_backtest(
     feature_bundle: ClassicalFeatureBundle | None = None,
     deep_model_builders=None,
     strategy=None,
+    adaptation_mode: str | None = None,
 ) -> list[BacktestFoldResult]:
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
         return []
 
     classical_models, deep_models = _resolve_backtest_model_groups(selected_models, random_seed)
+    resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
@@ -545,11 +571,14 @@ def run_temporal_backtest(
             deep_model_builders=deep_model_builders,
         )
         logger.info(
-            "Deep temporal backtesting: models=%s epochs=%d batch_size=%d",
+            "Deep temporal backtesting: models=%s epochs=%d batch_size=%d adaptation=%s",
             ",".join(deep_models),
             deep_epochs,
             deep_batch_size,
+            resolved_adaptation_mode,
         )
+        prior_weights: dict[str, object] = {}
+        previous_test_end = 0
 
         for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
             train_slice = _tail_slice(test_start, max_train_samples)
@@ -573,6 +602,21 @@ def run_temporal_backtest(
             fit_slice, val_slice = split_slices
 
             for model_name in deep_models:
+                incremental_fit_seq = X_train_seq[fit_slice]
+                incremental_fit_ctx = X_train_ctx[fit_slice]
+                incremental_y = y_train[fit_slice]
+                incremental_skip = y_skip_train[fit_slice]
+                if resolved_adaptation_mode == "continual" and model_name in prior_weights and previous_test_end < test_start:
+                    inc_seq_all = X_all_seq[previous_test_end:test_start]
+                    inc_ctx_all = X_all_ctx[previous_test_end:test_start]
+                    inc_y_all = y_all[previous_test_end:test_start]
+                    inc_skip_all = y_skip_all[previous_test_end:test_start]
+                    if len(inc_seq_all) > 1:
+                        incremental_fit_seq = inc_seq_all
+                        incremental_fit_ctx = inc_ctx_all
+                        incremental_y = inc_y_all
+                        incremental_skip = inc_skip_all
+                weight_sink: dict[str, object] = {}
                 try:
                     row = _run_deep_backtest_job(
                         model_name=model_name,
@@ -582,10 +626,10 @@ def run_temporal_backtest(
                         strategy=resolved_strategy,
                         batch_size=deep_batch_size,
                         epochs=deep_epochs,
-                        X_seq_fit=X_train_seq[fit_slice],
-                        X_ctx_fit=X_train_ctx[fit_slice],
-                        y_fit=y_train[fit_slice],
-                        y_skip_fit=y_skip_train[fit_slice],
+                        X_seq_fit=incremental_fit_seq,
+                        X_ctx_fit=incremental_fit_ctx,
+                        y_fit=incremental_y,
+                        y_skip_fit=incremental_skip,
                         X_seq_val=X_train_seq[val_slice],
                         X_ctx_val=X_train_ctx[val_slice],
                         y_val=y_train[val_slice],
@@ -593,19 +637,26 @@ def run_temporal_backtest(
                         X_seq_test=X_test_seq,
                         X_ctx_test=X_test_ctx,
                         y_test=y_test,
+                        initial_weights=(prior_weights.get(model_name) if resolved_adaptation_mode in ("warm", "continual") else None),
+                        weight_sink=weight_sink,
+                        adaptation_mode=resolved_adaptation_mode,
                     )
                 except Exception as exc:
                     logger.warning("Deep backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
                     continue
+                if resolved_adaptation_mode in ("warm", "continual") and "weights" in weight_sink:
+                    prior_weights[model_name] = weight_sink["weights"]
                 results.append(row)
                 logger.info(
-                    "[BACKTEST] fold=%d model=%s type=%s top1=%.4f top5=%s",
+                    "[BACKTEST] fold=%d model=%s type=%s adaptation=%s top1=%.4f top5=%s",
                     row.fold,
                     row.model_name,
                     row.model_type,
+                    row.adaptation_mode,
                     row.top1,
                     f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
                 )
+            previous_test_end = test_end
 
     _write_backtest_csv(results, output_dir / "temporal_backtest.csv")
     _plot_backtest(results, output_dir / "temporal_backtest_top1.png")

@@ -144,12 +144,26 @@ def summarize_prediction_sets(
     else:
         coverage = float("nan")
 
+    predicted = np.argmax(proba_arr, axis=1) if proba_arr.shape[1] > 0 else np.zeros(len(proba_arr), dtype="int64")
+    accepted = ~abstained
+    if np.any(accepted):
+        selective_accuracy = float(np.mean(predicted[accepted] == y_arr[accepted]))
+        selective_risk = float(1.0 - selective_accuracy)
+        accepted_rate = float(np.mean(accepted))
+    else:
+        selective_accuracy = float("nan")
+        selective_risk = float("nan")
+        accepted_rate = 0.0
+
     return {
         "coverage": coverage,
         "mean_set_size": float(np.mean(set_sizes)) if set_sizes.size else float("nan"),
         "median_set_size": float(np.median(set_sizes)) if set_sizes.size else float("nan"),
         "max_set_size": int(np.max(set_sizes)) if set_sizes.size else 0,
         "abstention_rate": float(np.mean(abstained)) if abstained.size else float("nan"),
+        "accepted_rate": accepted_rate,
+        "selective_accuracy": selective_accuracy,
+        "selective_risk": selective_risk,
         "top1_confidence_mean": float(np.mean(max_confidence)) if max_confidence.size else float("nan"),
     }
 

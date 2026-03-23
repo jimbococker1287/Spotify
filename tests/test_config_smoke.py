@@ -19,6 +19,11 @@ def test_default_config_paths() -> None:
     assert config.enable_conformal is True
     assert config.conformal_alpha == 0.10
     assert config.enable_classical_models is True
+    assert config.enable_self_supervised_pretraining is True
+    assert config.enable_retrieval_stack is True
+    assert config.enable_friction_analysis is True
+    assert config.enable_moonshot_lab is True
+    assert config.retrieval_candidate_k == 30
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
     assert config.optuna_trials == 18
@@ -51,6 +56,10 @@ def test_profile_defaults_are_applied() -> None:
     assert config.max_artists == 40
     assert config.model_names == ("dense", "lstm")
     assert config.classical_model_names == ("logreg", "random_forest", "knn")
+    assert config.enable_self_supervised_pretraining is False
+    assert config.enable_retrieval_stack is False
+    assert config.enable_friction_analysis is True
+    assert config.enable_moonshot_lab is False
     assert config.enable_mlflow is False
     assert config.enable_optuna is False
     assert config.enable_temporal_backtest is False
@@ -65,6 +74,8 @@ def test_fast_profile_defaults_are_applied() -> None:
     assert config.epochs == 4
     assert config.model_names == ("dense", "gru_artist", "lstm")
     assert config.classical_model_names == ("logreg", "extra_trees", "mlp", "session_knn")
+    assert config.enable_retrieval_stack is False
+    assert config.enable_moonshot_lab is False
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
     assert config.enable_temporal_backtest is True
@@ -128,6 +139,35 @@ def test_conformal_flags_override_profile_defaults() -> None:
 
     assert config.enable_conformal is False
     assert config.conformal_alpha == 0.2
+
+
+def test_retrieval_and_friction_flags_override_profile_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--profile",
+            "dev",
+            "--retrieval-stack",
+            "--self-supervised-pretrain",
+            "--no-friction-analysis",
+            "--retrieval-candidates",
+            "18",
+        ]
+    )
+    config = build_config(args)
+
+    assert config.enable_retrieval_stack is True
+    assert config.enable_self_supervised_pretraining is True
+    assert config.enable_friction_analysis is False
+    assert config.retrieval_candidate_k == 18
+
+
+def test_moonshot_flag_overrides_profile_default() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--profile", "dev", "--moonshot-lab"])
+    config = build_config(args)
+
+    assert config.enable_moonshot_lab is True
 
 
 def test_classical_subset_becomes_default_for_optuna_and_backtest() -> None:

@@ -16,3 +16,4 @@ def test_predict_module_help_runs() -> None:
     assert "--run-dir" in result.stdout
     assert "--model-name" in result.stdout
     assert "--top-k" in result.stdout
+    assert "--spotify-public-metadata" in result.stdout

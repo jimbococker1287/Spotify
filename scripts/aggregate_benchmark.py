@@ -118,6 +118,42 @@ def _plot_ci_chart(path: Path, summary_rows: list[dict[str, object]]) -> Path | 
     return path
 
 
+def _paired_significance(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, float]] = {}
+    for row in rows:
+        model_name = str(row.get("model_name", "")).strip()
+        run_id = str(row.get("run_id", "")).strip()
+        score = _safe_float(row.get("val_top1", ""))
+        if not model_name or not run_id or score is None:
+            continue
+        grouped.setdefault(model_name, {})[run_id] = float(score)
+
+    model_names = sorted(grouped)
+    out: list[dict[str, object]] = []
+    for idx, left in enumerate(model_names):
+        for right in model_names[idx + 1 :]:
+            common = sorted(set(grouped[left]) & set(grouped[right]))
+            if not common:
+                continue
+            diffs = np.asarray([grouped[left][run_id] - grouped[right][run_id] for run_id in common], dtype="float64")
+            mean_diff = float(np.mean(diffs))
+            std_diff = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
+            stderr = float(std_diff / math.sqrt(len(diffs))) if len(diffs) > 0 else float("nan")
+            z_score = float(mean_diff / stderr) if stderr > 0 else float("inf" if mean_diff > 0 else 0.0)
+            out.append(
+                {
+                    "left_model": left,
+                    "right_model": right,
+                    "shared_runs": len(common),
+                    "mean_diff_val_top1": mean_diff,
+                    "ci95_diff_val_top1": float(1.96 * stderr) if stderr > 0 else 0.0,
+                    "z_score": z_score,
+                    "significant_at_95": int(abs(z_score) >= 1.96),
+                }
+            )
+    return out
+
+
 def main() -> int:
     args = _parse_args()
     history_csv = Path(args.history_csv).expanduser().resolve()
@@ -222,6 +258,22 @@ def main() -> int:
 
     ci_plot = output_dir / f"benchmark_lock_{args.benchmark_id}_ci95.png"
     _plot_ci_chart(ci_plot, summary_rows)
+    significance_rows = _paired_significance(filtered)
+    significance_csv = output_dir / f"benchmark_lock_{args.benchmark_id}_significance.csv"
+    if significance_rows:
+        _write_csv(
+            significance_csv,
+            [
+                "left_model",
+                "right_model",
+                "shared_runs",
+                "mean_diff_val_top1",
+                "ci95_diff_val_top1",
+                "z_score",
+                "significant_at_95",
+            ],
+            significance_rows,
+        )
 
     history_append_rows = [
         {
@@ -245,6 +297,8 @@ def main() -> int:
     print(f"benchmark_rows={raw_path}")
     print(f"benchmark_summary={summary_csv}")
     print(f"benchmark_ci_plot={ci_plot}")
+    if significance_rows:
+        print(f"benchmark_significance={significance_csv}")
     return 0
 
 

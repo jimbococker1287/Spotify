@@ -97,7 +97,13 @@ def _select_candidate_rows(results: list[dict[str, object]], max_candidates: int
     rows = [
         row
         for row in results
-        if str(row.get("model_type", "")).strip() in ("deep", "classical", "classical_tuned")
+        if str(row.get("model_type", "")).strip() in (
+            "deep",
+            "classical",
+            "classical_tuned",
+            "retrieval",
+            "retrieval_reranker",
+        )
         and str(row.get("prediction_bundle_path", "")).strip()
         and Path(str(row.get("prediction_bundle_path", "")).strip()).exists()
     ]
@@ -106,7 +112,7 @@ def _select_candidate_rows(results: list[dict[str, object]], max_candidates: int
     selected: list[dict[str, object]] = []
     seen_keys: set[str] = set()
 
-    for target_type in ("classical_tuned", "classical", "deep"):
+    for target_type in ("retrieval_reranker", "retrieval", "classical_tuned", "classical", "deep"):
         for row in ordered:
             row_type = str(row.get("model_type", "")).strip()
             key = _base_model_key(row)

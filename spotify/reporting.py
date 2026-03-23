@@ -514,6 +514,7 @@ def append_backtest_history(
         "model_name",
         "model_type",
         "model_family",
+        "adaptation_mode",
         "fold",
         "train_rows",
         "test_rows",
@@ -529,6 +530,8 @@ def append_backtest_history(
                 existing_header = next(reader, [])
             if existing_header and "model_type" not in existing_header:
                 active_fieldnames = [name for name in fieldnames if name != "model_type"]
+            if existing_header and "adaptation_mode" not in existing_header:
+                active_fieldnames = [name for name in active_fieldnames if name != "adaptation_mode"]
         except Exception:
             active_fieldnames = list(fieldnames)
 
@@ -546,6 +549,7 @@ def append_backtest_history(
                 "model_name": row.get("model_name", ""),
                 "model_type": row.get("model_type", ""),
                 "model_family": row.get("model_family", ""),
+                "adaptation_mode": row.get("adaptation_mode", ""),
                 "fold": row.get("fold", ""),
                 "train_rows": row.get("train_rows", ""),
                 "test_rows": row.get("test_rows", ""),
@@ -751,6 +755,9 @@ def write_run_report(
         "run_leaderboard.png",
         "model_comparison.png",
         "utilization.png",
+        "benchmark_protocol.json",
+        "benchmark_protocol.md",
+        "experiment_registry.json",
         "optuna/optuna_results.json",
         "backtest/temporal_backtest.csv",
         "../history/history_best_runs.png",
@@ -762,6 +769,7 @@ def write_run_report(
             lines.append(f"- [{rel}]({rel})")
     analysis_dir = run_dir / "analysis"
     if analysis_dir.exists():
+        seen_analysis_paths: set[Path] = set()
         for pattern in (
             "ensemble_*_summary.json",
             "*_confidence_summary.json",
@@ -769,11 +777,37 @@ def write_run_report(
             "*drift*.json",
             "*drift*.csv",
             "*drift*.png",
+            "*robustness*.json",
+            "*robustness*.csv",
+            "*robustness*.png",
+            "*policy_simulation*.json",
+            "*policy_simulation*.csv",
+            "*ablation*.json",
+            "*ablation*.csv",
+            "*significance*.json",
+            "*significance*.csv",
+            "moonshot_summary.json",
+            "*multimodal*.json",
+            "*multimodal*.csv",
+            "*causal_skip*.json",
+            "*causal_skip*.csv",
+            "*digital_twin*.json",
+            "*digital_twin*.csv",
+            "*journey*.json",
+            "*journey*.csv",
+            "*safe_bandit*.json",
+            "*safe_bandit*.csv",
+            "*stress_test*.json",
+            "*stress_test*.csv",
             "*_reliability.png",
             "*_segment_metrics.csv",
             "*_top_errors.csv",
         ):
-            for path in sorted(analysis_dir.glob(pattern)):
+            for path in sorted(analysis_dir.rglob(pattern)):
+                resolved = path.resolve()
+                if not path.is_file() or resolved in seen_analysis_paths:
+                    continue
+                seen_analysis_paths.add(resolved)
                 rel = path.relative_to(run_dir).as_posix()
                 lines.append(f"- [{rel}]({rel})")
     lines.append("")

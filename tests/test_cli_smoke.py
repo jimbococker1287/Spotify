@@ -19,3 +19,4 @@ def test_python_module_help_runs() -> None:
     assert "--mlflow" in result.stdout
     assert "--optuna-trials" in result.stdout
     assert "--temporal-backtest" in result.stdout
+    assert "--moonshot-lab" in result.stdout

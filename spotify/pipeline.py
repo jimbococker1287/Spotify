@@ -34,6 +34,51 @@ def _track_file(tracker: MlflowTracker | None, path: Path) -> None:
         tracker.log_artifact(path)
 
 
+def _analysis_prefix_for_model_type(model_type: str) -> str | None:
+    normalized = str(model_type).strip().lower()
+    if normalized == "deep":
+        return "deep"
+    if normalized in ("classical", "classical_tuned"):
+        return "classical"
+    if normalized in ("retrieval", "retrieval_reranker", "ensemble"):
+        return normalized
+    return None
+
+
+def _safe_json_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _load_current_risk_metrics(run_dir: Path, result_rows: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    metrics: dict[str, dict[str, float]] = {}
+    analysis_dir = run_dir / "analysis"
+    if not analysis_dir.exists():
+        return metrics
+    for row in result_rows:
+        model_name = str(row.get("model_name", "")).strip()
+        model_type = str(row.get("model_type", "")).strip().lower()
+        prefix = _analysis_prefix_for_model_type(model_type)
+        if not model_name or prefix is None:
+            continue
+        path = analysis_dir / f"{prefix}_{model_name}_confidence_summary.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        metrics[model_name] = {
+            "val_selective_risk": _safe_json_float(payload.get("val_selective_risk", float("nan"))),
+            "val_abstention_rate": _safe_json_float(payload.get("val_abstention_rate", float("nan"))),
+            "test_selective_risk": _safe_json_float(payload.get("test_selective_risk", float("nan"))),
+            "test_abstention_rate": _safe_json_float(payload.get("test_abstention_rate", float("nan"))),
+        }
+    return metrics
+
+
 def _release_deep_runtime_resources(tf_module, logger) -> None:
     import gc
 
@@ -145,12 +190,18 @@ def run_pipeline(config: PipelineConfig) -> None:
                 "classical_only": config.classical_only,
                 "deep_models": config.model_names,
                 "classical_models": config.classical_model_names,
+                "enable_retrieval_stack": config.enable_retrieval_stack,
+                "enable_self_supervised_pretraining": config.enable_self_supervised_pretraining,
+                "enable_friction_analysis": config.enable_friction_analysis,
+                "enable_moonshot_lab": config.enable_moonshot_lab,
+                "retrieval_candidate_k": config.retrieval_candidate_k,
                 "enable_optuna": config.enable_optuna,
                 "optuna_trials": config.optuna_trials,
                 "optuna_models": config.optuna_model_names,
                 "enable_temporal_backtest": config.enable_temporal_backtest,
                 "temporal_backtest_folds": config.temporal_backtest_folds,
                 "temporal_backtest_models": config.temporal_backtest_model_names,
+                "temporal_backtest_adaptation_mode": os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold"),
             }
         )
 
@@ -172,8 +223,19 @@ def run_pipeline(config: PipelineConfig) -> None:
         from .drift import run_drift_diagnostics
         from .explainability import run_shap_analysis
         from .evaluation import run_extended_evaluation
+        from .friction import run_friction_proxy_analysis
         from .modeling import build_model_builders
         from .monitoring import ResourceMonitor
+        from .moonshot_lab import run_moonshot_lab
+        from .policy_eval import run_policy_simulation
+        from .research_artifacts import (
+            write_ablation_summary,
+            write_benchmark_protocol,
+            write_experiment_registry,
+            write_significance_summary,
+        )
+        from .retrieval import train_retrieval_stack
+        from .robustness import run_robustness_slice_evaluation
         from .reporting import (
             VAL_KEY,
             append_backtest_history,
@@ -455,6 +517,21 @@ def run_pipeline(config: PipelineConfig) -> None:
         elif config.enable_optuna:
             logger.info("Skipping Optuna tuning because classical models are disabled.")
 
+        if config.enable_retrieval_stack:
+            retrieval_result = train_retrieval_stack(
+                data=prepared,
+                output_dir=run_dir,
+                random_seed=config.random_seed,
+                candidate_k=config.retrieval_candidate_k,
+                enable_self_supervised_pretraining=config.enable_self_supervised_pretraining,
+                logger=logger,
+            )
+            for row in retrieval_result.rows:
+                result_rows.append(dict(row))
+            artifact_paths.extend(retrieval_result.artifact_paths)
+        else:
+            logger.info("Skipping retrieval stack for this run.")
+
         if config.enable_temporal_backtest:
             backtest_dir = run_dir / "backtest"
             deep_backtest_builders = model_builders
@@ -481,6 +558,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 feature_bundle=classical_feature_bundle,
                 deep_model_builders=deep_backtest_builders,
                 strategy=strategy,
+                adaptation_mode=os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold"),
             )
             for row in backtest_results:
                 backtest_rows.append(
@@ -488,6 +566,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "model_name": row.model_name,
                         "model_type": row.model_type,
                         "model_family": row.model_family,
+                        "adaptation_mode": row.adaptation_mode,
                         "fold": row.fold,
                         "train_rows": row.train_rows,
                         "test_rows": row.test_rows,
@@ -537,6 +616,48 @@ def run_pipeline(config: PipelineConfig) -> None:
                 logger=logger,
             )
         )
+        artifact_paths.extend(
+            run_robustness_slice_evaluation(
+                data=prepared,
+                results=result_rows,
+                sequence_length=config.sequence_length,
+                run_dir=run_dir,
+                logger=logger,
+            )
+        )
+        artifact_paths.extend(
+            run_policy_simulation(
+                data=prepared,
+                results=result_rows,
+                run_dir=run_dir,
+                logger=logger,
+            )
+        )
+        if config.enable_friction_analysis:
+            artifact_paths.extend(
+                run_friction_proxy_analysis(
+                    data=prepared,
+                    output_dir=run_dir / "analysis",
+                    logger=logger,
+                )
+            )
+        else:
+            logger.info("Skipping friction proxy analysis for this run.")
+
+        if config.enable_moonshot_lab:
+            artifact_paths.extend(
+                run_moonshot_lab(
+                    data=prepared,
+                    results=result_rows,
+                    run_dir=run_dir,
+                    sequence_length=config.sequence_length,
+                    artist_labels=artist_labels,
+                    random_seed=config.random_seed,
+                    logger=logger,
+                )
+            )
+        else:
+            logger.info("Skipping moonshot lab for this run.")
 
         leaderboard_path = plot_run_leaderboard(result_rows, run_dir)
         if leaderboard_path is not None:
@@ -570,6 +691,17 @@ def run_pipeline(config: PipelineConfig) -> None:
             champion_gate_significance_z = max(0.0, float(champion_gate_significance_z_raw))
         except Exception:
             champion_gate_significance_z = 1.96
+        current_risk_metrics = _load_current_risk_metrics(run_dir, result_rows)
+        gate_max_selective_risk_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK", "").strip()
+        gate_max_abstention_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE", "").strip()
+        try:
+            gate_max_selective_risk = float(gate_max_selective_risk_raw) if gate_max_selective_risk_raw else None
+        except Exception:
+            gate_max_selective_risk = None
+        try:
+            gate_max_abstention_rate = float(gate_max_abstention_raw) if gate_max_abstention_raw else None
+        except Exception:
+            gate_max_abstention_rate = None
         champion_gate = evaluate_champion_gate(
             history_csv=history_csv,
             current_run_id=run_id,
@@ -582,6 +714,9 @@ def run_pipeline(config: PipelineConfig) -> None:
             require_profile_match=champion_gate_match_profile,
             require_significant_lift=champion_gate_require_significance,
             significance_z=champion_gate_significance_z,
+            current_risk_metrics=current_risk_metrics,
+            max_selective_risk=gate_max_selective_risk,
+            max_abstention_rate=gate_max_abstention_rate,
         )
         champion_gate_path = run_dir / "champion_gate.json"
         champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
@@ -676,6 +811,35 @@ def run_pipeline(config: PipelineConfig) -> None:
         retention_path.write_text(json.dumps(retention_summary, indent=2), encoding="utf-8")
         artifact_paths.append(retention_path)
 
+        artifact_paths.extend(
+            write_benchmark_protocol(
+                output_dir=run_dir,
+                run_id=run_id,
+                profile=config.profile,
+                data=prepared,
+                cache_info=cache_info_payload,
+                config=config,
+            )
+        )
+        artifact_paths.append(
+            write_experiment_registry(
+                output_dir=run_dir,
+                run_id=run_id,
+                profile=config.profile,
+                results=result_rows,
+                backtest_rows=backtest_rows,
+                config=config,
+            )
+        )
+        artifact_paths.extend(write_ablation_summary(output_dir=run_dir / "analysis", results=result_rows))
+        artifact_paths.extend(
+            write_significance_summary(
+                output_dir=run_dir / "analysis",
+                results=result_rows,
+                backtest_rows=backtest_rows,
+            )
+        )
+
         if optuna_rows:
             optuna_history_csv = append_optuna_history(
                 history_csv=history_dir / "optuna_history.csv",
@@ -712,6 +876,11 @@ def run_pipeline(config: PipelineConfig) -> None:
             "num_context_features": prepared.num_ctx,
             "deep_models": list(config.model_names),
             "classical_models": list(config.classical_model_names) if run_classical_models else [],
+            "enable_retrieval_stack": config.enable_retrieval_stack,
+            "enable_self_supervised_pretraining": config.enable_self_supervised_pretraining,
+            "enable_friction_analysis": config.enable_friction_analysis,
+            "enable_moonshot_lab": config.enable_moonshot_lab,
+            "retrieval_candidate_k": config.retrieval_candidate_k,
             "enable_mlflow": config.enable_mlflow,
             "enable_optuna": config.enable_optuna,
             "optuna_models": list(config.optuna_model_names),
@@ -719,6 +888,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             "enable_temporal_backtest": config.enable_temporal_backtest,
             "temporal_backtest_models": list(config.temporal_backtest_model_names),
             "temporal_backtest_folds": config.temporal_backtest_folds,
+            "temporal_backtest_adaptation_mode": os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold"),
             "backtest_rows": len(backtest_rows),
             "optuna_rows": len(optuna_rows),
             "cache": cache_info_payload,

@@ -62,7 +62,14 @@ def best_serveable_model(
     for row in result_rows:
         model_name = str(row.get("model_name", "")).strip()
         model_type = str(row.get("model_type", "")).strip().lower()
-        if not model_name or model_type not in ("deep", "classical", "classical_tuned", "ensemble"):
+        if not model_name or model_type not in (
+            "deep",
+            "classical",
+            "classical_tuned",
+            "ensemble",
+            "retrieval",
+            "retrieval_reranker",
+        ):
             continue
         score = _to_float(row.get("val_top1"))
         if math.isnan(score):
@@ -73,6 +80,10 @@ def best_serveable_model(
         elif model_type in ("classical", "classical_tuned"):
             estimator_path = str(row.get("estimator_artifact_path", "")).strip()
             if not estimator_path or not Path(estimator_path).exists():
+                continue
+        elif model_type in ("retrieval", "retrieval_reranker"):
+            retrieval_path = str(row.get("retrieval_artifact_path", "")).strip()
+            if not retrieval_path or not Path(retrieval_path).exists():
                 continue
         elif model_type == "ensemble":
             members = row.get("ensemble_members", [])

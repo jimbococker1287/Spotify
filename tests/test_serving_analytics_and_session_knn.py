@@ -141,7 +141,7 @@ def test_analytics_db_refresh_builds_duckdb(tmp_path: Path) -> None:
 
     output_dir = tmp_path / "outputs"
     (output_dir / "history").mkdir(parents=True)
-    (output_dir / "runs" / "run_a").mkdir(parents=True)
+    (output_dir / "runs" / "run_a" / "analysis").mkdir(parents=True)
     pd.DataFrame([{"run_id": "run_a", "profile": "core", "model_name": "mlp", "val_top1": 0.3, "test_top1": 0.2}]).to_csv(
         output_dir / "history" / "experiment_history.csv",
         index=False,
@@ -166,6 +166,22 @@ def test_analytics_db_refresh_builds_duckdb(tmp_path: Path) -> None:
         json.dumps([{"model_name": "mlp", "model_type": "classical", "val_top1": 0.3, "test_top1": 0.2}]),
         encoding="utf-8",
     )
+    (output_dir / "runs" / "run_a" / "analysis" / "moonshot_summary.json").write_text(
+        json.dumps(
+            {
+                "multimodal_embedding_dim": 8,
+                "multimodal_feature_count": 14,
+                "multimodal_retrieval_fusion_enabled": True,
+                "digital_twin_test_auc": 0.71,
+                "causal_test_auc_total": 0.68,
+                "journey_mean_horizon": 6.0,
+                "safe_policy_bucket_count": 2,
+                "stress_worst_skip_scenario": "high_friction_spike",
+                "stress_worst_skip_risk": 0.42,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     db_path = refresh_analytics_database(
         data_dir=data_dir,
@@ -176,6 +192,13 @@ def test_analytics_db_refresh_builds_duckdb(tmp_path: Path) -> None:
 
     assert db_path is not None
     assert Path(db_path).exists()
+    import duckdb
+
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        rows = con.execute(
+            "SELECT run_id, multimodal_embedding_dim, stress_worst_skip_scenario FROM moonshot_run_summary"
+        ).fetchall()
+    assert rows == [("run_a", 8, "high_friction_spike")]
 
 
 def test_analytics_db_refresh_can_reuse_preloaded_raw_df(tmp_path: Path) -> None:

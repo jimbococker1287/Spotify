@@ -356,6 +356,8 @@ class PredictionService:
             prefix = "deep"
         elif model_type in ("classical", "classical_tuned"):
             prefix = "classical"
+        elif model_type in ("retrieval", "retrieval_reranker"):
+            prefix = model_type
         elif model_type == "ensemble":
             prefix = "ensemble"
         else:

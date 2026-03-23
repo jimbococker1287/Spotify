@@ -12,6 +12,7 @@ import numpy as np
 
 from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
+from .public_catalog import SpotifyArtistMetadata, SpotifyPublicCatalogClient, SpotifyPublicCatalogError
 from .serving import load_predictor, resolve_model_row
 
 
@@ -54,6 +55,17 @@ def _parse_args() -> argparse.Namespace:
         "--include-video",
         action="store_true",
         help="Include video history files while rebuilding the latest context.",
+    )
+    parser.add_argument(
+        "--spotify-public-metadata",
+        action="store_true",
+        help="Enrich printed predictions with Spotify public artist metadata via the Web API.",
+    )
+    parser.add_argument(
+        "--spotify-market",
+        type=str,
+        default="US",
+        help="Two-letter market code to use when looking up Spotify public artist metadata.",
     )
     return parser.parse_args()
 
@@ -175,6 +187,41 @@ def _prepare_inputs(
     return sequence_labels.reshape(1, -1), context.context_scaled.copy(), sequence_names
 
 
+def _build_public_catalog_client(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+) -> SpotifyPublicCatalogClient | None:
+    if not bool(args.spotify_public_metadata):
+        return None
+
+    client = SpotifyPublicCatalogClient.from_env(market=str(args.spotify_market or "US"))
+    if client is None:
+        logger.warning(
+            "Spotify public metadata was requested but SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET are not set. "
+            "Continuing without enrichment."
+        )
+        return None
+    return client
+
+
+def _metadata_suffix(metadata: SpotifyArtistMetadata | None) -> str:
+    if metadata is None:
+        return ""
+
+    details: list[str] = []
+    if metadata.popularity is not None:
+        details.append(f"popularity={metadata.popularity}")
+    if metadata.followers_total is not None:
+        details.append(f"followers={metadata.followers_total}")
+    if metadata.genres:
+        details.append("genres=" + ", ".join(metadata.genres[:3]))
+    if metadata.spotify_url:
+        details.append(f"url={metadata.spotify_url}")
+    if not details:
+        return ""
+    return " | spotify: " + " | ".join(details)
+
+
 def main() -> int:
     load_local_env()
     args = _parse_args()
@@ -218,6 +265,7 @@ def main() -> int:
     )
 
     artist_probs = predictor.predict_proba(seq_batch, ctx_batch)[0]
+    public_catalog_client = _build_public_catalog_client(args, logger)
 
     top_k = max(1, int(args.top_k))
     top_indices = np.argsort(artist_probs)[::-1][:top_k]
@@ -229,7 +277,14 @@ def main() -> int:
     for rank, label_idx in enumerate(top_indices, start=1):
         artist_name = artist_labels[int(label_idx)]
         prob = float(artist_probs[int(label_idx)])
-        print(f"{rank}. {artist_name} ({prob:.4f})")
+        metadata: SpotifyArtistMetadata | None = None
+        if public_catalog_client is not None:
+            try:
+                metadata = public_catalog_client.search_artist(artist_name)
+            except SpotifyPublicCatalogError as exc:
+                logger.warning("Spotify public metadata lookup failed for %s: %s", artist_name, exc)
+                public_catalog_client = None
+        print(f"{rank}. {artist_name} ({prob:.4f}){_metadata_suffix(metadata)}")
 
     return 0
 
