@@ -114,6 +114,7 @@ spotify-serve --help
 spotify-public-insights --help
 spotify-compare-public --help
 spotify-control-room --help
+spotify-taste-os-demo --help
 ```
 
 The existing `python -m spotify...` module entry points still work too.
@@ -460,6 +461,22 @@ Generate the control-room summary:
 make control-room
 ```
 
+## Taste OS Demo
+
+Run the first unified `Personal Taste OS` demo contract against the current champion run:
+
+```bash
+python -m spotify.taste_os_demo --mode focus --top-k 5
+```
+
+Or via the console script:
+
+```bash
+spotify-taste-os-demo --mode discovery --top-k 5
+```
+
+The contract and acceptance checklist for this demo live in `docs/taste_os_demo_contract.md`.
+
 ## Prediction CLI
 
 Load the best deep model from the latest promoted champion run and print top-5 predictions:
@@ -688,7 +705,7 @@ Artifacts are written under `outputs/analysis/public_spotify/`.
 
 ## Roadmaps
 
-See `docs/personal_taste_os.md` for the product thesis, `docs/project_threads.md` for the six-thread audit and expansion map, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
+See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the Week-1 demo contract, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
 ## Docker (Prediction Service)
 

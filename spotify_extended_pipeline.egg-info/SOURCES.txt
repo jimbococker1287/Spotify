@@ -49,6 +49,7 @@ spotify/serving.py
 spotify/session_knn.py
 spotify/storage_report.py
 spotify/stress_test.py
+spotify/taste_os_demo.py
 spotify/tracking.py
 spotify/training.py
 spotify/tuning.py
@@ -95,6 +96,8 @@ tests/test_retrieval_and_friction.py
 tests/test_runtime_acceleration.py
 tests/test_serving_analytics_and_session_knn.py
 tests/test_storage_report.py
+tests/test_taste_os_demo.py
+tests/test_taste_os_demo_cli_smoke.py
 tests/test_training_helpers.py
 tests/test_tuning_helpers.py
 tests/test_uncertainty.py
