@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import sqlite3
+from urllib.parse import unquote, urlparse
 
 
 def _file_size(path: Path) -> int:
@@ -56,6 +58,8 @@ def _categorize_output_path(output_dir: Path, path: Path) -> str:
         return "run_other"
     if parts[0] == "analytics":
         return "analytics"
+    if parts[0] == "mlruns":
+        return "mlflow_tracking"
     if parts[0] == "history":
         return "history"
     if parts[0] == "cache":
@@ -65,53 +69,102 @@ def _categorize_output_path(output_dir: Path, path: Path) -> str:
     return "other"
 
 
+def _resolve_path_from_uri(raw_uri: str) -> Path | None:
+    value = str(raw_uri or "").strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in ("", "file"):
+        return None
+    if parsed.scheme == "file":
+        uri_path = unquote(parsed.path or "")
+        if parsed.netloc:
+            uri_path = f"/{parsed.netloc}{uri_path}"
+        candidate = Path(uri_path).expanduser()
+    else:
+        candidate = Path(value).expanduser()
+    return candidate.resolve()
+
+
+def _discover_storage_roots(output_root: Path) -> list[tuple[str, Path]]:
+    roots: list[tuple[str, Path]] = [("outputs", output_root)]
+    seen = {output_root.resolve()}
+    db_path = output_root / "mlruns" / "mlflow.db"
+    if not db_path.exists():
+        return roots
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT artifact_location FROM experiments WHERE artifact_location IS NOT NULL AND artifact_location != ''"
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    for (raw_uri,) in rows:
+        root = _resolve_path_from_uri(str(raw_uri or "").strip())
+        if root is None or root in seen or not root.exists() or not root.is_dir():
+            continue
+        try:
+            root.relative_to(output_root)
+        except ValueError:
+            roots.append(("mlflow_artifacts", root))
+            seen.add(root)
+    return roots
+
+
 def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, object]:
     output_root = output_dir.expanduser().resolve()
-    files = [path for path in output_root.rglob("*") if path.is_file()]
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    storage_roots = _discover_storage_roots(output_root)
 
     section_totals: dict[str, int] = {}
     category_totals: dict[str, dict[str, int]] = {}
     run_totals: dict[str, dict[str, object]] = {}
     top_files: list[dict[str, object]] = []
 
-    for path in files:
-        size_bytes = _file_size(path)
-        try:
-            relative = path.resolve().relative_to(output_root)
-        except ValueError:
-            continue
-        category = _categorize_output_path(output_root, path)
-        section = relative.parts[0] if relative.parts else "other"
+    for root_label, root in storage_roots:
+        files = [path for path in root.rglob("*") if path.is_file()]
+        for path in files:
+            size_bytes = _file_size(path)
+            if root_label == "outputs":
+                try:
+                    relative = path.resolve().relative_to(output_root)
+                except ValueError:
+                    continue
+                category = _categorize_output_path(output_root, path)
+                section = relative.parts[0] if relative.parts else "other"
 
-        section_totals[section] = section_totals.get(section, 0) + size_bytes
-        bucket = category_totals.setdefault(category, {"bytes": 0, "file_count": 0})
-        bucket["bytes"] += size_bytes
-        bucket["file_count"] += 1
+                if section == "runs" and len(relative.parts) >= 2:
+                    run_id = relative.parts[1]
+                    run_entry = run_totals.setdefault(
+                        run_id,
+                        {
+                            "run_id": run_id,
+                            "run_dir": str((output_root / "runs" / run_id).resolve()),
+                            "total_bytes": 0,
+                            "file_count": 0,
+                            "categories": {},
+                            "top_files": [],
+                        },
+                    )
+                    run_entry["total_bytes"] += size_bytes
+                    run_entry["file_count"] += 1
+                    categories = run_entry["categories"]
+                    categories[category] = int(categories.get(category, 0)) + size_bytes
+                    top_entries = run_entry["top_files"]
+                    top_entries.append({"path": str(path.resolve()), "bytes": size_bytes})
+                    top_entries.sort(key=lambda item: int(item["bytes"]), reverse=True)
+                    del top_entries[top_n:]
+            else:
+                category = "mlflow_artifacts"
+                section = root_label
 
-        if section == "runs" and len(relative.parts) >= 2:
-            run_id = relative.parts[1]
-            run_entry = run_totals.setdefault(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "run_dir": str((output_root / "runs" / run_id).resolve()),
-                    "total_bytes": 0,
-                    "file_count": 0,
-                    "categories": {},
-                    "top_files": [],
-                },
-            )
-            run_entry["total_bytes"] += size_bytes
-            run_entry["file_count"] += 1
-            categories = run_entry["categories"]
-            categories[category] = int(categories.get(category, 0)) + size_bytes
-            top_entries = run_entry["top_files"]
-            top_entries.append({"path": str(path.resolve()), "bytes": size_bytes})
-            top_entries.sort(key=lambda item: int(item["bytes"]), reverse=True)
-            del top_entries[top_n:]
-
-        top_files.append({"path": str(path.resolve()), "bytes": size_bytes, "category": category})
+            section_totals[section] = section_totals.get(section, 0) + size_bytes
+            bucket = category_totals.setdefault(category, {"bytes": 0, "file_count": 0})
+            bucket["bytes"] += size_bytes
+            bucket["file_count"] += 1
+            top_files.append({"path": str(path.resolve()), "bytes": size_bytes, "category": category})
 
     top_files.sort(key=lambda item: int(item["bytes"]), reverse=True)
     top_files = top_files[:top_n]
@@ -153,6 +206,7 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
     report = {
         "generated_at": generated_at,
         "output_dir": str(output_root),
+        "scanned_roots": [{"label": label, "path": str(path)} for label, path in storage_roots],
         "total_bytes": sum(section_totals.values()),
         "human_size": _format_bytes(sum(section_totals.values())),
         "section_totals": section_rows,
@@ -179,9 +233,13 @@ def write_storage_report(output_dir: Path, *, top_n: int = 15) -> tuple[Path, Pa
         f"- Output root: `{report['output_dir']}`",
         f"- Total size: `{report['human_size']}`",
         "",
-        "## Sections",
+        "## Scanned Roots",
         "",
     ]
+    for row in report["scanned_roots"]:
+        lines.append(f"- `{row['label']}`: `{row['path']}`")
+
+    lines.extend(["", "## Sections", ""])
     for row in report["section_totals"]:
         lines.append(f"- `{row['section']}`: `{row['human_size']}`")
 

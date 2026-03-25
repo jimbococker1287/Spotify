@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-from .artifact_cleanup import prune_old_auxiliary_artifacts, prune_run_artifacts
+from .artifact_cleanup import prune_mlflow_artifacts, prune_old_auxiliary_artifacts, prune_run_artifacts
 from .champion_alias import best_serveable_model, write_champion_alias
 from .config import DEFAULT_MODEL_NAMES, PipelineConfig, configure_logging
 from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
@@ -140,6 +140,17 @@ def run_pipeline(config: PipelineConfig) -> None:
         "run_dir": "",
         "model_name": "",
         "reason": "gate_not_evaluated",
+    }
+    mlflow_artifact_cleanup_summary: dict[str, object] = {
+        "enabled": False,
+        "artifact_mode": "off",
+        "max_artifact_mb": 0.0,
+        "status": "not_run",
+        "artifact_dir_count": 0,
+        "artifact_dirs": [],
+        "deleted_file_count": 0,
+        "deleted_files": [],
+        "freed_bytes": 0,
     }
     artifact_paths: list[Path] = [run_dir / "train.log"]
     tracker: MlflowTracker | None = None
@@ -811,6 +822,13 @@ def run_pipeline(config: PipelineConfig) -> None:
         retention_path = run_dir / "artifact_retention.json"
         retention_path.write_text(json.dumps(retention_summary, indent=2), encoding="utf-8")
         artifact_paths.append(retention_path)
+        mlflow_artifact_cleanup_summary = prune_mlflow_artifacts(
+            output_dir=config.output_dir,
+            logger=logger,
+        )
+        mlflow_artifact_cleanup_path = run_dir / "mlflow_artifact_cleanup.json"
+        mlflow_artifact_cleanup_path.write_text(json.dumps(mlflow_artifact_cleanup_summary, indent=2), encoding="utf-8")
+        artifact_paths.append(mlflow_artifact_cleanup_path)
 
         artifact_paths.extend(
             write_benchmark_protocol(
@@ -897,6 +915,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             "champion_alias": champion_alias_payload,
             "artifact_cleanup": cleanup_summary,
             "artifact_retention": retention_summary,
+            "mlflow_artifact_cleanup": mlflow_artifact_cleanup_summary,
         }
         manifest_path = run_dir / "run_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as out:

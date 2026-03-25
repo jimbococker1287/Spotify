@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import json
+import sqlite3
+from urllib.parse import unquote, urlparse
 
 from .champion_alias import best_serveable_model, read_champion_alias
+from .tracking import resolve_mlflow_artifact_policy, should_log_mlflow_artifact
 
 
 def _normalize_cleanup_mode(raw: object) -> str:
@@ -34,6 +37,47 @@ def _resolve_existing_path(raw_path: str, *, fallbacks: list[Path]) -> Path | No
         if candidate.exists():
             return candidate.resolve()
     return None
+
+
+def _resolve_path_from_uri(raw_uri: str) -> Path | None:
+    value = str(raw_uri or "").strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in ("", "file"):
+        return None
+    if parsed.scheme == "file":
+        uri_path = unquote(parsed.path or "")
+        if parsed.netloc:
+            uri_path = f"/{parsed.netloc}{uri_path}"
+        candidate = Path(uri_path).expanduser()
+    else:
+        candidate = Path(value).expanduser()
+    return candidate.resolve()
+
+
+def _load_mlflow_artifact_dirs(output_dir: Path) -> list[Path]:
+    db_path = output_dir / "mlruns" / "mlflow.db"
+    if not db_path.exists():
+        return []
+
+    artifact_dirs: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT artifact_uri FROM runs WHERE artifact_uri IS NOT NULL AND artifact_uri != ''"
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    for (raw_uri,) in rows:
+        artifact_dir = _resolve_path_from_uri(str(raw_uri or "").strip())
+        if artifact_dir is None or artifact_dir in seen or not artifact_dir.exists() or not artifact_dir.is_dir():
+            continue
+        seen.add(artifact_dir)
+        artifact_dirs.append(artifact_dir)
+    return sorted(artifact_dirs)
 
 
 def _collect_required_models(
@@ -549,3 +593,80 @@ def prune_old_auxiliary_artifacts(
         "freed_bytes": total_freed,
         "runs": summaries,
     }
+
+
+def prune_mlflow_artifacts(
+    *,
+    output_dir: Path,
+    logger,
+    artifact_mode: str | None = None,
+    max_artifact_mb: float | None = None,
+) -> dict[str, object]:
+    resolved_mode, resolved_max_artifact_mb = resolve_mlflow_artifact_policy(
+        mode_raw=artifact_mode,
+        max_artifact_mb_raw=max_artifact_mb,
+    )
+    summary: dict[str, object] = {
+        "enabled": resolved_mode != "off",
+        "artifact_mode": resolved_mode,
+        "max_artifact_mb": float(resolved_max_artifact_mb),
+        "status": "pending",
+        "artifact_dir_count": 0,
+        "artifact_dirs": [],
+        "deleted_file_count": 0,
+        "deleted_files": [],
+        "freed_bytes": 0,
+    }
+    if resolved_mode in ("off", "all"):
+        summary["status"] = "skipped_policy"
+        return summary
+
+    artifact_dirs = _load_mlflow_artifact_dirs(output_dir.resolve())
+    summary["artifact_dir_count"] = len(artifact_dirs)
+    summary["artifact_dirs"] = [str(path) for path in artifact_dirs]
+    if not artifact_dirs:
+        summary["status"] = "skipped_no_artifact_dirs"
+        return summary
+
+    deleted_files: list[str] = []
+    freed_bytes = 0
+
+    for artifact_dir in artifact_dirs:
+        for file_path in sorted(artifact_dir.rglob("*"), reverse=True):
+            if not file_path.is_file():
+                continue
+            if should_log_mlflow_artifact(
+                file_path,
+                mode=resolved_mode,
+                max_artifact_mb=resolved_max_artifact_mb,
+            ):
+                continue
+            size_bytes = _file_size(file_path)
+            try:
+                file_path.unlink()
+            except OSError:
+                continue
+            deleted_files.append(str(file_path.resolve()))
+            freed_bytes += size_bytes
+
+        for path in sorted(artifact_dir.rglob("*"), reverse=True):
+            if not path.is_dir():
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+
+    summary["status"] = "completed"
+    summary["deleted_file_count"] = len(deleted_files)
+    summary["deleted_files"] = deleted_files
+    summary["freed_bytes"] = int(freed_bytes)
+    if deleted_files:
+        logger.info(
+            "MLflow artifact cleanup completed: pruned %d files and freed %.2f GB",
+            len(deleted_files),
+            freed_bytes / (1024 * 1024 * 1024),
+        )
+    else:
+        logger.info("MLflow artifact cleanup completed: nothing eligible for pruning.")
+    return summary

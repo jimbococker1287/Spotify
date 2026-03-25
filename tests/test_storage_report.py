@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 from spotify.storage_report import build_storage_report, write_storage_report
 
@@ -43,3 +44,32 @@ def test_write_storage_report_creates_json_and_markdown(tmp_path: Path) -> None:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["output_dir"] == str(output_dir.resolve())
     assert "Storage Report" in md_path.read_text(encoding="utf-8")
+
+
+def test_build_storage_report_includes_external_mlflow_artifact_roots(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir(parents=True)
+
+    mlflow_db_dir = output_dir / "mlruns"
+    mlflow_db_dir.mkdir(parents=True)
+    external_root = tmp_path / "mlruns" / "1"
+    external_root.mkdir(parents=True)
+    artifact_path = external_root / "run_manifest.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+
+    db_path = mlflow_db_dir / "mlflow.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE experiments (experiment_id INTEGER, artifact_location TEXT)")
+        conn.execute(
+            "INSERT INTO experiments (experiment_id, artifact_location) VALUES (?, ?)",
+            (1, str(external_root)),
+        )
+        conn.commit()
+
+    report = build_storage_report(output_dir, top_n=5)
+
+    categories = {row["category"]: row["bytes"] for row in report["category_totals"]}
+    scanned_roots = {row["path"] for row in report["scanned_roots"]}
+    assert categories["mlflow_artifacts"] == 2
+    assert str(external_root.resolve()) in scanned_roots
+    assert report["total_bytes"] >= 2

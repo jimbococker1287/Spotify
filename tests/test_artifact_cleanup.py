@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 from spotify.artifact_cleanup import (
     load_result_rows_for_cleanup,
     prune_existing_runs,
+    prune_mlflow_artifacts,
     prune_old_auxiliary_artifacts,
     prune_run_artifacts,
     retained_full_run_dirs,
@@ -290,3 +292,40 @@ def test_prune_old_auxiliary_artifacts_keeps_recent_full_runs(tmp_path: Path) ->
     updated = json.loads((old_full / "run_results.json").read_text(encoding="utf-8"))
     assert updated[0]["prediction_bundle_path"] == ""
     assert summary["deleted_file_count"] >= 2
+
+
+def test_prune_mlflow_artifacts_removes_binary_duplicates_from_external_store(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    mlflow_db_dir = output_dir / "mlruns"
+    mlflow_db_dir.mkdir(parents=True)
+
+    artifact_dir = tmp_path / "mlruns" / "1" / "run_123" / "artifacts"
+    artifact_dir.mkdir(parents=True)
+    kept_path = artifact_dir / "run_manifest.json"
+    kept_path.write_text("{}", encoding="utf-8")
+    deleted_model_path = artifact_dir / "classical_mlp.joblib"
+    deleted_model_path.write_bytes(b"binary")
+    deleted_large_csv_path = artifact_dir / "rows.csv"
+    deleted_large_csv_path.write_bytes(b"x" * (2 * 1024 * 1024))
+
+    db_path = mlflow_db_dir / "mlflow.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE runs (run_uuid TEXT, artifact_uri TEXT)")
+        conn.execute(
+            "INSERT INTO runs (run_uuid, artifact_uri) VALUES (?, ?)",
+            ("run_123", str(artifact_dir)),
+        )
+        conn.commit()
+
+    summary = prune_mlflow_artifacts(
+        output_dir=output_dir,
+        logger=_StubLogger(),
+        artifact_mode="metadata",
+        max_artifact_mb=1.0,
+    )
+
+    assert kept_path.exists()
+    assert not deleted_model_path.exists()
+    assert not deleted_large_csv_path.exists()
+    assert summary["deleted_file_count"] == 2
+    assert summary["freed_bytes"] >= (2 * 1024 * 1024)

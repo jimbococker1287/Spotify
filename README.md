@@ -83,6 +83,16 @@ All six threads meet that bar today. The detailed audit and expansion map lives 
 - `outputs/history/backtest_history.csv`: cumulative temporal backtest history
 - `outputs/history/benchmark_history.csv`: benchmark-lock aggregate history with CI stats
 - `outputs/mlruns/mlflow.db`: local MLflow tracking DB (default)
+- `mlruns/`: MLflow artifact store for local runs; storage reporting and pruning now include it alongside `outputs/`
+
+## Storage Controls
+
+MLflow still records params, metrics, and lightweight reports by default, but it now skips mirroring heavyweight local artifacts like model binaries, bundles, and databases unless you opt back in.
+
+- `SPOTIFY_MLFLOW_ARTIFACT_MODE=metadata|all|off`
+- `SPOTIFY_MLFLOW_ARTIFACT_MAX_MB=25`
+- `PYTHONPATH=. .venv/bin/python scripts/prune_artifacts.py` to clean retained run artifacts plus mirrored MLflow artifacts
+- `PYTHONPATH=. .venv/bin/python scripts/storage_report.py --output-dir outputs` to report both `outputs/` and external MLflow artifact roots
 
 ## Profiles
 

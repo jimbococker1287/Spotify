@@ -2,16 +2,117 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
-import time
 import re
+import time
 
 import numpy as np
+
+
+MLFLOW_METADATA_ARTIFACT_SUFFIXES = frozenset(
+    {
+        ".csv",
+        ".html",
+        ".json",
+        ".log",
+        ".md",
+        ".png",
+        ".svg",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+)
+MLFLOW_BINARY_ARTIFACT_SUFFIXES = frozenset(
+    {
+        ".bin",
+        ".db",
+        ".duckdb",
+        ".h5",
+        ".hdf5",
+        ".joblib",
+        ".keras",
+        ".npy",
+        ".npz",
+        ".onnx",
+        ".pkl",
+        ".pickle",
+        ".pt",
+        ".pth",
+    }
+)
+DEFAULT_MLFLOW_ARTIFACT_MODE = "metadata"
+DEFAULT_MLFLOW_ARTIFACT_MAX_MB = 25.0
 
 
 def _sanitize_metric_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.\-/]+", "_", name)
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
     return cleaned or "metric"
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def normalize_mlflow_artifact_mode(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    if value in ("", "1", "true", "yes", "on", "default", "light", "metadata", "safe"):
+        return DEFAULT_MLFLOW_ARTIFACT_MODE
+    if value in ("0", "false", "no", "off", "none", "disabled"):
+        return "off"
+    if value in ("all", "full"):
+        return "all"
+    return DEFAULT_MLFLOW_ARTIFACT_MODE
+
+
+def resolve_mlflow_artifact_policy(
+    *,
+    mode_raw: object | None = None,
+    max_artifact_mb_raw: object | None = None,
+) -> tuple[str, float]:
+    if mode_raw is None:
+        mode_raw = os.getenv("SPOTIFY_MLFLOW_ARTIFACT_MODE", DEFAULT_MLFLOW_ARTIFACT_MODE)
+    mode = normalize_mlflow_artifact_mode(mode_raw)
+
+    if max_artifact_mb_raw is None:
+        max_artifact_mb_raw = os.getenv("SPOTIFY_MLFLOW_ARTIFACT_MAX_MB", str(DEFAULT_MLFLOW_ARTIFACT_MAX_MB))
+    try:
+        max_artifact_mb = max(0.0, float(max_artifact_mb_raw))
+    except (TypeError, ValueError):
+        max_artifact_mb = DEFAULT_MLFLOW_ARTIFACT_MAX_MB
+    return mode, max_artifact_mb
+
+
+def should_log_mlflow_artifact(
+    path: Path,
+    *,
+    mode: str | None = None,
+    max_artifact_mb: float | None = None,
+) -> bool:
+    resolved_mode, resolved_max_artifact_mb = resolve_mlflow_artifact_policy(
+        mode_raw=mode,
+        max_artifact_mb_raw=max_artifact_mb,
+    )
+    if resolved_mode == "off":
+        return False
+    if resolved_mode == "all":
+        return path.is_file()
+    if not path.is_file():
+        return False
+
+    suffix = path.suffix.lower()
+    if suffix in MLFLOW_BINARY_ARTIFACT_SUFFIXES:
+        return False
+    if suffix not in MLFLOW_METADATA_ARTIFACT_SUFFIXES:
+        return False
+
+    max_bytes = int(resolved_max_artifact_mb * 1024 * 1024)
+    if max_bytes > 0 and _file_size(path) > max_bytes:
+        return False
+    return True
 
 
 class MlflowTracker:
@@ -30,6 +131,7 @@ class MlflowTracker:
         self._active_run = None
         self._logger = logger
         self._closed = False
+        self._artifact_mode, self._artifact_max_artifact_mb = resolve_mlflow_artifact_policy()
 
         if not enabled:
             return
@@ -60,6 +162,11 @@ class MlflowTracker:
 
         self.enabled = True
         logger.info("MLflow tracking enabled: experiment=%s uri=%s", experiment_name, resolved_tracking_uri)
+        logger.info(
+            "MLflow artifact policy: mode=%s max_mb=%.1f",
+            self._artifact_mode,
+            self._artifact_max_artifact_mb,
+        )
 
     def _cleanup_stale_runs(self, *, mlflow, experiment_name: str) -> None:
         stale_hours_raw = str(os.getenv("SPOTIFY_MLFLOW_STALE_RUN_HOURS", "12")).strip()
@@ -173,6 +280,12 @@ class MlflowTracker:
         if not self.enabled or self._mlflow is None:
             return
         if not path.exists():
+            return
+        if not should_log_mlflow_artifact(
+            path,
+            mode=self._artifact_mode,
+            max_artifact_mb=self._artifact_max_artifact_mb,
+        ):
             return
         try:
             self._mlflow.log_artifact(str(path))
