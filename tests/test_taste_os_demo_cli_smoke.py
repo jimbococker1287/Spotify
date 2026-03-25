@@ -14,4 +14,6 @@ def test_taste_os_demo_module_help_runs() -> None:
     assert result.returncode == 0
     assert "taste os" in result.stdout.lower()
     assert "--mode" in result.stdout
+    assert "--scenario" in result.stdout
+    assert "--output-dir" in result.stdout
     assert "--recent-artists" in result.stdout

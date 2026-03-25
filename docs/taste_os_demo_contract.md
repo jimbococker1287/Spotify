@@ -7,8 +7,9 @@ This document locks the first `Personal Taste OS` demo contract so the demo can 
 The first demo scope is intentionally narrow:
 
 - modes: `focus`, `workout`, `commute`, `discovery`
+- scenarios: `steady`, `skip_recovery`, `repeat_request`, `friction_spike`, `mixed_session`
 - core input: recent listening sequence plus current context
-- core outputs: next-step candidates, multi-step plan, explanation, and safe fallback route
+- core outputs: next-step candidates, multi-step plan, explanation, safe fallback route, and adaptive-session transcript
 - primary audience: product review, portfolio demo, and roadmap alignment
 
 ## Demo Entry Point
@@ -36,9 +37,11 @@ Optional fields:
 
 - `run_dir`: explicit run path; defaults to champion alias
 - `model_name`: explicit serveable model override
+- `scenario`: adaptive session pattern to simulate
 - `recent_artists`: pipe-separated artist tail override
 - `include_video`: whether rebuilt context should include video history
 - `data_dir`: raw Spotify history directory
+- `output_dir`: where the demo JSON and Markdown artifacts are written
 
 ## Response Contract
 
@@ -52,6 +55,8 @@ The first demo response is a single JSON payload with these top-level sections:
 - `why_this_next`: short explanation bullets for the first planned artist
 - `risk_summary`: current end-risk, friction score, and guardrail state
 - `fallback_policy`: which policy the demo would route to if risk rises
+- `adaptive_session`: scenario transcript showing replans after skip, repeat, or friction events
+- `demo_summary`: short operator-facing digest of top artist, replans, and safe-route steps
 - `artifacts_used`: paths to the required moonshot and serving artifacts
 
 ## Required Artifacts
@@ -67,6 +72,11 @@ The first demo requires these existing run artifacts:
 - `analysis/safe_policy/safe_bandit_policy.joblib`
 
 If any of the moonshot artifacts are missing, the demo should fail clearly rather than silently degrading.
+
+The CLI should also write:
+
+- one JSON artifact with the full payload
+- one Markdown artifact with a readable walkthrough of the plan and adaptive transcript
 
 ## Mode Semantics
 
@@ -116,6 +126,7 @@ The first roadmap milestone is complete when all of the following are true:
 - the four modes produce visibly different ranking or planning behavior
 - the response includes a human-readable explanation layer
 - the response includes a safe fallback policy summary
+- the response includes at least one adaptive-session transcript mode
 - missing artifact failures are clear and actionable
 
 ## Explicit Non-Goals For The First Demo

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 from pathlib import Path
@@ -40,6 +40,20 @@ class ModeConfig:
     energy_target: float
     energy_weight: float
     default_policy_name: str
+
+
+@dataclass(frozen=True)
+class AdaptiveEvent:
+    after_step: int
+    event_type: str
+    description: str
+
+
+@dataclass(frozen=True)
+class AdaptiveScenario:
+    name: str
+    description: str
+    events: tuple[AdaptiveEvent, ...]
 
 
 MODE_CONFIGS: dict[str, ModeConfig] = {
@@ -90,10 +104,68 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
 }
 
 
+SCENARIOS: dict[str, AdaptiveScenario] = {
+    "steady": AdaptiveScenario(
+        name="steady",
+        description="No disruption. The planner stays on its default mode behavior.",
+        events=(),
+    ),
+    "skip_recovery": AdaptiveScenario(
+        name="skip_recovery",
+        description="The listener skips an early suggestion and the planner moves closer to the recent arc.",
+        events=(
+            AdaptiveEvent(
+                after_step=1,
+                event_type="skip",
+                description="The listener skips the first suggested track.",
+            ),
+        ),
+    ),
+    "repeat_request": AdaptiveScenario(
+        name="repeat_request",
+        description="The listener repeats a track, so the planner leans into continuity and comfort.",
+        events=(
+            AdaptiveEvent(
+                after_step=1,
+                event_type="repeat_request",
+                description="The listener repeats a track and signals they want a familiar lane.",
+            ),
+        ),
+    ),
+    "friction_spike": AdaptiveScenario(
+        name="friction_spike",
+        description="Playback friction spikes mid-session and the planner routes toward safer behavior.",
+        events=(
+            AdaptiveEvent(
+                after_step=2,
+                event_type="friction_spike",
+                description="Playback errors or network friction spike after the second step.",
+            ),
+        ),
+    ),
+    "mixed_session": AdaptiveScenario(
+        name="mixed_session",
+        description="The session sees an early skip and then a friction spike, forcing two replans.",
+        events=(
+            AdaptiveEvent(
+                after_step=1,
+                event_type="skip",
+                description="The listener skips an early suggestion.",
+            ),
+            AdaptiveEvent(
+                after_step=3,
+                event_type="friction_spike",
+                description="Playback friction spikes later in the session.",
+            ),
+        ),
+    ),
+}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m spotify.taste_os_demo",
-        description="Run a thin Personal Taste OS demo using the current serving and moonshot artifacts.",
+        description="Run the Personal Taste OS demo with adaptive steering and written artifacts.",
     )
     parser.add_argument(
         "--run-dir",
@@ -110,6 +182,13 @@ def _parse_args() -> argparse.Namespace:
         choices=sorted(MODE_CONFIGS),
         help="Taste OS mode to simulate.",
     )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="steady",
+        choices=sorted(SCENARIOS),
+        help="Adaptive scenario to simulate after the first plan is built.",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Number of top candidates to surface.")
     parser.add_argument(
         "--recent-artists",
@@ -122,6 +201,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include video history files while rebuilding the latest context.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/analysis/taste_os_demo",
+        help="Directory to write the JSON and Markdown demo artifacts.",
+    )
+    parser.add_argument(
+        "--stdout-format",
+        type=str,
+        default="summary",
+        choices=("summary", "json"),
+        help="Whether to print a short summary or the full JSON payload to stdout.",
+    )
     return parser.parse_args()
 
 
@@ -129,6 +221,17 @@ def _load_artifact(path: Path, *, label: str):
     if not path.exists():
         raise FileNotFoundError(f"Missing {label} artifact: {path}")
     return joblib.load(path)
+
+
+def _slugify(raw: str) -> str:
+    cleaned = [
+        char.lower() if char.isalnum() else "-"
+        for char in str(raw).strip()
+    ]
+    value = "".join(cleaned)
+    while "--" in value:
+        value = value.replace("--", "-")
+    return value.strip("-") or "demo"
 
 
 def _energy_alignment(space: MultimodalArtistSpace, artist_id: int, *, target: float) -> float:
@@ -240,33 +343,6 @@ def _journey_plan_rows(
     return rows
 
 
-def _why_this_next(
-    *,
-    first_candidate: dict[str, object] | None,
-    mode: ModeConfig,
-) -> list[str]:
-    if not first_candidate:
-        return []
-
-    reasons = [
-        f"This choice fits the {mode.name} profile: {mode.description}",
-    ]
-    probability = float(first_candidate.get("model_probability", 0.0))
-    continuity = float(first_candidate.get("continuity", 0.0))
-    novelty = float(first_candidate.get("novelty", 0.0))
-    energy_alignment = float(first_candidate.get("energy_alignment", 0.0))
-
-    if probability >= 0.20:
-        reasons.append("The serving model already scores it strongly for the current session tail.")
-    if continuity >= 0.65:
-        reasons.append("It stays close to your recent listening arc instead of making a hard jump.")
-    if novelty >= 0.45 and mode.name in ("discovery", "workout"):
-        reasons.append("It adds novelty without leaving the learned taste boundary.")
-    if energy_alignment >= 0.70:
-        reasons.append("Its energy profile stays near the target band for this mode.")
-    return reasons[:4]
-
-
 def _friction_feature_indices(context_features: list[str]) -> list[int]:
     return [
         idx
@@ -323,6 +399,7 @@ def _fallback_policy(
             "active_policy_name": "safe_global",
             "reason": "Session-end risk is elevated, so the demo routes to the global safe policy.",
             "policy_weights": dict(safe_policy.global_policy),
+            "safe_routed": True,
         }
 
     if friction_score > 0.25 and "high_friction" in safe_policy.policy_map:
@@ -330,6 +407,7 @@ def _fallback_policy(
             "active_policy_name": "safe_bucket_high_friction",
             "reason": "Current context looks friction-heavy, so the demo routes to the high-friction safe bucket.",
             "policy_weights": dict(safe_policy.policy_map["high_friction"]),
+            "safe_routed": True,
         }
 
     default_policy = dict(POLICY_TEMPLATES.get(mode.default_policy_name, safe_policy.global_policy))
@@ -337,6 +415,186 @@ def _fallback_policy(
         "active_policy_name": mode.default_policy_name,
         "reason": "The current session is stable enough to stay on the mode's default policy.",
         "policy_weights": default_policy,
+        "safe_routed": False,
+    }
+
+
+def _why_this_next(
+    *,
+    first_candidate: dict[str, object] | None,
+    mode: ModeConfig,
+    policy_name: str,
+) -> list[str]:
+    if not first_candidate:
+        return []
+
+    reasons = [
+        f"This choice fits the {mode.name} profile: {mode.description}",
+    ]
+    probability = float(first_candidate.get("model_probability", first_candidate.get("transition_probability", 0.0)))
+    continuity = float(first_candidate.get("continuity", 0.0))
+    novelty = float(first_candidate.get("novelty", 0.0))
+    energy_alignment = float(first_candidate.get("energy_alignment", 0.0))
+
+    if probability >= 0.20:
+        reasons.append("The current model state already scores it strongly for this session tail.")
+    if continuity >= 0.65:
+        reasons.append("It stays close to the recent listening arc instead of making a hard jump.")
+    if novelty >= 0.45 and mode.name in ("discovery", "workout"):
+        reasons.append("It adds novelty without leaving the learned taste boundary.")
+    if energy_alignment >= 0.70:
+        reasons.append("Its energy profile stays near the target band for this mode.")
+    if str(policy_name).startswith("safe"):
+        reasons.append("The planner is guarding the session, so it is biasing toward a safer fallback path.")
+    return reasons[:5]
+
+
+def _apply_event(
+    *,
+    mode: ModeConfig,
+    event: AdaptiveEvent,
+    context_batch: np.ndarray,
+    context_features: list[str],
+) -> tuple[ModeConfig, np.ndarray, dict[str, object]]:
+    updated_mode = mode
+    updated_context = np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    planner_change = ""
+
+    if event.event_type == "skip":
+        updated_mode = replace(
+            mode,
+            continuity_weight=min(0.65, float(mode.continuity_weight) + 0.12),
+            novelty_weight=max(0.02, float(mode.novelty_weight) - 0.10),
+            repeat_penalty=min(1.25, float(mode.repeat_penalty) + 0.10),
+            default_policy_name="safe_balance",
+        )
+        planner_change = "The listener skipped a suggestion, so the planner reduced novelty and moved closer to the recent arc."
+    elif event.event_type == "repeat_request":
+        updated_mode = replace(
+            mode,
+            continuity_weight=min(0.65, float(mode.continuity_weight) + 0.08),
+            novelty_weight=max(0.02, float(mode.novelty_weight) - 0.08),
+            repeat_penalty=max(0.35, float(mode.repeat_penalty) - 0.20),
+        )
+        planner_change = "The listener repeated a track, so the planner leaned into comfort, continuity, and lower surprise."
+    elif event.event_type == "friction_spike":
+        friction_indices = _friction_feature_indices(list(context_features))
+        for idx in friction_indices:
+            updated_context[0, idx] = max(1.0, float(updated_context[0, idx])) * 2.0
+        updated_mode = replace(
+            mode,
+            continuity_weight=min(0.70, float(mode.continuity_weight) + 0.14),
+            novelty_weight=max(0.02, float(mode.novelty_weight) - 0.14),
+            default_policy_name="safe_balance",
+        )
+        planner_change = "Playback friction spiked, so the planner reduced novelty and prepared a safer route."
+    else:
+        planner_change = "The planner observed a session event and recalculated the next step."
+
+    return updated_mode, updated_context, {
+        "after_step": int(event.after_step),
+        "event_type": event.event_type,
+        "description": event.description,
+        "planner_change": planner_change,
+    }
+
+
+def _roll_sequence(sequence_labels: np.ndarray, *, next_artist: int) -> np.ndarray:
+    updated = np.asarray(sequence_labels, dtype="int32").copy()
+    updated = np.roll(updated, -1)
+    updated[-1] = int(next_artist)
+    return updated
+
+
+def _adaptive_session_payload(
+    *,
+    predictor: _PredictorLike,
+    artist_labels: list[str],
+    sequence_labels: np.ndarray,
+    context_batch: np.ndarray,
+    mode: ModeConfig,
+    scenario: AdaptiveScenario,
+    top_k: int,
+    digital_twin: ListenerDigitalTwinArtifact,
+    multimodal_space: MultimodalArtistSpace,
+    safe_policy: SafeBanditPolicyArtifact,
+) -> dict[str, object]:
+    working_sequence = np.asarray(sequence_labels, dtype="int32").reshape(-1).copy()
+    working_context = np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    current_mode = mode
+    transcript: list[dict[str, object]] = []
+    applied_events: list[dict[str, object]] = []
+    event_by_step = {int(event.after_step): event for event in scenario.events}
+    pending_replan_reason = ""
+    safe_route_steps = 0
+
+    for step in range(1, int(mode.horizon) + 1):
+        probs = np.asarray(predictor.predict_proba(working_sequence.reshape(1, -1), working_context), dtype="float32")[0]
+        candidates = _candidate_rows(
+            probs=probs,
+            sequence_labels=working_sequence,
+            artist_labels=artist_labels,
+            mode=current_mode,
+            multimodal_space=multimodal_space,
+            top_k=top_k,
+        )
+        chosen = candidates[0] if candidates else {}
+        risk_summary = _risk_summary(
+            sequence_labels=working_sequence,
+            context_batch=working_context,
+            digital_twin=digital_twin,
+        )
+        fallback_policy = _fallback_policy(
+            mode=current_mode,
+            risk_summary=risk_summary,
+            safe_policy=safe_policy,
+        )
+        if bool(fallback_policy.get("safe_routed")):
+            safe_route_steps += 1
+
+        transcript_row = {
+            "step": step,
+            "plan_origin": "replanned" if pending_replan_reason else "initial",
+            "why_changed": pending_replan_reason,
+            "policy_name": str(fallback_policy.get("active_policy_name", "")),
+            "selected_artist": str(chosen.get("artist_name", "")),
+            "model_probability": float(chosen.get("model_probability", 0.0)),
+            "continuity": float(chosen.get("continuity", 0.0)),
+            "novelty": float(chosen.get("novelty", 0.0)),
+            "energy_alignment": float(chosen.get("energy_alignment", 0.0)),
+            "end_risk": float(risk_summary.get("current_end_risk", 0.0)),
+            "friction_score": float(risk_summary.get("friction_score", 0.0)),
+            "event_applied_after_step": "",
+            "event_summary": "",
+        }
+        pending_replan_reason = ""
+
+        if chosen:
+            working_sequence = _roll_sequence(working_sequence, next_artist=int(chosen["artist_label"]))
+
+        if step in event_by_step:
+            current_mode, working_context, event_row = _apply_event(
+                mode=current_mode,
+                event=event_by_step[step],
+                context_batch=working_context,
+                context_features=list(digital_twin.context_features),
+            )
+            transcript_row["event_applied_after_step"] = str(event_row["event_type"])
+            transcript_row["event_summary"] = str(event_row["description"])
+            pending_replan_reason = str(event_row["planner_change"])
+            applied_events.append(event_row)
+
+        transcript.append(transcript_row)
+
+    final_tail = [artist_labels[int(item)] for item in working_sequence.tolist()]
+    return {
+        "scenario": scenario.name,
+        "description": scenario.description,
+        "events": applied_events,
+        "replan_count": int(len(applied_events)),
+        "safe_route_steps": int(safe_route_steps),
+        "transcript": transcript,
+        "final_sequence_tail": final_tail,
     }
 
 
@@ -351,10 +609,12 @@ def build_taste_os_demo_payload(
     multimodal_space: MultimodalArtistSpace,
     safe_policy: SafeBanditPolicyArtifact,
     mode_name: str,
+    scenario_name: str = "steady",
     top_k: int,
     artifact_paths: dict[str, str] | None = None,
 ) -> dict[str, object]:
     mode = MODE_CONFIGS[str(mode_name).strip().lower()]
+    scenario = SCENARIOS[str(scenario_name).strip().lower()]
     seq_arr = np.asarray(sequence_labels, dtype="int32").reshape(-1)
     ctx_arr = np.asarray(context_batch, dtype="float32").reshape(1, -1)
     probs = np.asarray(predictor.predict_proba(seq_arr.reshape(1, -1), ctx_arr), dtype="float32")[0]
@@ -384,10 +644,24 @@ def build_taste_os_demo_payload(
         risk_summary=risk_summary,
         safe_policy=safe_policy,
     )
+    adaptive_session = _adaptive_session_payload(
+        predictor=predictor,
+        artist_labels=artist_labels,
+        sequence_labels=seq_arr,
+        context_batch=ctx_arr,
+        mode=mode,
+        scenario=scenario,
+        top_k=top_k,
+        digital_twin=digital_twin,
+        multimodal_space=multimodal_space,
+        safe_policy=safe_policy,
+    )
 
+    top_choice = top_candidates[0] if top_candidates else {}
     return {
         "request": {
             "mode": mode.name,
+            "scenario": scenario.name,
             "top_k": int(top_k),
         },
         "current_session": {
@@ -405,13 +679,127 @@ def build_taste_os_demo_payload(
         "top_candidates": top_candidates,
         "journey_plan": journey_plan,
         "why_this_next": _why_this_next(
-            first_candidate=journey_plan[0] if journey_plan else (top_candidates[0] if top_candidates else None),
+            first_candidate=top_choice,
             mode=mode,
+            policy_name=str(fallback_policy.get("active_policy_name", "")),
         ),
         "risk_summary": risk_summary,
         "fallback_policy": fallback_policy,
+        "adaptive_session": adaptive_session,
+        "demo_summary": {
+            "top_artist": str(top_choice.get("artist_name", "")),
+            "adaptive_replans": int(adaptive_session["replan_count"]),
+            "adaptive_safe_route_steps": int(adaptive_session["safe_route_steps"]),
+            "final_sequence_tail": list(adaptive_session["final_sequence_tail"]),
+        },
         "artifacts_used": artifact_paths or {},
     }
+
+
+def write_taste_os_demo_artifacts(
+    payload: dict[str, object],
+    *,
+    output_dir: Path,
+) -> tuple[Path, Path]:
+    output_root = output_dir.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    request = payload.get("request", {}) if isinstance(payload, dict) else {}
+    mode = _slugify(str(request.get("mode", "demo")))
+    scenario = _slugify(str(request.get("scenario", "steady")))
+    stem = f"taste_os_demo_{mode}_{scenario}"
+
+    json_path = output_root / f"{stem}.json"
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    current_session = payload.get("current_session", {}) if isinstance(payload, dict) else {}
+    mode_block = payload.get("mode", {}) if isinstance(payload, dict) else {}
+    risk_summary = payload.get("risk_summary", {}) if isinstance(payload, dict) else {}
+    fallback_policy = payload.get("fallback_policy", {}) if isinstance(payload, dict) else {}
+    adaptive_session = payload.get("adaptive_session", {}) if isinstance(payload, dict) else {}
+
+    lines = [
+        "# Taste OS Demo",
+        "",
+        f"- Mode: `{request.get('mode', '')}`",
+        f"- Scenario: `{request.get('scenario', '')}`",
+        f"- Model: `{current_session.get('model_name', '')}` [{current_session.get('model_type', '')}]",
+        f"- Sequence tail: `{ ' | '.join(current_session.get('sequence_tail', [])) if isinstance(current_session.get('sequence_tail', []), list) else '' }`",
+        f"- Planned horizon: `{mode_block.get('planned_horizon', '')}`",
+        "",
+        "## Why This Next",
+        "",
+    ]
+    for reason in payload.get("why_this_next", []) if isinstance(payload, dict) else []:
+        lines.append(f"- {reason}")
+
+    lines.extend(
+        [
+            "",
+            "## Top Candidates",
+            "",
+        ]
+    )
+    for row in payload.get("top_candidates", []) if isinstance(payload, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"- `{row.get('rank', '')}. {row.get('artist_name', '')}` model_prob=`{row.get('model_probability', '')}` mode_score=`{row.get('mode_score', '')}` continuity=`{row.get('continuity', '')}` novelty=`{row.get('novelty', '')}`"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Baseline Plan",
+            "",
+        ]
+    )
+    for row in payload.get("journey_plan", []) if isinstance(payload, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"- Step `{row.get('step', '')}` -> `{row.get('artist_name', '')}` transition=`{row.get('transition_probability', '')}` mode_score=`{row.get('mode_score', '')}`"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Guardrails",
+            "",
+            f"- End risk: `{risk_summary.get('current_end_risk', '')}`",
+            f"- Friction score: `{risk_summary.get('friction_score', '')}`",
+            f"- Risk state: `{risk_summary.get('risk_state', '')}`",
+            f"- Fallback policy: `{fallback_policy.get('active_policy_name', '')}`",
+            f"- Fallback reason: {fallback_policy.get('reason', '')}",
+            "",
+            "## Adaptive Session",
+            "",
+            f"- Scenario summary: {adaptive_session.get('description', '')}",
+            f"- Replans: `{adaptive_session.get('replan_count', '')}`",
+            f"- Safe-route steps: `{adaptive_session.get('safe_route_steps', '')}`",
+            "",
+            "### Transcript",
+            "",
+        ]
+    )
+    for row in adaptive_session.get("transcript", []) if isinstance(adaptive_session, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        line = (
+            f"- Step `{row.get('step', '')}` [{row.get('plan_origin', '')}] -> `{row.get('selected_artist', '')}` "
+            f"via `{row.get('policy_name', '')}` end_risk=`{row.get('end_risk', '')}`"
+        )
+        lines.append(line)
+        why_changed = str(row.get("why_changed", "") or "").strip()
+        if why_changed:
+            lines.append(f"  Why changed: {why_changed}")
+        event_applied = str(row.get("event_applied_after_step", "") or "").strip()
+        if event_applied:
+            lines.append(f"  Event after step: `{event_applied}` - {row.get('event_summary', '')}")
+
+    md_path = output_root / f"{stem}.md"
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path
 
 
 def main() -> int:
@@ -472,10 +860,25 @@ def main() -> int:
         multimodal_space=multimodal_space,
         safe_policy=safe_policy,
         mode_name=str(args.mode),
+        scenario_name=str(args.scenario),
         top_k=max(1, int(args.top_k)),
         artifact_paths=artifact_paths,
     )
-    print(json.dumps(payload, indent=2))
+    json_path, md_path = write_taste_os_demo_artifacts(
+        payload,
+        output_dir=Path(args.output_dir),
+    )
+
+    if args.stdout_format == "json":
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"taste_os_demo_json={json_path}")
+        print(f"taste_os_demo_md={md_path}")
+        print(f"mode={payload['mode']['name']}")
+        print(f"scenario={payload['adaptive_session']['scenario']}")
+        print(f"top_artist={payload['demo_summary']['top_artist']}")
+        print(f"adaptive_replans={payload['demo_summary']['adaptive_replans']}")
+        print(f"adaptive_safe_route_steps={payload['demo_summary']['adaptive_safe_route_steps']}")
     return 0
 
 

@@ -5,7 +5,7 @@ import numpy as np
 from spotify.digital_twin import ListenerDigitalTwinArtifact
 from spotify.multimodal import MultimodalArtistSpace
 from spotify.safe_policy import SafeBanditPolicyArtifact
-from spotify.taste_os_demo import MODE_CONFIGS, build_taste_os_demo_payload
+from spotify.taste_os_demo import MODE_CONFIGS, build_taste_os_demo_payload, write_taste_os_demo_artifacts
 
 
 class _StubPredictor:
@@ -88,16 +88,20 @@ def test_build_taste_os_demo_payload_returns_contract_sections() -> None:
         multimodal_space=_space(),
         safe_policy=_safe_policy(),
         mode_name="focus",
+        scenario_name="steady",
         top_k=3,
         artifact_paths={"multimodal_space": "/tmp/mm.joblib"},
     )
 
     assert payload["request"]["mode"] == "focus"
+    assert payload["request"]["scenario"] == "steady"
     assert payload["current_session"]["model_name"] == "stub_retrieval"
     assert len(payload["top_candidates"]) == 3
     assert len(payload["journey_plan"]) == MODE_CONFIGS["focus"].horizon
     assert payload["why_this_next"]
     assert payload["fallback_policy"]["active_policy_name"] in {"comfort_policy", "safe_global", "safe_bucket_high_friction"}
+    assert payload["adaptive_session"]["scenario"] == "steady"
+    assert payload["demo_summary"]["top_artist"] == payload["top_candidates"][0]["artist_name"]
     assert payload["artifacts_used"]["multimodal_space"] == "/tmp/mm.joblib"
 
 
@@ -112,6 +116,7 @@ def test_discovery_mode_increases_novelty_priority() -> None:
         multimodal_space=_space(),
         safe_policy=_safe_policy(),
         mode_name="focus",
+        scenario_name="steady",
         top_k=2,
     )
     discovery_payload = build_taste_os_demo_payload(
@@ -124,6 +129,7 @@ def test_discovery_mode_increases_novelty_priority() -> None:
         multimodal_space=_space(),
         safe_policy=_safe_policy(),
         mode_name="discovery",
+        scenario_name="steady",
         top_k=2,
     )
 
@@ -137,3 +143,48 @@ def test_discovery_mode_increases_novelty_priority() -> None:
     assert focus_top == "Artist C"
     assert discovery_top in {"Artist C", "Artist D"}
     assert discovery_novelty >= focus_novelty
+
+
+def test_friction_spike_scenario_creates_replan_and_safe_route() -> None:
+    payload = build_taste_os_demo_payload(
+        predictor=_StubPredictor(),
+        artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+        sequence_labels=np.asarray([0, 1], dtype="int32"),
+        sequence_names=["Artist A", "Artist B"],
+        context_batch=np.asarray([[9.0, 0.0, 0.0]], dtype="float32"),
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+        mode_name="commute",
+        scenario_name="friction_spike",
+        top_k=3,
+    )
+
+    transcript = payload["adaptive_session"]["transcript"]
+    assert payload["adaptive_session"]["replan_count"] == 1
+    assert payload["adaptive_session"]["safe_route_steps"] >= 1
+    assert any(row["event_applied_after_step"] == "friction_spike" for row in transcript)
+    assert any(row["plan_origin"] == "replanned" for row in transcript)
+
+
+def test_write_taste_os_demo_artifacts_creates_json_and_markdown(tmp_path) -> None:
+    payload = build_taste_os_demo_payload(
+        predictor=_StubPredictor(),
+        artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+        sequence_labels=np.asarray([0, 1], dtype="int32"),
+        sequence_names=["Artist A", "Artist B"],
+        context_batch=np.asarray([[8.0, 0.3, 0.0]], dtype="float32"),
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+        mode_name="focus",
+        scenario_name="skip_recovery",
+        top_k=3,
+    )
+
+    json_path, md_path = write_taste_os_demo_artifacts(payload, output_dir=tmp_path)
+
+    assert json_path.exists()
+    assert md_path.exists()
+    assert "Taste OS Demo" in md_path.read_text(encoding="utf-8")
+    assert '"scenario": "skip_recovery"' in json_path.read_text(encoding="utf-8")

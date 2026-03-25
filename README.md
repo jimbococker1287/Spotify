@@ -476,16 +476,24 @@ make control-room
 Run the first unified `Personal Taste OS` demo contract against the current champion run:
 
 ```bash
-python -m spotify.taste_os_demo --mode focus --top-k 5
+python -m spotify.taste_os_demo --mode focus --scenario steady --top-k 5
 ```
 
 Or via the console script:
 
 ```bash
-spotify-taste-os-demo --mode discovery --top-k 5
+spotify-taste-os-demo --mode discovery --scenario skip_recovery --top-k 5
 ```
 
-The contract and acceptance checklist for this demo live in `docs/taste_os_demo_contract.md`.
+Or via Make:
+
+```bash
+make taste-os-demo EXTRA_ARGS='--mode commute --scenario friction_spike'
+```
+
+The command now writes both JSON and Markdown artifacts under `outputs/analysis/taste_os_demo/` and supports adaptive scenarios such as `skip_recovery`, `repeat_request`, `friction_spike`, and `mixed_session`.
+
+The contract lives in `docs/taste_os_demo_contract.md`, and a short usage guide lives in `docs/taste_os_demo_walkthrough.md`.
 
 ## Prediction CLI
 
@@ -715,7 +723,7 @@ Artifacts are written under `outputs/analysis/public_spotify/`.
 
 ## Roadmaps
 
-See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the Week-1 demo contract, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
+See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the demo contract, `docs/taste_os_demo_walkthrough.md` for a guided demo flow, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
 ## Docker (Prediction Service)
 
