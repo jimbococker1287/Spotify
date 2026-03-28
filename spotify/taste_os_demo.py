@@ -34,12 +34,20 @@ class ModeConfig:
     name: str
     description: str
     horizon: int
+    model_weight: float
     continuity_weight: float
+    arc_weight: float
     novelty_weight: float
+    freshness_weight: float
     repeat_penalty: float
+    frequency_penalty: float
+    hard_repeat_window: int
     energy_target: float
     energy_weight: float
     default_policy_name: str
+    friction_guard_threshold: float
+    friction_high_threshold: float
+    end_guard_threshold: float
 
 
 @dataclass(frozen=True)
@@ -61,45 +69,77 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         name="focus",
         description="Low-friction, low-surprise arcs for concentrated listening sessions.",
         horizon=6,
-        continuity_weight=0.35,
-        novelty_weight=0.08,
-        repeat_penalty=0.95,
+        model_weight=1.0,
+        continuity_weight=0.42,
+        arc_weight=0.18,
+        novelty_weight=0.04,
+        freshness_weight=0.02,
+        repeat_penalty=1.00,
+        frequency_penalty=0.55,
+        hard_repeat_window=2,
         energy_target=0.48,
-        energy_weight=0.12,
+        energy_weight=0.14,
         default_policy_name="comfort_policy",
+        friction_guard_threshold=1.70,
+        friction_high_threshold=2.00,
+        end_guard_threshold=0.42,
     ),
     "workout": ModeConfig(
         name="workout",
         description="Rising-energy plans with momentum and controlled novelty.",
         horizon=6,
-        continuity_weight=0.18,
-        novelty_weight=0.22,
-        repeat_penalty=0.70,
+        model_weight=0.90,
+        continuity_weight=0.20,
+        arc_weight=0.10,
+        novelty_weight=0.28,
+        freshness_weight=0.12,
+        repeat_penalty=0.85,
+        frequency_penalty=0.38,
+        hard_repeat_window=2,
         energy_target=0.78,
-        energy_weight=0.16,
+        energy_weight=0.18,
         default_policy_name="novelty_boosted",
+        friction_guard_threshold=1.35,
+        friction_high_threshold=1.75,
+        end_guard_threshold=0.46,
     ),
     "commute": ModeConfig(
         name="commute",
         description="Shorter, resilient plans that recover quickly from disruption.",
         horizon=4,
-        continuity_weight=0.28,
-        novelty_weight=0.10,
-        repeat_penalty=0.80,
+        model_weight=0.88,
+        continuity_weight=0.34,
+        arc_weight=0.16,
+        novelty_weight=0.06,
+        freshness_weight=0.04,
+        repeat_penalty=1.05,
+        frequency_penalty=0.62,
+        hard_repeat_window=2,
         energy_target=0.56,
-        energy_weight=0.10,
+        energy_weight=0.11,
         default_policy_name="safe_balance",
+        friction_guard_threshold=1.25,
+        friction_high_threshold=1.65,
+        end_guard_threshold=0.38,
     ),
     "discovery": ModeConfig(
         name="discovery",
         description="Novelty-weighted plans that stay inside learned taste boundaries.",
         horizon=6,
-        continuity_weight=0.16,
-        novelty_weight=0.34,
-        repeat_penalty=0.72,
+        model_weight=0.62,
+        continuity_weight=0.10,
+        arc_weight=0.04,
+        novelty_weight=0.46,
+        freshness_weight=0.24,
+        repeat_penalty=0.82,
+        frequency_penalty=0.48,
+        hard_repeat_window=2,
         energy_target=0.62,
-        energy_weight=0.08,
+        energy_weight=0.09,
         default_policy_name="novelty_boosted",
+        friction_guard_threshold=1.75,
+        friction_high_threshold=2.10,
+        end_guard_threshold=0.48,
     ),
 }
 
@@ -240,12 +280,20 @@ def _energy_alignment(space: MultimodalArtistSpace, artist_id: int, *, target: f
     return float(1.0 - abs(float(space.energy[artist_id]) - float(target)))
 
 
+def _normalized_artist_counts(artist_ids: np.ndarray, candidate_count: int) -> np.ndarray:
+    if candidate_count <= 0 or len(artist_ids) == 0:
+        return np.zeros(candidate_count, dtype="float64")
+    counts = np.bincount(np.asarray(artist_ids, dtype="int32"), minlength=candidate_count).astype("float64")
+    return counts / max(1.0, float(len(artist_ids)))
+
+
 def _mode_scores(
     *,
     base_scores: np.ndarray,
     sequence_labels: np.ndarray,
     mode: ModeConfig,
     multimodal_space: MultimodalArtistSpace,
+    planned_history: list[int] | None = None,
 ) -> np.ndarray:
     scores = np.asarray(base_scores, dtype="float64").reshape(-1)
     if scores.size == 0:
@@ -254,18 +302,64 @@ def _mode_scores(
     last_artist = int(sequence_labels[-1])
     artist_ids = np.arange(scores.size, dtype="int32")
     similarity = np.asarray(multimodal_space.embeddings[last_artist] @ multimodal_space.embeddings.T, dtype="float64")
+    recent_similarity = np.asarray(
+        multimodal_space.embeddings[np.asarray(sequence_labels, dtype="int32")] @ multimodal_space.embeddings.T,
+        dtype="float64",
+    )
+    arc_affinity = np.mean(recent_similarity, axis=0) if recent_similarity.size else np.zeros(scores.size, dtype="float64")
+    freshness = np.clip(1.0 - np.max(recent_similarity, axis=0), 0.0, 1.0) if recent_similarity.size else np.ones(scores.size, dtype="float64")
     novelty = np.asarray(1.0 - multimodal_space.popularity, dtype="float64")
+    recent_counts = _normalized_artist_counts(np.asarray(sequence_labels, dtype="int32"), scores.size)
+    if planned_history:
+        recent_counts = recent_counts + (1.2 * _normalized_artist_counts(np.asarray(planned_history, dtype="int32"), scores.size))
     repeats = np.isin(artist_ids, np.asarray(sequence_labels, dtype="int32")).astype("float64")
+    repeats = np.maximum(repeats, np.asarray(recent_counts > 0.0, dtype="float64"))
+    same_as_last = np.asarray(artist_ids == last_artist, dtype="float64")
     energy_delta = np.abs(np.asarray(multimodal_space.energy, dtype="float64") - float(mode.energy_target))
 
     adjusted = (
-        np.log(np.clip(scores, 1e-9, 1.0))
+        float(mode.model_weight) * np.log(np.clip(scores, 1e-9, 1.0))
         + float(mode.continuity_weight) * similarity
+        + float(mode.arc_weight) * arc_affinity
         + float(mode.novelty_weight) * novelty
+        + float(mode.freshness_weight) * freshness
         - float(mode.repeat_penalty) * repeats
+        - float(mode.frequency_penalty) * recent_counts
+        - 0.65 * same_as_last
         - float(mode.energy_weight) * energy_delta
     )
     return adjusted.astype("float32")
+
+
+def _select_next_artist(
+    *,
+    ranked_artist_ids: list[int],
+    sequence_labels: np.ndarray,
+    mode: ModeConfig,
+    planned_history: list[int] | None = None,
+) -> int:
+    if not ranked_artist_ids:
+        return int(sequence_labels[-1])
+
+    planned = list(planned_history or [])
+    recent_window = np.asarray(sequence_labels[-max(1, int(mode.hard_repeat_window)) :], dtype="int32")
+    last_selected = int(planned[-1]) if planned else None
+
+    for artist_id in ranked_artist_ids:
+        if int(artist_id) == int(sequence_labels[-1]):
+            continue
+        if last_selected is not None and int(artist_id) == last_selected:
+            continue
+        if np.any(recent_window == int(artist_id)):
+            continue
+        return int(artist_id)
+
+    for artist_id in ranked_artist_ids:
+        if last_selected is not None and int(artist_id) == last_selected:
+            continue
+        return int(artist_id)
+
+    return int(ranked_artist_ids[0])
 
 
 def _candidate_rows(
@@ -276,12 +370,14 @@ def _candidate_rows(
     mode: ModeConfig,
     multimodal_space: MultimodalArtistSpace,
     top_k: int,
+    planned_history: list[int] | None = None,
 ) -> list[dict[str, object]]:
     adjusted = _mode_scores(
         base_scores=probs,
         sequence_labels=sequence_labels,
         mode=mode,
         multimodal_space=multimodal_space,
+        planned_history=planned_history,
     )
     top_indices = np.argsort(adjusted)[::-1][: max(1, int(top_k))]
     last_artist = int(sequence_labels[-1])
@@ -315,6 +411,7 @@ def _journey_plan_rows(
 ) -> list[dict[str, object]]:
     working = np.asarray(sequence_labels, dtype="int32").copy()
     rows: list[dict[str, object]] = []
+    planned_history: list[int] = []
 
     for step in range(1, int(mode.horizon) + 1):
         last_artist = int(working[-1])
@@ -324,8 +421,15 @@ def _journey_plan_rows(
             sequence_labels=working,
             mode=mode,
             multimodal_space=multimodal_space,
+            planned_history=planned_history,
         )
-        next_artist = int(np.argsort(adjusted)[::-1][0])
+        ranked_artist_ids = [int(item) for item in np.argsort(adjusted)[::-1].tolist()]
+        next_artist = _select_next_artist(
+            ranked_artist_ids=ranked_artist_ids,
+            sequence_labels=working,
+            mode=mode,
+            planned_history=planned_history,
+        )
         rows.append(
             {
                 "step": step,
@@ -338,6 +442,7 @@ def _journey_plan_rows(
                 "energy_alignment": round(_energy_alignment(multimodal_space, next_artist, target=mode.energy_target), 4),
             }
         )
+        planned_history.append(next_artist)
         working = np.roll(working, -1)
         working[-1] = next_artist
     return rows
@@ -347,16 +452,97 @@ def _friction_feature_indices(context_features: list[str]) -> list[int]:
     return [
         idx
         for idx, feature_name in enumerate(context_features)
-        if str(feature_name).startswith("tech_")
-        or "error" in str(feature_name)
-        or str(feature_name) == "offline"
+        if (
+            str(feature_name).lower() == "offline"
+            or (
+                not any(
+                    token in str(feature_name).lower()
+                    for token in ("bitrate", "reachability", "allow_downgrade", "cloud_stats_events")
+                )
+                and any(
+                    token in str(feature_name).lower()
+                    for token in (
+                        "error",
+                        "fatal",
+                        "stutter",
+                        "stall",
+                        "not_played",
+                        "fail",
+                        "connection_none",
+                        "offline",
+                    )
+                )
+            )
+        )
     ]
+
+
+def _friction_profile(
+    *,
+    context_raw_batch: np.ndarray | None,
+    context_features: list[str],
+    friction_reference: dict[str, object] | None,
+) -> dict[str, object]:
+    if context_raw_batch is None or len(context_features) == 0:
+        return {
+            "friction_score": 0.0,
+            "friction_score_raw": 0.0,
+            "friction_threshold": 0.0,
+            "friction_bucket": "unknown",
+        }
+
+    friction_indices = _friction_feature_indices(context_features)
+    if not friction_indices:
+        return {
+            "friction_score": 0.0,
+            "friction_score_raw": 0.0,
+            "friction_threshold": 0.0,
+            "friction_bucket": "stable",
+        }
+
+    friction_values = np.asarray(context_raw_batch, dtype="float32").reshape(1, -1)[0, friction_indices]
+    friction_medians = np.zeros(len(friction_indices), dtype="float32")
+    friction_threshold = 0.0
+    if isinstance(friction_reference, dict):
+        ref_names = [str(item) for item in friction_reference.get("feature_names", [])]
+        ref_medians = np.asarray(friction_reference.get("median_values", []), dtype="float32")
+        ref_map = {
+            ref_name: float(ref_medians[idx])
+            for idx, ref_name in enumerate(ref_names)
+            if idx < len(ref_medians)
+        }
+        friction_medians = np.asarray(
+            [ref_map.get(str(context_features[idx]), 0.0) for idx in friction_indices],
+            dtype="float32",
+        )
+        friction_threshold = float(friction_reference.get("aggregate_threshold", 0.0) or 0.0)
+
+    centered = np.maximum(friction_values - friction_medians, 0.0)
+    raw_score = float(np.sum(centered))
+    normalized_score = raw_score / max(friction_threshold, 1e-6) if friction_threshold > 0 else raw_score
+
+    if normalized_score >= 2.0:
+        bucket = "high_friction"
+    elif normalized_score >= 1.2:
+        bucket = "normal_friction"
+    else:
+        bucket = "stable"
+
+    return {
+        "friction_score": round(normalized_score, 4),
+        "friction_score_raw": round(raw_score, 4),
+        "friction_threshold": round(friction_threshold, 4),
+        "friction_bucket": bucket,
+    }
 
 
 def _risk_summary(
     *,
     sequence_labels: np.ndarray,
     context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None,
+    context_features: list[str],
+    friction_reference: dict[str, object] | None,
     digital_twin: ListenerDigitalTwinArtifact,
 ) -> dict[str, object]:
     features = build_serving_tabular_features(
@@ -365,15 +551,16 @@ def _risk_summary(
     )
     end_risk = float(np.asarray(digital_twin.end_estimator.predict_proba(features), dtype="float32")[:, 1][0])
 
-    friction_indices = _friction_feature_indices(list(digital_twin.context_features))
-    if friction_indices:
-        friction_score = float(np.mean(np.maximum(np.asarray(context_batch, dtype="float32")[0, friction_indices], 0.0)))
-    else:
-        friction_score = 0.0
+    friction_profile = _friction_profile(
+        context_raw_batch=context_raw_batch,
+        context_features=context_features,
+        friction_reference=friction_reference,
+    )
+    friction_score = float(friction_profile["friction_score"])
 
-    if end_risk >= 0.45:
+    if end_risk >= 0.45 or friction_score >= 2.0:
         risk_state = "guarded"
-    elif end_risk >= 0.25:
+    elif end_risk >= 0.25 or friction_score >= 1.2:
         risk_state = "watch"
     else:
         risk_state = "normal"
@@ -381,6 +568,9 @@ def _risk_summary(
     return {
         "current_end_risk": round(end_risk, 4),
         "friction_score": round(friction_score, 4),
+        "friction_score_raw": float(friction_profile["friction_score_raw"]),
+        "friction_threshold": float(friction_profile["friction_threshold"]),
+        "friction_bucket": str(friction_profile["friction_bucket"]),
         "risk_state": risk_state,
     }
 
@@ -393,8 +583,9 @@ def _fallback_policy(
 ) -> dict[str, object]:
     end_risk = float(risk_summary.get("current_end_risk", 0.0))
     friction_score = float(risk_summary.get("friction_score", 0.0))
+    friction_bucket = str(risk_summary.get("friction_bucket", ""))
 
-    if end_risk >= 0.45:
+    if end_risk >= float(mode.end_guard_threshold):
         return {
             "active_policy_name": "safe_global",
             "reason": "Session-end risk is elevated, so the demo routes to the global safe policy.",
@@ -402,11 +593,27 @@ def _fallback_policy(
             "safe_routed": True,
         }
 
-    if friction_score > 0.25 and "high_friction" in safe_policy.policy_map:
+    if (
+        friction_bucket == "high_friction"
+        and friction_score >= float(mode.friction_high_threshold)
+        and "high_friction" in safe_policy.policy_map
+    ):
         return {
             "active_policy_name": "safe_bucket_high_friction",
             "reason": "Current context looks friction-heavy, so the demo routes to the high-friction safe bucket.",
             "policy_weights": dict(safe_policy.policy_map["high_friction"]),
+            "safe_routed": True,
+        }
+
+    if (
+        friction_bucket == "normal_friction"
+        and friction_bucket in safe_policy.policy_map
+        and friction_score >= float(mode.friction_guard_threshold)
+    ):
+        return {
+            "active_policy_name": f"safe_bucket_{friction_bucket}",
+            "reason": "The session is showing some technical friction, so the demo moves to a safer bucket before it escalates.",
+            "policy_weights": dict(safe_policy.policy_map[friction_bucket]),
             "safe_routed": True,
         }
 
@@ -449,15 +656,39 @@ def _why_this_next(
     return reasons[:5]
 
 
+def _rescale_context_from_raw(
+    *,
+    context_raw_batch: np.ndarray | None,
+    context_batch: np.ndarray,
+    scaler_mean: np.ndarray | None,
+    scaler_scale: np.ndarray | None,
+) -> np.ndarray:
+    if context_raw_batch is None:
+        return np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    if scaler_mean is None or scaler_scale is None:
+        return np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    mean = np.asarray(scaler_mean, dtype="float32").reshape(-1)
+    scale = np.asarray(scaler_scale, dtype="float32").reshape(-1)
+    safe_scale = np.where(np.abs(scale) <= 1e-6, 1.0, scale)
+    raw = np.asarray(context_raw_batch, dtype="float32").reshape(1, -1)
+    if raw.shape[1] != mean.shape[0]:
+        return np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    return ((raw - mean.reshape(1, -1)) / safe_scale.reshape(1, -1)).astype("float32")
+
+
 def _apply_event(
     *,
     mode: ModeConfig,
     event: AdaptiveEvent,
     context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None,
     context_features: list[str],
-) -> tuple[ModeConfig, np.ndarray, dict[str, object]]:
+    scaler_mean: np.ndarray | None,
+    scaler_scale: np.ndarray | None,
+) -> tuple[ModeConfig, np.ndarray, np.ndarray | None, dict[str, object]]:
     updated_mode = mode
     updated_context = np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    updated_raw_context = None if context_raw_batch is None else np.asarray(context_raw_batch, dtype="float32").reshape(1, -1).copy()
     planner_change = ""
 
     if event.event_type == "skip":
@@ -480,7 +711,18 @@ def _apply_event(
     elif event.event_type == "friction_spike":
         friction_indices = _friction_feature_indices(list(context_features))
         for idx in friction_indices:
-            updated_context[0, idx] = max(1.0, float(updated_context[0, idx])) * 2.0
+            if updated_raw_context is not None and idx < updated_raw_context.shape[1]:
+                boost = max(0.75, abs(float(updated_raw_context[0, idx])) * 1.25)
+                updated_raw_context[0, idx] = float(updated_raw_context[0, idx] + boost)
+            else:
+                updated_context[0, idx] = float(updated_context[0, idx] + 1.25)
+        if updated_raw_context is not None:
+            updated_context = _rescale_context_from_raw(
+                context_raw_batch=updated_raw_context,
+                context_batch=updated_context,
+                scaler_mean=scaler_mean,
+                scaler_scale=scaler_scale,
+            )
         updated_mode = replace(
             mode,
             continuity_weight=min(0.70, float(mode.continuity_weight) + 0.14),
@@ -491,7 +733,7 @@ def _apply_event(
     else:
         planner_change = "The planner observed a session event and recalculated the next step."
 
-    return updated_mode, updated_context, {
+    return updated_mode, updated_context, updated_raw_context, {
         "after_step": int(event.after_step),
         "event_type": event.event_type,
         "description": event.description,
@@ -512,6 +754,11 @@ def _adaptive_session_payload(
     artist_labels: list[str],
     sequence_labels: np.ndarray,
     context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None,
+    context_features: list[str],
+    friction_reference: dict[str, object] | None,
+    scaler_mean: np.ndarray | None,
+    scaler_scale: np.ndarray | None,
     mode: ModeConfig,
     scenario: AdaptiveScenario,
     top_k: int,
@@ -521,12 +768,14 @@ def _adaptive_session_payload(
 ) -> dict[str, object]:
     working_sequence = np.asarray(sequence_labels, dtype="int32").reshape(-1).copy()
     working_context = np.asarray(context_batch, dtype="float32").reshape(1, -1).copy()
+    working_raw_context = None if context_raw_batch is None else np.asarray(context_raw_batch, dtype="float32").reshape(1, -1).copy()
     current_mode = mode
     transcript: list[dict[str, object]] = []
     applied_events: list[dict[str, object]] = []
     event_by_step = {int(event.after_step): event for event in scenario.events}
     pending_replan_reason = ""
     safe_route_steps = 0
+    planned_history: list[int] = []
 
     for step in range(1, int(mode.horizon) + 1):
         probs = np.asarray(predictor.predict_proba(working_sequence.reshape(1, -1), working_context), dtype="float32")[0]
@@ -537,11 +786,22 @@ def _adaptive_session_payload(
             mode=current_mode,
             multimodal_space=multimodal_space,
             top_k=top_k,
+            planned_history=planned_history,
         )
-        chosen = candidates[0] if candidates else {}
+        candidate_ids = [int(row.get("artist_label", -1)) for row in candidates if isinstance(row, dict)]
+        chosen_artist = _select_next_artist(
+            ranked_artist_ids=[artist_id for artist_id in candidate_ids if artist_id >= 0],
+            sequence_labels=working_sequence,
+            mode=current_mode,
+            planned_history=planned_history,
+        ) if candidates else int(working_sequence[-1])
+        chosen = next((row for row in candidates if int(row.get("artist_label", -1)) == chosen_artist), candidates[0] if candidates else {})
         risk_summary = _risk_summary(
             sequence_labels=working_sequence,
             context_batch=working_context,
+            context_raw_batch=working_raw_context,
+            context_features=context_features,
+            friction_reference=friction_reference,
             digital_twin=digital_twin,
         )
         fallback_policy = _fallback_policy(
@@ -570,14 +830,18 @@ def _adaptive_session_payload(
         pending_replan_reason = ""
 
         if chosen:
+            planned_history.append(int(chosen["artist_label"]))
             working_sequence = _roll_sequence(working_sequence, next_artist=int(chosen["artist_label"]))
 
         if step in event_by_step:
-            current_mode, working_context, event_row = _apply_event(
+            current_mode, working_context, working_raw_context, event_row = _apply_event(
                 mode=current_mode,
                 event=event_by_step[step],
                 context_batch=working_context,
-                context_features=list(digital_twin.context_features),
+                context_raw_batch=working_raw_context,
+                context_features=context_features,
+                scaler_mean=scaler_mean,
+                scaler_scale=scaler_scale,
             )
             transcript_row["event_applied_after_step"] = str(event_row["event_type"])
             transcript_row["event_summary"] = str(event_row["description"])
@@ -605,6 +869,11 @@ def build_taste_os_demo_payload(
     sequence_labels: np.ndarray,
     sequence_names: list[str],
     context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None = None,
+    context_features: list[str] | None = None,
+    friction_reference: dict[str, object] | None = None,
+    scaler_mean: np.ndarray | None = None,
+    scaler_scale: np.ndarray | None = None,
     digital_twin: ListenerDigitalTwinArtifact,
     multimodal_space: MultimodalArtistSpace,
     safe_policy: SafeBanditPolicyArtifact,
@@ -617,6 +886,9 @@ def build_taste_os_demo_payload(
     scenario = SCENARIOS[str(scenario_name).strip().lower()]
     seq_arr = np.asarray(sequence_labels, dtype="int32").reshape(-1)
     ctx_arr = np.asarray(context_batch, dtype="float32").reshape(1, -1)
+    raw_ctx_source = context_batch if context_raw_batch is None else context_raw_batch
+    raw_ctx_arr = np.asarray(raw_ctx_source, dtype="float32").reshape(1, -1)
+    resolved_context_features = list(context_features or list(digital_twin.context_features))
     probs = np.asarray(predictor.predict_proba(seq_arr.reshape(1, -1), ctx_arr), dtype="float32")[0]
 
     top_candidates = _candidate_rows(
@@ -637,6 +909,9 @@ def build_taste_os_demo_payload(
     risk_summary = _risk_summary(
         sequence_labels=seq_arr,
         context_batch=ctx_arr,
+        context_raw_batch=raw_ctx_arr,
+        context_features=resolved_context_features,
+        friction_reference=friction_reference,
         digital_twin=digital_twin,
     )
     fallback_policy = _fallback_policy(
@@ -649,6 +924,11 @@ def build_taste_os_demo_payload(
         artist_labels=artist_labels,
         sequence_labels=seq_arr,
         context_batch=ctx_arr,
+        context_raw_batch=raw_ctx_arr,
+        context_features=resolved_context_features,
+        friction_reference=friction_reference,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
         mode=mode,
         scenario=scenario,
         top_k=top_k,
@@ -768,6 +1048,8 @@ def write_taste_os_demo_artifacts(
             "",
             f"- End risk: `{risk_summary.get('current_end_risk', '')}`",
             f"- Friction score: `{risk_summary.get('friction_score', '')}`",
+            f"- Friction raw / threshold: `{risk_summary.get('friction_score_raw', '')}` / `{risk_summary.get('friction_threshold', '')}`",
+            f"- Friction bucket: `{risk_summary.get('friction_bucket', '')}`",
             f"- Risk state: `{risk_summary.get('risk_state', '')}`",
             f"- Fallback policy: `{fallback_policy.get('active_policy_name', '')}`",
             f"- Fallback reason: {fallback_policy.get('reason', '')}",
@@ -856,6 +1138,11 @@ def main() -> int:
         sequence_labels=np.asarray(seq_batch[0], dtype="int32"),
         sequence_names=sequence_names,
         context_batch=np.asarray(ctx_batch, dtype="float32"),
+        context_raw_batch=prediction_context.context_raw,
+        context_features=list(prediction_context.context_features or []),
+        friction_reference=prediction_context.friction_reference,
+        scaler_mean=prediction_context.scaler_mean,
+        scaler_scale=prediction_context.scaler_scale,
         digital_twin=digital_twin,
         multimodal_space=multimodal_space,
         safe_policy=safe_policy,

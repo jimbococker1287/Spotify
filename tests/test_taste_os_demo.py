@@ -99,7 +99,9 @@ def test_build_taste_os_demo_payload_returns_contract_sections() -> None:
     assert len(payload["top_candidates"]) == 3
     assert len(payload["journey_plan"]) == MODE_CONFIGS["focus"].horizon
     assert payload["why_this_next"]
-    assert payload["fallback_policy"]["active_policy_name"] in {"comfort_policy", "safe_global", "safe_bucket_high_friction"}
+    assert payload["fallback_policy"]["active_policy_name"] == "comfort_policy"
+    assert payload["fallback_policy"]["safe_routed"] is False
+    assert len({row["artist_name"] for row in payload["journey_plan"]}) >= 3
     assert payload["adaptive_session"]["scenario"] == "steady"
     assert payload["demo_summary"]["top_artist"] == payload["top_candidates"][0]["artist_name"]
     assert payload["artifacts_used"]["multimodal_space"] == "/tmp/mm.joblib"

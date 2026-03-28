@@ -24,6 +24,14 @@ class PredictionInputContext:
     latest_sequence_labels: np.ndarray
     latest_sequence_names: list[str]
     context_scaled: np.ndarray
+    context_raw: np.ndarray | None = None
+    context_features: list[str] | None = None
+    friction_reference: dict[str, object] | None = None
+    scaler_mean: np.ndarray | None = None
+    scaler_scale: np.ndarray | None = None
+
+
+_PREDICTION_CONTEXT_CACHE_VERSION = 3
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,12 +95,140 @@ def _resolve_model_name(run_dir: Path, explicit: str | None, alias_model_name: s
     return model_name
 
 
+def _signature_for_paths(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
+    signature: list[tuple[str, int, int]] = []
+    for path in sorted({item.resolve() for item in paths if item.exists()}):
+        stat = path.stat()
+        signature.append(
+            (
+                str(path),
+                int(stat.st_size),
+                int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            )
+        )
+    return tuple(signature)
+
+
+def prediction_source_signature(
+    *,
+    run_dir: Path,
+    data_dir: Path,
+    include_video: bool,
+) -> tuple[tuple[str, int, int], ...]:
+    root = data_dir.expanduser().resolve()
+    json_paths = sorted(path for path in root.rglob("*.json") if path.is_file())
+    if not include_video:
+        json_paths = [path for path in json_paths if "Streaming_History_Video_" not in path.name]
+    paths = list(json_paths)
+    paths.extend(
+        [
+            run_dir / "feature_metadata.json",
+            run_dir / "context_scaler.joblib",
+        ]
+    )
+    return _signature_for_paths(paths)
+
+
+def _prediction_context_cache_path(run_dir: Path, *, include_video: bool) -> Path:
+    cache_dir = run_dir / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "audio_video" if include_video else "audio"
+    return cache_dir / f"prediction_input_context_{suffix}.joblib"
+
+
+def _load_cached_prediction_input_context(
+    *,
+    cache_path: Path,
+    signature: tuple[tuple[str, int, int], ...],
+    logger: logging.Logger,
+) -> PredictionInputContext | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = joblib.load(cache_path)
+    except Exception as exc:
+        logger.warning("Prediction context cache load failed for %s: %s", cache_path, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version", -1)) != _PREDICTION_CONTEXT_CACHE_VERSION:
+        return None
+    if tuple(payload.get("signature", ())) != signature:
+        return None
+    context = payload.get("context")
+    if not isinstance(context, PredictionInputContext):
+        return None
+    logger.info("Loaded cached prediction context: %s", cache_path)
+    return context
+
+
+def _store_prediction_input_context_cache(
+    *,
+    cache_path: Path,
+    signature: tuple[tuple[str, int, int], ...],
+    context: PredictionInputContext,
+    logger: logging.Logger,
+) -> None:
+    payload = {
+        "version": _PREDICTION_CONTEXT_CACHE_VERSION,
+        "signature": signature,
+        "context": context,
+    }
+    try:
+        joblib.dump(payload, cache_path, compress=3)
+    except Exception as exc:
+        logger.warning("Prediction context cache write failed for %s: %s", cache_path, exc)
+
+
+def _is_friction_feature_name(feature_name: str) -> bool:
+    name = str(feature_name).lower()
+    if name == "offline":
+        return True
+    if any(token in name for token in ("bitrate", "reachability", "allow_downgrade", "cloud_stats_events")):
+        return False
+    return any(
+        token in name
+        for token in (
+            "error",
+            "fatal",
+            "stutter",
+            "stall",
+            "not_played",
+            "fail",
+            "connection_none",
+            "offline",
+        )
+    )
+
+
+def _friction_feature_indices(context_features: list[str]) -> list[int]:
+    return [
+        idx
+        for idx, feature_name in enumerate(context_features)
+        if _is_friction_feature_name(str(feature_name))
+    ]
+
+
 def load_prediction_input_context(
     run_dir: Path,
     data_dir: Path,
     include_video: bool,
     logger: logging.Logger,
 ) -> PredictionInputContext:
+    signature = prediction_source_signature(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        include_video=include_video,
+    )
+    cache_path = _prediction_context_cache_path(run_dir, include_video=include_video)
+    cached = _load_cached_prediction_input_context(
+        cache_path=cache_path,
+        signature=signature,
+        logger=logger,
+    )
+    if cached is not None:
+        return cached
+
     # Import data pipeline lazily so TensorFlow can initialize first on macOS.
     from .data import append_audio_features, append_technical_log_features, engineer_features, load_streaming_history
 
@@ -130,11 +266,13 @@ def load_prediction_input_context(
     latest_sequence_labels = df["artist_label"].to_numpy(dtype="int32")[-sequence_length:].copy()
     latest_sequence_names = [artist_labels[idx] for idx in latest_sequence_labels.tolist()]
 
-    context_row = df[context_features].iloc[-1].to_numpy(dtype="float32")
+    context_frame = df[context_features].to_numpy(dtype="float32", copy=True)
     for key in skew_features:
         if key in context_features:
             idx = context_features.index(key)
-            context_row[idx] = float(np.log1p(max(float(context_row[idx]), 0.0)))
+            context_frame[:, idx] = np.log1p(np.maximum(context_frame[:, idx], 0.0)).astype("float32", copy=False)
+
+    context_row = context_frame[-1].copy()
 
     scaler_path = run_dir / "context_scaler.joblib"
     if not scaler_path.exists():
@@ -142,14 +280,49 @@ def load_prediction_input_context(
     scaler = joblib.load(scaler_path)
     context_scaled = scaler.transform(context_row.reshape(1, -1)).astype("float32")
 
-    return PredictionInputContext(
+    friction_indices = _friction_feature_indices(context_features)
+    friction_reference: dict[str, object] | None = None
+    if friction_indices:
+        friction_values = np.asarray(context_frame[:, friction_indices], dtype="float32")
+        friction_medians = np.nanmedian(friction_values, axis=0).astype("float32", copy=False)
+        centered = np.maximum(friction_values - friction_medians.reshape(1, -1), 0.0)
+        aggregate = np.sum(centered, axis=1)
+        positive_aggregate = aggregate[aggregate > 0.0]
+        if len(positive_aggregate):
+            friction_threshold = max(
+                float(np.quantile(aggregate, 0.75)) if len(aggregate) else 0.0,
+                float(np.quantile(positive_aggregate, 0.50)),
+            )
+        else:
+            friction_threshold = 0.0
+        friction_reference = {
+            "feature_names": [context_features[idx] for idx in friction_indices],
+            "median_values": friction_medians.astype("float32", copy=False),
+            "aggregate_threshold": friction_threshold,
+        }
+
+    scaler_mean = getattr(scaler, "mean_", None)
+    scaler_scale = getattr(scaler, "scale_", None)
+    context = PredictionInputContext(
         artist_labels=artist_labels,
         artist_to_label=artist_to_label,
         sequence_length=sequence_length,
         latest_sequence_labels=latest_sequence_labels,
         latest_sequence_names=latest_sequence_names,
         context_scaled=context_scaled,
+        context_raw=context_row.reshape(1, -1).astype("float32"),
+        context_features=context_features,
+        friction_reference=friction_reference,
+        scaler_mean=np.asarray(scaler_mean, dtype="float32") if scaler_mean is not None else None,
+        scaler_scale=np.asarray(scaler_scale, dtype="float32") if scaler_scale is not None else None,
     )
+    _store_prediction_input_context_cache(
+        cache_path=cache_path,
+        signature=signature,
+        context=context,
+        logger=logger,
+    )
+    return context
 
 
 def _prepare_inputs(

@@ -16,7 +16,12 @@ import numpy as np
 
 from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
-from .predict_next import PredictionInputContext, _prepare_inputs, load_prediction_input_context
+from .predict_next import (
+    PredictionInputContext,
+    _prepare_inputs,
+    load_prediction_input_context,
+    prediction_source_signature,
+)
 from .serving import load_predictor, resolve_model_row
 from .uncertainty import SplitConformalCalibration, calibration_from_payload, conformal_prediction_sets
 
@@ -376,22 +381,11 @@ class PredictionService:
         return calibration
 
     def _prediction_source_signature(self, *, include_video: bool) -> tuple[tuple[str, int, int], ...]:
-        root = self.data_dir.expanduser().resolve()
-        files = sorted(path for path in root.rglob("Streaming_History_Audio_*.json") if path.is_file())
-        if include_video:
-            files.extend(sorted(path for path in root.rglob("Streaming_History_Video_*.json") if path.is_file()))
-
-        signature: list[tuple[str, int, int]] = []
-        for path in files:
-            stat = path.stat()
-            signature.append(
-                (
-                    str(path.resolve()),
-                    int(stat.st_size),
-                    int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
-                )
-            )
-        return tuple(signature)
+        return prediction_source_signature(
+            run_dir=self.run_dir,
+            data_dir=self.data_dir,
+            include_video=include_video,
+        )
 
     def _get_prediction_context(self, *, include_video: bool) -> PredictionInputContext:
         signature = self._prediction_source_signature(include_video=include_video)
