@@ -18,6 +18,16 @@ class _StubPredictor:
         return np.asarray([[0.10, 0.18, 0.52, 0.20]], dtype="float32")
 
 
+class _CloseProbPredictor:
+    model_name = "close_prob"
+    model_type = "retrieval_reranker"
+    artist_labels = ["Artist A", "Artist B", "Artist C", "Artist D"]
+
+    def predict_proba(self, seq_batch: np.ndarray, ctx_batch: np.ndarray) -> np.ndarray:
+        _ = (seq_batch, ctx_batch)
+        return np.asarray([[0.32, 0.31, 0.30, 0.29]], dtype="float32")
+
+
 class _StubEndEstimator:
     def predict_proba(self, features: np.ndarray) -> np.ndarray:
         _ = features
@@ -101,6 +111,7 @@ def test_build_taste_os_demo_payload_returns_contract_sections() -> None:
     assert payload["why_this_next"]
     assert payload["fallback_policy"]["active_policy_name"] == "comfort_policy"
     assert payload["fallback_policy"]["safe_routed"] is False
+    assert "surface_score" in payload["top_candidates"][0]
     assert len({row["artist_name"] for row in payload["journey_plan"]}) >= 3
     assert payload["adaptive_session"]["scenario"] == "steady"
     assert payload["demo_summary"]["top_artist"] == payload["top_candidates"][0]["artist_name"]
@@ -145,6 +156,55 @@ def test_discovery_mode_increases_novelty_priority() -> None:
     assert focus_top == "Artist C"
     assert discovery_top in {"Artist C", "Artist D"}
     assert discovery_novelty >= focus_novelty
+
+
+def test_mode_surface_reranker_can_change_opening_artist_when_probs_are_close() -> None:
+    focus_payload = build_taste_os_demo_payload(
+        predictor=_CloseProbPredictor(),
+        artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+        sequence_labels=np.asarray([0, 1], dtype="int32"),
+        sequence_names=["Artist A", "Artist B"],
+        context_batch=np.asarray([[9.0, 0.0, 0.0]], dtype="float32"),
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+        mode_name="focus",
+        scenario_name="steady",
+        top_k=3,
+    )
+    discovery_payload = build_taste_os_demo_payload(
+        predictor=_CloseProbPredictor(),
+        artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+        sequence_labels=np.asarray([0, 1], dtype="int32"),
+        sequence_names=["Artist A", "Artist B"],
+        context_batch=np.asarray([[9.0, 0.0, 0.0]], dtype="float32"),
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+        mode_name="discovery",
+        scenario_name="steady",
+        top_k=3,
+    )
+    commute_payload = build_taste_os_demo_payload(
+        predictor=_CloseProbPredictor(),
+        artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+        sequence_labels=np.asarray([0, 1], dtype="int32"),
+        sequence_names=["Artist A", "Artist B"],
+        context_batch=np.asarray([[9.0, 0.0, 0.0]], dtype="float32"),
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+        mode_name="commute",
+        scenario_name="steady",
+        top_k=3,
+    )
+
+    assert focus_payload["top_candidates"][0]["artist_name"] == "Artist A"
+    assert discovery_payload["top_candidates"][0]["artist_name"] == "Artist C"
+    assert commute_payload["top_candidates"][0]["artist_name"] == "Artist A"
+    assert [row["artist_name"] for row in focus_payload["top_candidates"]] != [
+        row["artist_name"] for row in discovery_payload["top_candidates"]
+    ]
 
 
 def test_friction_spike_scenario_creates_replan_and_safe_route() -> None:

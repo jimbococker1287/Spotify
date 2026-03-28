@@ -34,6 +34,7 @@ class ModeConfig:
     name: str
     description: str
     horizon: int
+    candidate_shortlist: int
     model_weight: float
     continuity_weight: float
     arc_weight: float
@@ -48,6 +49,14 @@ class ModeConfig:
     friction_guard_threshold: float
     friction_high_threshold: float
     end_guard_threshold: float
+    surface_probability_weight: float
+    surface_transition_weight: float
+    surface_continuity_target: float
+    surface_continuity_weight: float
+    surface_arc_target: float
+    surface_arc_weight: float
+    surface_freshness_target: float
+    surface_freshness_weight: float
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,7 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         name="focus",
         description="Low-friction, low-surprise arcs for concentrated listening sessions.",
         horizon=6,
+        candidate_shortlist=14,
         model_weight=1.0,
         continuity_weight=0.42,
         arc_weight=0.18,
@@ -83,11 +93,20 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         friction_guard_threshold=1.70,
         friction_high_threshold=2.00,
         end_guard_threshold=0.42,
+        surface_probability_weight=0.34,
+        surface_transition_weight=0.08,
+        surface_continuity_target=0.78,
+        surface_continuity_weight=0.28,
+        surface_arc_target=0.74,
+        surface_arc_weight=0.18,
+        surface_freshness_target=0.30,
+        surface_freshness_weight=0.12,
     ),
     "workout": ModeConfig(
         name="workout",
         description="Rising-energy plans with momentum and controlled novelty.",
         horizon=6,
+        candidate_shortlist=14,
         model_weight=0.90,
         continuity_weight=0.20,
         arc_weight=0.10,
@@ -102,11 +121,20 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         friction_guard_threshold=1.35,
         friction_high_threshold=1.75,
         end_guard_threshold=0.46,
+        surface_probability_weight=0.30,
+        surface_transition_weight=0.12,
+        surface_continuity_target=0.56,
+        surface_continuity_weight=0.16,
+        surface_arc_target=0.50,
+        surface_arc_weight=0.12,
+        surface_freshness_target=0.74,
+        surface_freshness_weight=0.30,
     ),
     "commute": ModeConfig(
         name="commute",
         description="Shorter, resilient plans that recover quickly from disruption.",
         horizon=4,
+        candidate_shortlist=12,
         model_weight=0.88,
         continuity_weight=0.34,
         arc_weight=0.16,
@@ -121,11 +149,20 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         friction_guard_threshold=1.25,
         friction_high_threshold=1.65,
         end_guard_threshold=0.38,
+        surface_probability_weight=0.40,
+        surface_transition_weight=0.14,
+        surface_continuity_target=0.58,
+        surface_continuity_weight=0.20,
+        surface_arc_target=0.58,
+        surface_arc_weight=0.14,
+        surface_freshness_target=0.48,
+        surface_freshness_weight=0.12,
     ),
     "discovery": ModeConfig(
         name="discovery",
         description="Novelty-weighted plans that stay inside learned taste boundaries.",
         horizon=6,
+        candidate_shortlist=16,
         model_weight=0.62,
         continuity_weight=0.10,
         arc_weight=0.04,
@@ -140,6 +177,14 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         friction_guard_threshold=1.75,
         friction_high_threshold=2.10,
         end_guard_threshold=0.48,
+        surface_probability_weight=0.22,
+        surface_transition_weight=0.06,
+        surface_continuity_target=0.20,
+        surface_continuity_weight=0.16,
+        surface_arc_target=0.24,
+        surface_arc_weight=0.12,
+        surface_freshness_target=0.88,
+        surface_freshness_weight=0.44,
     ),
 }
 
@@ -287,6 +332,105 @@ def _normalized_artist_counts(artist_ids: np.ndarray, candidate_count: int) -> n
     return counts / max(1.0, float(len(artist_ids)))
 
 
+def _percentile_ranks(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype="float64").reshape(-1)
+    if arr.size == 0:
+        return arr.astype("float32")
+    order = np.argsort(arr, kind="stable")
+    ranks = np.empty(arr.size, dtype="float64")
+    if arr.size == 1:
+        ranks[0] = 1.0
+        return ranks.astype("float32")
+    ranks[order] = np.linspace(0.0, 1.0, num=arr.size, dtype="float64")
+    return ranks.astype("float32")
+
+
+def _target_alignment(ranks: np.ndarray, *, target: float) -> np.ndarray:
+    return np.clip(1.0 - np.abs(np.asarray(ranks, dtype="float64") - float(target)), 0.0, 1.0).astype("float32")
+
+
+def _candidate_metric_arrays(
+    *,
+    sequence_labels: np.ndarray,
+    multimodal_space: MultimodalArtistSpace,
+    digital_twin: ListenerDigitalTwinArtifact,
+) -> dict[str, np.ndarray]:
+    seq_arr = np.asarray(sequence_labels, dtype="int32")
+    last_artist = int(seq_arr[-1])
+    recent_similarity = np.asarray(
+        multimodal_space.embeddings[seq_arr] @ multimodal_space.embeddings.T,
+        dtype="float64",
+    )
+    continuity = np.asarray(multimodal_space.embeddings[last_artist] @ multimodal_space.embeddings.T, dtype="float64")
+    arc_affinity = np.mean(recent_similarity, axis=0) if recent_similarity.size else np.zeros(len(multimodal_space.artist_labels), dtype="float64")
+    freshness = np.clip(1.0 - np.max(recent_similarity, axis=0), 0.0, 1.0) if recent_similarity.size else np.ones(len(multimodal_space.artist_labels), dtype="float64")
+    transition = np.asarray(digital_twin.transition_matrix[last_artist], dtype="float64")
+    return {
+        "continuity": continuity.astype("float32"),
+        "arc_affinity": np.asarray(arc_affinity, dtype="float32"),
+        "freshness": np.asarray(freshness, dtype="float32"),
+        "transition_support": transition.astype("float32"),
+    }
+
+
+def _surface_reranked_indices(
+    *,
+    probs: np.ndarray,
+    adjusted_scores: np.ndarray,
+    metric_arrays: dict[str, np.ndarray],
+    mode: ModeConfig,
+    top_k: int,
+) -> tuple[list[int], dict[int, float]]:
+    candidate_count = len(adjusted_scores)
+    if candidate_count == 0:
+        return [], {}
+
+    shortlist_size = min(
+        candidate_count,
+        max(int(mode.candidate_shortlist), int(top_k) * 4, 8),
+    )
+    adjusted_top = np.argsort(adjusted_scores)[::-1][:shortlist_size].tolist()
+    prob_top = np.argsort(probs)[::-1][: max(6, shortlist_size // 2)].tolist()
+    union_shortlist = list(dict.fromkeys(adjusted_top + prob_top))
+    if len(union_shortlist) < max(1, int(top_k)):
+        union_shortlist = np.argsort(adjusted_scores)[::-1][: max(1, int(top_k))].tolist()
+    shortlist = np.asarray(union_shortlist, dtype="int32")
+
+    prob_ranks = _percentile_ranks(np.asarray(probs, dtype="float64")[shortlist])
+    transition_ranks = _percentile_ranks(np.asarray(metric_arrays["transition_support"], dtype="float64")[shortlist])
+    continuity_alignment = _target_alignment(
+        _percentile_ranks(np.asarray(metric_arrays["continuity"], dtype="float64")[shortlist]),
+        target=mode.surface_continuity_target,
+    )
+    arc_alignment = _target_alignment(
+        _percentile_ranks(np.asarray(metric_arrays["arc_affinity"], dtype="float64")[shortlist]),
+        target=mode.surface_arc_target,
+    )
+    freshness_alignment = _target_alignment(
+        _percentile_ranks(np.asarray(metric_arrays["freshness"], dtype="float64")[shortlist]),
+        target=mode.surface_freshness_target,
+    )
+
+    surface = (
+        float(mode.surface_probability_weight) * np.asarray(prob_ranks, dtype="float64")
+        + float(mode.surface_transition_weight) * np.asarray(transition_ranks, dtype="float64")
+        + float(mode.surface_continuity_weight) * np.asarray(continuity_alignment, dtype="float64")
+        + float(mode.surface_arc_weight) * np.asarray(arc_alignment, dtype="float64")
+        + float(mode.surface_freshness_weight) * np.asarray(freshness_alignment, dtype="float64")
+    )
+    surface_map = {int(idx): float(surface[pos]) for pos, idx in enumerate(shortlist.tolist())}
+    ranked = sorted(
+        shortlist.tolist(),
+        key=lambda idx: (
+            surface_map.get(int(idx), float("-inf")),
+            float(adjusted_scores[int(idx)]),
+            float(probs[int(idx)]),
+        ),
+        reverse=True,
+    )
+    return [int(item) for item in ranked[: max(1, int(top_k))]], surface_map
+
+
 def _mode_scores(
     *,
     base_scores: np.ndarray,
@@ -369,6 +513,7 @@ def _candidate_rows(
     artist_labels: list[str],
     mode: ModeConfig,
     multimodal_space: MultimodalArtistSpace,
+    digital_twin: ListenerDigitalTwinArtifact,
     top_k: int,
     planned_history: list[int] | None = None,
 ) -> list[dict[str, object]]:
@@ -379,12 +524,23 @@ def _candidate_rows(
         multimodal_space=multimodal_space,
         planned_history=planned_history,
     )
-    top_indices = np.argsort(adjusted)[::-1][: max(1, int(top_k))]
+    metric_arrays = _candidate_metric_arrays(
+        sequence_labels=sequence_labels,
+        multimodal_space=multimodal_space,
+        digital_twin=digital_twin,
+    )
+    top_indices, surface_map = _surface_reranked_indices(
+        probs=probs,
+        adjusted_scores=adjusted,
+        metric_arrays=metric_arrays,
+        mode=mode,
+        top_k=top_k,
+    )
     last_artist = int(sequence_labels[-1])
 
     rows: list[dict[str, object]] = []
-    for rank, artist_id in enumerate(top_indices.tolist(), start=1):
-        continuity = float(multimodal_space.embeddings[last_artist] @ multimodal_space.embeddings[int(artist_id)])
+    for rank, artist_id in enumerate(top_indices, start=1):
+        continuity = float(metric_arrays["continuity"][int(artist_id)])
         novelty = float(1.0 - multimodal_space.popularity[int(artist_id)])
         rows.append(
             {
@@ -393,7 +549,11 @@ def _candidate_rows(
                 "artist_name": artist_labels[int(artist_id)],
                 "model_probability": round(float(probs[int(artist_id)]), 4),
                 "mode_score": round(float(adjusted[int(artist_id)]), 4),
+                "surface_score": round(float(surface_map.get(int(artist_id), float(adjusted[int(artist_id)]))), 4),
                 "continuity": round(continuity, 4),
+                "arc_affinity": round(float(metric_arrays["arc_affinity"][int(artist_id)]), 4),
+                "freshness": round(float(metric_arrays["freshness"][int(artist_id)]), 4),
+                "transition_support": round(float(metric_arrays["transition_support"][int(artist_id)]), 4),
                 "novelty": round(novelty, 4),
                 "energy_alignment": round(_energy_alignment(multimodal_space, int(artist_id), target=mode.energy_target), 4),
             }
@@ -641,12 +801,15 @@ def _why_this_next(
     probability = float(first_candidate.get("model_probability", first_candidate.get("transition_probability", 0.0)))
     continuity = float(first_candidate.get("continuity", 0.0))
     novelty = float(first_candidate.get("novelty", 0.0))
+    freshness = float(first_candidate.get("freshness", 0.0))
     energy_alignment = float(first_candidate.get("energy_alignment", 0.0))
 
     if probability >= 0.20:
         reasons.append("The current model state already scores it strongly for this session tail.")
     if continuity >= 0.65:
         reasons.append("It stays close to the recent listening arc instead of making a hard jump.")
+    if freshness >= 0.60 and mode.name in ("discovery", "workout"):
+        reasons.append("It opens a fresher lane than the recent loop while staying inside the candidate shortlist.")
     if novelty >= 0.45 and mode.name in ("discovery", "workout"):
         reasons.append("It adds novelty without leaving the learned taste boundary.")
     if energy_alignment >= 0.70:
@@ -785,6 +948,7 @@ def _adaptive_session_payload(
             artist_labels=artist_labels,
             mode=current_mode,
             multimodal_space=multimodal_space,
+            digital_twin=digital_twin,
             top_k=top_k,
             planned_history=planned_history,
         )
@@ -897,6 +1061,7 @@ def build_taste_os_demo_payload(
         artist_labels=artist_labels,
         mode=mode,
         multimodal_space=multimodal_space,
+        digital_twin=digital_twin,
         top_k=top_k,
     )
     journey_plan = _journey_plan_rows(
@@ -1024,7 +1189,9 @@ def write_taste_os_demo_artifacts(
         if not isinstance(row, dict):
             continue
         lines.append(
-            f"- `{row.get('rank', '')}. {row.get('artist_name', '')}` model_prob=`{row.get('model_probability', '')}` mode_score=`{row.get('mode_score', '')}` continuity=`{row.get('continuity', '')}` novelty=`{row.get('novelty', '')}`"
+            f"- `{row.get('rank', '')}. {row.get('artist_name', '')}` model_prob=`{row.get('model_probability', '')}` "
+            f"surface_score=`{row.get('surface_score', '')}` mode_score=`{row.get('mode_score', '')}` "
+            f"continuity=`{row.get('continuity', '')}` freshness=`{row.get('freshness', '')}` novelty=`{row.get('novelty', '')}`"
         )
 
     lines.extend(
