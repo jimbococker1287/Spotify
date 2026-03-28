@@ -8,6 +8,139 @@ import pandas as pd
 from spotify.control_room import build_control_room_report, write_control_room_report
 
 
+def _write_run_fixture(
+    output_dir: Path,
+    *,
+    run_id: str,
+    timestamp: str,
+    profile: str,
+    promoted: bool,
+    promotion_status: str,
+    best_model_name: str,
+    best_model_type: str,
+    val_top1: float,
+    test_top1: float,
+    gate_regression: float,
+    drift_jsd: float,
+    ece: float,
+    selective_risk: float,
+    abstention_rate: float,
+    robustness_gap: float,
+    stress_skip_risk: float,
+    stress_scenario: str,
+) -> None:
+    run_dir = output_dir / "runs" / run_id
+    analysis_dir = run_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    champion_alias = (
+        {"model_name": best_model_name, "model_type": best_model_type}
+        if promoted
+        else {"model_name": "", "model_type": ""}
+    )
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "run_name": run_id,
+                "profile": profile,
+                "timestamp": timestamp,
+                "data_records": 1234,
+                "num_artists": 87,
+                "num_context_features": 12,
+                "champion_gate": {
+                    "status": promotion_status,
+                    "promoted": promoted,
+                    "metric_source": "backtest_top1",
+                    "regression": gate_regression,
+                },
+                "champion_alias": champion_alias,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "run_results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "model_name": best_model_name,
+                    "model_type": best_model_type,
+                    "val_top1": val_top1,
+                    "test_top1": test_top1,
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / f"{best_model_type}_{best_model_name}_confidence_summary.json").write_text(
+        json.dumps(
+            {
+                "test_ece": ece,
+                "test_selective_risk": selective_risk,
+                "test_abstention_rate": abstention_rate,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "data_drift_summary.json").write_text(
+        json.dumps(
+            {
+                "target_drift": {"train_vs_test_jsd": drift_jsd},
+                "largest_context_shift": {"feature": "tech_stutter_events_24h", "max_abs_std_mean_diff": 1.2},
+                "largest_segment_shift": {
+                    "split": "test",
+                    "segment": "repeat_from_prev",
+                    "bucket": "new",
+                    "abs_share_shift": 0.24,
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "friction_proxy_summary.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "friction_feature_count": 3,
+                "proxy_counterfactual": {"test_mean_delta": 0.01},
+                "top_friction_features": [{"feature": "offline", "mean_risk_delta": 0.01}],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "robustness_summary.json").write_text(
+        json.dumps(
+            [
+                {
+                    "model_name": best_model_name,
+                    "max_top1_gap": robustness_gap,
+                    "worst_segment": "repeat_from_prev",
+                    "worst_bucket": "new",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "moonshot_summary.json").write_text(
+        json.dumps(
+            {
+                "digital_twin_test_auc": 0.72,
+                "causal_test_auc_total": 0.69,
+                "stress_worst_skip_scenario": stress_scenario,
+                "stress_worst_skip_risk": stress_skip_risk,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_build_control_room_report_summarizes_latest_run(tmp_path: Path) -> None:
     output_dir = tmp_path / "outputs"
     history_dir = output_dir / "history"
@@ -155,6 +288,83 @@ def test_build_control_room_report_summarizes_latest_run(tmp_path: Path) -> None
     assert report["next_bets"]
 
 
+def test_control_room_compares_latest_run_to_last_promoted_baseline(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_b", "model_name": "blended_ensemble", "model_type": "ensemble", "val_top1": 0.54},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+            {"run_id": "run_b", "model_name": "blended_ensemble", "model_type": "ensemble", "top1": 0.49},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+    pd.DataFrame(
+        [{"run_id": "run_b", "model_name": "logreg_tuned", "base_model_name": "logreg", "val_top1": 0.47}]
+    ).to_csv(history_dir / "optuna_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-03-20T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.02,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.11,
+        stress_skip_risk=0.22,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-03-22T20:00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="blended_ensemble",
+        best_model_type="ensemble",
+        val_top1=0.54,
+        test_top1=0.49,
+        gate_regression=0.03,
+        drift_jsd=0.19,
+        ece=0.09,
+        selective_risk=0.61,
+        abstention_rate=0.0,
+        robustness_gap=0.27,
+        stress_skip_risk=0.44,
+        stress_scenario="evening_drift",
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["latest_run"]["run_id"] == "run_b"
+    assert report["baseline_comparison"]["baseline_available"] is True
+    assert report["baseline_comparison"]["baseline_run"]["run_id"] == "run_a"
+    assert any(
+        row["key"] == "best_model_test_top1" and row["status"] == "worse"
+        for row in report["baseline_comparison"]["metric_deltas"]
+    )
+    assert any("worsened" in item for item in report["baseline_comparison"]["summary"])
+    assert any(action["area"] == "promotion" for action in report["review_actions"])
+    assert any(action["area"] == "robustness" for action in report["review_actions"])
+    assert any(action["area"] == "stress_test" for action in report["review_actions"])
+
+
 def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> None:
     output_dir = tmp_path / "outputs"
     run_dir = output_dir / "runs" / "run_a"
@@ -174,4 +384,7 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert md_path.exists()
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["latest_run"]["run_id"] == "run_a"
-    assert "Control Room" in md_path.read_text(encoding="utf-8")
+    markdown = md_path.read_text(encoding="utf-8")
+    assert "Control Room" in markdown
+    assert "Since Last Strong Run" in markdown
+    assert "Review Actions" in markdown

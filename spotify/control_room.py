@@ -67,16 +67,42 @@ def _collect_run_manifests(output_dir: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _manifest_sort_key(row: dict[str, object]) -> tuple[str, str]:
+    return (
+        str(row.get("timestamp", "")),
+        str(row.get("run_id", "")),
+    )
+
+
 def _latest_manifest(manifests: list[dict[str, object]]) -> dict[str, object]:
     if not manifests:
         return {}
-    return max(
-        manifests,
-        key=lambda row: (
-            str(row.get("timestamp", "")),
-            str(row.get("run_id", "")),
+    return max(manifests, key=_manifest_sort_key)
+
+
+def _is_promoted_manifest(manifest: dict[str, object]) -> bool:
+    gate = manifest.get("champion_gate", {})
+    if not isinstance(gate, dict):
+        return False
+    return bool(gate.get("promoted"))
+
+
+def _latest_promoted_manifest(
+    manifests: list[dict[str, object]],
+    *,
+    exclude_run_id: str | None = None,
+) -> dict[str, object]:
+    promoted = sorted(
+        (
+            manifest
+            for manifest in manifests
+            if _is_promoted_manifest(manifest)
+            and str(manifest.get("run_id", "")) != str(exclude_run_id or "")
         ),
+        key=_manifest_sort_key,
+        reverse=True,
     )
+    return promoted[0] if promoted else {}
 
 
 def _load_run_results(run_dir: Path) -> list[dict[str, object]]:
@@ -217,42 +243,25 @@ def _build_next_bets(
     return bets[:5]
 
 
-def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, object]:
-    output_root = output_dir.expanduser().resolve()
-    manifests = _collect_run_manifests(output_root)
-    latest_manifest = _latest_manifest(manifests)
-    latest_run_dir = Path(str(latest_manifest.get("run_dir", ""))).expanduser() if latest_manifest else None
-    latest_results = _load_run_results(latest_run_dir) if latest_run_dir and latest_run_dir.exists() else []
-    latest_best = _best_result_row(latest_results)
+def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[str, object]]:
+    run_dir = Path(str(manifest.get("run_dir", ""))).expanduser() if manifest else None
+    results = _load_run_results(run_dir) if run_dir and run_dir.exists() else []
+    best_result = _best_result_row(results)
+    analysis_dir = run_dir / "analysis" if run_dir and run_dir.exists() else None
 
-    experiment_history = _safe_read_csv(output_root / "history" / "experiment_history.csv")
-    backtest_history = _safe_read_csv(output_root / "history" / "backtest_history.csv")
-    optuna_history = _safe_read_csv(output_root / "history" / "optuna_history.csv")
-
-    promoted_runs = 0
-    profile_values: set[str] = set()
-    for manifest in manifests:
-        profile = str(manifest.get("profile", "")).strip()
-        if profile:
-            profile_values.add(profile)
-        gate = manifest.get("champion_gate", {})
-        if isinstance(gate, dict) and bool(gate.get("promoted")):
-            promoted_runs += 1
-
-    latest_analysis_dir = latest_run_dir / "analysis" if latest_run_dir and latest_run_dir.exists() else None
-    drift_summary = _safe_read_json(latest_analysis_dir / "data_drift_summary.json") if latest_analysis_dir is not None else {}
-    friction_summary = _safe_read_json(latest_analysis_dir / "friction_proxy_summary.json") if latest_analysis_dir is not None else {}
-    moonshot_summary = _safe_read_json(latest_analysis_dir / "moonshot_summary.json") if latest_analysis_dir is not None else {}
-    robustness_summary = _safe_read_json(latest_analysis_dir / "robustness_summary.json") if latest_analysis_dir is not None else {}
+    drift_summary = _safe_read_json(analysis_dir / "data_drift_summary.json") if analysis_dir is not None else {}
+    friction_summary = _safe_read_json(analysis_dir / "friction_proxy_summary.json") if analysis_dir is not None else {}
+    moonshot_summary = _safe_read_json(analysis_dir / "moonshot_summary.json") if analysis_dir is not None else {}
+    robustness_summary = _safe_read_json(analysis_dir / "robustness_summary.json") if analysis_dir is not None else {}
     confidence_summary = (
-        _resolve_confidence_summary(run_dir=latest_run_dir, manifest=latest_manifest, results=latest_results)
-        if latest_run_dir is not None and latest_run_dir.exists()
+        _resolve_confidence_summary(run_dir=run_dir, manifest=manifest, results=results)
+        if run_dir is not None and run_dir.exists()
         else {}
     )
 
-    gate = latest_manifest.get("champion_gate", {})
+    gate = manifest.get("champion_gate", {})
     gate = gate if isinstance(gate, dict) else {}
-    alias = latest_manifest.get("champion_alias", {})
+    alias = manifest.get("champion_alias", {})
     alias = alias if isinstance(alias, dict) else {}
     largest_context_shift = drift_summary.get("largest_context_shift", {}) if isinstance(drift_summary, dict) else {}
     largest_segment_shift = drift_summary.get("largest_segment_shift", {}) if isinstance(drift_summary, dict) else {}
@@ -260,33 +269,22 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
     top_friction = top_friction_rows[0] if isinstance(top_friction_rows, list) and top_friction_rows else {}
     worst_robustness = robustness_summary[0] if isinstance(robustness_summary, list) and robustness_summary else {}
 
-    portfolio = {
-        "total_runs": int(len(manifests)),
-        "promoted_runs": int(promoted_runs),
-        "profiles_seen": sorted(profile_values),
-        "experiment_history_rows": int(len(experiment_history.index)),
-        "backtest_history_rows": int(len(backtest_history.index)),
-        "optuna_history_rows": int(len(optuna_history.index)),
-        "latest_run_id": str(latest_manifest.get("run_id", "")),
-        "latest_profile": str(latest_manifest.get("profile", "")),
-    }
-
-    latest_run = {
-        "run_id": str(latest_manifest.get("run_id", "")),
-        "run_name": str(latest_manifest.get("run_name", "") or ""),
-        "profile": str(latest_manifest.get("profile", "")),
-        "timestamp": str(latest_manifest.get("timestamp", "")),
-        "data_records": _safe_int(latest_manifest.get("data_records")),
-        "num_artists": _safe_int(latest_manifest.get("num_artists")),
-        "num_context_features": _safe_int(latest_manifest.get("num_context_features")),
+    run = {
+        "run_id": str(manifest.get("run_id", "")),
+        "run_name": str(manifest.get("run_name", "") or ""),
+        "profile": str(manifest.get("profile", "")),
+        "timestamp": str(manifest.get("timestamp", "")),
+        "data_records": _safe_int(manifest.get("data_records")),
+        "num_artists": _safe_int(manifest.get("num_artists")),
+        "num_context_features": _safe_int(manifest.get("num_context_features")),
         "promoted": bool(gate.get("promoted")),
         "promotion_status": str(gate.get("status", "unknown")),
         "champion_model_name": str(alias.get("model_name", "")),
         "champion_model_type": str(alias.get("model_type", "")),
-        "best_model_name": str(latest_best.get("model_name", "")),
-        "best_model_type": str(latest_best.get("model_type", "")),
-        "best_model_val_top1": _safe_float(latest_best.get("val_top1")),
-        "best_model_test_top1": _safe_float(latest_best.get("test_top1")),
+        "best_model_name": str(best_result.get("model_name", "")),
+        "best_model_type": str(best_result.get("model_type", "")),
+        "best_model_val_top1": _safe_float(best_result.get("val_top1")),
+        "best_model_test_top1": _safe_float(best_result.get("test_top1")),
     }
 
     safety = {
@@ -326,11 +324,320 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
         "stress_worst_skip_scenario": str(moonshot_summary.get("stress_worst_skip_scenario", "")) if isinstance(moonshot_summary, dict) else "",
         "stress_worst_skip_risk": _safe_float(moonshot_summary.get("stress_worst_skip_risk")) if isinstance(moonshot_summary, dict) else float("nan"),
     }
+    return {
+        "run": run,
+        "safety": safety,
+        "qoe": qoe,
+    }
+
+
+def _metric_delta_row(
+    *,
+    key: str,
+    label: str,
+    current: object,
+    baseline: object,
+    higher_is_better: bool,
+    epsilon: float = 0.005,
+) -> dict[str, object]:
+    current_value = _safe_float(current)
+    baseline_value = _safe_float(baseline)
+    if not math.isfinite(current_value) or not math.isfinite(baseline_value):
+        return {
+            "key": key,
+            "label": label,
+            "current": current_value,
+            "baseline": baseline_value,
+            "delta": float("nan"),
+            "status": "unknown",
+            "direction": "higher" if higher_is_better else "lower",
+        }
+
+    delta = current_value - baseline_value
+    if abs(delta) < epsilon:
+        status = "flat"
+    elif (higher_is_better and delta > 0.0) or ((not higher_is_better) and delta < 0.0):
+        status = "better"
+    else:
+        status = "worse"
+
+    return {
+        "key": key,
+        "label": label,
+        "current": current_value,
+        "baseline": baseline_value,
+        "delta": delta,
+        "status": status,
+        "direction": "higher" if higher_is_better else "lower",
+    }
+
+
+def _build_baseline_comparison(
+    *,
+    latest_run: dict[str, object],
+    safety: dict[str, object],
+    qoe: dict[str, object],
+    baseline_manifest: dict[str, object],
+) -> dict[str, object]:
+    if not baseline_manifest:
+        return {
+            "baseline_available": False,
+            "comparison_mode": "latest_vs_last_strong_run",
+            "summary": ["No prior promoted run is available yet, so future ops reviews will use the first successful promotion as the baseline."],
+            "metric_deltas": [],
+        }
+
+    baseline_snapshot = _build_run_health_snapshot(baseline_manifest)
+    baseline_run = baseline_snapshot["run"]
+    baseline_safety = baseline_snapshot["safety"]
+    baseline_qoe = baseline_snapshot["qoe"]
+
+    metric_rows = [
+        _metric_delta_row(
+            key="best_model_test_top1",
+            label="Best model test top1",
+            current=latest_run.get("best_model_test_top1"),
+            baseline=baseline_run.get("best_model_test_top1"),
+            higher_is_better=True,
+        ),
+        _metric_delta_row(
+            key="best_model_val_top1",
+            label="Best model val top1",
+            current=latest_run.get("best_model_val_top1"),
+            baseline=baseline_run.get("best_model_val_top1"),
+            higher_is_better=True,
+        ),
+        _metric_delta_row(
+            key="target_drift_jsd",
+            label="Target drift JSD",
+            current=safety.get("test_jsd_target_drift"),
+            baseline=baseline_safety.get("test_jsd_target_drift"),
+            higher_is_better=False,
+        ),
+        _metric_delta_row(
+            key="test_ece",
+            label="Test ECE",
+            current=safety.get("test_ece"),
+            baseline=baseline_safety.get("test_ece"),
+            higher_is_better=False,
+        ),
+        _metric_delta_row(
+            key="test_selective_risk",
+            label="Selective risk",
+            current=safety.get("test_selective_risk"),
+            baseline=baseline_safety.get("test_selective_risk"),
+            higher_is_better=False,
+        ),
+        _metric_delta_row(
+            key="robustness_gap",
+            label="Worst robustness gap",
+            current=safety.get("robustness_max_top1_gap"),
+            baseline=baseline_safety.get("robustness_max_top1_gap"),
+            higher_is_better=False,
+        ),
+        _metric_delta_row(
+            key="stress_skip_risk",
+            label="Worst stress skip risk",
+            current=qoe.get("stress_worst_skip_risk"),
+            baseline=baseline_qoe.get("stress_worst_skip_risk"),
+            higher_is_better=False,
+        ),
+    ]
+
+    summary: list[str] = []
+    changed_model = (
+        str(latest_run.get("best_model_name", "")).strip()
+        and str(baseline_run.get("best_model_name", "")).strip()
+        and str(latest_run.get("best_model_name", "")).strip() != str(baseline_run.get("best_model_name", "")).strip()
+    )
+    if changed_model:
+        summary.append(
+            f"Best model changed from {baseline_run['best_model_name']} to {latest_run['best_model_name']}."
+        )
+
+    for key in ("best_model_test_top1", "target_drift_jsd", "robustness_gap", "stress_skip_risk"):
+        row = next((item for item in metric_rows if str(item.get("key")) == key), None)
+        if row is None or str(row.get("status")) in ("flat", "unknown"):
+            continue
+        direction_word = "improved" if str(row.get("status")) == "better" else "worsened"
+        summary.append(
+            f"{row['label']} {direction_word} from {_format_metric(row['baseline'])} to {_format_metric(row['current'])} (delta `{_format_metric(row['delta'])}`)."
+        )
+
+    if not summary:
+        summary.append("The latest run is broadly in line with the last promoted baseline across the tracked ops metrics.")
+
+    return {
+        "baseline_available": True,
+        "comparison_mode": "latest_vs_last_strong_run",
+        "baseline_run": {
+            "run_id": str(baseline_run.get("run_id", "")),
+            "profile": str(baseline_run.get("profile", "")),
+            "timestamp": str(baseline_run.get("timestamp", "")),
+            "best_model_name": str(baseline_run.get("best_model_name", "")),
+            "best_model_type": str(baseline_run.get("best_model_type", "")),
+            "promotion_status": str(baseline_run.get("promotion_status", "")),
+        },
+        "summary": summary[:5],
+        "metric_deltas": metric_rows,
+    }
+
+
+def _build_review_actions(
+    *,
+    latest_run: dict[str, object],
+    safety: dict[str, object],
+    qoe: dict[str, object],
+    baseline_comparison: dict[str, object],
+) -> list[dict[str, object]]:
+    actions: list[dict[str, object]] = []
+
+    if not bool(latest_run.get("promoted")):
+        regression = _safe_float(safety.get("champion_gate_regression"))
+        detail = (
+            f"Latest run failed promotion on {latest_run.get('promotion_status', 'unknown')} "
+            f"with champion-gate regression `{_format_metric(regression)}`."
+        )
+        baseline_run = baseline_comparison.get("baseline_run", {})
+        if isinstance(baseline_run, dict) and baseline_run.get("run_id"):
+            detail += f" Compare against promoted baseline `{baseline_run['run_id']}` before retraining."
+        actions.append(
+            {
+                "priority": "high",
+                "area": "promotion",
+                "title": "Recover the champion path",
+                "detail": detail,
+                "inspect": ["run_manifest.json", "run_results.json"],
+            }
+        )
+
+    robustness_gap = _safe_float(safety.get("robustness_max_top1_gap"))
+    if math.isfinite(robustness_gap) and robustness_gap >= 0.15:
+        actions.append(
+            {
+                "priority": "high",
+                "area": "robustness",
+                "title": "Harden the worst slice before the next full run",
+                "detail": (
+                    f"Worst robustness gap is `{_format_metric(robustness_gap)}` on "
+                    f"{safety.get('robustness_worst_segment', 'segment')}={safety.get('robustness_worst_bucket', 'bucket')}."
+                ),
+                "inspect": ["analysis/robustness_summary.json"],
+            }
+        )
+
+    target_drift = _safe_float(safety.get("test_jsd_target_drift"))
+    if math.isfinite(target_drift) and target_drift >= 0.15:
+        actions.append(
+            {
+                "priority": "medium",
+                "area": "drift",
+                "title": "Review drift before trusting regressions",
+                "detail": (
+                    f"Target drift JSD is `{_format_metric(target_drift)}` and segment shift peaks at "
+                    f"`{_format_metric(safety.get('largest_segment_shift_value'))}` for {safety.get('largest_segment_shift_label', 'n/a')}."
+                ),
+                "inspect": ["analysis/data_drift_summary.json"],
+            }
+        )
+
+    stress_skip_risk = _safe_float(qoe.get("stress_worst_skip_risk"))
+    if math.isfinite(stress_skip_risk) and stress_skip_risk >= 0.35:
+        actions.append(
+            {
+                "priority": "medium",
+                "area": "stress_test",
+                "title": "Promote the worst stress scenario into regression checks",
+                "detail": (
+                    f"Scenario `{qoe.get('stress_worst_skip_scenario', 'unknown')}` reaches skip risk "
+                    f"`{_format_metric(stress_skip_risk)}` under the current safety route."
+                ),
+                "inspect": ["analysis/moonshot_summary.json", "analysis/stress_test/stress_test_summary.json"],
+            }
+        )
+
+    selective_risk = _safe_float(safety.get("test_selective_risk"))
+    abstention_rate = _safe_float(safety.get("test_abstention_rate"))
+    if math.isfinite(selective_risk) and selective_risk >= 0.50 and (not math.isfinite(abstention_rate) or abstention_rate <= 0.01):
+        actions.append(
+            {
+                "priority": "medium",
+                "area": "uncertainty",
+                "title": "Inspect abstention settings before serving broadly",
+                "detail": (
+                    f"Selective risk is `{_format_metric(selective_risk)}` while abstention is `{_format_metric(abstention_rate)}`."
+                ),
+                "inspect": ["analysis/*_conformal_summary.json"],
+            }
+        )
+
+    if not actions:
+        actions.append(
+            {
+                "priority": "low",
+                "area": "review",
+                "title": "Run the normal weekly review",
+                "detail": "No acute promotion, drift, robustness, or stress issues crossed the current control-room thresholds.",
+                "inspect": ["outputs/analytics/control_room.md"],
+            }
+        )
+
+    return actions[:6]
+
+
+def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, object]:
+    output_root = output_dir.expanduser().resolve()
+    manifests = _collect_run_manifests(output_root)
+    latest_manifest = _latest_manifest(manifests)
+    latest_snapshot = _build_run_health_snapshot(latest_manifest) if latest_manifest else {"run": {}, "safety": {}, "qoe": {}}
+
+    experiment_history = _safe_read_csv(output_root / "history" / "experiment_history.csv")
+    backtest_history = _safe_read_csv(output_root / "history" / "backtest_history.csv")
+    optuna_history = _safe_read_csv(output_root / "history" / "optuna_history.csv")
+
+    promoted_runs = 0
+    profile_values: set[str] = set()
+    for manifest in manifests:
+        profile = str(manifest.get("profile", "")).strip()
+        if profile:
+            profile_values.add(profile)
+        if _is_promoted_manifest(manifest):
+            promoted_runs += 1
+
+    latest_run = latest_snapshot["run"]
+    safety = latest_snapshot["safety"]
+    qoe = latest_snapshot["qoe"]
+
+    baseline_manifest = _latest_promoted_manifest(
+        manifests,
+        exclude_run_id=str(latest_run.get("run_id", "")) if bool(latest_run.get("promoted")) else None,
+    )
+    baseline_comparison = _build_baseline_comparison(
+        latest_run=latest_run,
+        safety=safety,
+        qoe=qoe,
+        baseline_manifest=baseline_manifest,
+    )
+    review_actions = _build_review_actions(
+        latest_run=latest_run,
+        safety=safety,
+        qoe=qoe,
+        baseline_comparison=baseline_comparison,
+    )
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "output_dir": str(output_root),
-        "portfolio": portfolio,
+        "portfolio": {
+            "total_runs": int(len(manifests)),
+            "promoted_runs": int(promoted_runs),
+            "profiles_seen": sorted(profile_values),
+            "experiment_history_rows": int(len(experiment_history.index)),
+            "backtest_history_rows": int(len(backtest_history.index)),
+            "optuna_history_rows": int(len(optuna_history.index)),
+            "latest_run_id": str(latest_manifest.get("run_id", "")),
+            "latest_profile": str(latest_manifest.get("profile", "")),
+        },
         "latest_run": latest_run,
         "safety": safety,
         "qoe": qoe,
@@ -338,9 +645,17 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
             "experiment_top_models": _rank_models(experiment_history, metric_column="val_top1", top_n=top_n),
             "backtest_top_models": _rank_models(backtest_history, metric_column="top1", top_n=top_n),
         },
+        "baseline_comparison": baseline_comparison,
+        "review_actions": review_actions,
+        "review_ritual": [
+            "Open this control room first after every meaningful run.",
+            "Compare the latest run to the last promoted baseline before interpreting regressions.",
+            "Work through every high-priority review action before scheduling another full run.",
+            "If only medium and low priorities remain, capture decisions asynchronously and keep the operating cadence moving.",
+        ],
     }
     report["next_bets"] = _build_next_bets(
-        portfolio=portfolio,
+        portfolio=report["portfolio"],
         latest_run=latest_run,
         safety=safety,
         qoe=qoe,
@@ -368,6 +683,8 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     latest_run = report["latest_run"]
     safety = report["safety"]
     qoe = report["qoe"]
+    baseline = report.get("baseline_comparison", {})
+    review_actions = report.get("review_actions", [])
 
     lines = [
         "# Control Room",
@@ -408,11 +725,63 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
         f"- Digital twin test AUC: `{_format_metric(qoe['digital_twin_test_auc'])}` causal test AUC=`{_format_metric(qoe['causal_test_auc_total'])}`",
         f"- Stress scenario: `{qoe['stress_worst_skip_scenario']}` skip_risk=`{_format_metric(qoe['stress_worst_skip_risk'])}`",
         "",
-        "## Leaderboards",
-        "",
-        "### Experiment Top Models",
+        "## Since Last Strong Run",
         "",
     ]
+
+    if isinstance(baseline, dict) and bool(baseline.get("baseline_available")):
+        baseline_run = baseline.get("baseline_run", {})
+        baseline_run = baseline_run if isinstance(baseline_run, dict) else {}
+        lines.extend(
+            [
+                f"- Baseline run: `{baseline_run.get('run_id', '')}` (`{baseline_run.get('profile', '')}`) at `{baseline_run.get('timestamp', '')}`",
+                f"- Baseline best model: `{baseline_run.get('best_model_name', '')}` [{baseline_run.get('best_model_type', '')}]",
+                "",
+            ]
+        )
+        for item in baseline.get("summary", []):
+            lines.append(f"- {item}")
+    else:
+        for item in baseline.get("summary", []):
+            lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
+            "## Review Actions",
+            "",
+        ]
+    )
+    for action in review_actions:
+        if not isinstance(action, dict):
+            continue
+        detail = str(action.get("detail", "")).strip()
+        inspect = action.get("inspect", [])
+        inspect_items = inspect if isinstance(inspect, list) else []
+        inspect_text = f" Inspect: {', '.join(str(item) for item in inspect_items if item)}." if inspect_items else ""
+        lines.append(
+            f"- [{str(action.get('priority', '')).upper()}] {action.get('title', '')}: {detail}{inspect_text}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Review Ritual",
+            "",
+        ]
+    )
+    for step in report.get("review_ritual", []):
+        lines.append(f"- {step}")
+
+    lines.extend(
+        [
+            "",
+            "## Leaderboards",
+            "",
+            "### Experiment Top Models",
+            "",
+        ]
+    )
 
     for row in report["leaderboards"]["experiment_top_models"]:
         lines.append(
