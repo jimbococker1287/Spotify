@@ -24,23 +24,26 @@ print(total)
 PY
 )"
 
-# Apple Silicon uses unified memory, so leave a little more headroom for the
-# handoff from Metal training into the parallel classical stages on 16-18 GB
-# machines unless the user explicitly overrides the worker counts.
+# Apple Silicon uses unified memory, so leave more headroom for the handoff
+# from Metal training into the classical stages on 16-18 GB machines unless
+# the user explicitly overrides the worker counts.
 if [[ -z "${SPOTIFY_CLASSICAL_MODEL_WORKERS:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
-  export SPOTIFY_CLASSICAL_MODEL_WORKERS="3"
+  export SPOTIFY_CLASSICAL_MODEL_WORKERS="2"
 fi
 if [[ -z "${SPOTIFY_MAX_CLASSICAL_WORKERS:-}" ]] && [[ -n "${SPOTIFY_CLASSICAL_MODEL_WORKERS:-}" ]]; then
   export SPOTIFY_MAX_CLASSICAL_WORKERS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
 fi
 if [[ -z "${SPOTIFY_BACKTEST_WORKERS:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
-  export SPOTIFY_BACKTEST_WORKERS="2"
+  export SPOTIFY_BACKTEST_WORKERS="1"
 fi
 if [[ -z "${SPOTIFY_OPTUNA_JOBS:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
-  export SPOTIFY_OPTUNA_JOBS="3"
+  export SPOTIFY_OPTUNA_JOBS="2"
 fi
 if [[ -z "${SPOTIFY_OPTUNA_MODEL_WORKERS:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
   export SPOTIFY_OPTUNA_MODEL_WORKERS="1"
+fi
+if [[ -z "${SPOTIFY_SKLEARN_NJOBS:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
+  export SPOTIFY_SKLEARN_NJOBS="1"
 fi
 if [[ -z "${SPOTIFY_TF_DATA_CACHE_FRACTION:-}" ]] && (( TOTAL_RAM_GB > 0 )) && (( TOTAL_RAM_GB <= 18 )); then
   export SPOTIFY_TF_DATA_CACHE_FRACTION="0.40"

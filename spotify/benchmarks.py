@@ -231,8 +231,10 @@ def resolve_classical_parallelism() -> tuple[int, int]:
             estimator_jobs = -1
     else:
         if workers > 1:
-            # Split CPU resources across model workers by default.
-            estimator_jobs = max(1, cpu_count // workers)
+            # When we already parallelize across classical models, default to a
+            # single internal estimator worker to avoid multiplying memory
+            # pressure across tree/instance-based models.
+            estimator_jobs = 1
         else:
             estimator_jobs = -1
 

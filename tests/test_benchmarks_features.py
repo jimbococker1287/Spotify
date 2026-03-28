@@ -141,3 +141,27 @@ def test_run_classical_benchmarks_reuses_provided_feature_bundle(tmp_path, monke
 
     assert len(results) == 1
     assert results[0].model_name == "dummy"
+
+
+def test_resolve_classical_parallelism_avoids_nested_jobs_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(benchmarks.os, "cpu_count", lambda: 12)
+    monkeypatch.setenv("SPOTIFY_CLASSICAL_MODEL_WORKERS", "3")
+    monkeypatch.setenv("SPOTIFY_MAX_CLASSICAL_WORKERS", "3")
+    monkeypatch.delenv("SPOTIFY_SKLEARN_NJOBS", raising=False)
+
+    workers, estimator_n_jobs = benchmarks.resolve_classical_parallelism()
+
+    assert workers == 3
+    assert estimator_n_jobs == 1
+
+
+def test_resolve_classical_parallelism_respects_explicit_estimator_jobs(monkeypatch) -> None:
+    monkeypatch.setattr(benchmarks.os, "cpu_count", lambda: 12)
+    monkeypatch.setenv("SPOTIFY_CLASSICAL_MODEL_WORKERS", "3")
+    monkeypatch.setenv("SPOTIFY_MAX_CLASSICAL_WORKERS", "3")
+    monkeypatch.setenv("SPOTIFY_SKLEARN_NJOBS", "4")
+
+    workers, estimator_n_jobs = benchmarks.resolve_classical_parallelism()
+
+    assert workers == 3
+    assert estimator_n_jobs == 4
