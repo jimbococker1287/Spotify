@@ -71,6 +71,30 @@ The Markdown artifact is the best review surface for humans. Read it in this ord
 4. `Guardrails`
 5. `Adaptive Session`
 
+## Showcase Pack
+
+For the Week 3-4 review pack, generate the canonical adaptive examples plus a steady-mode comparison in one command:
+
+```bash
+spotify-taste-os-showcase --top-k 5
+```
+
+Artifacts are written under:
+
+```bash
+outputs/analysis/taste_os_demo/showcase/
+```
+
+This pack produces:
+
+- four canonical demo artifacts under `showcase/examples/`
+- `taste_os_showcase.json`
+- `taste_os_showcase.md`
+- `taste_os_mode_comparison.json`
+- `taste_os_mode_comparison.md`
+
+Use the showcase pack when you need a short product review artifact instead of a single demo run.
+
 ## What A Good Demo Looks Like
 
 A good demo should make all of the following obvious:

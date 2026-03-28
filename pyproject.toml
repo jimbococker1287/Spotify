@@ -44,6 +44,7 @@ spotify-public-insights = "spotify.public_insights:main"
 spotify-compare-public = "spotify.compare_public:main"
 spotify-control-room = "spotify.control_room:main"
 spotify-taste-os-demo = "spotify.taste_os_demo:main"
+spotify-taste-os-showcase = "spotify.taste_os_showcase:main"
 
 [tool.setuptools]
 include-package-data = true

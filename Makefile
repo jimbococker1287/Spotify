@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert analytics-db compare-public public-insights prune-artifacts storage-report control-room taste-os-demo predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert control-room-guard analytics-db compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -88,6 +88,9 @@ regression-guard:
 regression-alert:
 	$(RUN_PY) scripts/regression_alert.py $(EXTRA_ARGS)
 
+control-room-guard:
+	$(RUN_PY) scripts/control_room_guard.py $(EXTRA_ARGS)
+
 analytics-db:
 	$(RUN_PY) scripts/build_analytics_db.py $(EXTRA_ARGS)
 
@@ -108,6 +111,9 @@ control-room:
 
 taste-os-demo:
 	$(RUN_PY) -m spotify.taste_os_demo $(EXTRA_ARGS)
+
+taste-os-showcase:
+	$(RUN_PY) -m spotify.taste_os_showcase $(EXTRA_ARGS)
 
 predict-next:
 	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)
