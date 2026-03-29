@@ -26,16 +26,18 @@ Every aggregated benchmark-lock should preserve:
 - `benchmark_lock_<id>_summary.csv`
 - `benchmark_lock_<id>_summary.json`
 - `benchmark_lock_<id>_ci95.png`
+- `benchmark_lock_<id>_significance.csv`
 - `benchmark_lock_<id>_manifest.json`
 - `benchmark_lock_<id>_manifest.md`
 
 ## What Must Stay Stable
 
 - Keep the repeated-seed benchmark profile fixed at `small` until the contract version changes.
-- Do not change the run-name prefix, metric columns, or minimum seed-count rule for in-contract comparisons.
+- Do not change the exact run-name pattern `benchmark-lock-<id>-seed-<seed>`, metric columns, or minimum seed-count rule for in-contract comparisons.
 - Treat changes to sequence length, max artists, random seed policy, or data fingerprint as a new benchmark version.
 - Require the full artifact pack before calling a result publication-grade.
+- Require every published model in the summary table to appear in all repeated runs, not just the benchmark aggregate overall.
 
 ## Working Rule
 
-Use `make benchmark-lock` when you want a benchmark-grade comparison and treat its manifest as the source of truth for whether the comparison is actually ready.
+Use `make benchmark-lock` when you want a benchmark-grade comparison and treat its manifest as the source of truth for whether the comparison is actually ready. The benchmark runner now resumes missing seeds by default, so rerunning the same benchmark id is safe when a prior pass stopped early.

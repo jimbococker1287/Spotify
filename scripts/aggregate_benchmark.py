@@ -50,6 +50,20 @@ def _safe_float(value: str | object) -> float | None:
     return float(numeric)
 
 
+def _matches_run_name_prefix(run_name: str, prefix: str) -> bool:
+    candidate = str(run_name or "").strip()
+    if not candidate:
+        return False
+    if candidate == prefix:
+        return True
+    if not candidate.startswith(prefix):
+        return False
+    remainder = candidate[len(prefix) :]
+    if not remainder:
+        return True
+    return not remainder[0].isalnum()
+
+
 def _metric_stats(values: list[float]) -> dict[str, float | int]:
     if not values:
         return {"n": 0, "mean": float("nan"), "std": float("nan"), "ci95": float("nan")}
@@ -181,7 +195,7 @@ def main() -> int:
     with history_csv.open("r", encoding="utf-8") as infile:
         rows = list(csv.DictReader(infile))
 
-    filtered = [row for row in rows if str(row.get("run_name", "")).startswith(prefix)]
+    filtered = [row for row in rows if _matches_run_name_prefix(str(row.get("run_name", "")), prefix)]
     if not filtered:
         raise RuntimeError(
             f"No rows found for run_name prefix '{prefix}' in {history_csv}."
@@ -267,20 +281,19 @@ def main() -> int:
     _plot_ci_chart(ci_plot, summary_rows)
     significance_rows = _paired_significance(filtered)
     significance_csv = output_dir / f"benchmark_lock_{args.benchmark_id}_significance.csv"
-    if significance_rows:
-        _write_csv(
-            significance_csv,
-            [
-                "left_model",
-                "right_model",
-                "shared_runs",
-                "mean_diff_val_top1",
-                "ci95_diff_val_top1",
-                "z_score",
-                "significant_at_95",
-            ],
-            significance_rows,
-        )
+    _write_csv(
+        significance_csv,
+        [
+            "left_model",
+            "right_model",
+            "shared_runs",
+            "mean_diff_val_top1",
+            "ci95_diff_val_top1",
+            "z_score",
+            "significant_at_95",
+        ],
+        significance_rows,
+    )
     manifest_json, manifest_md = write_benchmark_lock_manifest(
         output_dir=output_dir,
         benchmark_id=args.benchmark_id,
@@ -314,8 +327,7 @@ def main() -> int:
     print(f"benchmark_ci_plot={ci_plot}")
     print(f"benchmark_manifest={manifest_json}")
     print(f"benchmark_manifest_md={manifest_md}")
-    if significance_rows:
-        print(f"benchmark_significance={significance_csv}")
+    print(f"benchmark_significance={significance_csv}")
     return 0
 
 

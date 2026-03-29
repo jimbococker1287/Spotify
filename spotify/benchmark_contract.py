@@ -31,6 +31,7 @@ _REQUIRED_LOCK_ARTIFACT_PATTERNS = (
     "benchmark_lock_<id>_summary.csv",
     "benchmark_lock_<id>_summary.json",
     "benchmark_lock_<id>_ci95.png",
+    "benchmark_lock_<id>_significance.csv",
     "benchmark_lock_<id>_manifest.json",
     "benchmark_lock_<id>_manifest.md",
 )
@@ -85,6 +86,7 @@ def build_benchmark_lock_manifest(
     summary_rows: list[dict[str, object]],
     significance_rows: list[dict[str, object]],
     raw_rows: list[dict[str, object]],
+    assume_present_artifacts: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     contract = describe_canonical_benchmark_contract()
     unique_run_ids = sorted(
@@ -113,13 +115,31 @@ def build_benchmark_lock_manifest(
         if _safe_int(row.get("significant_at_95"), default=0) == 1
     )
     required_artifacts = _materialize_required_paths(output_dir=output_dir, benchmark_id=benchmark_id)
-    present_artifacts = [path for path in required_artifacts if Path(path).exists()]
+    assumed_present = {str(Path(path).resolve()) for path in (assume_present_artifacts or ()) if str(path).strip()}
+    present_artifacts = [path for path in required_artifacts if Path(path).exists() or path in assumed_present]
+    minimum_repeated_runs = int(contract["minimum_repeated_runs"])
+    summary_run_counts = sorted(
+        {
+            _safe_int(row.get("run_count"), default=0)
+            for row in summary_rows
+            if str(row.get("model_name", "")).strip()
+        }
+    )
+    per_model_runs_ok = bool(summary_rows) and all(run_count >= minimum_repeated_runs for run_count in summary_run_counts)
 
     stability_checks = [
         {
             "key": "minimum_repeated_runs",
-            "status": "pass" if run_count >= _MIN_REPEATED_RUNS else "fail",
-            "detail": f"Observed `{run_count}` repeated run(s); contract expects at least `{_MIN_REPEATED_RUNS}`.",
+            "status": "pass" if run_count >= minimum_repeated_runs else "fail",
+            "detail": f"Observed `{run_count}` repeated run(s); contract expects at least `{minimum_repeated_runs}`.",
+        },
+        {
+            "key": "minimum_repeated_runs_per_model",
+            "status": "pass" if per_model_runs_ok else "fail",
+            "detail": (
+                f"Per-model repeated runs: `{', '.join(str(value) for value in summary_run_counts) if summary_run_counts else 'none'}`. "
+                f"Every published model should appear in at least `{minimum_repeated_runs}` repeated run(s)."
+            ),
         },
         {
             "key": "canonical_profile_only",
@@ -166,11 +186,12 @@ def build_benchmark_lock_manifest(
         "contract_version": contract["contract_version"],
         "comparison_mode": contract["comparison_mode"],
         "canonical_profile": contract["canonical_profile"],
-        "minimum_repeated_runs": contract["minimum_repeated_runs"],
+        "minimum_repeated_runs": minimum_repeated_runs,
         "run_count": run_count,
         "observed_run_ids": unique_run_ids,
         "observed_profiles": observed_profiles,
         "model_names": model_names,
+        "summary_run_counts": summary_run_counts,
         "required_artifacts": required_artifacts,
         "present_artifact_count": len(present_artifacts),
         "required_artifact_count": len(required_artifacts),
@@ -194,6 +215,8 @@ def write_benchmark_lock_manifest(
     raw_rows: list[dict[str, object]],
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"benchmark_lock_{benchmark_id}_manifest.json"
+    md_path = output_dir / f"benchmark_lock_{benchmark_id}_manifest.md"
     payload = build_benchmark_lock_manifest(
         output_dir=output_dir,
         benchmark_id=benchmark_id,
@@ -201,9 +224,9 @@ def write_benchmark_lock_manifest(
         summary_rows=summary_rows,
         significance_rows=significance_rows,
         raw_rows=raw_rows,
+        assume_present_artifacts=[str(json_path.resolve()), str(md_path.resolve())],
     )
 
-    json_path = output_dir / f"benchmark_lock_{benchmark_id}_manifest.json"
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     lines = [
@@ -246,7 +269,6 @@ def write_benchmark_lock_manifest(
     for item in payload["stability_rules"]:
         lines.append(f"- {item}")
 
-    md_path = output_dir / f"benchmark_lock_{benchmark_id}_manifest.md"
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, md_path
 
