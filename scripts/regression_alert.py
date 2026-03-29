@@ -126,6 +126,17 @@ def _load_control_room_payload(outputs_dir: Path) -> dict[str, object]:
     return _read_json(candidate_path)
 
 
+def _resolve_run_dir_from_control_room(outputs_dir: Path, control_room: dict[str, object]) -> Path | None:
+    latest_run = control_room.get("latest_run", {})
+    if not isinstance(latest_run, dict):
+        return None
+    run_id = str(latest_run.get("run_id", "")).strip()
+    if not run_id:
+        return None
+    run_dir = outputs_dir / "runs" / run_id
+    return run_dir if run_dir.exists() else None
+
+
 def _review_actions_for_run(
     *,
     control_room: dict[str, object],
@@ -181,7 +192,11 @@ def _review_action_summary(action: dict[str, object]) -> str:
 def main() -> int:
     args = _parse_args()
     outputs_dir = Path(args.outputs_dir).expanduser().resolve()
-    run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else _find_latest_run(outputs_dir)
+    control_room = _load_control_room_payload(outputs_dir)
+    if args.run_dir:
+        run_dir = Path(args.run_dir).expanduser().resolve()
+    else:
+        run_dir = _resolve_run_dir_from_control_room(outputs_dir, control_room) or _find_latest_run(outputs_dir)
 
     gate_path = run_dir / "champion_gate.json"
     if not gate_path.exists():
@@ -195,18 +210,26 @@ def main() -> int:
     threshold = gate.get("threshold", "")
     model_name = str(gate.get("challenger_model_name", ""))
     review_threshold = _normalize_review_threshold(args.review_threshold)
-    control_room = _load_control_room_payload(outputs_dir)
     review_actions, control_room_status = _review_actions_for_run(
         control_room=control_room,
         run_id=run_dir.name,
         max_actions=max(0, int(args.max_review_actions)),
     )
     highest_review_priority = _highest_review_priority(review_actions)
+    async_handoff = control_room.get("async_handoff", {})
+    async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
+    handoff_status = str(async_handoff.get("status", "missing")).strip() or "missing"
+    next_step = (
+        str(async_handoff.get("recommended_run_command", "")).strip()
+        or str(async_handoff.get("recommended_review_command", "")).strip()
+        or "make control-room"
+    )
 
     message = (
         f"run={run_dir.name} promoted={promoted} status={status} "
         f"metric={metric_source} regression={regression} threshold={threshold} challenger={model_name} "
-        f"review_status={control_room_status} review_priority={highest_review_priority} review_count={len(review_actions)}"
+        f"review_status={control_room_status} review_priority={highest_review_priority} review_count={len(review_actions)} "
+        f"handoff={handoff_status} next_step={next_step}"
     )
     print(message)
     for idx, action in enumerate(review_actions, start=1):
@@ -230,6 +253,8 @@ def main() -> int:
             "review_priority": highest_review_priority,
             "review_actions": review_actions,
             "baseline_summary": baseline_summary.get("summary", []),
+            "async_handoff": async_handoff,
+            "next_step": next_step,
         }
         try:
             _post_webhook(webhook_url, payload)

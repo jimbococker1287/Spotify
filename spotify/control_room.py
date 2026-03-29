@@ -77,6 +77,75 @@ def _latest_promoted_manifest(
     )
 
 
+def _profile_signal_rank(profile: str) -> int:
+    normalized = str(profile).strip().lower()
+    if normalized == "full":
+        return 5
+    if normalized in {"experimental", "core"}:
+        return 4
+    if normalized in {"small", "fast"}:
+        return 3
+    if normalized == "dev":
+        return 1
+    return 2
+
+
+def _manifest_looks_like_smoke_run(manifest: dict[str, object]) -> bool:
+    combined = " ".join(
+        [
+            str(manifest.get("run_name", "")).strip().lower(),
+            str(manifest.get("run_id", "")).strip().lower(),
+        ]
+    )
+    if not combined.strip():
+        return False
+    smoke_hints = ("check", "smoke", "probe", "debug", "verify")
+    return any(hint in combined for hint in smoke_hints)
+
+
+def _normalize_reference_time(reference_time: datetime | None) -> datetime:
+    if reference_time is None:
+        return datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        return reference_time.replace(tzinfo=timezone.utc)
+    return reference_time.astimezone(timezone.utc)
+
+
+def _parse_manifest_timestamp(value: object) -> datetime | None:
+    raw_value = str(value).strip()
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _age_hours(timestamp: object, *, reference_time: datetime) -> float:
+    parsed = _parse_manifest_timestamp(timestamp)
+    if parsed is None:
+        return float("nan")
+    delta_hours = (reference_time - parsed).total_seconds() / 3600.0
+    return max(delta_hours, 0.0)
+
+
+def _freshness_rank(age_hours: float) -> int:
+    if not math.isfinite(age_hours):
+        return 0
+    if age_hours <= 36:
+        return 4
+    if age_hours <= 24 * 7:
+        return 3
+    if age_hours <= 24 * 14:
+        return 2
+    if age_hours <= 24 * 30:
+        return 1
+    return 0
+
+
 def _load_run_results(run_dir: Path) -> list[dict[str, object]]:
     payload = _safe_read_json(run_dir / "run_results.json", default=None)
     if isinstance(payload, list):
@@ -183,8 +252,20 @@ def _build_next_bets(
     latest_run: dict[str, object],
     safety: dict[str, object],
     qoe: dict[str, object],
+    operating_rhythm: dict[str, object],
+    run_selection: dict[str, object],
 ) -> list[str]:
     bets: list[str] = []
+
+    full_lane = _operating_lane(operating_rhythm, "full")
+    fast_lane = _operating_lane(operating_rhythm, "fast")
+    if str(full_lane.get("status", "")) in {"missing", "stale"}:
+        bets.append("The weekly full lane is stale; restore `make schedule-run MODE=full` before expanding the roadmap.")
+    elif str(fast_lane.get("status", "")) in {"missing", "stale", "attention"}:
+        bets.append("The daily fast lane needs attention; tighten the recurring cadence before trusting the current operating rhythm.")
+
+    if bool(operating_rhythm.get("selection_gap")):
+        bets.append("The freshest observed run is not the review-ready ops run yet; keep smoke/dev runs separate or finish their artifacts before handoff.")
 
     if not bool(latest_run.get("promoted")):
         bets.append("Stabilize the promotion path so the latest run can graduate cleanly to champion.")
@@ -325,6 +406,314 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "safety": safety,
         "qoe": qoe,
         "ops_coverage": ops_coverage,
+    }
+
+
+def _manifest_ops_signal(
+    manifest: dict[str, object],
+    snapshot: dict[str, dict[str, object]],
+    *,
+    reference_time: datetime,
+) -> dict[str, object]:
+    profile = str(manifest.get("profile", "")).strip().lower()
+    ops_coverage = snapshot.get("ops_coverage", {})
+    ops_coverage = ops_coverage if isinstance(ops_coverage, dict) else {}
+    coverage_ratio = _safe_float(ops_coverage.get("coverage_ratio"))
+    if not math.isfinite(coverage_ratio):
+        coverage_ratio = -1.0
+    backtest_rows = _safe_int(manifest.get("backtest_rows"))
+    optuna_rows = _safe_int(manifest.get("optuna_rows"))
+    smoke_like = _manifest_looks_like_smoke_run(manifest)
+    production_profile = profile not in {"", "dev"}
+    profile_rank = _profile_signal_rank(profile)
+    coverage_ready = coverage_ratio >= 0.80
+    age_hours = _age_hours(manifest.get("timestamp", ""), reference_time=reference_time)
+    freshness_rank = _freshness_rank(age_hours)
+    return {
+        "run_id": str(manifest.get("run_id", "")),
+        "run_name": str(manifest.get("run_name", "") or ""),
+        "profile": profile,
+        "timestamp": str(manifest.get("timestamp", "")),
+        "smoke_like": bool(smoke_like),
+        "production_profile": bool(production_profile),
+        "profile_rank": int(profile_rank),
+        "backtest_rows": int(backtest_rows),
+        "optuna_rows": int(optuna_rows),
+        "coverage_ratio": float(coverage_ratio),
+        "available_summary_count": _safe_int(ops_coverage.get("available_summary_count"), default=0),
+        "expected_summary_count": _safe_int(ops_coverage.get("expected_summary_count"), default=0),
+        "coverage_ready": bool(coverage_ready),
+        "age_hours": float(age_hours) if math.isfinite(age_hours) else float("nan"),
+        "freshness_rank": int(freshness_rank),
+        "sort_key": (
+            int(coverage_ready),
+            int(not smoke_like),
+            int(freshness_rank),
+            int(production_profile),
+            int(backtest_rows > 0),
+            int(profile_rank),
+            float(coverage_ratio),
+            int(backtest_rows),
+            int(optuna_rows),
+            str(manifest.get("timestamp", "")),
+            str(manifest.get("run_id", "")),
+        ),
+    }
+
+
+def _build_run_selection_summary(
+    *,
+    latest_observed_signal: dict[str, object],
+    selected_signal: dict[str, object],
+) -> dict[str, object]:
+    observed_run_id = str(latest_observed_signal.get("run_id", ""))
+    selected_run_id = str(selected_signal.get("run_id", ""))
+    observed_matches_selected = observed_run_id == selected_run_id
+
+    if observed_matches_selected:
+        if bool(selected_signal.get("coverage_ready")) and not bool(selected_signal.get("smoke_like")):
+            reason = "Latest observed run already looks like the strongest ops candidate."
+        elif not bool(selected_signal.get("smoke_like")) and bool(selected_signal.get("production_profile")):
+            reason = "Latest observed run is still the strongest ops candidate, but its ops coverage is incomplete."
+        else:
+            reason = "No stronger ops candidate was available, so the control room stayed on the latest observed run."
+    else:
+        reasons: list[str] = []
+        if bool(latest_observed_signal.get("smoke_like")):
+            reasons.append("the latest observed run looks like a smoke/check run")
+        if not bool(latest_observed_signal.get("production_profile")):
+            reasons.append(
+                f"the latest observed run uses the `{latest_observed_signal.get('profile', 'unknown')}` profile"
+            )
+        if float(selected_signal.get("coverage_ratio", -1.0)) > float(latest_observed_signal.get("coverage_ratio", -1.0)):
+            reasons.append("the selected run has better ops artifact coverage")
+        if _safe_int(selected_signal.get("backtest_rows"), default=0) > _safe_int(latest_observed_signal.get("backtest_rows"), default=0):
+            reasons.append("the selected run has stronger backtest evidence")
+        if not reasons:
+            reasons.append("the selected run scored higher on the ops signal ranking")
+        reason = (
+            "Latest observed run was skipped because "
+            + "; ".join(reasons)
+            + f". Control room selected `{selected_run_id}` instead."
+        )
+
+    return {
+        "selection_mode": "ops_signal_ranking",
+        "observed_matches_selected": bool(observed_matches_selected),
+        "selection_reason": reason,
+        "latest_observed_run": latest_observed_signal,
+        "selected_run": selected_signal,
+    }
+
+
+def _select_latest_control_room_candidate(
+    manifests: list[dict[str, object]],
+    *,
+    reference_time: datetime,
+) -> tuple[dict[str, object], dict[str, dict[str, object]], dict[str, object]]:
+    if not manifests:
+        return {}, {"run": {}, "safety": {}, "qoe": {}, "ops_coverage": {}}, {
+            "selection_mode": "ops_signal_ranking",
+            "observed_matches_selected": True,
+            "selection_reason": "No run manifests were available.",
+            "latest_observed_run": {},
+            "selected_run": {},
+        }
+
+    candidates: list[dict[str, object]] = []
+    for manifest in manifests:
+        snapshot = _build_run_health_snapshot(manifest)
+        signal = _manifest_ops_signal(manifest, snapshot, reference_time=reference_time)
+        candidates.append(
+            {
+                "manifest": manifest,
+                "snapshot": snapshot,
+                "signal": signal,
+            }
+        )
+
+    latest_observed = max(candidates, key=lambda item: _manifest_sort_key(item["manifest"]))
+    selected = max(candidates, key=lambda item: (item["signal"]["sort_key"], _manifest_sort_key(item["manifest"])))
+    selection = _build_run_selection_summary(
+        latest_observed_signal=latest_observed["signal"],
+        selected_signal=selected["signal"],
+    )
+    return selected["manifest"], selected["snapshot"], selection
+
+
+def _status_rank(status: str) -> int:
+    normalized = str(status).strip().lower()
+    if normalized == "healthy":
+        return 0
+    if normalized == "attention":
+        return 1
+    if normalized == "stale":
+        return 2
+    if normalized == "missing":
+        return 3
+    if normalized == "blocked":
+        return 4
+    return 1
+
+
+def _latest_manifest_for_profiles(
+    manifests: list[dict[str, object]],
+    *,
+    profiles: set[str],
+) -> dict[str, object]:
+    candidates = [
+        manifest
+        for manifest in manifests
+        if str(manifest.get("profile", "")).strip().lower() in profiles and not _manifest_looks_like_smoke_run(manifest)
+    ]
+    return max(candidates, key=_manifest_sort_key, default={})
+
+
+def _build_cadence_lane(
+    *,
+    manifests: list[dict[str, object]],
+    lane: str,
+    profiles: set[str],
+    target_interval_hours: int,
+    reference_time: datetime,
+) -> dict[str, object]:
+    manifest = _latest_manifest_for_profiles(manifests, profiles=profiles)
+    if not manifest:
+        return {
+            "lane": lane,
+            "profiles": sorted(profiles),
+            "target_interval_hours": int(target_interval_hours),
+            "status": "missing",
+            "latest_run": {},
+            "hours_since_run": float("nan"),
+            "overdue_hours": float("nan"),
+            "recommended_command": f"make schedule-run MODE={lane}",
+            "summary": f"No recent `{lane}`-lane run was found. Run `make schedule-run MODE={lane}` to restore cadence.",
+        }
+
+    snapshot = _build_run_health_snapshot(manifest)
+    signal = _manifest_ops_signal(manifest, snapshot, reference_time=reference_time)
+    hours_since_run = _safe_float(signal.get("age_hours"))
+    overdue_hours = max(hours_since_run - float(target_interval_hours), 0.0) if math.isfinite(hours_since_run) else float("nan")
+
+    if not math.isfinite(hours_since_run):
+        status = "attention"
+        summary = f"The latest `{lane}`-lane run is missing a readable timestamp, so cadence could not be verified."
+    elif hours_since_run > float(target_interval_hours) * 2.0:
+        status = "stale"
+        summary = (
+            f"The `{lane}` lane is stale at `{hours_since_run:.1f}` hours since `{signal.get('run_id', '')}`. "
+            f"Restore cadence with `make schedule-run MODE={lane}`."
+        )
+    elif hours_since_run > float(target_interval_hours):
+        status = "attention"
+        summary = (
+            f"The `{lane}` lane is slipping at `{hours_since_run:.1f}` hours since `{signal.get('run_id', '')}`. "
+            f"Plan `make schedule-run MODE={lane}` soon."
+        )
+    elif float(signal.get("coverage_ratio", 0.0)) < 0.8:
+        status = "attention"
+        summary = (
+            f"The latest `{lane}`-lane run is recent, but ops coverage is only `{_format_metric(signal.get('coverage_ratio'))}`. "
+            f"Backfill analysis before treating it as the cadence anchor."
+        )
+    else:
+        status = "healthy"
+        summary = (
+            f"The `{lane}` lane is healthy with `{signal.get('run_id', '')}` at `{hours_since_run:.1f}` hours old "
+            f"and coverage `{_format_metric(signal.get('coverage_ratio'))}`."
+        )
+
+    return {
+        "lane": lane,
+        "profiles": sorted(profiles),
+        "target_interval_hours": int(target_interval_hours),
+        "status": status,
+        "latest_run": {
+            "run_id": str(signal.get("run_id", "")),
+            "profile": str(signal.get("profile", "")),
+            "timestamp": str(signal.get("timestamp", "")),
+            "coverage_ratio": _safe_float(signal.get("coverage_ratio")),
+        },
+        "hours_since_run": hours_since_run,
+        "overdue_hours": overdue_hours,
+        "recommended_command": f"make schedule-run MODE={lane}",
+        "summary": summary,
+    }
+
+
+def _operating_lane(operating_rhythm: dict[str, object], lane: str) -> dict[str, object]:
+    lanes = operating_rhythm.get("lanes", {})
+    lanes = lanes if isinstance(lanes, dict) else {}
+    lane_payload = lanes.get(lane, {})
+    return lane_payload if isinstance(lane_payload, dict) else {}
+
+
+def _build_operating_rhythm(
+    *,
+    manifests: list[dict[str, object]],
+    latest_run: dict[str, object],
+    run_selection: dict[str, object],
+    reference_time: datetime,
+) -> dict[str, object]:
+    fast_lane = _build_cadence_lane(
+        manifests=manifests,
+        lane="fast",
+        profiles={"fast", "small", "core", "experimental", "dev"},
+        target_interval_hours=24,
+        reference_time=reference_time,
+    )
+    full_lane = _build_cadence_lane(
+        manifests=manifests,
+        lane="full",
+        profiles={"full"},
+        target_interval_hours=24 * 7,
+        reference_time=reference_time,
+    )
+    lane_statuses = [str(fast_lane.get("status", "")), str(full_lane.get("status", ""))]
+    overall_status = max(lane_statuses, key=_status_rank, default="attention")
+
+    latest_observed = run_selection.get("latest_observed_run", {})
+    latest_observed = latest_observed if isinstance(latest_observed, dict) else {}
+    observed_run_id = str(latest_observed.get("run_id", ""))
+    selected_run_id = str(latest_run.get("run_id", ""))
+    selection_gap = bool(observed_run_id) and observed_run_id != selected_run_id
+
+    recommended_run_command = ""
+    recommended_run_reason = ""
+    if str(full_lane.get("status", "")) in {"missing", "stale"}:
+        recommended_run_command = str(full_lane.get("recommended_command", ""))
+        recommended_run_reason = "The weekly full lane is stale or missing."
+    elif str(fast_lane.get("status", "")) in {"missing", "stale", "attention"}:
+        recommended_run_command = str(fast_lane.get("recommended_command", ""))
+        recommended_run_reason = "The daily fast lane needs attention."
+
+    summary = [
+        str(fast_lane.get("summary", "")).strip(),
+        str(full_lane.get("summary", "")).strip(),
+    ]
+    if selection_gap:
+        summary.append(
+            f"Latest observed run `{observed_run_id}` is newer than the ops-selected run `{selected_run_id}`. "
+            f"{run_selection.get('selection_reason', '')}".strip()
+        )
+    if recommended_run_command:
+        summary.append(f"Recommended next scheduled command: `{recommended_run_command}`.")
+    else:
+        summary.append("Cadence is healthy enough that the next move is review, not an immediate scheduled rerun.")
+
+    return {
+        "overall_status": overall_status,
+        "reference_time": reference_time.isoformat(timespec="seconds"),
+        "lanes": {
+            "fast": fast_lane,
+            "full": full_lane,
+        },
+        "selection_gap": selection_gap,
+        "recommended_review_command": "make control-room",
+        "recommended_run_command": recommended_run_command,
+        "recommended_run_reason": recommended_run_reason,
+        "summary": [item for item in summary if item][:5],
     }
 
 
@@ -487,6 +876,8 @@ def _build_review_actions(
     qoe: dict[str, object],
     ops_coverage: dict[str, object],
     baseline_comparison: dict[str, object],
+    run_selection: dict[str, object],
+    operating_rhythm: dict[str, object],
 ) -> list[dict[str, object]]:
     actions: list[dict[str, object]] = []
 
@@ -506,6 +897,35 @@ def _build_review_actions(
                     f"Missing: {preview}."
                 ),
                 "inspect": missing_summaries or ["outputs/runs/<run_id>/analysis/"],
+            }
+        )
+
+    cadence_notes: list[str] = []
+    fast_lane = _operating_lane(operating_rhythm, "fast")
+    full_lane = _operating_lane(operating_rhythm, "full")
+    for lane_payload in (fast_lane, full_lane):
+        lane_status = str(lane_payload.get("status", ""))
+        if lane_status not in {"missing", "stale"}:
+            continue
+        cadence_notes.append(str(lane_payload.get("summary", "")).strip())
+
+    latest_observed = run_selection.get("latest_observed_run", {})
+    latest_observed = latest_observed if isinstance(latest_observed, dict) else {}
+    if bool(operating_rhythm.get("selection_gap")):
+        cadence_notes.append(
+            f"Latest observed run `{latest_observed.get('run_id', '')}` is newer than the ops-selected run "
+            f"`{latest_run.get('run_id', '')}` because {run_selection.get('selection_reason', 'the newer run is not review-ready yet')}."
+        )
+
+    if cadence_notes:
+        cadence_priority = "high" if str(full_lane.get("status", "")) in {"missing", "stale"} else "medium"
+        actions.append(
+            {
+                "priority": cadence_priority,
+                "area": "cadence",
+                "title": "Restore the recurring run cadence",
+                "detail": " ".join(note for note in cadence_notes if note),
+                "inspect": ["outputs/analytics/control_room_history.csv", "scripts/run_scheduled.sh"],
             }
         )
 
@@ -602,6 +1022,68 @@ def _build_review_actions(
     return actions[:6]
 
 
+def _build_async_handoff(
+    *,
+    latest_run: dict[str, object],
+    review_actions: list[dict[str, object]],
+    next_bets: list[str],
+    operating_rhythm: dict[str, object],
+    run_selection: dict[str, object],
+    ops_coverage: dict[str, object],
+) -> dict[str, object]:
+    top_action = review_actions[0] if review_actions and isinstance(review_actions[0], dict) else {}
+    top_priority = str(top_action.get("priority", "")).strip().lower()
+    coverage_ratio = _safe_float(ops_coverage.get("coverage_ratio"))
+    recommended_run_command = str(operating_rhythm.get("recommended_run_command", "")).strip()
+    recommended_review_command = str(operating_rhythm.get("recommended_review_command", "make control-room")).strip()
+
+    if math.isfinite(coverage_ratio) and coverage_ratio < 0.8:
+        status = "blocked"
+        headline = "Async review is blocked until the missing ops artifacts are backfilled."
+    elif top_priority == "high":
+        status = "attention"
+        headline = "Async review can proceed, but high-priority actions should close before another full run."
+    elif str(operating_rhythm.get("overall_status", "")) in {"missing", "stale", "attention"}:
+        status = "attention"
+        headline = "Async review is usable, but the recurring cadence still needs attention."
+    else:
+        status = "ready"
+        headline = "Async review is ready; the current report is enough for a teammate handoff."
+
+    latest_observed = run_selection.get("latest_observed_run", {})
+    latest_observed = latest_observed if isinstance(latest_observed, dict) else {}
+    summary = [
+        f"Start with `{recommended_review_command}` and review ops-selected run `{latest_run.get('run_id', '')}` (`{latest_run.get('profile', '')}`).",
+        f"Promotion is `{latest_run.get('promotion_status', '')}` and the top open action is `{top_action.get('title', 'none')}`.",
+    ]
+    if bool(operating_rhythm.get("selection_gap")) and latest_observed.get("run_id"):
+        summary.append(
+            f"Latest observed run `{latest_observed.get('run_id', '')}` is newer than the selected run, so include the run-selection note in the handoff."
+        )
+    if recommended_run_command:
+        summary.append(f"Recommended next scheduled command: `{recommended_run_command}`.")
+    else:
+        summary.append("No immediate scheduled rerun is required once the current review actions are acknowledged.")
+    if next_bets:
+        summary.append(f"Primary next bet: {next_bets[0]}")
+
+    share_artifacts = [
+        "outputs/analytics/control_room.md",
+        "outputs/analytics/control_room_weekly_summary.md",
+    ]
+    if top_priority in {"high", "medium"}:
+        share_artifacts.append("outputs/analytics/control_room_triage.md")
+
+    return {
+        "status": status,
+        "headline": headline,
+        "recommended_review_command": recommended_review_command,
+        "recommended_run_command": recommended_run_command,
+        "share_artifacts": share_artifacts,
+        "summary": summary[:5],
+    }
+
+
 def _snapshot_sort_frame(history_df: pd.DataFrame) -> pd.DataFrame:
     if history_df.empty:
         return history_df.copy()
@@ -649,6 +1131,10 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
     qoe = qoe if isinstance(qoe, dict) else {}
     ops_coverage = report.get("ops_coverage", {})
     ops_coverage = ops_coverage if isinstance(ops_coverage, dict) else {}
+    operating_rhythm = report.get("operating_rhythm", {})
+    operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
+    async_handoff = report.get("async_handoff", {})
+    async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
     review_actions = report.get("review_actions", [])
     review_actions = review_actions if isinstance(review_actions, list) else []
     baseline = report.get("baseline_comparison", {})
@@ -695,6 +1181,11 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
         "ops_coverage_ratio": _safe_float(ops_coverage.get("coverage_ratio")),
         "available_summary_count": _safe_int(ops_coverage.get("available_summary_count"), default=0),
         "expected_summary_count": _safe_int(ops_coverage.get("expected_summary_count"), default=0),
+        "operating_status": str(operating_rhythm.get("overall_status", "")),
+        "fast_cadence_status": str(_operating_lane(operating_rhythm, "fast").get("status", "")),
+        "full_cadence_status": str(_operating_lane(operating_rhythm, "full").get("status", "")),
+        "async_handoff_status": str(async_handoff.get("status", "")),
+        "recommended_run_command": str(operating_rhythm.get("recommended_run_command", "")),
         "review_action_count": int(len(review_actions)),
         "high_priority_review_actions": int(high_count),
         "medium_priority_review_actions": int(medium_count),
@@ -822,6 +1313,20 @@ def _build_ops_trends(report: dict[str, object], history_df: pd.DataFrame) -> di
     if recurring_areas:
         summary.append(f"Recurring ops areas across recent runs: {', '.join(recurring_areas[:3])}.")
 
+    async_blocked_count = int(
+        recent_window.get("async_handoff_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["blocked"]).sum()
+    ) if not recent_window.empty else 0
+    fast_issue_count = int(
+        recent_window.get("fast_cadence_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["attention", "stale", "missing"]).sum()
+    ) if not recent_window.empty else 0
+    full_issue_count = int(
+        recent_window.get("full_cadence_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["attention", "stale", "missing"]).sum()
+    ) if not recent_window.empty else 0
+    if async_blocked_count > 0 or fast_issue_count > 0 or full_issue_count > 0:
+        summary.append(
+            f"Async handoff was blocked in `{async_blocked_count}` recent snapshot(s); fast cadence needed attention in `{fast_issue_count}` and full cadence in `{full_issue_count}`."
+        )
+
     return {
         "history_available": True,
         "snapshot_count": int(len(frame.index)),
@@ -838,6 +1343,7 @@ def _write_weekly_ops_summary(
     history_df: pd.DataFrame,
     *,
     lookback_days: int = 7,
+    generated_at: datetime | None = None,
 ) -> tuple[Path, Path, dict[str, object]]:
     history_frame = _snapshot_sort_frame(history_df)
     if history_frame.empty:
@@ -858,6 +1364,15 @@ def _write_weekly_ops_summary(
     worst_robustness_gap = _safe_float(pd.to_numeric(window_frame.get("robustness_gap"), errors="coerce").max()) if not window_frame.empty else float("nan")
     worst_stress_skip_risk = _safe_float(pd.to_numeric(window_frame.get("stress_skip_risk"), errors="coerce").max()) if not window_frame.empty else float("nan")
     worst_selective_risk = _safe_float(pd.to_numeric(window_frame.get("test_selective_risk"), errors="coerce").max()) if not window_frame.empty else float("nan")
+    async_blocked_snapshots = int(
+        window_frame.get("async_handoff_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["blocked"]).sum()
+    ) if not window_frame.empty else 0
+    fast_cadence_issue_snapshots = int(
+        window_frame.get("fast_cadence_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["attention", "stale", "missing"]).sum()
+    ) if not window_frame.empty else 0
+    full_cadence_issue_snapshots = int(
+        window_frame.get("full_cadence_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["attention", "stale", "missing"]).sum()
+    ) if not window_frame.empty else 0
 
     area_counts: dict[str, int] = {}
     for raw_value in window_frame.get("review_action_areas", pd.Series(dtype="object")).fillna("").astype(str):
@@ -885,6 +1400,7 @@ def _write_weekly_ops_summary(
         f"Runs in window: `{len(window_frame.index)}` with `{promoted_runs}` promotions and `{failed_promotions}` failed promotions.",
         f"Average best-model test top1 across the window is `{_format_metric(avg_test_top1)}`.",
         f"Worst observed robustness gap is `{_format_metric(worst_robustness_gap)}` and worst stress skip risk is `{_format_metric(worst_stress_skip_risk)}`.",
+        f"Async handoff was blocked in `{async_blocked_snapshots}` snapshot(s); fast cadence needed attention in `{fast_cadence_issue_snapshots}` and full cadence in `{full_cadence_issue_snapshots}`.",
     ]
     if recurring_areas:
         recurring_labels = [f"{row['area']} ({row['count']})" for row in recurring_areas[:3]]
@@ -895,7 +1411,7 @@ def _write_weekly_ops_summary(
         summary_lines.append("No ops area repeated often enough yet to count as a weekly recurring pattern.")
 
     payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": _normalize_reference_time(generated_at).isoformat(timespec="seconds"),
         "lookback_days": int(max(1, int(lookback_days))),
         "snapshots_considered": int(len(window_frame.index)),
         "promoted_runs": int(promoted_runs),
@@ -904,6 +1420,9 @@ def _write_weekly_ops_summary(
         "worst_robustness_gap": worst_robustness_gap,
         "worst_stress_skip_risk": worst_stress_skip_risk,
         "worst_selective_risk": worst_selective_risk,
+        "async_handoff_blocked_snapshots": int(async_blocked_snapshots),
+        "fast_cadence_issue_snapshots": int(fast_cadence_issue_snapshots),
+        "full_cadence_issue_snapshots": int(full_cadence_issue_snapshots),
         "recurring_areas": recurring_areas,
         "current_focus": current_focus,
         "summary": summary_lines,
@@ -936,6 +1455,16 @@ def _write_weekly_ops_summary(
     ]
     for item in payload["summary"]:
         lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "## Operating Rhythm",
+            "",
+            f"- Async handoff blocked snapshots: `{payload['async_handoff_blocked_snapshots']}`",
+            f"- Fast cadence issue snapshots: `{payload['fast_cadence_issue_snapshots']}`",
+            f"- Full cadence issue snapshots: `{payload['full_cadence_issue_snapshots']}`",
+        ]
+    )
     lines.extend(["", "## Current Focus", ""])
     if current_focus:
         for item in current_focus:
@@ -948,14 +1477,18 @@ def _write_weekly_ops_summary(
     return json_path, md_path, payload
 
 
-def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, object]:
+def build_control_room_report(
+    output_dir: Path,
+    *,
+    top_n: int = 5,
+    reference_time: datetime | None = None,
+) -> dict[str, object]:
     output_root = output_dir.expanduser().resolve()
+    now = _normalize_reference_time(reference_time)
     manifests = _collect_run_manifests(output_root)
-    latest_manifest = _latest_manifest(manifests)
-    latest_snapshot = (
-        _build_run_health_snapshot(latest_manifest)
-        if latest_manifest
-        else {"run": {}, "safety": {}, "qoe": {}, "ops_coverage": {}}
+    latest_manifest, latest_snapshot, run_selection = _select_latest_control_room_candidate(
+        manifests,
+        reference_time=now,
     )
 
     experiment_history = _safe_read_csv(output_root / "history" / "experiment_history.csv")
@@ -975,6 +1508,12 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
     safety = latest_snapshot["safety"]
     qoe = latest_snapshot["qoe"]
     ops_coverage = latest_snapshot["ops_coverage"]
+    operating_rhythm = _build_operating_rhythm(
+        manifests=manifests,
+        latest_run=latest_run,
+        run_selection=run_selection,
+        reference_time=now,
+    )
 
     baseline_manifest = _latest_promoted_manifest(
         manifests,
@@ -992,10 +1531,12 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
         qoe=qoe,
         ops_coverage=ops_coverage,
         baseline_comparison=baseline_comparison,
+        run_selection=run_selection,
+        operating_rhythm=operating_rhythm,
     )
 
     report = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": now.isoformat(timespec="seconds"),
         "output_dir": str(output_root),
         "portfolio": {
             "total_runs": int(len(manifests)),
@@ -1006,11 +1547,15 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
             "optuna_history_rows": int(len(optuna_history.index)),
             "latest_run_id": str(latest_manifest.get("run_id", "")),
             "latest_profile": str(latest_manifest.get("profile", "")),
+            "latest_observed_run_id": str((run_selection.get("latest_observed_run", {}) if isinstance(run_selection, dict) else {}).get("run_id", "")),
+            "latest_observed_profile": str((run_selection.get("latest_observed_run", {}) if isinstance(run_selection, dict) else {}).get("profile", "")),
         },
         "latest_run": latest_run,
         "safety": safety,
         "qoe": qoe,
         "ops_coverage": ops_coverage,
+        "run_selection": run_selection,
+        "operating_rhythm": operating_rhythm,
         "leaderboards": {
             "experiment_top_models": _rank_models(experiment_history, metric_column="val_top1", top_n=top_n),
             "backtest_top_models": _rank_models(backtest_history, metric_column="top1", top_n=top_n),
@@ -1029,6 +1574,16 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
         latest_run=latest_run,
         safety=safety,
         qoe=qoe,
+        operating_rhythm=operating_rhythm,
+        run_selection=run_selection,
+    )
+    report["async_handoff"] = _build_async_handoff(
+        latest_run=latest_run,
+        review_actions=review_actions,
+        next_bets=report["next_bets"],
+        operating_rhythm=operating_rhythm,
+        run_selection=run_selection,
+        ops_coverage=ops_coverage,
     )
     return report
 
@@ -1040,17 +1595,24 @@ def _format_metric(value) -> str:
     return f"{metric:.3f}"
 
 
-def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path, Path]:
+def write_control_room_report(
+    output_dir: Path,
+    *,
+    top_n: int = 5,
+    reference_time: datetime | None = None,
+) -> tuple[Path, Path]:
     output_root = output_dir.expanduser().resolve()
     analytics_dir = output_root / "analytics"
     analytics_dir.mkdir(parents=True, exist_ok=True)
-    report = build_control_room_report(output_root, top_n=top_n)
+    now = _normalize_reference_time(reference_time)
+    report = build_control_room_report(output_root, top_n=top_n, reference_time=now)
     history_path, history_df = _write_control_room_history(analytics_dir, report)
     ops_trends = _build_ops_trends(report, history_df)
     weekly_json_path, weekly_md_path, weekly_payload = _write_weekly_ops_summary(
         analytics_dir,
         report,
         history_df,
+        generated_at=now,
     )
     report["ops_history"] = {
         "csv_path": str(history_path),
@@ -1071,6 +1633,9 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
         if isinstance(weekly_payload.get("summary", []), list)
         else [],
         "current_focus": weekly_payload.get("current_focus", []),
+        "async_handoff_blocked_snapshots": _safe_int(weekly_payload.get("async_handoff_blocked_snapshots"), default=0),
+        "fast_cadence_issue_snapshots": _safe_int(weekly_payload.get("fast_cadence_issue_snapshots"), default=0),
+        "full_cadence_issue_snapshots": _safe_int(weekly_payload.get("full_cadence_issue_snapshots"), default=0),
     }
 
     json_path = analytics_dir / "control_room.json"
@@ -1082,6 +1647,12 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     qoe = report["qoe"]
     ops_coverage = report.get("ops_coverage", {})
     ops_coverage = ops_coverage if isinstance(ops_coverage, dict) else {}
+    run_selection = report.get("run_selection", {})
+    run_selection = run_selection if isinstance(run_selection, dict) else {}
+    operating_rhythm = report.get("operating_rhythm", {})
+    operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
+    async_handoff = report.get("async_handoff", {})
+    async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
     baseline = report.get("baseline_comparison", {})
     ops_history = report.get("ops_history", {})
     ops_history = ops_history if isinstance(ops_history, dict) else {}
@@ -1104,6 +1675,20 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
         f"- Profiles seen: `{', '.join(portfolio['profiles_seen']) if portfolio['profiles_seen'] else 'n/a'}`",
         f"- Experiment history rows: `{portfolio['experiment_history_rows']}`",
         f"- Backtest history rows: `{portfolio['backtest_history_rows']}`",
+        "",
+        "## Run Selection",
+        "",
+        f"- Latest observed run: `{(run_selection.get('latest_observed_run', {}) if isinstance(run_selection.get('latest_observed_run', {}), dict) else {}).get('run_id', '')}` (`{(run_selection.get('latest_observed_run', {}) if isinstance(run_selection.get('latest_observed_run', {}), dict) else {}).get('profile', '')}`)",
+        f"- Ops-selected run: `{(run_selection.get('selected_run', {}) if isinstance(run_selection.get('selected_run', {}), dict) else {}).get('run_id', '')}` (`{(run_selection.get('selected_run', {}) if isinstance(run_selection.get('selected_run', {}), dict) else {}).get('profile', '')}`)",
+        f"- Selection mode: `{run_selection.get('selection_mode', '')}`",
+        f"- Selection reason: {run_selection.get('selection_reason', 'n/a')}",
+        "",
+        "## Operating Rhythm",
+        "",
+        f"- Overall status: `{operating_rhythm.get('overall_status', '')}`",
+        f"- Fast lane: `{_operating_lane(operating_rhythm, 'fast').get('status', '')}` latest=`{(_operating_lane(operating_rhythm, 'fast').get('latest_run', {}) if isinstance(_operating_lane(operating_rhythm, 'fast').get('latest_run', {}), dict) else {}).get('run_id', '')}` age_h=`{_format_metric(_operating_lane(operating_rhythm, 'fast').get('hours_since_run'))}`",
+        f"- Full lane: `{_operating_lane(operating_rhythm, 'full').get('status', '')}` latest=`{(_operating_lane(operating_rhythm, 'full').get('latest_run', {}) if isinstance(_operating_lane(operating_rhythm, 'full').get('latest_run', {}), dict) else {}).get('run_id', '')}` age_h=`{_format_metric(_operating_lane(operating_rhythm, 'full').get('hours_since_run'))}`",
+        f"- Recommended next run: `{operating_rhythm.get('recommended_run_command', '') or 'none'}`",
         "",
         "## Latest Run",
         "",
@@ -1212,6 +1797,22 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     lines.extend(
         [
             "",
+            "## Async Handoff",
+            "",
+            f"- Status: `{async_handoff.get('status', '')}`",
+            f"- Headline: {async_handoff.get('headline', 'n/a')}",
+            f"- Review command: `{async_handoff.get('recommended_review_command', '')}`",
+            f"- Next run command: `{async_handoff.get('recommended_run_command', '') or 'none'}`",
+            f"- Share artifacts: `{', '.join(async_handoff.get('share_artifacts', [])) if isinstance(async_handoff.get('share_artifacts', []), list) else ''}`",
+            "",
+        ]
+    )
+    for item in async_handoff.get("summary", []):
+        lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
             "## Leaderboards",
             "",
             "### Experiment Top Models",
@@ -1252,16 +1853,30 @@ def main() -> int:
         report = build_control_room_report(output_dir, top_n=max(1, int(args.top_n)))
 
     latest_run = report["latest_run"]
+    run_selection = report.get("run_selection", {})
+    run_selection = run_selection if isinstance(run_selection, dict) else {}
+    latest_observed = run_selection.get("latest_observed_run", {})
+    latest_observed = latest_observed if isinstance(latest_observed, dict) else {}
     print(f"Control room written to {json_path}")
     print(f"Markdown summary written to {md_path}")
     history_path = output_dir / "analytics" / "control_room_history.csv"
     weekly_md_path = output_dir / "analytics" / "control_room_weekly_summary.md"
+    operating_rhythm = report.get("operating_rhythm", {})
+    operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
+    async_handoff = report.get("async_handoff", {})
+    async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
     if history_path.exists():
         print(f"Ops history written to {history_path}")
     if weekly_md_path.exists():
         print(f"Weekly ops summary written to {weekly_md_path}")
+    if str(latest_observed.get("run_id", "")) and str(latest_observed.get("run_id", "")) != str(latest_run.get("run_id", "")):
+        print(f"Latest observed run: {latest_observed['run_id']} ({latest_observed.get('profile', '')})")
     print(f"Latest run: {latest_run['run_id']} ({latest_run['profile']})")
     print(f"Best model: {latest_run['best_model_name']} val_top1={_format_metric(latest_run['best_model_val_top1'])}")
+    if str(operating_rhythm.get("recommended_run_command", "")):
+        print(f"Recommended next run: {operating_rhythm['recommended_run_command']}")
+    if str(async_handoff.get("headline", "")):
+        print(f"Async handoff: {async_handoff.get('status', '')} | {async_handoff['headline']}")
     print("Next bets:")
     for bet in report["next_bets"]:
         print(f"- {bet}")

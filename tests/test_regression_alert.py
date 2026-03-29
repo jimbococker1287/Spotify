@@ -179,7 +179,8 @@ def test_regression_alert_returns_three_on_high_review_action(tmp_path: Path) ->
     assert result.returncode == 3
     assert "review_status=ok" in result.stdout
     assert "review_priority=high" in result.stdout
-    assert "review_action[1]=[HIGH] Harden the worst slice before the next full run" in result.stdout
+    assert "handoff=" in result.stdout
+    assert "[HIGH] Harden the worst slice before the next full run" in result.stdout
 
 
 def test_regression_alert_review_threshold_off_returns_zero(tmp_path: Path) -> None:
@@ -232,3 +233,55 @@ def test_regression_alert_review_threshold_off_returns_zero(tmp_path: Path) -> N
 
     assert result.returncode == 0
     assert "review_priority=high" in result.stdout
+
+
+def test_regression_alert_defaults_to_control_room_selected_run(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-03-20T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="retrieval_reranker",
+        model_type="retrieval_reranker",
+        val_top1=0.59,
+        test_top1=0.56,
+        regression=-0.01,
+        robustness_gap=0.09,
+        stress_skip_risk=0.22,
+    )
+    _write_run(
+        output_dir,
+        run_id="run_smoke_check",
+        timestamp="2026-03-22T20:00:00",
+        promoted=False,
+        status="fail",
+        model_name="dense",
+        model_type="deep",
+        val_top1=0.52,
+        test_top1=0.48,
+        regression=0.04,
+        robustness_gap=0.08,
+        stress_skip_risk=0.20,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--review-threshold",
+            "off",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0
+    assert "run=run_full" in result.stdout
+    assert "promoted=True" in result.stdout
+    assert "next_step=" in result.stdout

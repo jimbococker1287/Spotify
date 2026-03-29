@@ -221,6 +221,21 @@ def _triage_playbook(area: str) -> dict[str, list[str]]:
                 "Only treat threshold output as authoritative once the coverage section shows the expected artifacts.",
             ],
         }
+    if normalized == "cadence":
+        return {
+            "inspect": [
+                "Open outputs/analytics/control_room_history.csv and confirm when the last fast and full lanes actually ran.",
+                "Inspect scripts/run_scheduled.sh and the scheduler entry that triggers it to confirm the intended cadence is still active.",
+            ],
+            "fix": [
+                "Restore the daily fast or weekly full lane before widening the roadmap again.",
+                "If smoke or probe runs are polluting review, keep them off the main scheduled cadence or make them complete their analysis pack.",
+            ],
+            "rerun": [
+                "Run the missing scheduled lane and refresh the control room.",
+                "Confirm the async handoff and cadence sections now point at the fresh run instead of the stale fallback.",
+            ],
+        }
     return {
         "inspect": [
             "Open outputs/analytics/control_room.md and review the latest run against the promoted baseline.",

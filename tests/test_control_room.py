@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -393,13 +394,17 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert payload["ops_history"]["snapshot_count"] == 1
     assert payload["ops_trends"]["history_available"] is True
     assert payload["weekly_ops_summary"]["snapshots_considered"] == 1
+    assert payload["operating_rhythm"]["overall_status"]
+    assert payload["async_handoff"]["status"]
     markdown = md_path.read_text(encoding="utf-8")
     assert "Control Room" in markdown
+    assert "Operating Rhythm" in markdown
     assert "Ops Coverage" in markdown
     assert "Since Last Strong Run" in markdown
     assert "Recent Trends" in markdown
     assert "Weekly Window" in markdown
     assert "Review Actions" in markdown
+    assert "Async Handoff" in markdown
 
 
 def test_control_room_history_and_weekly_summary_track_multiple_runs(tmp_path: Path) -> None:
@@ -488,3 +493,146 @@ def test_control_room_history_and_weekly_summary_track_multiple_runs(tmp_path: P
     assert "Recent Trends" in markdown
     assert "Weekly Window" in markdown
     assert "Previous snapshot was `run_a`" in markdown
+
+
+def test_control_room_prefers_high_signal_ops_run_over_newer_smoke_run(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_smoke_check", "model_name": "dense", "model_type": "deep", "val_top1": 0.57},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+            {"run_id": "run_smoke_check", "model_name": "dense", "model_type": "deep", "top1": 0.54},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-03-20T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.02,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.11,
+        stress_skip_risk=0.22,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_smoke_check",
+        timestamp="2026-03-22T20:00:00",
+        profile="dev",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="dense",
+        best_model_type="deep",
+        val_top1=0.57,
+        test_top1=0.54,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.15,
+        abstention_rate=0.09,
+        robustness_gap=0.09,
+        stress_skip_risk=0.18,
+        stress_scenario="quick_probe",
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["latest_run"]["run_id"] == "run_full"
+    assert report["run_selection"]["latest_observed_run"]["run_id"] == "run_smoke_check"
+    assert report["run_selection"]["selected_run"]["run_id"] == "run_full"
+    assert report["run_selection"]["observed_matches_selected"] is False
+    assert "smoke/check run" in report["run_selection"]["selection_reason"]
+
+
+def test_control_room_operating_rhythm_flags_stale_full_lane_and_async_handoff(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_old", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_fast_recent", "model_name": "mlp", "model_type": "classical", "val_top1": 0.57},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_old", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+            {"run_id": "run_fast_recent", "model_name": "mlp", "model_type": "classical", "top1": 0.55},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full_old",
+        timestamp="2026-03-01T20:00:00+00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.02,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.11,
+        stress_skip_risk=0.22,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_fast_recent",
+        timestamp="2026-03-28T18:00:00+00:00",
+        profile="fast",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="mlp",
+        best_model_type="classical",
+        val_top1=0.57,
+        test_top1=0.55,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.15,
+        abstention_rate=0.09,
+        robustness_gap=0.09,
+        stress_skip_risk=0.18,
+        stress_scenario="quick_probe",
+    )
+
+    report = build_control_room_report(
+        output_dir,
+        top_n=3,
+        reference_time=datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["latest_run"]["run_id"] == "run_fast_recent"
+    assert report["operating_rhythm"]["overall_status"] in {"attention", "stale"}
+    assert report["operating_rhythm"]["lanes"]["fast"]["status"] == "healthy"
+    assert report["operating_rhythm"]["lanes"]["full"]["status"] == "stale"
+    assert report["operating_rhythm"]["recommended_run_command"] == "make schedule-run MODE=full"
+    assert any(action["area"] == "cadence" for action in report["review_actions"])
+    assert report["async_handoff"]["status"] == "attention"
+    assert any("make schedule-run MODE=full" in item for item in report["async_handoff"]["summary"])
