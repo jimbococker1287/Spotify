@@ -6,4 +6,5 @@ spotify-predict = spotify.predict_next:main
 spotify-public-insights = spotify.public_insights:main
 spotify-serve = spotify.predict_service:main
 spotify-taste-os-demo = spotify.taste_os_demo:main
+spotify-taste-os-serve = spotify.taste_os_service:main
 spotify-taste-os-showcase = spotify.taste_os_showcase:main

@@ -10,6 +10,9 @@ import numpy as np
 import pandas as pd
 
 from spotify.data import PreparedData
+from spotify.digital_twin import ListenerDigitalTwinArtifact
+from spotify.journey_planner import build_journey_plans
+from spotify.multimodal import MultimodalArtistSpace, _top_neighbors, _transition_features
 from spotify.moonshot_lab import run_moonshot_lab
 from spotify.reporting import write_run_report
 
@@ -141,3 +144,106 @@ def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:
     assert "analysis/moonshot_summary.json" in content
     assert "analysis/multimodal/multimodal_artist_space_summary.json" in content
     assert "analysis/group_auto_dj/group_auto_dj_summary.json" in content
+
+
+def test_transition_features_match_smoothed_entropy_math() -> None:
+    frame = pd.DataFrame(
+        {
+            "ts": pd.date_range("2026-03-01", periods=6, freq="h"),
+            "artist_label": [0, 1, 1, 2, 0, 2],
+            "session_id": [0, 0, 0, 1, 1, 1],
+        }
+    )
+
+    features = _transition_features(frame, num_artists=3)
+
+    expected_source_zero = np.log(5.0) - ((4.0 * np.log(2.0)) / 5.0)
+    expected_source_one = np.log(4.0) - ((2.0 * np.log(2.0)) / 4.0)
+    expected_source_two = expected_source_one
+
+    assert np.allclose(features[:, 0], np.array([2.0, 1.0, 1.0], dtype="float32"))
+    assert np.allclose(features[:, 1], np.array([1.0, 2.0, 1.0], dtype="float32"))
+    assert np.allclose(
+        features[:, 2],
+        np.array([expected_source_zero, expected_source_one, expected_source_two], dtype="float32"),
+        atol=1e-6,
+    )
+
+
+def test_top_neighbors_returns_expected_neighbor_order() -> None:
+    embeddings = np.array(
+        [
+            [1.0, 0.0],
+            [0.8, 0.2],
+            [0.0, 1.0],
+        ],
+        dtype="float32",
+    )
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    space = MultimodalArtistSpace(
+        artist_labels=["A", "B", "C"],
+        feature_names=["f0", "f1"],
+        raw_features=np.zeros((3, 2), dtype="float32"),
+        embeddings=embeddings,
+        popularity=np.array([0.5, 0.3, 0.2], dtype="float32"),
+        energy=np.array([0.4, 0.5, 0.7], dtype="float32"),
+        danceability=np.array([0.4, 0.6, 0.8], dtype="float32"),
+        tempo=np.array([100.0, 110.0, 130.0], dtype="float32"),
+    )
+
+    rows = _top_neighbors(space, top_k=2)
+    artist_zero_neighbors = [row for row in rows if row["artist_label"] == 0]
+
+    assert [row["neighbor_name"] for row in artist_zero_neighbors] == ["B", "C"]
+
+
+def test_build_journey_plans_writes_deterministic_best_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_MOONSHOT_PLAN_HORIZON", "4")
+    monkeypatch.setenv("SPOTIFY_MOONSHOT_PLAN_BEAM", "3")
+    data = _prepared_data()
+    space = MultimodalArtistSpace(
+        artist_labels=["A", "B", "C"],
+        feature_names=["f0", "f1"],
+        raw_features=np.zeros((3, 2), dtype="float32"),
+        embeddings=np.array(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.1, 0.9],
+            ],
+            dtype="float32",
+        ),
+        popularity=np.array([0.5, 0.2, 0.3], dtype="float32"),
+        energy=np.array([0.40, 0.45, 0.80], dtype="float32"),
+        danceability=np.array([0.5, 0.6, 0.7], dtype="float32"),
+        tempo=np.array([100.0, 110.0, 130.0], dtype="float32"),
+    )
+    twin = ListenerDigitalTwinArtifact(
+        artist_labels=["A", "B", "C"],
+        transition_matrix=np.array(
+            [
+                [0.10, 0.80, 0.10],
+                [0.05, 0.15, 0.80],
+                [0.70, 0.20, 0.10],
+            ],
+            dtype="float32",
+        ),
+        end_estimator=object(),
+        context_features=["hour"],
+        average_track_seconds=180.0,
+    )
+
+    artifacts = build_journey_plans(
+        data=data,
+        artist_labels=["A", "B", "C"],
+        multimodal_space=space,
+        digital_twin=twin,
+        output_dir=tmp_path,
+        logger=_logger("spotify.test.journey"),
+    )
+
+    summary = json.loads((tmp_path / "journey_plans_summary.json").read_text(encoding="utf-8"))
+
+    assert artifacts
+    assert summary[0]["planned_horizon"] == 4
+    assert summary[0]["first_artist"] in {"A", "B", "C"}

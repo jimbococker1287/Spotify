@@ -22,6 +22,7 @@ from .predict_next import (
     load_prediction_input_context,
     prediction_source_signature,
 )
+from .ranking import topk_indices_1d
 from .serving import load_predictor, resolve_model_row
 from .uncertainty import SplitConformalCalibration, calibration_from_payload, conformal_prediction_sets
 
@@ -433,7 +434,7 @@ class PredictionService:
             artist_probs = self.predictor.predict_proba(seq_batch, ctx_batch)[0]
 
         top_k = max(1, int(top_k))
-        top_indices = np.argsort(artist_probs)[::-1][:top_k]
+        top_indices = topk_indices_1d(artist_probs, top_k)
         predictions: list[dict[str, object]] = []
         for rank, idx in enumerate(top_indices, start=1):
             label_idx = int(idx)

@@ -152,6 +152,14 @@ def _distribution_counts(reference: np.ndarray, compare: np.ndarray) -> tuple[np
     return ref, comp
 
 
+def _string_bucket_counts(values: np.ndarray) -> tuple[dict[str, int], int]:
+    arr = np.asarray(values).reshape(-1)
+    if arr.size == 0:
+        return {}, 0
+    labels, counts = _labels_and_counts(arr.astype(object, copy=False))
+    return {str(label): int(counts.get(label, 0)) for label in labels}, int(arr.size)
+
+
 def build_temporal_backtest_windows(
     n_rows: int,
     folds: int,
@@ -391,26 +399,27 @@ def compute_segment_share_shift_rows(
 
     reference_frame = reference_split.frame.reset_index(drop=True)
     reference_segments = _extract(reference_frame)
+    reference_counts_by_segment = {
+        segment_name: _string_bucket_counts(reference_values)
+        for segment_name, reference_values in reference_segments.items()
+    }
     rows: list[dict[str, object]] = []
     for compare_split in comparison_splits:
         if compare_split.frame is None:
             continue
         compare_frame = compare_split.frame.reset_index(drop=True)
         compare_segments = _extract(compare_frame)
-        for segment_name, reference_values in reference_segments.items():
-            compare_values = compare_segments.get(segment_name)
-            if compare_values is None:
+        compare_counts_by_segment = {
+            segment_name: _string_bucket_counts(compare_values)
+            for segment_name, compare_values in compare_segments.items()
+        }
+        for segment_name, (reference_counts, reference_total_raw) in reference_counts_by_segment.items():
+            compare_counts_payload = compare_counts_by_segment.get(segment_name)
+            if compare_counts_payload is None:
                 continue
-            reference_total = max(1, reference_values.size)
-            compare_total = max(1, compare_values.size)
-            reference_counts = {
-                str(value): int(count)
-                for value, count in zip(*np.unique(reference_values.astype(object), return_counts=True))
-            }
-            compare_counts = {
-                str(value): int(count)
-                for value, count in zip(*np.unique(compare_values.astype(object), return_counts=True))
-            }
+            compare_counts, compare_total_raw = compare_counts_payload
+            reference_total = max(1, reference_total_raw)
+            compare_total = max(1, compare_total_raw)
             all_buckets = sorted(set(reference_counts) | set(compare_counts))
             for bucket in all_buckets:
                 reference_share = float(reference_counts.get(bucket, 0)) / float(reference_total)

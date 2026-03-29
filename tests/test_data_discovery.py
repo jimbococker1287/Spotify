@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from spotify.data import discover_streaming_files
+from spotify.data import discover_streaming_files, discover_technical_log_files
 
 
 def _logger() -> logging.Logger:
@@ -68,3 +68,46 @@ def test_discover_streaming_files_ignores_account_data_exports(tmp_path) -> None
     discovered = discover_streaming_files(tmp_path, include_video=False, logger=_logger())
 
     assert [path.name for path in discovered] == ["Streaming_History_Audio_2025-2026_9.json"]
+
+
+def test_discover_technical_log_files_supports_nested_export_folder(tmp_path) -> None:
+    export_dir = tmp_path / "Spotify Technical Log Information"
+    export_dir.mkdir()
+    for name in (
+        "ConnectionInfo.json",
+        "AudioStreamingSettingsReport.json",
+        "PlaybackError.json",
+    ):
+        (export_dir / name).write_text("[]", encoding="utf-8")
+
+    discovered = discover_technical_log_files(tmp_path, logger=_logger())
+
+    assert [path.name for path in discovered] == [
+        "ConnectionInfo.json",
+        "AudioStreamingSettingsReport.json",
+        "PlaybackError.json",
+    ]
+
+
+def test_discover_technical_log_files_prefers_largest_group(tmp_path) -> None:
+    root_dir = tmp_path / "Spotify Technical Log Information"
+    root_dir.mkdir()
+    (root_dir / "ConnectionInfo.json").write_text("[]", encoding="utf-8")
+
+    nested_dir = tmp_path / "Exports" / "Spotify Technical Log Information"
+    nested_dir.mkdir(parents=True)
+    for name in (
+        "ConnectionInfo.json",
+        "PlaybackError.json",
+        "Stutter.json",
+    ):
+        (nested_dir / name).write_text("[]", encoding="utf-8")
+
+    discovered = discover_technical_log_files(tmp_path, logger=_logger())
+
+    assert [path.parent for path in discovered] == [nested_dir, nested_dir, nested_dir]
+    assert [path.name for path in discovered] == [
+        "ConnectionInfo.json",
+        "PlaybackError.json",
+        "Stutter.json",
+    ]

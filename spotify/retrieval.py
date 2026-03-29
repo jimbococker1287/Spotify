@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 from .data import PreparedData
 from .probability_bundles import save_prediction_bundle
-from .ranking import ranking_metrics_from_proba
+from .ranking import ranking_metrics_from_proba, topk_indices_1d
 
 DEFAULT_EMBEDDING_DIM = 32
 DEFAULT_PRETRAIN_EPOCHS = 5
@@ -662,13 +662,13 @@ def _ann_recall_and_latency(
     pool = max(int(top_k) * 4, int(top_k))
     for row_idx in range(len(session_vec)):
         started = time.perf_counter()
-        exact_idx = np.argsort(scores[row_idx])[::-1][:top_k]
+        exact_idx = topk_indices_1d(scores[row_idx], top_k)
         exact_times.append((time.perf_counter() - started) * 1000.0)
 
         started = time.perf_counter()
         candidate_ids = ann_index.candidate_ids(session_vec[row_idx : row_idx + 1], candidate_pool=pool)[0]
         ann_scores = scores[row_idx, candidate_ids]
-        ann_ranked = candidate_ids[np.argsort(ann_scores)[::-1][:top_k]]
+        ann_ranked = candidate_ids[topk_indices_1d(ann_scores, top_k)]
         ann_times.append((time.perf_counter() - started) * 1000.0)
 
         recalls.append(float(len(set(exact_idx.tolist()) & set(ann_ranked.tolist())) / max(1, top_k)))

@@ -34,6 +34,24 @@ def _track_file(tracker: MlflowTracker | None, path: Path) -> None:
         tracker.log_artifact(path)
 
 
+def _existing_path(raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    return Path(text) if text else None
+
+
+def _append_existing_artifact_path(artifact_paths: list[Path], raw_path: object) -> None:
+    path = _existing_path(raw_path)
+    if path is not None and path.exists():
+        artifact_paths.append(path)
+
+
+def _write_json_artifact(path: Path, payload: object, artifact_paths: list[Path] | None = None) -> Path:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if artifact_paths is not None:
+        artifact_paths.append(path)
+    return path
+
+
 def _analysis_prefix_for_model_type(model_type: str) -> str | None:
     normalized = str(model_type).strip().lower()
     if normalized == "deep":
@@ -311,18 +329,16 @@ def run_pipeline(config: PipelineConfig) -> None:
         )
         artist_labels = artist_label_frame["master_metadata_album_artist_name"].astype(str).tolist()
         metadata_path = run_dir / "feature_metadata.json"
-        with metadata_path.open("w", encoding="utf-8") as out:
-            json.dump(
-                {
-                    "sequence_length": config.sequence_length,
-                    "context_features": list(prepared.context_features),
-                    "skew_context_features": list(SKEW_CONTEXT_FEATURES),
-                    "artist_labels": artist_labels,
-                },
-                out,
-                indent=2,
-            )
-        artifact_paths.append(metadata_path)
+        _write_json_artifact(
+            metadata_path,
+            {
+                "sequence_length": config.sequence_length,
+                "context_features": list(prepared.context_features),
+                "skew_context_features": list(SKEW_CONTEXT_FEATURES),
+                "artist_labels": artist_labels,
+            },
+            artifact_paths,
+        )
 
         baseline_metrics = compute_baselines(prepared, logger)
         tracker.log_params(
@@ -419,10 +435,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "prediction_bundle_path": str(artifacts.prediction_bundle_paths.get(name, "")),
                     }
                 )
-                bundle_raw = str(artifacts.prediction_bundle_paths.get(name, "")).strip()
-                bundle_path = Path(bundle_raw) if bundle_raw else None
-                if bundle_path is not None and bundle_path.exists():
-                    artifact_paths.append(bundle_path)
+                _append_existing_artifact_path(artifact_paths, artifacts.prediction_bundle_paths.get(name, ""))
         else:
             logger.info("Skipping deep models for this run.")
 
@@ -464,14 +477,8 @@ def run_pipeline(config: PipelineConfig) -> None:
                         "estimator_artifact_path": row.estimator_artifact_path,
                     }
                 )
-                bundle_raw = str(row.prediction_bundle_path).strip()
-                bundle_path = Path(bundle_raw) if bundle_raw else None
-                if bundle_path is not None and bundle_path.exists():
-                    artifact_paths.append(bundle_path)
-                estimator_raw = str(row.estimator_artifact_path).strip()
-                estimator_path = Path(estimator_raw) if estimator_raw else None
-                if estimator_path is not None and estimator_path.exists():
-                    artifact_paths.append(estimator_path)
+                _append_existing_artifact_path(artifact_paths, row.prediction_bundle_path)
+                _append_existing_artifact_path(artifact_paths, row.estimator_artifact_path)
         else:
             logger.info("Skipping classical model benchmarks for this run.")
 
@@ -516,14 +523,8 @@ def run_pipeline(config: PipelineConfig) -> None:
                 }
                 result_rows.append(payload)
                 optuna_rows.append(payload)
-                bundle_raw = str(row.prediction_bundle_path).strip()
-                bundle_path = Path(bundle_raw) if bundle_raw else None
-                if bundle_path is not None and bundle_path.exists():
-                    artifact_paths.append(bundle_path)
-                estimator_raw = str(row.estimator_artifact_path).strip()
-                estimator_path = Path(estimator_raw) if estimator_raw else None
-                if estimator_path is not None and estimator_path.exists():
-                    artifact_paths.append(estimator_path)
+                _append_existing_artifact_path(artifact_paths, row.prediction_bundle_path)
+                _append_existing_artifact_path(artifact_paths, row.estimator_artifact_path)
             if optuna_dir.exists():
                 artifact_paths.extend(sorted(p for p in optuna_dir.glob("*") if p.is_file()))
         elif config.enable_optuna:
@@ -730,9 +731,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             max_selective_risk=gate_max_selective_risk,
             max_abstention_rate=gate_max_abstention_rate,
         )
-        champion_gate_path = run_dir / "champion_gate.json"
-        champion_gate_path.write_text(json.dumps(champion_gate, indent=2), encoding="utf-8")
-        artifact_paths.append(champion_gate_path)
+        _write_json_artifact(run_dir / "champion_gate.json", champion_gate, artifact_paths)
         logger.info(
             "Champion gate: source=%s promoted=%s regression=%.6f threshold=%.6f",
             str(champion_gate.get("metric_source", champion_gate_metric)),
@@ -798,9 +797,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             cleanup_mode=artifact_cleanup_mode,
             min_size_mb=artifact_cleanup_min_mb,
         )
-        cleanup_path = run_dir / "artifact_cleanup.json"
-        cleanup_path.write_text(json.dumps(cleanup_summary, indent=2), encoding="utf-8")
-        artifact_paths.append(cleanup_path)
+        _write_json_artifact(run_dir / "artifact_cleanup.json", cleanup_summary, artifact_paths)
 
         prune_old_prediction_bundles_raw = os.getenv("SPOTIFY_PRUNE_OLD_PREDICTION_BUNDLES", "1").strip().lower()
         prune_old_prediction_bundles = prune_old_prediction_bundles_raw in ("1", "true", "yes", "on")
@@ -819,16 +816,16 @@ def run_pipeline(config: PipelineConfig) -> None:
             prune_prediction_bundles=prune_old_prediction_bundles,
             prune_run_databases=prune_old_run_dbs,
         )
-        retention_path = run_dir / "artifact_retention.json"
-        retention_path.write_text(json.dumps(retention_summary, indent=2), encoding="utf-8")
-        artifact_paths.append(retention_path)
+        _write_json_artifact(run_dir / "artifact_retention.json", retention_summary, artifact_paths)
         mlflow_artifact_cleanup_summary = prune_mlflow_artifacts(
             output_dir=config.output_dir,
             logger=logger,
         )
-        mlflow_artifact_cleanup_path = run_dir / "mlflow_artifact_cleanup.json"
-        mlflow_artifact_cleanup_path.write_text(json.dumps(mlflow_artifact_cleanup_summary, indent=2), encoding="utf-8")
-        artifact_paths.append(mlflow_artifact_cleanup_path)
+        _write_json_artifact(
+            run_dir / "mlflow_artifact_cleanup.json",
+            mlflow_artifact_cleanup_summary,
+            artifact_paths,
+        )
 
         artifact_paths.extend(
             write_benchmark_protocol(
@@ -917,15 +914,8 @@ def run_pipeline(config: PipelineConfig) -> None:
             "artifact_retention": retention_summary,
             "mlflow_artifact_cleanup": mlflow_artifact_cleanup_summary,
         }
-        manifest_path = run_dir / "run_manifest.json"
-        with manifest_path.open("w", encoding="utf-8") as out:
-            json.dump(manifest, out, indent=2)
-        artifact_paths.append(manifest_path)
-
-        run_results_path = run_dir / "run_results.json"
-        with run_results_path.open("w", encoding="utf-8") as out:
-            json.dump(result_rows, out, indent=2)
-        artifact_paths.append(run_results_path)
+        _write_json_artifact(run_dir / "run_manifest.json", manifest, artifact_paths)
+        _write_json_artifact(run_dir / "run_results.json", result_rows, artifact_paths)
 
         refresh_analytics_raw = os.getenv("SPOTIFY_REFRESH_ANALYTICS_DB", "1").strip().lower()
         refresh_analytics = refresh_analytics_raw not in ("0", "false", "no", "off")

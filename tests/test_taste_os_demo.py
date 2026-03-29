@@ -5,7 +5,14 @@ import numpy as np
 from spotify.digital_twin import ListenerDigitalTwinArtifact
 from spotify.multimodal import MultimodalArtistSpace
 from spotify.safe_policy import SafeBanditPolicyArtifact
-from spotify.taste_os_demo import MODE_CONFIGS, build_taste_os_demo_payload, write_taste_os_demo_artifacts
+from spotify.taste_os_demo import (
+    MODE_CONFIGS,
+    _percentile_ranks,
+    _surface_reranked_indices,
+    _target_alignment,
+    build_taste_os_demo_payload,
+    write_taste_os_demo_artifacts,
+)
 
 
 class _StubPredictor:
@@ -250,3 +257,85 @@ def test_write_taste_os_demo_artifacts_creates_json_and_markdown(tmp_path) -> No
     assert md_path.exists()
     assert "Taste OS Demo" in md_path.read_text(encoding="utf-8")
     assert '"scenario": "skip_recovery"' in json_path.read_text(encoding="utf-8")
+
+
+def test_surface_reranked_indices_matches_full_sort_union_logic() -> None:
+    rng = np.random.default_rng(42)
+    probs = rng.random(512, dtype="float32")
+    adjusted_scores = rng.random(512, dtype="float32")
+    metric_arrays = {
+        "transition_support": rng.random(512, dtype="float32"),
+        "continuity": rng.random(512, dtype="float32"),
+        "arc_affinity": rng.random(512, dtype="float32"),
+        "freshness": rng.random(512, dtype="float32"),
+    }
+    mode = MODE_CONFIGS["focus"]
+    top_k = 6
+
+    current_ranked, current_surface_map = _surface_reranked_indices(
+        probs=probs,
+        adjusted_scores=adjusted_scores,
+        metric_arrays=metric_arrays,
+        mode=mode,
+        top_k=top_k,
+    )
+
+    shortlist_size = min(len(adjusted_scores), max(int(mode.candidate_shortlist), int(top_k) * 4, 8))
+    adjusted_top = np.argsort(adjusted_scores)[::-1][:shortlist_size].tolist()
+    prob_top = np.argsort(probs)[::-1][: max(6, shortlist_size // 2)].tolist()
+    union_shortlist = list(dict.fromkeys(adjusted_top + prob_top))
+    if len(union_shortlist) < max(1, int(top_k)):
+        union_shortlist = np.argsort(adjusted_scores)[::-1][: max(1, int(top_k))].tolist()
+    shortlist = np.asarray(union_shortlist, dtype="int32")
+
+    prob_ranks = np.asarray(
+        _percentile_ranks(probs[shortlist]),
+        dtype="float64",
+    )
+    transition_ranks = np.asarray(
+        _percentile_ranks(metric_arrays["transition_support"][shortlist]),
+        dtype="float64",
+    )
+    continuity_alignment = np.asarray(
+        _target_alignment(
+            _percentile_ranks(metric_arrays["continuity"][shortlist]),
+            target=mode.surface_continuity_target,
+        ),
+        dtype="float64",
+    )
+    arc_alignment = np.asarray(
+        _target_alignment(
+            _percentile_ranks(metric_arrays["arc_affinity"][shortlist]),
+            target=mode.surface_arc_target,
+        ),
+        dtype="float64",
+    )
+    freshness_alignment = np.asarray(
+        _target_alignment(
+            _percentile_ranks(metric_arrays["freshness"][shortlist]),
+            target=mode.surface_freshness_target,
+        ),
+        dtype="float64",
+    )
+    surface = (
+        float(mode.surface_probability_weight) * prob_ranks
+        + float(mode.surface_transition_weight) * transition_ranks
+        + float(mode.surface_continuity_weight) * continuity_alignment
+        + float(mode.surface_arc_weight) * arc_alignment
+        + float(mode.surface_freshness_weight) * freshness_alignment
+    )
+    expected_surface_map = {int(idx): float(surface[pos]) for pos, idx in enumerate(shortlist.tolist())}
+    expected_ranked = sorted(
+        shortlist.tolist(),
+        key=lambda idx: (
+            expected_surface_map.get(int(idx), float("-inf")),
+            float(adjusted_scores[int(idx)]),
+            float(probs[int(idx)]),
+        ),
+        reverse=True,
+    )[:top_k]
+
+    assert current_ranked == [int(item) for item in expected_ranked]
+    assert set(current_surface_map) == set(expected_surface_map)
+    for key, value in expected_surface_map.items():
+        assert np.isclose(current_surface_map[key], value)

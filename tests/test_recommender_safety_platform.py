@@ -129,6 +129,37 @@ def test_generic_drift_helpers_support_custom_segments_and_targets() -> None:
     assert "baseline_vs_canary_jsd" in target_drift
 
 
+def test_segment_share_shift_supports_multiple_comparison_splits() -> None:
+    reference = SequenceSplitSnapshot(
+        name="baseline",
+        context=np.zeros((3, 1), dtype="float32"),
+        frame=pd.DataFrame({"device": ["mobile", "mobile", "desktop"], "phase": ["early", "mid", "late"]}),
+    )
+    canary = SequenceSplitSnapshot(
+        name="canary",
+        context=np.zeros((2, 1), dtype="float32"),
+        frame=pd.DataFrame({"device": ["desktop", "desktop"], "phase": ["late", "late"]}),
+    )
+    shadow = SequenceSplitSnapshot(
+        name="shadow",
+        context=np.zeros((2, 1), dtype="float32"),
+        frame=pd.DataFrame({"device": ["mobile", "desktop"], "phase": ["mid", "late"]}),
+    )
+
+    rows = compute_segment_share_shift_rows(
+        reference_split=reference,
+        comparison_splits=[canary, shadow],
+        segment_extractors={
+            "device_type": lambda frame: frame["device"].to_numpy(),
+            "session_phase": lambda frame: frame["phase"].to_numpy(),
+        },
+    )
+
+    assert rows
+    assert {row["compare_split"] for row in rows} == {"canary", "shadow"}
+    assert any(row["segment"] == "session_phase" and row["compare_split"] == "shadow" for row in rows)
+
+
 def test_build_conformal_abstention_summary_returns_generic_payload() -> None:
     payload = build_conformal_abstention_summary(
         tag="video_home_feed",

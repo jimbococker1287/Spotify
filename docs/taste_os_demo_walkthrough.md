@@ -106,12 +106,16 @@ A good demo should make all of the following obvious:
 
 ## Current Boundaries
 
-This demo is intentionally still a thin product layer. It does not yet include:
+This demo is intentionally still a thin product layer. The browser service now adds:
 
-- a front-end UI
-- persistent user feedback memory
+- a built-in consumer-style session studio at `GET /taste-os`
+- persistent feedback memory and recent-session history under `outputs/analysis/taste_os_service/`
+- `GET /taste-os/history` and `POST /taste-os/feedback` so the planner can reuse simple preference memory across sessions
+
+It still does not yet include:
+
 - full creator-intelligence integration
 - group-listening integration
-- live service endpoints beyond the current command surface
+- a fully polished consumer app beyond the current local studio
 
 Those are later roadmap steps.

@@ -8,6 +8,7 @@ import numpy as np
 
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
+from .ranking import topk_indices_2d
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> Path:
@@ -46,8 +47,9 @@ def _synthetic_utility(
     last_artist = seq_arr[:, -1]
     transition_score = transition_matrix[last_artist]
     session_repeat = np.zeros_like(transition_score, dtype="float32")
-    for row_idx, session in enumerate(seq_arr):
-        session_repeat[row_idx, np.unique(session)] = 1.0
+    if seq_arr.size:
+        row_idx = np.arange(seq_arr.shape[0], dtype="int32").reshape(-1, 1)
+        session_repeat[row_idx, seq_arr] = 1.0
     novelty = np.broadcast_to(novelty_weights.reshape(1, -1), transition_score.shape)
     utility = (0.65 * transition_score) + (0.20 * session_repeat) + (0.15 * novelty)
     utility /= utility.sum(axis=1, keepdims=True)
@@ -55,13 +57,14 @@ def _synthetic_utility(
 
 
 def _discounted_reward(topk_idx: np.ndarray, utility: np.ndarray) -> float:
-    rewards = []
-    for row_idx in range(len(topk_idx)):
-        score = 0.0
-        for rank, artist_idx in enumerate(topk_idx[row_idx], start=1):
-            score += float(utility[row_idx, artist_idx]) / np.log2(rank + 1.0)
-        rewards.append(score)
-    return float(np.mean(rewards)) if rewards else float("nan")
+    topk_arr = np.asarray(topk_idx, dtype="int32")
+    utility_arr = np.asarray(utility, dtype="float32")
+    if topk_arr.ndim != 2 or topk_arr.size == 0 or utility_arr.ndim != 2 or utility_arr.shape[0] != topk_arr.shape[0]:
+        return float("nan")
+    discounts = 1.0 / np.log2(np.arange(topk_arr.shape[1], dtype="float64") + 2.0)
+    gathered = np.take_along_axis(utility_arr, topk_arr, axis=1)
+    rewards = np.sum(np.asarray(gathered, dtype="float64") * discounts.reshape(1, -1), axis=1)
+    return float(np.mean(rewards)) if rewards.size else float("nan")
 
 
 def _hit_at_k(topk_idx: np.ndarray, y_true: np.ndarray) -> float:
@@ -100,8 +103,8 @@ def run_policy_simulation(
             logger.warning("Policy simulation skipped for %s: %s", model_name, exc)
             continue
         kk = max(1, min(int(k), int(val_proba.shape[1]) if val_proba.ndim == 2 else int(k)))
-        val_topk = np.argsort(val_proba, axis=1)[:, ::-1][:, :kk]
-        test_topk = np.argsort(test_proba, axis=1)[:, ::-1][:, :kk]
+        val_topk = topk_indices_2d(val_proba, kk)
+        test_topk = topk_indices_2d(test_proba, kk)
         rows.append(
             {
                 "model_name": model_name,

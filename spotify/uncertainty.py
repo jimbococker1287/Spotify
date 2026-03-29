@@ -107,7 +107,11 @@ def conformal_prediction_sets(
     out: list[np.ndarray] = []
     for row_idx in range(mask.shape[0]):
         indices = np.flatnonzero(mask[row_idx])
-        if indices.size > 0:
+        if indices.size == 2:
+            left, right = int(indices[0]), int(indices[1])
+            if proba_arr[row_idx, right] >= proba_arr[row_idx, left]:
+                indices = indices[::-1]
+        elif indices.size > 2:
             order = np.argsort(proba_arr[row_idx, indices])[::-1]
             indices = indices[order]
         out.append(indices.astype("int64", copy=False))

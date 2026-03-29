@@ -9,6 +9,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from .ranking import topk_indices_2d
+
 
 @dataclass(frozen=True)
 class MultimodalArtistSpace:
@@ -119,11 +121,14 @@ def _transition_features(df: pd.DataFrame, *, num_artists: int) -> np.ndarray:
     in_degree = np.bincount(next_items, minlength=num_artists).astype("float32")
     transition_entropy = np.zeros(num_artists, dtype="float32")
     if prev_items.size:
-        counts = np.ones((num_artists, num_artists), dtype="float32")
-        np.add.at(counts, (prev_items, next_items), 1.0)
-        probs = counts / counts.sum(axis=1, keepdims=True)
-        entropy = -np.sum(probs * np.log(np.clip(probs, 1e-9, 1.0)), axis=1)
-        transition_entropy = entropy.astype("float32", copy=False)
+        totals = out_degree.astype("float64") + float(num_artists)
+        pair_ids = prev_items.astype("int64", copy=False) * int(num_artists) + next_items.astype("int64", copy=False)
+        unique_pairs, pair_counts = np.unique(pair_ids, return_counts=True)
+        source_ids = (unique_pairs // int(num_artists)).astype("int32", copy=False)
+        smoothed_counts = pair_counts.astype("float64") + 1.0
+        weighted_logs = smoothed_counts * np.log(smoothed_counts)
+        correction = np.bincount(source_ids, weights=weighted_logs, minlength=num_artists)
+        transition_entropy = np.asarray(np.log(totals) - (correction / totals), dtype="float32")
     return np.stack([out_degree, in_degree, transition_entropy], axis=1).astype("float32", copy=False)
 
 
@@ -133,8 +138,9 @@ def _top_neighbors(space: MultimodalArtistSpace, top_k: int = 5) -> list[dict[st
     np.fill_diagonal(similarities, -1.0)
     rows: list[dict[str, object]] = []
     kk = max(1, min(top_k, len(space.artist_labels) - 1 if len(space.artist_labels) > 1 else 1))
+    neighbor_matrix = topk_indices_2d(similarities, kk)
     for idx, artist_name in enumerate(space.artist_labels):
-        neighbor_ids = np.argsort(similarities[idx])[::-1][:kk]
+        neighbor_ids = neighbor_matrix[idx]
         for rank, neighbor_idx in enumerate(neighbor_ids.tolist(), start=1):
             rows.append(
                 {

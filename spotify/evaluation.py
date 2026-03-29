@@ -40,8 +40,11 @@ def _build_label_lookup(df: pd.DataFrame) -> dict[int, str]:
         .sort_values("artist_label")
     )
     return {
-        int(row["artist_label"]): str(row["master_metadata_album_artist_name"])
-        for _, row in unique.iterrows()
+        int(artist_label): str(artist_name)
+        for artist_label, artist_name in zip(
+            unique["artist_label"].to_numpy(copy=False),
+            unique["master_metadata_album_artist_name"].to_numpy(copy=False),
+        )
     }
 
 

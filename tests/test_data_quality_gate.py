@@ -46,6 +46,19 @@ def test_run_data_quality_gate_raises_and_writes_report(tmp_path) -> None:
     assert report_path.exists()
 
 
+def test_evaluate_data_quality_flags_non_boolean_like_values() -> None:
+    frame = _valid_df()
+    frame["shuffle"] = [1, " yes "]
+    frame["offline"] = [0.0, "false"]
+
+    report = evaluate_data_quality(frame)
+    boolean_check = next(row for row in report["checks"] if row["name"] == "boolean_column_values")
+
+    assert report["status"] == "fail"
+    assert boolean_check["details"]["shuffle"] == 1
+    assert boolean_check["details"]["offline"] == 1
+
+
 class _DummyLogger:
     def error(self, *_args, **_kwargs) -> None:
         return None

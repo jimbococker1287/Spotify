@@ -13,6 +13,7 @@ import numpy as np
 from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
 from .public_catalog import SpotifyArtistMetadata, SpotifyPublicCatalogClient, SpotifyPublicCatalogError
+from .ranking import topk_indices_1d
 from .serving import load_predictor, resolve_model_row
 
 
@@ -441,7 +442,7 @@ def main() -> int:
     public_catalog_client = _build_public_catalog_client(args, logger)
 
     top_k = max(1, int(args.top_k))
-    top_indices = np.argsort(artist_probs)[::-1][:top_k]
+    top_indices = topk_indices_1d(artist_probs, top_k)
 
     print(f"model={predictor.model_name}")
     print(f"model_type={predictor.model_type}")

@@ -64,6 +64,23 @@ def test_conformal_prediction_sets_and_summary_use_calibrated_threshold() -> Non
     assert summary["mean_set_size"] >= 1.0
 
 
+def test_conformal_prediction_sets_keep_descending_probability_order_for_small_sets() -> None:
+    proba = np.array(
+        [
+            [0.90, 0.05, 0.05],
+            [0.40, 0.60, 0.10],
+            [0.55, 0.20, 0.55],
+        ],
+        dtype="float32",
+    )
+
+    prediction_sets = conformal_prediction_sets(proba, threshold=0.35)
+
+    assert prediction_sets[0].tolist() == [0]
+    assert prediction_sets[1].tolist() == [1, 0]
+    assert prediction_sets[2].tolist() == [2, 0]
+
+
 def test_calibration_from_payload_rehydrates_dataclass() -> None:
     payload = {
         "method": "lac",

@@ -320,6 +320,8 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
 - `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
 - `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
+- `SPOTIFY_STRESS_TEST_MAX_SESSIONS` (default `2500`; cap held-out sessions evaluated per stress-test scenario/policy, use `0` for full sweep)
+- `SPOTIFY_STRESS_TEST_PROGRESS_EVERY` (default `500`; progress-log interval inside the stress-test lab)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
 
@@ -476,6 +478,8 @@ Generate the control-room summary:
 make control-room
 ```
 
+The control room now ranks runs by ops signal instead of blindly taking the newest folder, so newer `dev` or smoke/check runs do not automatically replace the main ops candidate if an older production-style run has stronger review coverage.
+
 ## Taste OS Demo
 
 Run the first unified `Personal Taste OS` demo contract against the current champion run:
@@ -509,6 +513,32 @@ Or via Make:
 ```bash
 make taste-os-showcase EXTRA_ARGS='--top-k 5'
 ```
+
+Serve Taste OS session plans over HTTP:
+
+```bash
+python -m spotify.taste_os_service --host 127.0.0.1 --port 8010
+```
+
+Then open [http://127.0.0.1:8010/taste-os](http://127.0.0.1:8010/taste-os) for the built-in session studio.
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8010/taste-os/session \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"focus","scenario":"skip_recovery","top_k":5,"persist_artifacts":true,"use_feedback_memory":true}'
+```
+
+That service exposes a browser UI at `GET /taste-os`, plus:
+
+- `GET /health`
+- `GET /taste-os/catalog`
+- `GET /taste-os/history`
+- `POST /taste-os/session`
+- `POST /taste-os/feedback`
+
+It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now keeps a lightweight feedback-memory store that can seed future sessions when `use_feedback_memory` is enabled.
 
 The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
@@ -687,6 +717,8 @@ Creator / label intelligence graph:
 ```bash
 python -m spotify.public_insights creator-label-intelligence --top-n 8 --lookback-days 365 --neighbor-k 5
 ```
+
+That report now reads more like a strategy brief: it starts with an executive summary, adds scene and seed comparison views, and writes comparison CSVs alongside the core adjacency, scene, migration, whitespace, and opportunity outputs.
 
 Release inbox:
 

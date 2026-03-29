@@ -81,6 +81,46 @@ def test_top_tracks_from_history_groups_by_track_uri() -> None:
     ]
 
 
+def test_top_tracks_from_history_uses_most_frequent_metadata_per_uri() -> None:
+    history = pd.DataFrame(
+        {
+            "ts": [
+                "2026-03-01T00:00:00Z",
+                "2026-03-02T00:00:00Z",
+                "2026-03-03T00:00:00Z",
+                "2026-03-04T00:00:00Z",
+            ],
+            "spotify_track_uri": [
+                "spotify:track:aaa",
+                "spotify:track:aaa",
+                "spotify:track:aaa",
+                "spotify:track:bbb",
+            ],
+            "master_metadata_track_name": [
+                "Track A",
+                "Track A",
+                "Track Alt",
+                "Track B",
+            ],
+            "master_metadata_album_artist_name": [
+                "Artist A",
+                "Artist A",
+                "Artist Z",
+                "Artist B",
+            ],
+        }
+    )
+
+    result = _top_tracks_from_history(history, lookback_days=30, limit=2)
+
+    assert result[0] == {
+        "spotify_track_uri": "spotify:track:aaa",
+        "plays": 3,
+        "track_name": "Track A",
+        "artist_name": "Artist A",
+    }
+
+
 def test_playlist_diff_detects_additions_and_metadata_changes() -> None:
     previous = {
         "snapshot_id": "old",

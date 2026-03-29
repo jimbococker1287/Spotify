@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock regression-guard regression-alert control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -117,6 +117,9 @@ taste-os-demo:
 
 taste-os-showcase:
 	$(RUN_PY) -m spotify.taste_os_showcase $(EXTRA_ARGS)
+
+serve-taste-os:
+	$(RUN_PY) -m spotify.taste_os_service $(EXTRA_ARGS)
 
 predict-next:
 	$(RUN_PY) -m spotify.predict_next $(EXTRA_ARGS)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+from functools import lru_cache
 import json
 import logging
 from pathlib import Path
@@ -837,29 +838,63 @@ def _top_tracks_from_history(df: pd.DataFrame, *, lookback_days: int, limit: int
     if frame.empty:
         return []
 
-    grouped = (
-        frame.groupby("spotify_track_uri", dropna=False)
-        .agg(
-            plays=("spotify_track_uri", "size"),
-            track_name=("master_metadata_track_name", lambda values: values.mode().iloc[0] if not values.mode().empty else values.iloc[0]),
-            artist_name=(
-                "master_metadata_album_artist_name",
-                lambda values: values.mode().iloc[0] if not values.mode().empty else values.iloc[0],
-            ),
+    name_counts = (
+        frame.groupby(
+            ["spotify_track_uri", "master_metadata_track_name", "master_metadata_album_artist_name"],
+            dropna=False,
+            sort=False,
         )
-        .sort_values(["plays", "track_name"], ascending=[False, True])
+        .size()
+        .rename("name_plays")
         .reset_index()
+    )
+    grouped = (
+        name_counts.groupby("spotify_track_uri", dropna=False, sort=False)["name_plays"]
+        .sum()
+        .rename("plays")
+        .reset_index()
+        .merge(
+            name_counts.sort_values(
+                ["spotify_track_uri", "name_plays", "master_metadata_track_name", "master_metadata_album_artist_name"],
+                ascending=[True, False, True, True],
+                kind="stable",
+            )
+            .drop_duplicates(subset=["spotify_track_uri"], keep="first")
+            .rename(
+                columns={
+                    "master_metadata_track_name": "track_name",
+                    "master_metadata_album_artist_name": "artist_name",
+                }
+            )[["spotify_track_uri", "track_name", "artist_name"]],
+            on="spotify_track_uri",
+            how="left",
+        )
+        .sort_values(["plays", "track_name", "artist_name"], ascending=[False, True, True], kind="stable")
+        .reset_index(drop=True)
     )
     return grouped.head(max(1, int(limit))).to_dict(orient="records")
 
 
+@lru_cache(maxsize=4096)
 def _parse_release_date(value: str, precision: str) -> pd.Timestamp | None:
     raw = str(value or "").strip()
     if not raw:
         return None
-    if precision == "year":
+    precision_key = str(precision or "").strip()
+    try:
+        if precision_key == "year":
+            return pd.Timestamp(year=int(raw), month=1, day=1, tz="UTC")
+        if precision_key == "month":
+            year_text, month_text = raw.split("-", 1)
+            return pd.Timestamp(year=int(year_text), month=int(month_text), day=1, tz="UTC")
+        if precision_key in {"", "day"}:
+            year_text, month_text, day_text = raw.split("-", 2)
+            return pd.Timestamp(year=int(year_text), month=int(month_text), day=int(day_text), tz="UTC")
+    except (TypeError, ValueError):
+        pass
+    if precision_key == "year":
         raw = f"{raw}-01-01"
-    elif precision == "month":
+    elif precision_key == "month":
         raw = f"{raw}-01"
     timestamp = pd.to_datetime(raw, errors="coerce", utc=True)
     if pd.isna(timestamp):

@@ -492,12 +492,19 @@ Control room:
 
 - `outputs/analytics/control_room.json`
 - `outputs/analytics/control_room.md`
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
 
 Generate the control-room summary:
 
 ```bash
 make control-room
 ```
+
+The control room now ranks runs by ops signal instead of blindly taking the newest folder, so newer `dev` or smoke/check runs do not automatically replace the main ops candidate if an older production-style run has stronger review coverage.
 
 ## Taste OS Demo
 
@@ -842,6 +849,16 @@ python scripts/control_room_guard.py \
   --max-target-drift-jsd 0.20 \
   --max-selective-risk 0.50
 ```
+
+That guard also writes:
+
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
+
+The history artifact keeps one snapshot per run, the weekly summary rolls recent runs into a trend view, the control room now calls out missing analysis coverage explicitly, and the triage artifacts expand the current review actions into inspect/fix/rerun steps so the next ops move is explicit after a failed scheduled run.
 
 ## Spotify API Credentials
 

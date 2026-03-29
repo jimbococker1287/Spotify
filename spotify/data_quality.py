@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import json
 
+import numpy as np
 import pandas as pd
 
 REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -21,15 +22,31 @@ BOOLEAN_COLUMNS: tuple[str, ...] = (
 MAX_ALLOWED_MS_PLAYED = 86_400_000
 MIN_VALID_TS_RATIO = 0.50
 MIN_VALID_ARTIST_RATIO = 0.50
+_VALID_BOOLEAN_TEXT = frozenset({"0", "1", "true", "false"})
+_VALID_BOOLEAN_VALUES = {0, 1, True, False, "0", "1", "true", "false"}
 
 
 def _bool_like_invalid_count(series: pd.Series) -> int:
-    valid_values = {0, 1, True, False, "0", "1", "true", "false", "True", "False"}
     cleaned = series.dropna()
     if cleaned.empty:
         return 0
-    invalid = cleaned.apply(lambda value: value not in valid_values)
-    return int(invalid.sum())
+    invalid = 0
+    valid_values = _VALID_BOOLEAN_VALUES
+    valid_text = _VALID_BOOLEAN_TEXT
+    str_type = str
+    float_type = float
+    np_floating = np.floating
+    for value in cleaned.to_numpy(dtype="object", copy=False):
+        value_type = type(value)
+        if value in valid_values:
+            if value_type is float_type or isinstance(value, np_floating):
+                invalid += 1
+            continue
+        if value_type is str_type:
+            if value.strip().lower() in valid_text:
+                continue
+        invalid += 1
+    return invalid
 
 
 def evaluate_data_quality(df: pd.DataFrame) -> dict[str, object]:

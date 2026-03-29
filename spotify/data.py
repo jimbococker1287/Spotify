@@ -151,6 +151,48 @@ class PreparedDataCacheInfo:
     source_file_count: int
 
 
+@dataclass(frozen=True)
+class PreparedDataCachePaths:
+    fingerprint: str
+    cache_dir: Path
+    bundle_path: Path
+    metadata_path: Path
+
+
+def _select_preferred_grouped_files(
+    data_dir: Path,
+    grouped_files: dict[Path, list[Path]],
+    *,
+    preferred_dir_name: str,
+    logger,
+    multi_dir_label: str,
+    nested_label: str,
+    count_label: str,
+) -> tuple[Path, list[Path]]:
+    preferred_dir = max(
+        grouped_files,
+        key=lambda parent: (
+            len(grouped_files[parent]),
+            parent == data_dir,
+            parent.name.lower() == preferred_dir_name,
+            str(parent),
+        ),
+    )
+    selected = list(grouped_files[preferred_dir])
+    if len(grouped_files) > 1:
+        logger.warning(
+            "Found %s in multiple directories under %s. Using %s (%d %s).",
+            multi_dir_label,
+            data_dir,
+            preferred_dir,
+            len(selected),
+            count_label,
+        )
+    elif preferred_dir != data_dir:
+        logger.info("Using nested %s export folder: %s", nested_label, preferred_dir)
+    return preferred_dir, selected
+
+
 def discover_streaming_files(data_dir: Path, include_video: bool, logger) -> list[Path]:
     data_dir = data_dir.expanduser().resolve()
 
@@ -159,26 +201,15 @@ def discover_streaming_files(data_dir: Path, include_video: bool, logger) -> lis
         grouped_audio_files.setdefault(path.parent, []).append(path)
 
     if grouped_audio_files:
-        preferred_dir = max(
+        preferred_dir, discovered = _select_preferred_grouped_files(
+            data_dir,
             grouped_audio_files,
-            key=lambda parent: (
-                len(grouped_audio_files[parent]),
-                parent == data_dir,
-                parent.name.lower() == "spotify extended streaming history",
-                str(parent),
-            ),
+            preferred_dir_name="spotify extended streaming history",
+            logger=logger,
+            multi_dir_label="streaming history files",
+            nested_label="streaming history",
+            count_label="audio files",
         )
-        if len(grouped_audio_files) > 1:
-            logger.warning(
-                "Found streaming history files in multiple directories under %s. Using %s (%d audio files).",
-                data_dir,
-                preferred_dir,
-                len(grouped_audio_files[preferred_dir]),
-            )
-        elif preferred_dir != data_dir:
-            logger.info("Using nested streaming history export folder: %s", preferred_dir)
-
-        discovered = list(grouped_audio_files[preferred_dir])
         if include_video:
             discovered.extend(
                 sorted(candidate for candidate in preferred_dir.glob("Streaming_History_Video_*.json") if candidate.is_file())
@@ -207,26 +238,16 @@ def discover_technical_log_files(data_dir: Path, logger) -> list[Path]:
         logger.info("No Spotify technical-log export found under %s; using zero-filled technical context features.", data_dir)
         return []
 
-    preferred_dir = max(
+    preferred_dir, selected = _select_preferred_grouped_files(
+        data_dir,
         grouped_files,
-        key=lambda parent: (
-            len(grouped_files[parent]),
-            parent == data_dir,
-            parent.name.lower() == "spotify technical log information",
-            str(parent),
-        ),
+        preferred_dir_name="spotify technical log information",
+        logger=logger,
+        multi_dir_label="technical log files",
+        nested_label="technical log",
+        count_label="files",
     )
-    if len(grouped_files) > 1:
-        logger.warning(
-            "Found technical log files in multiple directories under %s. Using %s (%d files).",
-            data_dir,
-            preferred_dir,
-            len(grouped_files[preferred_dir]),
-        )
-    elif preferred_dir != data_dir:
-        logger.info("Using nested technical log export folder: %s", preferred_dir)
-
-    discovered_by_name = {path.name: path for path in grouped_files[preferred_dir]}
+    discovered_by_name = {path.name: path for path in selected}
     discovered = [discovered_by_name[name] for name in TECHNICAL_LOG_FILENAMES if name in discovered_by_name]
     logger.info("Discovered %d technical log files for feature augmentation.", len(discovered))
     return discovered
@@ -243,11 +264,7 @@ def load_streaming_history(data_dir: Path, include_video: bool, logger) -> pd.Da
         fast_json = None
 
     for path in files:
-        if fast_json is not None:
-            records = fast_json.loads(path.read_bytes())
-        else:
-            with path.open("r", encoding="utf-8") as infile:
-                records = json.load(infile)
+        records = _load_json_records(path, fast_json)
         logger.info("Loaded %s with %d records", path.name, len(records))
         all_records.extend(records)
 
@@ -311,6 +328,78 @@ def _build_prepared_cache_fingerprint(
     return fingerprint, fingerprint_payload
 
 
+def _resolve_prepared_cache_paths(cache_root: Path, fingerprint: str) -> PreparedDataCachePaths:
+    cache_dir = (cache_root / fingerprint).resolve()
+    return PreparedDataCachePaths(
+        fingerprint=fingerprint,
+        cache_dir=cache_dir,
+        bundle_path=cache_dir / "prepared_bundle.joblib",
+        metadata_path=cache_dir / "cache_meta.json",
+    )
+
+
+def _load_prepared_cache(
+    *,
+    cache_paths: PreparedDataCachePaths,
+    scaler_path: Path,
+    source_file_count: int,
+    logger,
+) -> tuple[PreparedData, PreparedDataCacheInfo] | None:
+    if not cache_paths.bundle_path.exists():
+        return None
+
+    try:
+        payload = joblib.load(cache_paths.bundle_path)
+        prepared = payload.get("prepared")
+        scaler = payload.get("scaler")
+        if not isinstance(prepared, PreparedData):
+            raise TypeError("cached payload has unexpected prepared object type")
+        if scaler is not None:
+            scaler_path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(scaler, scaler_path)
+        logger.info("Prepared-data cache hit: %s", cache_paths.bundle_path)
+        return prepared, PreparedDataCacheInfo(
+            enabled=True,
+            hit=True,
+            fingerprint=cache_paths.fingerprint,
+            cache_path=cache_paths.bundle_path,
+            metadata_path=(cache_paths.metadata_path if cache_paths.metadata_path.exists() else None),
+            source_file_count=source_file_count,
+        )
+    except Exception as exc:
+        logger.warning("Prepared-data cache load failed (%s). Rebuilding cache.", exc)
+        return None
+
+
+def _save_prepared_cache(
+    *,
+    cache_paths: PreparedDataCachePaths,
+    prepared: PreparedData,
+    scaler_path: Path,
+    fingerprint_payload: dict[str, object],
+    logger,
+) -> None:
+    try:
+        scaler = joblib.load(scaler_path)
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"prepared": prepared, "scaler": scaler}, cache_paths.bundle_path, compress=3)
+        cache_paths.metadata_path.write_text(
+            json.dumps(
+                {
+                    "fingerprint": cache_paths.fingerprint,
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    "created_at_epoch_s": int(time.time()),
+                    "fingerprint_payload": fingerprint_payload,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        logger.info("Prepared-data cache saved: %s", cache_paths.bundle_path)
+    except Exception as exc:
+        logger.warning("Prepared-data cache save skipped due to error: %s", exc)
+
+
 def load_or_prepare_training_data(
     *,
     data_dir: Path,
@@ -325,6 +414,7 @@ def load_or_prepare_training_data(
 ) -> tuple[PreparedData, PreparedDataCacheInfo]:
     files = discover_streaming_files(data_dir, include_video, logger)
     technical_files = discover_technical_log_files(data_dir, logger)
+    source_file_count = len(files) + len(technical_files)
     fingerprint, fingerprint_payload = _build_prepared_cache_fingerprint(
         files=files,
         technical_files=technical_files,
@@ -335,31 +425,17 @@ def load_or_prepare_training_data(
     )
 
     cache_enabled = _cache_enabled_from_env()
-    cache_dir = (cache_root / fingerprint).resolve()
-    bundle_path = cache_dir / "prepared_bundle.joblib"
-    metadata_path = cache_dir / "cache_meta.json"
+    cache_paths = _resolve_prepared_cache_paths(cache_root, fingerprint)
 
-    if cache_enabled and bundle_path.exists():
-        try:
-            payload = joblib.load(bundle_path)
-            prepared = payload.get("prepared")
-            scaler = payload.get("scaler")
-            if not isinstance(prepared, PreparedData):
-                raise TypeError("cached payload has unexpected prepared object type")
-            if scaler is not None:
-                scaler_path.parent.mkdir(parents=True, exist_ok=True)
-                joblib.dump(scaler, scaler_path)
-            logger.info("Prepared-data cache hit: %s", bundle_path)
-            return prepared, PreparedDataCacheInfo(
-                enabled=True,
-                hit=True,
-                fingerprint=fingerprint,
-                cache_path=bundle_path,
-                metadata_path=(metadata_path if metadata_path.exists() else None),
-                source_file_count=len(files) + len(technical_files),
-            )
-        except Exception as exc:
-            logger.warning("Prepared-data cache load failed (%s). Rebuilding cache.", exc)
+    if cache_enabled:
+        cached = _load_prepared_cache(
+            cache_paths=cache_paths,
+            scaler_path=scaler_path,
+            source_file_count=source_file_count,
+            logger=logger,
+        )
+        if cached is not None:
+            return cached
 
     df = raw_df.copy() if raw_df is not None else load_streaming_history(data_dir, include_video, logger)
     df = engineer_features(df, max_artists, logger)
@@ -373,33 +449,21 @@ def load_or_prepare_training_data(
     )
 
     if cache_enabled:
-        try:
-            scaler = joblib.load(scaler_path)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            joblib.dump({"prepared": prepared, "scaler": scaler}, bundle_path, compress=3)
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "fingerprint": fingerprint,
-                        "schema_version": CACHE_SCHEMA_VERSION,
-                        "created_at_epoch_s": int(time.time()),
-                        "fingerprint_payload": fingerprint_payload,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            logger.info("Prepared-data cache saved: %s", bundle_path)
-        except Exception as exc:
-            logger.warning("Prepared-data cache save skipped due to error: %s", exc)
+        _save_prepared_cache(
+            cache_paths=cache_paths,
+            prepared=prepared,
+            scaler_path=scaler_path,
+            fingerprint_payload=fingerprint_payload,
+            logger=logger,
+        )
 
     return prepared, PreparedDataCacheInfo(
         enabled=cache_enabled,
         hit=False,
         fingerprint=fingerprint,
-        cache_path=(bundle_path if cache_enabled else None),
-        metadata_path=(metadata_path if cache_enabled else None),
-        source_file_count=len(files) + len(technical_files),
+        cache_path=(cache_paths.bundle_path if cache_enabled else None),
+        metadata_path=(cache_paths.metadata_path if cache_enabled else None),
+        source_file_count=source_file_count,
     )
 
 

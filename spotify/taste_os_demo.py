@@ -16,6 +16,7 @@ from .digital_twin import ListenerDigitalTwinArtifact
 from .env import load_local_env
 from .multimodal import MultimodalArtistSpace
 from .predict_next import _prepare_inputs, load_prediction_input_context
+from .ranking import topk_indices_1d
 from .safe_policy import POLICY_TEMPLATES, SafeBanditPolicyArtifact
 from .serving import load_predictor, resolve_model_row
 
@@ -71,6 +72,14 @@ class AdaptiveScenario:
     name: str
     description: str
     events: tuple[AdaptiveEvent, ...]
+
+
+@dataclass(frozen=True)
+class DemoStepEvaluation:
+    candidates: list[dict[str, object]]
+    chosen_candidate: dict[str, object]
+    risk_summary: dict[str, object]
+    fallback_policy: dict[str, object]
 
 
 MODE_CONFIGS: dict[str, ModeConfig] = {
@@ -389,11 +398,11 @@ def _surface_reranked_indices(
         candidate_count,
         max(int(mode.candidate_shortlist), int(top_k) * 4, 8),
     )
-    adjusted_top = np.argsort(adjusted_scores)[::-1][:shortlist_size].tolist()
-    prob_top = np.argsort(probs)[::-1][: max(6, shortlist_size // 2)].tolist()
+    adjusted_top = topk_indices_1d(adjusted_scores, shortlist_size).tolist()
+    prob_top = topk_indices_1d(probs, max(6, shortlist_size // 2)).tolist()
     union_shortlist = list(dict.fromkeys(adjusted_top + prob_top))
     if len(union_shortlist) < max(1, int(top_k)):
-        union_shortlist = np.argsort(adjusted_scores)[::-1][: max(1, int(top_k))].tolist()
+        union_shortlist = topk_indices_1d(adjusted_scores, max(1, int(top_k))).tolist()
     shortlist = np.asarray(union_shortlist, dtype="int32")
 
     prob_ranks = _percentile_ranks(np.asarray(probs, dtype="float64")[shortlist])
@@ -485,6 +494,35 @@ def _select_next_artist(
     if not ranked_artist_ids:
         return int(sequence_labels[-1])
 
+    preferred = _preferred_next_artist(
+        ranked_artist_ids=ranked_artist_ids,
+        sequence_labels=sequence_labels,
+        mode=mode,
+        planned_history=planned_history,
+    )
+    if preferred is not None:
+        return preferred
+
+    planned = list(planned_history or [])
+    last_selected = int(planned[-1]) if planned else None
+    for artist_id in ranked_artist_ids:
+        if last_selected is not None and int(artist_id) == last_selected:
+            continue
+        return int(artist_id)
+
+    return int(ranked_artist_ids[0])
+
+
+def _preferred_next_artist(
+    *,
+    ranked_artist_ids: list[int],
+    sequence_labels: np.ndarray,
+    mode: ModeConfig,
+    planned_history: list[int] | None = None,
+) -> int | None:
+    if not ranked_artist_ids:
+        return None
+
     planned = list(planned_history or [])
     recent_window = np.asarray(sequence_labels[-max(1, int(mode.hard_repeat_window)) :], dtype="int32")
     last_selected = int(planned[-1]) if planned else None
@@ -497,13 +535,86 @@ def _select_next_artist(
         if np.any(recent_window == int(artist_id)):
             continue
         return int(artist_id)
+    return None
 
-    for artist_id in ranked_artist_ids:
-        if last_selected is not None and int(artist_id) == last_selected:
-            continue
-        return int(artist_id)
 
-    return int(ranked_artist_ids[0])
+def _resolve_demo_inputs(
+    *,
+    sequence_labels: np.ndarray,
+    context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None,
+    context_features: list[str] | None,
+    digital_twin: ListenerDigitalTwinArtifact,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    seq_arr = np.asarray(sequence_labels, dtype="int32").reshape(-1)
+    ctx_arr = np.asarray(context_batch, dtype="float32").reshape(1, -1)
+    raw_ctx_source = context_batch if context_raw_batch is None else context_raw_batch
+    raw_ctx_arr = np.asarray(raw_ctx_source, dtype="float32").reshape(1, -1)
+    resolved_context_features = list(context_features or list(digital_twin.context_features))
+    return seq_arr, ctx_arr, raw_ctx_arr, resolved_context_features
+
+
+def _evaluate_demo_step(
+    *,
+    predictor: _PredictorLike,
+    artist_labels: list[str],
+    sequence_labels: np.ndarray,
+    context_batch: np.ndarray,
+    context_raw_batch: np.ndarray | None,
+    context_features: list[str],
+    friction_reference: dict[str, object] | None,
+    mode: ModeConfig,
+    top_k: int,
+    digital_twin: ListenerDigitalTwinArtifact,
+    multimodal_space: MultimodalArtistSpace,
+    safe_policy: SafeBanditPolicyArtifact,
+    planned_history: list[int] | None = None,
+) -> DemoStepEvaluation:
+    probs = np.asarray(predictor.predict_proba(sequence_labels.reshape(1, -1), context_batch), dtype="float32")[0]
+    candidates = _candidate_rows(
+        probs=probs,
+        sequence_labels=sequence_labels,
+        artist_labels=artist_labels,
+        mode=mode,
+        multimodal_space=multimodal_space,
+        digital_twin=digital_twin,
+        top_k=top_k,
+        planned_history=planned_history,
+    )
+    candidate_ids = [int(row.get("artist_label", -1)) for row in candidates if isinstance(row, dict)]
+    chosen_artist = (
+        _select_next_artist(
+            ranked_artist_ids=[artist_id for artist_id in candidate_ids if artist_id >= 0],
+            sequence_labels=sequence_labels,
+            mode=mode,
+            planned_history=planned_history,
+        )
+        if candidates
+        else int(sequence_labels[-1])
+    )
+    chosen = next(
+        (row for row in candidates if int(row.get("artist_label", -1)) == chosen_artist),
+        candidates[0] if candidates else {},
+    )
+    risk_summary = _risk_summary(
+        sequence_labels=sequence_labels,
+        context_batch=context_batch,
+        context_raw_batch=context_raw_batch,
+        context_features=context_features,
+        friction_reference=friction_reference,
+        digital_twin=digital_twin,
+    )
+    fallback_policy = _fallback_policy(
+        mode=mode,
+        risk_summary=risk_summary,
+        safe_policy=safe_policy,
+    )
+    return DemoStepEvaluation(
+        candidates=candidates,
+        chosen_candidate=chosen,
+        risk_summary=risk_summary,
+        fallback_policy=fallback_policy,
+    )
 
 
 def _candidate_rows(
@@ -536,7 +647,6 @@ def _candidate_rows(
         mode=mode,
         top_k=top_k,
     )
-    last_artist = int(sequence_labels[-1])
 
     rows: list[dict[str, object]] = []
     for rank, artist_id in enumerate(top_indices, start=1):
@@ -583,7 +693,18 @@ def _journey_plan_rows(
             multimodal_space=multimodal_space,
             planned_history=planned_history,
         )
-        ranked_artist_ids = [int(item) for item in np.argsort(adjusted)[::-1].tolist()]
+        shortlist_size = min(
+            len(adjusted),
+            max(int(mode.candidate_shortlist), int(mode.hard_repeat_window) * 6, 24),
+        )
+        ranked_artist_ids = topk_indices_1d(adjusted, shortlist_size).tolist()
+        if _preferred_next_artist(
+            ranked_artist_ids=ranked_artist_ids,
+            sequence_labels=working,
+            mode=mode,
+            planned_history=planned_history,
+        ) is None and shortlist_size < len(adjusted):
+            ranked_artist_ids = np.argsort(adjusted)[::-1].astype("int32", copy=False).tolist()
         next_artist = _select_next_artist(
             ranked_artist_ids=ranked_artist_ids,
             sequence_labels=working,
@@ -941,53 +1062,37 @@ def _adaptive_session_payload(
     planned_history: list[int] = []
 
     for step in range(1, int(mode.horizon) + 1):
-        probs = np.asarray(predictor.predict_proba(working_sequence.reshape(1, -1), working_context), dtype="float32")[0]
-        candidates = _candidate_rows(
-            probs=probs,
-            sequence_labels=working_sequence,
+        step_eval = _evaluate_demo_step(
+            predictor=predictor,
             artist_labels=artist_labels,
-            mode=current_mode,
-            multimodal_space=multimodal_space,
-            digital_twin=digital_twin,
-            top_k=top_k,
-            planned_history=planned_history,
-        )
-        candidate_ids = [int(row.get("artist_label", -1)) for row in candidates if isinstance(row, dict)]
-        chosen_artist = _select_next_artist(
-            ranked_artist_ids=[artist_id for artist_id in candidate_ids if artist_id >= 0],
-            sequence_labels=working_sequence,
-            mode=current_mode,
-            planned_history=planned_history,
-        ) if candidates else int(working_sequence[-1])
-        chosen = next((row for row in candidates if int(row.get("artist_label", -1)) == chosen_artist), candidates[0] if candidates else {})
-        risk_summary = _risk_summary(
             sequence_labels=working_sequence,
             context_batch=working_context,
             context_raw_batch=working_raw_context,
             context_features=context_features,
             friction_reference=friction_reference,
-            digital_twin=digital_twin,
-        )
-        fallback_policy = _fallback_policy(
             mode=current_mode,
-            risk_summary=risk_summary,
+            top_k=top_k,
+            multimodal_space=multimodal_space,
+            digital_twin=digital_twin,
             safe_policy=safe_policy,
+            planned_history=planned_history,
         )
-        if bool(fallback_policy.get("safe_routed")):
+        chosen = step_eval.chosen_candidate
+        if bool(step_eval.fallback_policy.get("safe_routed")):
             safe_route_steps += 1
 
         transcript_row = {
             "step": step,
             "plan_origin": "replanned" if pending_replan_reason else "initial",
             "why_changed": pending_replan_reason,
-            "policy_name": str(fallback_policy.get("active_policy_name", "")),
+            "policy_name": str(step_eval.fallback_policy.get("active_policy_name", "")),
             "selected_artist": str(chosen.get("artist_name", "")),
             "model_probability": float(chosen.get("model_probability", 0.0)),
             "continuity": float(chosen.get("continuity", 0.0)),
             "novelty": float(chosen.get("novelty", 0.0)),
             "energy_alignment": float(chosen.get("energy_alignment", 0.0)),
-            "end_risk": float(risk_summary.get("current_end_risk", 0.0)),
-            "friction_score": float(risk_summary.get("friction_score", 0.0)),
+            "end_risk": float(step_eval.risk_summary.get("current_end_risk", 0.0)),
+            "friction_score": float(step_eval.risk_summary.get("friction_score", 0.0)),
             "event_applied_after_step": "",
             "event_summary": "",
         }
@@ -1048,21 +1153,26 @@ def build_taste_os_demo_payload(
 ) -> dict[str, object]:
     mode = MODE_CONFIGS[str(mode_name).strip().lower()]
     scenario = SCENARIOS[str(scenario_name).strip().lower()]
-    seq_arr = np.asarray(sequence_labels, dtype="int32").reshape(-1)
-    ctx_arr = np.asarray(context_batch, dtype="float32").reshape(1, -1)
-    raw_ctx_source = context_batch if context_raw_batch is None else context_raw_batch
-    raw_ctx_arr = np.asarray(raw_ctx_source, dtype="float32").reshape(1, -1)
-    resolved_context_features = list(context_features or list(digital_twin.context_features))
-    probs = np.asarray(predictor.predict_proba(seq_arr.reshape(1, -1), ctx_arr), dtype="float32")[0]
-
-    top_candidates = _candidate_rows(
-        probs=probs,
-        sequence_labels=seq_arr,
-        artist_labels=artist_labels,
-        mode=mode,
-        multimodal_space=multimodal_space,
+    seq_arr, ctx_arr, raw_ctx_arr, resolved_context_features = _resolve_demo_inputs(
+        sequence_labels=sequence_labels,
+        context_batch=context_batch,
+        context_raw_batch=context_raw_batch,
+        context_features=context_features,
         digital_twin=digital_twin,
+    )
+    step_eval = _evaluate_demo_step(
+        predictor=predictor,
+        artist_labels=artist_labels,
+        sequence_labels=seq_arr,
+        context_batch=ctx_arr,
+        context_raw_batch=raw_ctx_arr,
+        context_features=resolved_context_features,
+        friction_reference=friction_reference,
+        mode=mode,
         top_k=top_k,
+        digital_twin=digital_twin,
+        multimodal_space=multimodal_space,
+        safe_policy=safe_policy,
     )
     journey_plan = _journey_plan_rows(
         sequence_labels=seq_arr,
@@ -1070,19 +1180,6 @@ def build_taste_os_demo_payload(
         mode=mode,
         multimodal_space=multimodal_space,
         digital_twin=digital_twin,
-    )
-    risk_summary = _risk_summary(
-        sequence_labels=seq_arr,
-        context_batch=ctx_arr,
-        context_raw_batch=raw_ctx_arr,
-        context_features=resolved_context_features,
-        friction_reference=friction_reference,
-        digital_twin=digital_twin,
-    )
-    fallback_policy = _fallback_policy(
-        mode=mode,
-        risk_summary=risk_summary,
-        safe_policy=safe_policy,
     )
     adaptive_session = _adaptive_session_payload(
         predictor=predictor,
@@ -1102,6 +1199,7 @@ def build_taste_os_demo_payload(
         safe_policy=safe_policy,
     )
 
+    top_candidates = step_eval.candidates
     top_choice = top_candidates[0] if top_candidates else {}
     return {
         "request": {
@@ -1126,10 +1224,10 @@ def build_taste_os_demo_payload(
         "why_this_next": _why_this_next(
             first_candidate=top_choice,
             mode=mode,
-            policy_name=str(fallback_policy.get("active_policy_name", "")),
+            policy_name=str(step_eval.fallback_policy.get("active_policy_name", "")),
         ),
-        "risk_summary": risk_summary,
-        "fallback_policy": fallback_policy,
+        "risk_summary": step_eval.risk_summary,
+        "fallback_policy": step_eval.fallback_policy,
         "adaptive_session": adaptive_session,
         "demo_summary": {
             "top_artist": str(top_choice.get("artist_name", "")),

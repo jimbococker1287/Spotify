@@ -2,15 +2,37 @@ from __future__ import annotations
 
 import numpy as np
 
+_TOPK_1D_ARGPARTITION_MIN_SIZE = 128
+
+
+def topk_indices_1d(scores: np.ndarray, k: int) -> np.ndarray:
+    score_arr = np.asarray(scores)
+    if score_arr.ndim != 1 or score_arr.size == 0:
+        return np.empty(0, dtype="int32")
+    kk = max(1, min(int(k), int(score_arr.shape[0])))
+    if kk >= score_arr.shape[0] or score_arr.shape[0] <= _TOPK_1D_ARGPARTITION_MIN_SIZE:
+        return np.asarray(np.argsort(score_arr)[::-1][:kk], dtype="int32")
+    idx = np.argpartition(score_arr, -kk)[-kk:]
+    top_scores = score_arr[idx]
+    order = np.argsort(top_scores)[::-1]
+    return np.asarray(idx[order], dtype="int32")
+
+
+def topk_indices_2d(proba: np.ndarray, k: int) -> np.ndarray:
+    proba_arr = np.asarray(proba)
+    if proba_arr.ndim != 2 or proba_arr.size == 0:
+        return np.empty((0, 0), dtype="int32")
+    kk = max(1, min(int(k), int(proba_arr.shape[1])))
+    if kk >= proba_arr.shape[1]:
+        return np.asarray(np.argsort(proba_arr, axis=1)[:, ::-1][:, :kk], dtype="int32")
+    topk = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+    topk_scores = np.take_along_axis(proba_arr, topk, axis=1)
+    order = np.argsort(-topk_scores, axis=1)
+    return np.asarray(np.take_along_axis(topk, order, axis=1), dtype="int32")
+
 
 def _topk_indices(proba: np.ndarray, k: int) -> np.ndarray:
-    if proba.ndim != 2:
-        return np.empty((0, 0), dtype="int32")
-    kk = max(1, min(int(k), int(proba.shape[1])))
-    topk = np.argpartition(proba, -kk, axis=1)[:, -kk:]
-    topk_scores = np.take_along_axis(proba, topk, axis=1)
-    order = np.argsort(-topk_scores, axis=1)
-    return np.take_along_axis(topk, order, axis=1)
+    return topk_indices_2d(proba, k)
 
 
 def ranking_metrics_from_proba(
@@ -29,7 +51,7 @@ def ranking_metrics_from_proba(
         }
 
     y_true = y_true.astype(int).reshape(-1)
-    topk = _topk_indices(np.asarray(proba), k)
+    topk = topk_indices_2d(np.asarray(proba), k)
     if topk.shape[0] != y_true.shape[0]:
         return {
             "ndcg_at_k": float("nan"),

@@ -4,6 +4,7 @@ spotify/__init__.py
 spotify/__main__.py
 spotify/analytics_db.py
 spotify/artifact_cleanup.py
+spotify/aws_athena.py
 spotify/backtesting.py
 spotify/benchmarks.py
 spotify/causal_friction.py
@@ -43,6 +44,7 @@ spotify/reporting.py
 spotify/research_artifacts.py
 spotify/retrieval.py
 spotify/robustness.py
+spotify/run_artifacts.py
 spotify/runtime.py
 spotify/safe_policy.py
 spotify/serving.py
@@ -50,6 +52,7 @@ spotify/session_knn.py
 spotify/storage_report.py
 spotify/stress_test.py
 spotify/taste_os_demo.py
+spotify/taste_os_service.py
 spotify/taste_os_showcase.py
 spotify/tracking.py
 spotify/training.py
@@ -62,6 +65,7 @@ spotify_extended_pipeline.egg-info/entry_points.txt
 spotify_extended_pipeline.egg-info/requires.txt
 spotify_extended_pipeline.egg-info/top_level.txt
 tests/test_artifact_cleanup.py
+tests/test_athena_export.py
 tests/test_audio_features.py
 tests/test_benchmarks_features.py
 tests/test_champion_alias.py
@@ -92,6 +96,7 @@ tests/test_profiles_and_ensemble.py
 tests/test_public_catalog.py
 tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
+tests/test_public_insights_creator_brief.py
 tests/test_ranking_metrics.py
 tests/test_recommender_safety_platform.py
 tests/test_regression_alert.py
@@ -102,6 +107,8 @@ tests/test_serving_analytics_and_session_knn.py
 tests/test_storage_report.py
 tests/test_taste_os_demo.py
 tests/test_taste_os_demo_cli_smoke.py
+tests/test_taste_os_service.py
+tests/test_taste_os_service_cli_smoke.py
 tests/test_taste_os_showcase.py
 tests/test_taste_os_showcase_cli_smoke.py
 tests/test_tracking.py

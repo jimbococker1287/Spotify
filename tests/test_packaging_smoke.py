@@ -14,3 +14,4 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-control-room"] == "spotify.control_room:main"
     assert scripts["spotify-taste-os-demo"] == "spotify.taste_os_demo:main"
     assert scripts["spotify-taste-os-showcase"] == "spotify.taste_os_showcase:main"
+    assert scripts["spotify-taste-os-serve"] == "spotify.taste_os_service:main"

@@ -1228,56 +1228,66 @@ def _build_ops_trends(report: dict[str, object], history_df: pd.DataFrame) -> di
 
     frame = _snapshot_sort_frame(history_df)
     current_run_id = str((report.get("latest_run", {}) if isinstance(report.get("latest_run", {}), dict) else {}).get("run_id", ""))
-    current_row = frame[frame["run_id"].astype(str) == current_run_id].head(1)
-    previous_rows = frame[frame["run_id"].astype(str) != current_run_id].head(1)
+    run_ids = frame.get("run_id", pd.Series(dtype="object")).fillna("").astype(str)
+    current_mask = run_ids == current_run_id
+    current_records = list(
+        frame.loc[current_mask, ["run_id", "run_timestamp", "profile", "promotion_status", "best_model_test_top1", "robustness_gap", "target_drift_jsd", "stress_skip_risk", "test_selective_risk"]]
+        .head(1)
+        .itertuples(index=False, name=None)
+    )
+    previous_records = list(
+        frame.loc[~current_mask, ["run_id", "run_timestamp", "profile", "promotion_status", "best_model_test_top1", "robustness_gap", "target_drift_jsd", "stress_skip_risk", "test_selective_risk"]]
+        .head(1)
+        .itertuples(index=False, name=None)
+    )
     recent_window = frame.head(min(5, len(frame.index))).copy()
 
     summary: list[str] = []
     metric_deltas: list[dict[str, object]] = []
     previous_snapshot: dict[str, object] = {}
-    if not previous_rows.empty:
-        previous = previous_rows.iloc[0].to_dict()
+    if previous_records:
+        previous = previous_records[0]
         previous_snapshot = {
-            "run_id": str(previous.get("run_id", "")),
-            "run_timestamp": str(previous.get("run_timestamp", "")),
-            "profile": str(previous.get("profile", "")),
-            "promotion_status": str(previous.get("promotion_status", "")),
+            "run_id": str(previous[0]),
+            "run_timestamp": str(previous[1]),
+            "profile": str(previous[2]),
+            "promotion_status": str(previous[3]),
         }
-        current = current_row.iloc[0].to_dict() if not current_row.empty else {}
+        current = current_records[0] if current_records else ("", "", "", "", None, None, None, None, None)
         metric_deltas = [
             _metric_delta_row(
                 key="best_model_test_top1",
                 label="Best model test top1",
-                current=current.get("best_model_test_top1"),
-                baseline=previous.get("best_model_test_top1"),
+                current=current[4],
+                baseline=previous[4],
                 higher_is_better=True,
             ),
             _metric_delta_row(
                 key="robustness_gap",
                 label="Worst robustness gap",
-                current=current.get("robustness_gap"),
-                baseline=previous.get("robustness_gap"),
+                current=current[5],
+                baseline=previous[5],
                 higher_is_better=False,
             ),
             _metric_delta_row(
                 key="target_drift_jsd",
                 label="Target drift JSD",
-                current=current.get("target_drift_jsd"),
-                baseline=previous.get("target_drift_jsd"),
+                current=current[6],
+                baseline=previous[6],
                 higher_is_better=False,
             ),
             _metric_delta_row(
                 key="stress_skip_risk",
                 label="Worst stress skip risk",
-                current=current.get("stress_skip_risk"),
-                baseline=previous.get("stress_skip_risk"),
+                current=current[7],
+                baseline=previous[7],
                 higher_is_better=False,
             ),
             _metric_delta_row(
                 key="selective_risk",
                 label="Selective risk",
-                current=current.get("test_selective_risk"),
-                baseline=previous.get("test_selective_risk"),
+                current=current[8],
+                baseline=previous[8],
                 higher_is_better=False,
             ),
         ]
@@ -1428,15 +1438,25 @@ def _write_weekly_ops_summary(
         "summary": summary_lines,
         "window_runs": [
             {
-                "run_id": str(row.get("run_id", "")),
-                "run_timestamp": str(row.get("run_timestamp", "")),
-                "promotion_status": str(row.get("promotion_status", "")),
-                "best_model_name": str(row.get("best_model_name", "")),
-                "best_model_test_top1": _safe_float(row.get("best_model_test_top1")),
-                "robustness_gap": _safe_float(row.get("robustness_gap")),
-                "stress_skip_risk": _safe_float(row.get("stress_skip_risk")),
+                "run_id": str(run_id),
+                "run_timestamp": str(run_timestamp),
+                "promotion_status": str(promotion_status),
+                "best_model_name": str(best_model_name),
+                "best_model_test_top1": _safe_float(best_model_test_top1),
+                "robustness_gap": _safe_float(robustness_gap),
+                "stress_skip_risk": _safe_float(stress_skip_risk),
             }
-            for row in window_frame.to_dict(orient="records")
+            for run_id, run_timestamp, promotion_status, best_model_name, best_model_test_top1, robustness_gap, stress_skip_risk in window_frame.reindex(
+                columns=[
+                    "run_id",
+                    "run_timestamp",
+                    "promotion_status",
+                    "best_model_name",
+                    "best_model_test_top1",
+                    "robustness_gap",
+                    "stress_skip_risk",
+                ]
+            ).itertuples(index=False, name=None)
         ],
     }
 
