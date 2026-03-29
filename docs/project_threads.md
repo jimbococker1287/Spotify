@@ -56,9 +56,11 @@ This is the reusable infrastructure thread. Its job is to turn Spotify-specific 
 Current anchors:
 
 - Generic utilities in `spotify/recommender_safety.py`
+- Curated platform surface in `spotify/safety_platform.py`
 - Spotify integrations in `spotify/backtesting.py`, `spotify/drift.py`, `spotify/governance.py`, and `spotify/evaluation.py`
 - Focused verification in `tests/test_recommender_safety_platform.py`
 - Product framing in `README.md`
+- Reuse framing in `docs/recommender_safety_platform.md`
 
 Expanded scope:
 
@@ -66,11 +68,14 @@ Expanded scope:
 - Treat drift analysis as a reusable diagnostics layer over context features, targets, and custom segment extractors.
 - Treat promotion gating as a policy engine that can enforce utility thresholds and risk caps together.
 - Treat conformal abstention as a serving contract: models can refuse unsafe predictions instead of always emitting a top-1 guess.
+- Make the minimum public API explicit so another project can discover the reusable surface without reading the Spotify wrappers first.
+- Keep the Spotify modules as adapters that translate repo-specific data structures and report shapes into the generic safety layer.
 
 What success looks like:
 
 - Another recommender project could import this layer without depending on Spotify-specific training code.
 - Safety reports become comparable across model families, retrieval stacks, and future product surfaces.
+- A new reader can point to one module and one doc that define the reusable platform contract.
 
 ## 3. Control Room
 
