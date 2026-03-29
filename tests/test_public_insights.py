@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import pandas as pd
 
 from spotify.public_insights import (
+    _build_client,
     _cross_media_graph_payload,
     _cross_media_history_frame,
     _playlist_diff,
@@ -199,3 +201,13 @@ def test_cross_media_graph_payload_summarizes_mixed_sessions_and_transitions() -
     assert payload["edges"][0]["source_name"] == "Artist A"
     assert payload["edges"][0]["target_name"] == "Deep Cuts"
     assert payload["edges"][0]["cross_media"] is True
+
+
+def test_build_client_allows_offline_creator_label_intelligence_without_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+
+    client = _build_client(argparse.Namespace(spotify_market="US", command="creator-label-intelligence"))
+
+    assert client.mode == "offline_local_only"
+    assert client.search_artist("Artist A") is None

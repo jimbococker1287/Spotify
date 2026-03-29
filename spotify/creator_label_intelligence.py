@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from functools import lru_cache
 import logging
 from typing import Any
 
@@ -11,6 +12,17 @@ from sklearn.cluster import KMeans
 from .data import engineer_features
 from .multimodal import MultimodalArtistSpace, compute_multimodal_artist_space
 from .public_catalog import SpotifyArtistMetadata, SpotifyPublicCatalogClient
+
+_TRANSITION_COLUMNS = [
+    "source_label",
+    "target_label",
+    "transition_count",
+    "source_out_share",
+    "target_in_share",
+    "source_artist",
+    "target_artist",
+]
+_NEIGHBOR_ARGPARTITION_MIN_SIZE = 192
 
 
 def _normalize_name(value: str) -> str:
@@ -115,20 +127,14 @@ def _local_artist_stats(history_df: pd.DataFrame, *, artist_labels: list[str]) -
     return counts
 
 
+def _empty_transition_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=_TRANSITION_COLUMNS)
+
+
 def _transition_frame(history_df: pd.DataFrame, *, artist_labels: list[str]) -> pd.DataFrame:
     required = {"artist_label", "session_id", "ts"}
     if history_df.empty or not required.issubset(history_df.columns):
-        return pd.DataFrame(
-            columns=[
-                "source_label",
-                "target_label",
-                "transition_count",
-                "source_out_share",
-                "target_in_share",
-                "source_artist",
-                "target_artist",
-            ]
-        )
+        return _empty_transition_frame()
     ordered = history_df.sort_values("ts").reset_index(drop=True)
     current = ordered["artist_label"].to_numpy(dtype="int32", copy=False)
     session_ids = ordered["session_id"].to_numpy(dtype="int64", copy=False)
@@ -136,17 +142,7 @@ def _transition_frame(history_df: pd.DataFrame, *, artist_labels: list[str]) -> 
     prev_items = current[:-1][valid]
     next_items = current[1:][valid]
     if prev_items.size == 0:
-        return pd.DataFrame(
-            columns=[
-                "source_label",
-                "target_label",
-                "transition_count",
-                "source_out_share",
-                "target_in_share",
-                "source_artist",
-                "target_artist",
-            ]
-        )
+        return _empty_transition_frame()
 
     frame = pd.DataFrame({"source_label": prev_items, "target_label": next_items})
     grouped = (
@@ -176,23 +172,120 @@ def _top_similarity_neighbors(
         return {artist_id: [] for artist_id in artist_ids}
     similarities = embeddings @ embeddings.T
     results: dict[int, list[tuple[int, float]]] = {}
+    max_neighbors = max(1, int(top_k))
     for artist_id in artist_ids:
         if artist_id < 0 or artist_id >= similarities.shape[0]:
             results[artist_id] = []
             continue
         row = similarities[artist_id].copy()
-        row[artist_id] = -1.0
-        neighbor_ids = np.argsort(row)[::-1]
+        row[artist_id] = float("-inf")
+        candidate_count = min(max_neighbors, max(0, row.size - 1))
+        if candidate_count <= 0:
+            results[artist_id] = []
+            continue
+        if candidate_count >= row.size - 1 or row.size <= _NEIGHBOR_ARGPARTITION_MIN_SIZE:
+            neighbor_ids = np.argsort(row)[::-1]
+        else:
+            top_idx = np.argpartition(row, -candidate_count)[-candidate_count:]
+            neighbor_ids = top_idx[np.argsort(row[top_idx])[::-1]]
         pairs: list[tuple[int, float]] = []
-        for neighbor_id in neighbor_ids.tolist():
+        for neighbor_id in np.asarray(neighbor_ids, dtype="int32").tolist():
             score = float(row[int(neighbor_id)])
             if score <= 0.0:
                 continue
             pairs.append((int(neighbor_id), score))
-            if len(pairs) >= max(1, int(top_k)):
+            if len(pairs) >= max_neighbors:
                 break
         results[artist_id] = pairs
     return results
+
+
+def _seed_transition_helpers(
+    transition_rows: list[tuple[object, ...]],
+    *,
+    seed_local_ids: list[int],
+    neighbor_k: int,
+) -> tuple[dict[int, list[int]], dict[int, list[int]], dict[tuple[int, int], float]]:
+    seed_set = {int(seed_id) for seed_id in seed_local_ids}
+    limit = max(1, int(neighbor_k))
+    outgoing: dict[int, list[int]] = defaultdict(list)
+    incoming: dict[int, list[int]] = defaultdict(list)
+    transition_share_lookup: dict[tuple[int, int], float] = {}
+
+    for row in transition_rows:
+        source_label = int(row[0])
+        target_label = int(row[1])
+        if len(row) >= 8:
+            source_out_share = float(row[5])
+        else:
+            source_out_share = float(row[3])
+        transition_share_lookup[(source_label, target_label)] = source_out_share
+        if source_label in seed_set and len(outgoing[source_label]) < limit:
+            outgoing[source_label].append(target_label)
+        if target_label in seed_set and len(incoming[target_label]) < limit:
+            incoming[target_label].append(source_label)
+
+    return outgoing, incoming, transition_share_lookup
+
+
+def _opportunity_band(score: float) -> str:
+    normalized = _safe_float(score)
+    if normalized >= 0.65:
+        return "priority_now"
+    if normalized >= 0.50:
+        return "watchlist"
+    return "explore"
+
+
+def _primary_opportunity_driver(
+    *,
+    adjacency_score: float,
+    migration_score: float,
+    freshness_score: float,
+    whitespace_score: float,
+    local_gap: float,
+    popularity_tail: float,
+) -> str:
+    weighted_scores = {
+        "seed_adjacency": 0.35 * _safe_float(adjacency_score),
+        "fan_migration": 0.20 * _safe_float(migration_score),
+        "recent_release": 0.20 * _safe_float(freshness_score),
+        "release_whitespace": 0.15 * _safe_float(whitespace_score),
+        "long_tail_fit": 0.10 * min(_safe_float(local_gap), _safe_float(popularity_tail)),
+    }
+    return max(weighted_scores, key=weighted_scores.get)
+
+
+def _opportunity_why_now(
+    *,
+    artist_name: str,
+    scene_name: str,
+    connected_seed_artists: list[str],
+    primary_driver: str,
+    rationale: list[str],
+    dominant_release_labels: list[str],
+    days_since_latest_release: int | None,
+) -> str:
+    seed_text = ", ".join(connected_seed_artists[:2]) if connected_seed_artists else "current seeds"
+    label_text = ", ".join(str(item) for item in dominant_release_labels[:2] if str(item).strip())
+    release_text = (
+        f"latest release `{days_since_latest_release}` day(s) ago"
+        if days_since_latest_release is not None
+        else "release cadence still unresolved"
+    )
+
+    if primary_driver == "seed_adjacency":
+        return f"{artist_name} is the cleanest adjacency bridge out of {seed_text} inside `{scene_name}`."
+    if primary_driver == "fan_migration":
+        return f"Audience movement already points toward {artist_name}, making `{scene_name}` the strongest migration lane."
+    if primary_driver == "recent_release":
+        return f"{artist_name} has active release momentum in `{scene_name}` with {release_text}."
+    if primary_driver == "release_whitespace":
+        label_suffix = f" across `{label_text}`" if label_text else ""
+        return f"{artist_name} shows whitespace in `{scene_name}`{label_suffix}, which makes the lane feel under-served."
+    if rationale:
+        return f"{artist_name} combines {'; '.join(rationale[:2])} in `{scene_name}`."
+    return f"{artist_name} is the strongest current explore candidate in `{scene_name}`."
 
 
 def _genre_overlap(left: list[str], right: list[str]) -> float:
@@ -217,13 +310,27 @@ def _median_gap_days(release_dates: list[pd.Timestamp]) -> float | None:
     return float(np.median(np.asarray(deltas, dtype="float32")))
 
 
+@lru_cache(maxsize=4096)
 def _parse_release_date(raw_value: str, precision: str) -> pd.Timestamp | None:
     value = str(raw_value or "").strip()
     if not value:
         return None
-    if precision == "year":
+    precision_key = str(precision or "").strip()
+    try:
+        if precision_key == "year":
+            return pd.Timestamp(year=int(value), month=1, day=1, tz="UTC")
+        if precision_key == "month":
+            year_text, month_text = value.split("-", 1)
+            return pd.Timestamp(year=int(year_text), month=int(month_text), day=1, tz="UTC")
+        if precision_key in {"", "day"}:
+            year_text, month_text, day_text = value.split("-", 2)
+            return pd.Timestamp(year=int(year_text), month=int(month_text), day=int(day_text), tz="UTC")
+    except (TypeError, ValueError):
+        pass
+
+    if precision_key == "year":
         value = f"{value}-01-01"
-    elif precision == "month":
+    elif precision_key == "month":
         value = f"{value}-01"
     timestamp = pd.to_datetime(value, errors="coerce", utc=True)
     if pd.isna(timestamp):
@@ -364,8 +471,15 @@ def build_creator_label_intelligence(
     play_stats = _local_artist_stats(history_df, artist_labels=artist_labels)
     transitions = _transition_frame(history_df, artist_labels=artist_labels)
     local_name_to_id = {_normalize_name(name): idx for idx, name in enumerate(artist_labels)}
-    play_count_map = {int(row["artist_label"]): int(row["play_count"]) for row in play_stats.to_dict(orient="records")}
-    play_share_map = {int(row["artist_label"]): float(row["play_share"]) for row in play_stats.to_dict(orient="records")}
+    play_count_map = {
+        int(artist_label): int(play_count)
+        for artist_label, play_count in zip(play_stats["artist_label"], play_stats["play_count"])
+    }
+    play_share_map = {
+        int(artist_label): float(play_share)
+        for artist_label, play_share in zip(play_stats["artist_label"], play_stats["play_share"])
+    }
+    transition_rows = list(transitions[_TRANSITION_COLUMNS].itertuples(index=False, name=None))
 
     seed_local_ids = [local_name_to_id[key] for key in [_normalize_name(item) for item in seed_artists] if key in local_name_to_id]
     if not seed_local_ids and not play_stats.empty:
@@ -378,12 +492,16 @@ def build_creator_label_intelligence(
     for pairs in neighbor_map.values():
         for neighbor_id, _score in pairs:
             candidate_local_ids.add(int(neighbor_id))
-    if not transitions.empty and seed_local_ids:
-        for seed_id in seed_local_ids:
-            seed_routes = transitions[transitions["source_label"] == int(seed_id)].head(max(1, int(neighbor_k)))
-            candidate_local_ids.update(seed_routes["target_label"].astype(int).tolist())
-            inbound_routes = transitions[transitions["target_label"] == int(seed_id)].head(max(1, int(neighbor_k)))
-            candidate_local_ids.update(inbound_routes["source_label"].astype(int).tolist())
+    outgoing_seed_targets, incoming_seed_sources, transition_share_lookup = _seed_transition_helpers(
+        transition_rows,
+        seed_local_ids=seed_local_ids,
+        neighbor_k=max(1, int(neighbor_k)),
+    )
+    for seed_id in seed_local_ids:
+        candidate_local_ids.update(outgoing_seed_targets.get(int(seed_id), []))
+        candidate_local_ids.update(incoming_seed_sources.get(int(seed_id), []))
+    candidate_local_id_list = sorted(candidate_local_ids)
+    candidate_local_id_set = set(candidate_local_id_list)
 
     metadata_lookup: dict[str, SpotifyArtistMetadata] = {}
     spotify_id_lookup: dict[str, SpotifyArtistMetadata] = {}
@@ -405,13 +523,13 @@ def build_creator_label_intelligence(
             continue
         seed_metadata.append(register_metadata(metadata))
 
-    for local_id in sorted(candidate_local_ids):
+    for local_id in candidate_local_id_list:
         artist_name = artist_labels[int(local_id)]
         metadata = client.search_artist(artist_name)
         if metadata is not None:
             register_metadata(metadata)
 
-    scene_map = _cluster_local_scenes(space=space, local_artist_ids=sorted(candidate_local_ids), scene_count=scene_count)
+    scene_map = _cluster_local_scenes(space=space, local_artist_ids=candidate_local_id_list, scene_count=scene_count)
 
     for metadata in seed_metadata:
         related_artists = client.get_related_artists(metadata.spotify_id, limit=max(1, int(related_limit)))
@@ -455,6 +573,7 @@ def build_creator_label_intelligence(
     edge_rows: list[dict[str, object]] = []
     adjacency_scores_by_artist: dict[str, list[float]] = defaultdict(list)
     migration_scores_by_artist: dict[str, list[float]] = defaultdict(list)
+    connected_seed_sources: dict[str, list[str]] = defaultdict(list)
 
     for seed_id in seed_local_ids:
         source_name = artist_labels[int(seed_id)]
@@ -463,13 +582,7 @@ def build_creator_label_intelligence(
         for target_id, similarity in neighbor_map.get(int(seed_id), []):
             target_name = artist_labels[int(target_id)]
             target_metadata = metadata_lookup.get(_normalize_name(target_name))
-            transition_share = 0.0
-            if not transitions.empty:
-                route = transitions[
-                    (transitions["source_label"] == int(seed_id)) & (transitions["target_label"] == int(target_id))
-                ].head(1)
-                if not route.empty:
-                    transition_share = _safe_float(route.iloc[0]["source_out_share"])
+            transition_share = _safe_float(transition_share_lookup.get((int(seed_id), int(target_id))), default=0.0)
             public_related = float(
                 1.0 if target_metadata is not None and target_metadata.spotify_id in source_related_ids else 0.0
             )
@@ -487,24 +600,24 @@ def build_creator_label_intelligence(
             adjacency_rows.append(row)
             edge_rows.append(row)
             adjacency_scores_by_artist[target_name].append(float(hybrid_score))
+            connected_seed_sources[target_name].append(source_name)
 
-    transition_rows = transitions[
-        transitions["source_label"].isin(sorted(candidate_local_ids)) & transitions["target_label"].isin(sorted(candidate_local_ids))
-    ].copy()
     fan_migration_rows: list[dict[str, object]] = []
-    for row in transition_rows.to_dict(orient="records"):
-        source_label = int(row["source_label"])
-        target_label = int(row["target_label"])
-        source_name = artist_labels[source_label]
-        target_name = artist_labels[target_label]
+    for row in transition_rows:
+        source_label = int(row[0])
+        target_label = int(row[1])
+        if source_label not in candidate_local_id_set or target_label not in candidate_local_id_set:
+            continue
+        source_name = str(row[5])
+        target_name = str(row[6])
         migration_row = {
             "source_artist": source_name,
             "target_artist": target_name,
             "source_scene_id": scene_map.get(source_label),
             "target_scene_id": scene_map.get(target_label),
-            "transition_count": int(row["transition_count"]),
-            "source_out_share": round(_safe_float(row["source_out_share"]), 4),
-            "target_in_share": round(_safe_float(row["target_in_share"]), 4),
+            "transition_count": int(row[2]),
+            "source_out_share": round(_safe_float(row[3]), 4),
+            "target_in_share": round(_safe_float(row[4]), 4),
         }
         fan_migration_rows.append(migration_row)
         edge_rows.append(
@@ -527,10 +640,11 @@ def build_creator_label_intelligence(
 
     seed_name_set = {_normalize_name(item) for item in seed_artists}
     seed_spotify_ids = {item.spotify_id for item in seed_metadata}
-    candidate_node_names = {artist_labels[int(local_id)] for local_id in candidate_local_ids}
+    candidate_node_names = {artist_labels[int(local_id)] for local_id in candidate_local_id_list}
     candidate_node_names.update(metadata.name for metadata in metadata_lookup.values())
 
     nodes: list[dict[str, object]] = []
+    scene_nodes_by_id: dict[int, list[dict[str, object]]] = defaultdict(list)
     for artist_name in sorted(candidate_node_names):
         norm_name = _normalize_name(artist_name)
         local_id = local_name_to_id.get(norm_name)
@@ -568,14 +682,18 @@ def build_creator_label_intelligence(
             "release_whitespace_score": release_profile.get("release_whitespace_score", 0.0),
             "seed_adjacency_score": round(max(adjacency_scores_by_artist.get(artist_name, [0.0])), 4),
             "fan_migration_score": round(max(migration_scores_by_artist.get(artist_name, [0.0])), 4),
-            "connected_seed_artists": sorted(set(external_seed_names.get(spotify_id or "", []))),
+            "connected_seed_artists": sorted(
+                set(external_seed_names.get(spotify_id or "", []) + connected_seed_sources.get(artist_name, []))
+            ),
         }
         nodes.append(node)
+        if scene_id is not None:
+            scene_nodes_by_id[int(scene_id)].append(node)
 
     scene_rows: list[dict[str, object]] = []
     scene_names: dict[int, str] = {}
-    for scene_id in sorted({row["scene_id"] for row in nodes if row["scene_id"] is not None}):
-        scene_nodes = [row for row in nodes if row["scene_id"] == scene_id]
+    for scene_id in sorted(scene_nodes_by_id):
+        scene_nodes = scene_nodes_by_id[scene_id]
         genre_counter: Counter[str] = Counter()
         label_counter: Counter[str] = Counter()
         for row in scene_nodes:
@@ -611,6 +729,10 @@ def build_creator_label_intelligence(
     for row in nodes:
         scene_id = row.get("scene_id")
         row["scene_name"] = scene_names.get(int(scene_id), "unmapped") if scene_id is not None else "unmapped"
+    scene_share_lookup = {
+        int(row["scene_id"]): _safe_float(row.get("scene_local_play_share"))
+        for row in scene_rows
+    }
 
     release_whitespace_rows = [
         {
@@ -671,23 +793,57 @@ def build_creator_label_intelligence(
             rationale.append("under-penetrated long-tail fit")
         if not rationale:
             continue
+        primary_driver = _primary_opportunity_driver(
+            adjacency_score=adjacency_score,
+            migration_score=migration_score,
+            freshness_score=freshness_score,
+            whitespace_score=whitespace_score,
+            local_gap=local_gap,
+            popularity_tail=popularity_tail,
+        )
+        connected_seed_artists = [
+            str(item)
+            for item in row.get("connected_seed_artists", [])
+            if str(item).strip()
+        ]
+        opportunity_band = _opportunity_band(opportunity_score)
         opportunity_rows.append(
             {
                 "artist_name": row["artist_name"],
                 "scene_id": row["scene_id"],
                 "scene_name": row["scene_name"],
+                "scene_local_play_share": round(scene_share_lookup.get(int(row["scene_id"]), 0.0), 6)
+                if row.get("scene_id") is not None
+                else 0.0,
                 "opportunity_score": round(float(opportunity_score), 4),
+                "opportunity_band": opportunity_band,
+                "primary_driver": primary_driver,
                 "seed_adjacency_score": round(adjacency_score, 4),
                 "fan_migration_score": round(migration_score, 4),
                 "freshness_score": round(float(freshness_score), 4),
                 "release_whitespace_score": round(_safe_float(row.get("release_whitespace_score")), 4),
                 "local_play_share": round(local_play_share, 6),
                 "public_popularity": popularity,
+                "days_since_latest_release": row.get("days_since_latest_release"),
                 "dominant_release_labels": row["dominant_release_labels"],
+                "connected_seed_artists": connected_seed_artists,
                 "rationale": rationale,
+                "why_now": _opportunity_why_now(
+                    artist_name=str(row["artist_name"]),
+                    scene_name=str(row["scene_name"]),
+                    connected_seed_artists=connected_seed_artists,
+                    primary_driver=primary_driver,
+                    rationale=rationale,
+                    dominant_release_labels=[
+                        str(item) for item in row.get("dominant_release_labels", []) if str(item).strip()
+                    ],
+                    days_since_latest_release=_safe_int(row.get("days_since_latest_release")),
+                ),
             }
         )
     opportunity_rows.sort(key=lambda row: row["opportunity_score"], reverse=True)
+    for rank, row in enumerate(opportunity_rows, start=1):
+        row["opportunity_rank"] = int(rank)
 
     adjacency_rows.sort(key=lambda row: row["hybrid_score"], reverse=True)
     edge_rows.sort(

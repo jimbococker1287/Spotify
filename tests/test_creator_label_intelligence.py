@@ -4,8 +4,14 @@ import logging
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from spotify.creator_label_intelligence import build_creator_label_intelligence, prepare_creator_intelligence_inputs
+from spotify.creator_label_intelligence import (
+    _seed_transition_helpers,
+    _transition_frame,
+    build_creator_label_intelligence,
+    prepare_creator_intelligence_inputs,
+)
 from spotify.multimodal import MultimodalArtistSpace
 from spotify.public_catalog import SpotifyArtistMetadata
 
@@ -258,3 +264,26 @@ def test_build_creator_label_intelligence_fuses_adjacency_scenes_and_opportuniti
         row["artist_name"] == "Emerging E" and "Indie Arc" in row["dominant_release_labels"]
         for row in payload["nodes"]
     )
+    assert payload["opportunities"][0]["opportunity_rank"] == 1
+    assert all(row["opportunity_band"] in {"priority_now", "watchlist", "explore"} for row in payload["opportunities"][:3])
+    assert all(row["primary_driver"] for row in payload["opportunities"][:3])
+    assert all(row["why_now"] for row in payload["opportunities"][:3])
+    emerging_row = next(row for row in payload["opportunities"] if row["artist_name"] == "Emerging E")
+    assert isinstance(emerging_row["connected_seed_artists"], list)
+    assert emerging_row["connected_seed_artists"]
+    assert emerging_row["why_now"]
+
+
+def test_seed_transition_helpers_preserve_top_routes_and_shares() -> None:
+    transitions = _transition_frame(_history_df(), artist_labels=_space().artist_labels)
+
+    outgoing, incoming, share_lookup = _seed_transition_helpers(
+        list(transitions.itertuples(index=False, name=None)),
+        seed_local_ids=[0, 1],
+        neighbor_k=1,
+    )
+
+    assert outgoing == {0: [1], 1: [3]}
+    assert incoming == {1: [0]}
+    assert share_lookup[(0, 1)] == pytest.approx(2.0 / 3.0)
+    assert share_lookup[(1, 3)] == pytest.approx(2.0 / 3.0)

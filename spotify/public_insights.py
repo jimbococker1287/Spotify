@@ -15,7 +15,30 @@ import pandas as pd
 from .creator_label_intelligence import build_creator_label_intelligence, prepare_creator_intelligence_inputs
 from .data import load_streaming_history
 from .env import load_local_env
-from .public_catalog import SpotifyPublicCatalogClient, SpotifyPublicCatalogError, parse_spotify_id
+from .public_catalog import SpotifyArtistMetadata, SpotifyPublicCatalogClient, SpotifyPublicCatalogError, parse_spotify_id
+
+
+class _OfflineSpotifyPublicCatalogClient:
+    mode = "offline_local_only"
+
+    def search_artist(self, artist_name: str) -> SpotifyArtistMetadata | None:
+        return None
+
+    def get_related_artists(self, artist_id_or_uri: str, *, limit: int = 10) -> list[SpotifyArtistMetadata]:
+        return []
+
+    def get_artist_albums(
+        self,
+        artist_id_or_uri: str,
+        *,
+        include_groups: str = "album,single",
+        limit: int = 50,
+        market: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def get_album(self, album_id_or_uri: str, *, market: str | None = None) -> dict[str, Any]:
+        return {"id": album_id_or_uri, "label": ""}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1000,9 +1023,11 @@ def _release_state_rows(previous: dict[str, Any] | None) -> set[str]:
     return {str(item).strip() for item in rows if str(item).strip()}
 
 
-def _build_client(args: argparse.Namespace) -> SpotifyPublicCatalogClient:
+def _build_client(args: argparse.Namespace) -> SpotifyPublicCatalogClient | _OfflineSpotifyPublicCatalogClient:
     client = SpotifyPublicCatalogClient.from_env(market=str(args.spotify_market or "US"))
     if client is None:
+        if str(getattr(args, "command", "")).strip() == "creator-label-intelligence":
+            return _OfflineSpotifyPublicCatalogClient()  # type: ignore[return-value]
         raise RuntimeError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are required for Spotify public metadata tools.")
     return client
 
@@ -2171,6 +2196,253 @@ def _handle_media_explorer(args: argparse.Namespace, client: SpotifyPublicCatalo
     return 0
 
 
+def _creator_brief_scene_comparison(payload: dict[str, Any]) -> list[dict[str, object]]:
+    scenes = payload.get("scenes", [])
+    scenes = scenes if isinstance(scenes, list) else []
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+
+    top_opportunity_by_scene: dict[int, dict[str, object]] = {}
+    opportunity_count_by_scene: Counter[int] = Counter()
+    for row in opportunities:
+        if not isinstance(row, dict):
+            continue
+        scene_id = row.get("scene_id")
+        if not isinstance(scene_id, int):
+            continue
+        opportunity_count_by_scene[int(scene_id)] += 1
+        current_best = top_opportunity_by_scene.get(int(scene_id))
+        if current_best is None or float(row.get("opportunity_score", 0.0) or 0.0) > float(
+            current_best.get("opportunity_score", 0.0) or 0.0
+        ):
+            top_opportunity_by_scene[int(scene_id)] = row
+
+    rows: list[dict[str, object]] = []
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = int(scene.get("scene_id", -1))
+        top_opportunity = top_opportunity_by_scene.get(scene_id, {})
+        rows.append(
+            {
+                "scene_id": scene_id,
+                "scene_name": str(scene.get("scene_name", "")),
+                "scene_local_play_share": float(scene.get("scene_local_play_share", 0.0) or 0.0),
+                "seed_count": int(scene.get("seed_count", 0) or 0),
+                "artist_count": int(scene.get("artist_count", 0) or 0),
+                "opportunity_count": int(opportunity_count_by_scene.get(scene_id, 0)),
+                "top_opportunity_artist": str(top_opportunity.get("artist_name", "")),
+                "top_opportunity_score": float(top_opportunity.get("opportunity_score", 0.0) or 0.0),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            float(row["scene_local_play_share"]),
+            int(row["opportunity_count"]),
+            float(row["top_opportunity_score"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _creator_brief_seed_comparison(payload: dict[str, Any]) -> list[dict[str, object]]:
+    adjacency = payload.get("artist_adjacency", [])
+    adjacency = adjacency if isinstance(adjacency, list) else []
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+
+    opportunity_by_artist = {
+        str(row.get("artist_name", "")): float(row.get("opportunity_score", 0.0) or 0.0)
+        for row in opportunities
+        if isinstance(row, dict)
+    }
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in adjacency:
+        if not isinstance(row, dict):
+            continue
+        source_artist = str(row.get("source_artist", "")).strip()
+        if not source_artist:
+            continue
+        grouped.setdefault(source_artist, []).append(row)
+
+    rows: list[dict[str, object]] = []
+    for source_artist, source_rows in grouped.items():
+        ordered = sorted(
+            source_rows,
+            key=lambda row: (
+                float(row.get("hybrid_score", 0.0) or 0.0),
+                float(row.get("transition_share", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        best = ordered[0]
+        best_target = str(best.get("target_artist", ""))
+        rows.append(
+            {
+                "seed_artist": source_artist,
+                "top_adjacent_artist": best_target,
+                "top_hybrid_score": float(best.get("hybrid_score", 0.0) or 0.0),
+                "top_transition_share": float(best.get("transition_share", 0.0) or 0.0),
+                "top_target_opportunity_score": float(opportunity_by_artist.get(best_target, 0.0)),
+                "adjacent_artist_count": int(len(ordered)),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            float(row["top_hybrid_score"]),
+            float(row["top_target_opportunity_score"]),
+            int(row["adjacent_artist_count"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
+    summary = payload.get("graph_summary", {})
+    summary = summary if isinstance(summary, dict) else {}
+    scene_comparison = _creator_brief_scene_comparison(payload)
+    seed_comparison = _creator_brief_seed_comparison(payload)
+    release_whitespace = payload.get("release_whitespace", [])
+    release_whitespace = release_whitespace if isinstance(release_whitespace, list) else []
+    fan_migration = payload.get("fan_migration", [])
+    fan_migration = fan_migration if isinstance(fan_migration, list) else []
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+
+    lines = [
+        (
+            f"The graph covers `{summary.get('node_count', 0)}` artists across `{summary.get('scene_count', 0)}` scenes, "
+            f"with `{summary.get('opportunity_count', 0)}` ranked opportunity lanes."
+        )
+    ]
+    if scene_comparison:
+        top_scene = scene_comparison[0]
+        lines.append(
+            f"The strongest current scene is `{top_scene['scene_name']}` with local play share `{top_scene['scene_local_play_share']:.3f}` and `{top_scene['opportunity_count']}` mapped opportunities."
+        )
+    if opportunities:
+        top_opportunity = opportunities[0]
+        lines.append(
+            f"The clearest near-term opportunity is `{top_opportunity.get('artist_name', '')}` in `{top_opportunity.get('scene_name', 'unmapped')}` with score `{float(top_opportunity.get('opportunity_score', 0.0) or 0.0):.3f}`."
+        )
+    if release_whitespace:
+        top_whitespace = release_whitespace[0]
+        lines.append(
+            f"Release whitespace is strongest around `{top_whitespace.get('artist_name', '')}`, whose cadence score is `{float(top_whitespace.get('release_whitespace_score', 0.0) or 0.0):.3f}`."
+        )
+    elif seed_comparison:
+        top_seed = seed_comparison[0]
+        lines.append(
+            f"`{top_seed['seed_artist']}` is best positioned to bridge into `{top_seed['top_adjacent_artist']}` with hybrid score `{top_seed['top_hybrid_score']:.3f}`."
+        )
+    if fan_migration:
+        meaningful_migrations = [
+            row
+            for row in fan_migration
+            if isinstance(row, dict) and str(row.get("source_artist", "")) != str(row.get("target_artist", ""))
+        ]
+        top_migration = max(
+            meaningful_migrations or [row for row in fan_migration if isinstance(row, dict)],
+            key=lambda row: float(row.get("source_out_share", 0.0) or 0.0),
+            default={},
+        )
+        if top_migration:
+            lines.append(
+                f"The strongest fan-migration route is `{top_migration.get('source_artist', '')} -> {top_migration.get('target_artist', '')}` at share `{float(top_migration.get('source_out_share', 0.0) or 0.0):.3f}`."
+            )
+    return lines[:5]
+
+
+def _creator_brief_priority_shortlist(payload: dict[str, Any]) -> list[dict[str, object]]:
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+    rows: list[dict[str, object]] = []
+    for row in opportunities[:5]:
+        if not isinstance(row, dict):
+            continue
+        connected_seed_artists = row.get("connected_seed_artists", [])
+        connected_seed_artists = (
+            [str(item) for item in connected_seed_artists if str(item).strip()]
+            if isinstance(connected_seed_artists, list)
+            else []
+        )
+        dominant_release_labels = row.get("dominant_release_labels", [])
+        dominant_release_labels = (
+            [str(item) for item in dominant_release_labels if str(item).strip()]
+            if isinstance(dominant_release_labels, list)
+            else []
+        )
+        rows.append(
+            {
+                "opportunity_rank": int(row.get("opportunity_rank", len(rows) + 1) or len(rows) + 1),
+                "artist_name": str(row.get("artist_name", "")),
+                "scene_name": str(row.get("scene_name", "")),
+                "opportunity_score": float(row.get("opportunity_score", 0.0) or 0.0),
+                "opportunity_band": str(row.get("opportunity_band", "")),
+                "primary_driver": str(row.get("primary_driver", "")),
+                "connected_seed_artists": connected_seed_artists,
+                "dominant_release_labels": dominant_release_labels,
+                "why_now": str(row.get("why_now", "")),
+            }
+        )
+    return rows
+
+
+def _creator_brief_migration_watch(payload: dict[str, Any]) -> list[dict[str, object]]:
+    migration_rows = payload.get("fan_migration", [])
+    migration_rows = migration_rows if isinstance(migration_rows, list) else []
+    meaningful_rows = [
+        item
+        for item in migration_rows
+        if isinstance(item, dict) and str(item.get("source_artist", "")) != str(item.get("target_artist", ""))
+    ]
+    rows: list[dict[str, object]] = []
+    for row in sorted(
+        meaningful_rows or [item for item in migration_rows if isinstance(item, dict)],
+        key=lambda item: (float(item.get("source_out_share", 0.0) or 0.0), int(item.get("transition_count", 0) or 0)),
+        reverse=True,
+    )[:5]:
+        rows.append(
+            {
+                "source_artist": str(row.get("source_artist", "")),
+                "target_artist": str(row.get("target_artist", "")),
+                "source_scene_id": row.get("source_scene_id"),
+                "target_scene_id": row.get("target_scene_id"),
+                "transition_count": int(row.get("transition_count", 0) or 0),
+                "source_out_share": float(row.get("source_out_share", 0.0) or 0.0),
+                "target_in_share": float(row.get("target_in_share", 0.0) or 0.0),
+            }
+        )
+    return rows
+
+
+def _creator_brief_release_watch(payload: dict[str, Any]) -> list[dict[str, object]]:
+    whitespace_rows = payload.get("release_whitespace", [])
+    whitespace_rows = whitespace_rows if isinstance(whitespace_rows, list) else []
+    rows: list[dict[str, object]] = []
+    for row in whitespace_rows[:5]:
+        if not isinstance(row, dict):
+            continue
+        dominant_release_labels = row.get("dominant_release_labels", [])
+        dominant_release_labels = (
+            [str(item) for item in dominant_release_labels if str(item).strip()]
+            if isinstance(dominant_release_labels, list)
+            else []
+        )
+        rows.append(
+            {
+                "artist_name": str(row.get("artist_name", "")),
+                "scene_name": str(row.get("scene_name", "")),
+                "release_whitespace_score": float(row.get("release_whitespace_score", 0.0) or 0.0),
+                "days_since_latest_release": row.get("days_since_latest_release"),
+                "dominant_release_labels": dominant_release_labels,
+            }
+        )
+    return rows
+
+
 def _handle_creator_label_intelligence(
     args: argparse.Namespace,
     client: SpotifyPublicCatalogClient,
@@ -2212,6 +2484,7 @@ def _handle_creator_label_intelligence(
     payload = {
         "command": "creator-label-intelligence",
         "market": str(args.spotify_market).upper(),
+        "catalog_mode": str(getattr(client, "mode", "spotify_public_api")),
         "lookback_days": int(args.lookback_days),
         "related_limit": int(args.related_limit),
         "neighbor_k": int(args.neighbor_k),
@@ -2220,49 +2493,105 @@ def _handle_creator_label_intelligence(
         "multimodal_source": space_info,
         **intelligence_payload,
     }
+    payload["executive_summary"] = _creator_brief_executive_summary(payload)
+    payload["comparison_views"] = {
+        "scene_comparison": _creator_brief_scene_comparison(payload),
+        "seed_comparison": _creator_brief_seed_comparison(payload),
+    }
+    payload["brief_views"] = {
+        "priority_shortlist": _creator_brief_priority_shortlist(payload),
+        "migration_watch": _creator_brief_migration_watch(payload),
+        "release_watch": _creator_brief_release_watch(payload),
+    }
 
     markdown_lines = [
-        "# Creator And Label Intelligence Graph",
+        "# Creator And Label Intelligence Brief",
         "",
         f"- Market: `{payload['market']}`",
+        f"- Catalog mode: `{payload['catalog_mode']}`",
         f"- Seed artists: `{len(artists)}`",
         f"- Multimodal source: `{space_info['mode']}`",
         f"- Nodes: `{payload['graph_summary']['node_count']}`",
         f"- Scenes: `{payload['graph_summary']['scene_count']}`",
         f"- Opportunities: `{payload['graph_summary']['opportunity_count']}`",
         "",
-        "## Artist Adjacency",
+        "## Executive Summary",
         "",
     ]
+    for line in payload["executive_summary"]:
+        markdown_lines.append(f"- {line}")
+    markdown_lines.extend(
+        [
+            "",
+            "## Immediate Opportunity Shortlist",
+            "",
+        ]
+    )
+    for row in payload["brief_views"]["priority_shortlist"]:
+        seed_text = ", ".join(row["connected_seed_artists"][:2]) if row["connected_seed_artists"] else "current seeds"
+        label_text = ", ".join(row["dominant_release_labels"][:2]) if row["dominant_release_labels"] else "n/a"
+        markdown_lines.append(
+            f"- #{row['opportunity_rank']} {row['artist_name']} ({row['opportunity_band']}): score `{row['opportunity_score']:.3f}`, "
+            f"scene `{row['scene_name']}`, driver `{row['primary_driver']}`, seed bridges `{seed_text}`, labels `{label_text}`. {row['why_now']}"
+        )
+    markdown_lines.extend(
+        [
+            "",
+            "## Scene Comparison",
+            "",
+        ]
+    )
+    for row in payload["comparison_views"]["scene_comparison"][:10]:
+        markdown_lines.append(
+            f"- {row['scene_name']}: play_share `{row['scene_local_play_share']:.3f}`, artists `{row['artist_count']}`, "
+            f"seeds `{row['seed_count']}`, opportunities `{row['opportunity_count']}`, "
+            f"top opportunity `{row['top_opportunity_artist'] or 'n/a'}`"
+        )
+    markdown_lines.extend(["", "## Seed Comparison", ""])
+    for row in payload["comparison_views"]["seed_comparison"][:10]:
+        markdown_lines.append(
+            f"- {row['seed_artist']}: best bridge `{row['top_adjacent_artist']}` hybrid `{row['top_hybrid_score']:.3f}`, "
+            f"transition `{row['top_transition_share']:.3f}`, target opportunity `{row['top_target_opportunity_score']:.3f}`"
+        )
+    markdown_lines.extend(
+        [
+            "",
+            "## Audience Migration",
+            "",
+        ]
+    )
+    for row in payload["brief_views"]["migration_watch"]:
+        markdown_lines.append(
+            f"- {row['source_artist']} -> {row['target_artist']}: transition share `{row['source_out_share']:.3f}`, "
+            f"count `{row['transition_count']}`, target intake `{row['target_in_share']:.3f}`"
+        )
+    markdown_lines.extend(["", "## Release Whitespace", ""])
+    if payload["brief_views"]["release_watch"]:
+        for row in payload["brief_views"]["release_watch"]:
+            markdown_lines.append(
+                f"- {row['artist_name']}: whitespace `{row['release_whitespace_score']:.3f}`, scene `{row['scene_name']}`, "
+                f"days since latest `{row['days_since_latest_release']}`, labels `{', '.join(row['dominant_release_labels'][:3]) or 'n/a'}`"
+            )
+    else:
+        markdown_lines.append("- Public-catalog release metadata was unavailable for this run, so whitespace stayed empty.")
+    markdown_lines.extend(["", "## Opportunity Scoreboard", ""])
+    for row in payload["opportunities"][:10]:
+        markdown_lines.append(
+            f"- #{row['opportunity_rank']} {row['artist_name']}: score `{row['opportunity_score']}`, "
+            f"band `{row['opportunity_band']}`, reasons `{'; '.join(row['rationale'])}`, why now `{row['why_now']}`"
+        )
+    markdown_lines.extend(["", "## Supporting Graph", "", "### Artist Adjacency", ""])
     for row in payload["artist_adjacency"][:10]:
         markdown_lines.append(
             f"- {row['source_artist']} -> {row['target_artist']}: hybrid `{row['hybrid_score']}`, "
             f"similarity `{row['embedding_similarity']}`, transition `{row['transition_share']}`"
         )
-    markdown_lines.extend(["", "## Scene Map", ""])
+    markdown_lines.extend(["", "### Scene Map", ""])
     for row in payload["scenes"][:10]:
         markdown_lines.append(
             f"- {row['scene_name']}: artists `{row['artist_count']}`, seeds `{row['seed_count']}`, "
             f"genres `{', '.join(row['dominant_genres'][:3]) or 'n/a'}`, "
             f"labels `{', '.join(row['dominant_labels'][:3]) or 'n/a'}`"
-        )
-    markdown_lines.extend(["", "## Release Whitespace", ""])
-    for row in payload["release_whitespace"][:10]:
-        markdown_lines.append(
-            f"- {row['artist_name']}: whitespace `{row['release_whitespace_score']}`, "
-            f"latest `{row['latest_release_date']}`, labels `{', '.join(row['dominant_release_labels'][:3]) or 'n/a'}`"
-        )
-    markdown_lines.extend(["", "## Fan Migration", ""])
-    for row in payload["fan_migration"][:10]:
-        markdown_lines.append(
-            f"- {row['source_artist']} -> {row['target_artist']}: count `{row['transition_count']}`, "
-            f"share `{row['source_out_share']}`"
-        )
-    markdown_lines.extend(["", "## Long-Tail Opportunities", ""])
-    for row in payload["opportunities"][:10]:
-        markdown_lines.append(
-            f"- {row['artist_name']}: score `{row['opportunity_score']}`, "
-            f"reasons `{'; '.join(row['rationale'])}`"
         )
 
     stem = f"creator_label_intelligence_{_slugify('-'.join(artists[:3]) or 'history')}"
@@ -2285,6 +2614,26 @@ def _handle_creator_label_intelligence(
         ),
         "fan_migration": _write_csv_rows(report_dir / f"{stem}_fan_migration.csv", payload["fan_migration"]),
         "opportunities": _write_csv_rows(report_dir / f"{stem}_opportunities.csv", payload["opportunities"]),
+        "scene_comparison": _write_csv_rows(
+            report_dir / f"{stem}_scene_comparison.csv",
+            payload["comparison_views"]["scene_comparison"],
+        ),
+        "seed_comparison": _write_csv_rows(
+            report_dir / f"{stem}_seed_comparison.csv",
+            payload["comparison_views"]["seed_comparison"],
+        ),
+        "priority_shortlist": _write_csv_rows(
+            report_dir / f"{stem}_priority_shortlist.csv",
+            payload["brief_views"]["priority_shortlist"],
+        ),
+        "migration_watch": _write_csv_rows(
+            report_dir / f"{stem}_migration_watch.csv",
+            payload["brief_views"]["migration_watch"],
+        ),
+        "release_watch": _write_csv_rows(
+            report_dir / f"{stem}_release_watch.csv",
+            payload["brief_views"]["release_watch"],
+        ),
     }
     print(f"creator_label_intelligence_json={json_path}")
     print(f"creator_label_intelligence_md={md_path}")
