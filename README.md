@@ -317,6 +317,7 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK` (optional absolute ceiling for conformal selective risk)
 - `SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE` (optional absolute ceiling for abstention rate)
 - `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail,contrastive_session`)
+- `SPOTIFY_PRETRAIN_MAX_PAIRS` (default `1000000`; cap self-supervised pretraining pairs per objective, use `0` for no cap)
 - `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
 - `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
 - `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
@@ -841,6 +842,8 @@ The scheduled wrapper also runs a dedicated control-room guard with these defaul
 - `SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK=0.45`
 - `SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD=0.20`
 - `SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK=0.50`
+
+The scheduled `full` wrapper is now intentionally more opinionated than the raw profile defaults: it seeds retrieval pretraining with `cooccurrence,masked_tail`, caps pretraining pairs at `1000000`, and tunes only `logreg,extra_trees,mlp` unless you override `SPOTIFY_PRETRAIN_OBJECTIVES`, `SPOTIFY_PRETRAIN_MAX_PAIRS`, or `OPTUNA_MODELS`.
 
 You can run that guard directly:
 

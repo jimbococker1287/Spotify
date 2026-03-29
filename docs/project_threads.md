@@ -13,6 +13,21 @@ The six threads added in the latest expansion are no longer just loose ideas. Th
 
 This document audits those requirements and expands the scope of each thread so future work stays coherent.
 
+## Clean Hierarchy Of Bets
+
+The repo now has four primary outward-facing branches:
+
+- `Personal Taste OS`: the product-demo branch
+- `Control Room`: the operating-review branch
+- `Creator / Label Intelligence`: the external strategy branch
+- `Recommender Safety and Research Platform`: the infrastructure and evidence branch
+
+That means some existing threads are deliberately nested rather than promoted to front-door status:
+
+- `Group Auto-DJ` stays a moonshot extension under Taste OS plus research.
+- The `Doctorate-Level Roadmap` stays the strategy spine inside the safety-and-research branch.
+- One-off public-insight variants stay inside creator intelligence unless they become repeatable report families.
+
 ## Audit Snapshot
 
 | Thread | Thesis set | Code set | Tests set | Surface set | Artifacts set | Docs set | Status |

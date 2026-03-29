@@ -20,6 +20,7 @@ else
 fi
 
 CLASSICAL_ALL="logreg,random_forest,extra_trees,hist_gbm,knn,gaussian_nb,mlp"
+OPTUNA_MODELS="${OPTUNA_MODELS:-logreg,extra_trees,mlp}"
 DEEP_ALL="dense,lstm,gru,transformer,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist"
 EPOCHS="${EPOCHS:-12}"
 OPTUNA_TRIALS="${OPTUNA_TRIALS:-18}"
@@ -37,6 +38,8 @@ export SPOTIFY_OPTUNA_PRUNER="${SPOTIFY_OPTUNA_PRUNER:-median}"
 export SPOTIFY_OPTUNA_PRUNING_FIDELITIES="${SPOTIFY_OPTUNA_PRUNING_FIDELITIES:-0.25,0.60,1.0}"
 export SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS="${SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS:-120}"
 export SPOTIFY_OPTUNA_MODEL_TIMEOUTS="${SPOTIFY_OPTUNA_MODEL_TIMEOUTS:-logreg=300,random_forest=900,extra_trees=600,hist_gbm=900,knn=180,gaussian_nb=120,mlp=600}"
+export SPOTIFY_PRETRAIN_OBJECTIVES="${SPOTIFY_PRETRAIN_OBJECTIVES:-cooccurrence,masked_tail}"
+export SPOTIFY_PRETRAIN_MAX_PAIRS="${SPOTIFY_PRETRAIN_MAX_PAIRS:-1000000}"
 export SPOTIFY_CHAMPION_GATE_MAX_REGRESSION="${SPOTIFY_CHAMPION_GATE_MAX_REGRESSION:-0.005}"
 export SPOTIFY_CHAMPION_GATE_METRIC="${SPOTIFY_CHAMPION_GATE_METRIC:-backtest_top1}"
 export SPOTIFY_CHAMPION_GATE_MATCH_PROFILE="${SPOTIFY_CHAMPION_GATE_MATCH_PROFILE:-1}"
@@ -158,6 +161,6 @@ exec "$PYTHON_CMD" -m spotify \
   --classical-max-train-samples "$CLASSICAL_MAX_TRAIN_SAMPLES" \
   --classical-max-eval-samples "$CLASSICAL_MAX_EVAL_SAMPLES" \
   --classical-models "$CLASSICAL_ALL" \
-  --optuna-models "$CLASSICAL_ALL" \
+  --optuna-models "$OPTUNA_MODELS" \
   --backtest-models "$CLASSICAL_ALL" \
   "$@"

@@ -9,7 +9,7 @@ import pandas as pd
 
 from spotify.data import PreparedData
 from spotify.friction import run_friction_proxy_analysis
-from spotify.retrieval import train_retrieval_stack
+from spotify.retrieval import train_retrieval_stack, train_self_supervised_artist_embeddings
 from spotify.serving import load_predictor, resolve_model_row
 
 
@@ -133,6 +133,25 @@ def test_train_retrieval_stack_writes_artifacts_and_rows(tmp_path: Path) -> None
     assert "ann_validation" in summary
     assert "retrieval" in summary
     assert "reranker" in summary
+
+
+def test_self_supervised_pretraining_caps_pair_count(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    monkeypatch.setenv("SPOTIFY_PRETRAIN_MAX_PAIRS", "4")
+    monkeypatch.setenv("SPOTIFY_PRETRAIN_EPOCHS", "1")
+
+    result, artifact_path = train_self_supervised_artist_embeddings(
+        data=data,
+        output_dir=tmp_path,
+        random_seed=11,
+        logger=_logger("spotify.test.retrieval.pretrain_cap"),
+        embedding_dim=8,
+        objective_name="contrastive_session",
+    )
+
+    assert result.objective_name == "contrastive_session"
+    assert result.pair_count == 4
+    assert artifact_path.exists()
 
 
 def test_retrieval_reranker_artifact_is_serveable(tmp_path: Path) -> None:

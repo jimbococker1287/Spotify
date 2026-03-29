@@ -13,12 +13,14 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .benchmarks import sample_indices
 from .data import PreparedData
 from .probability_bundles import save_prediction_bundle
 from .ranking import ranking_metrics_from_proba, topk_indices_1d
 
 DEFAULT_EMBEDDING_DIM = 32
 DEFAULT_PRETRAIN_EPOCHS = 5
+DEFAULT_PRETRAIN_MAX_PAIRS = 1_000_000
 DEFAULT_RETRIEVAL_EPOCHS = 6
 DEFAULT_RETRIEVAL_CANDIDATE_K = 30
 
@@ -311,6 +313,17 @@ def train_self_supervised_artist_embeddings(
     rng = np.random.default_rng(random_seed)
     objective = str(objective_name).strip().lower() or "cooccurrence"
     pairs = _build_pretraining_pairs(data.X_seq_train, window_size=window_size, objective_name=objective)
+    pair_count_before_sampling = int(len(pairs))
+    max_pairs = _env_int("SPOTIFY_PRETRAIN_MAX_PAIRS", DEFAULT_PRETRAIN_MAX_PAIRS)
+    if max_pairs > 0 and len(pairs) > max_pairs:
+        selected = sample_indices(len(pairs), max_pairs, rng)
+        pairs = pairs[selected]
+        logger.info(
+            "Sampling self-supervised pretraining pairs for %s: using %d/%d pairs.",
+            objective,
+            len(pairs),
+            pair_count_before_sampling,
+        )
     if len(pairs) == 0:
         embeddings = _normalize_rows(rng.normal(scale=0.05, size=(data.num_artists, embedding_dim)).astype("float32"))
         frequency = np.full(data.num_artists, 1.0 / max(1, data.num_artists), dtype="float32")
