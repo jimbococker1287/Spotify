@@ -7,24 +7,9 @@ import json
 import math
 
 import pandas as pd
-
-
-def _safe_read_csv(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path, on_bad_lines="skip")
-    except Exception:
-        return pd.read_csv(path, engine="python", on_bad_lines="skip")
-
-
-def _safe_read_json(path: Path) -> object:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+from .run_artifacts import collect_run_manifests as _collect_run_manifests
+from .run_artifacts import safe_read_csv as _safe_read_csv
+from .run_artifacts import safe_read_json as _safe_read_json
 
 
 def _safe_float(value) -> float:
@@ -55,18 +40,6 @@ def _analysis_prefix_for_model_type(model_type: str) -> str | None:
     return None
 
 
-def _collect_run_manifests(output_dir: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for path in sorted((output_dir / "runs").glob("*/run_manifest.json")):
-        payload = _safe_read_json(path)
-        if not isinstance(payload, dict):
-            continue
-        row = dict(payload)
-        row["run_dir"] = str(path.parent.resolve())
-        rows.append(row)
-    return rows
-
-
 def _manifest_sort_key(row: dict[str, object]) -> tuple[str, str]:
     return (
         str(row.get("timestamp", "")),
@@ -92,7 +65,7 @@ def _latest_promoted_manifest(
     *,
     exclude_run_id: str | None = None,
 ) -> dict[str, object]:
-    promoted = sorted(
+    return max(
         (
             manifest
             for manifest in manifests
@@ -100,13 +73,12 @@ def _latest_promoted_manifest(
             and str(manifest.get("run_id", "")) != str(exclude_run_id or "")
         ),
         key=_manifest_sort_key,
-        reverse=True,
+        default={},
     )
-    return promoted[0] if promoted else {}
 
 
 def _load_run_results(run_dir: Path) -> list[dict[str, object]]:
-    payload = _safe_read_json(run_dir / "run_results.json")
+    payload = _safe_read_json(run_dir / "run_results.json", default=None)
     if isinstance(payload, list):
         return [dict(row) for row in payload if isinstance(row, dict)]
     return []
@@ -115,15 +87,14 @@ def _load_run_results(run_dir: Path) -> list[dict[str, object]]:
 def _best_result_row(rows: list[dict[str, object]]) -> dict[str, object]:
     if not rows:
         return {}
-    ranked = sorted(
+    return max(
         rows,
         key=lambda row: (
             _safe_float(row.get("val_top1")),
             _safe_float(row.get("test_top1")),
         ),
-        reverse=True,
+        default={},
     )
-    return ranked[0] if ranked else {}
 
 
 def _resolve_confidence_summary(
@@ -157,7 +128,10 @@ def _resolve_confidence_summary(
     if prefix is None:
         return {}
 
-    payload = _safe_read_json(run_dir / "analysis" / f"{prefix}_{target_name}_confidence_summary.json")
+    payload = _safe_read_json(
+        run_dir / "analysis" / f"{prefix}_{target_name}_confidence_summary.json",
+        default=None,
+    )
     return payload if isinstance(payload, dict) else {}
 
 
@@ -167,11 +141,12 @@ def _rank_models(history_df: pd.DataFrame, *, metric_column: str, top_n: int) ->
 
     frame = history_df.copy()
     frame[metric_column] = pd.to_numeric(frame[metric_column], errors="coerce")
-    frame = frame[frame["model_name"].notna()].copy()
-    frame = frame[frame["model_name"].astype(str).str.strip() != ""].copy()
-    frame = frame[frame[metric_column].notna()].copy()
+    model_name = frame["model_name"].fillna("").astype(str).str.strip()
+    valid_rows = model_name.ne("") & frame[metric_column].notna()
+    frame = frame.loc[valid_rows].copy()
     if frame.empty:
         return []
+    frame["model_name"] = model_name.loc[frame.index]
 
     if "model_type" not in frame.columns:
         frame["model_type"] = "unknown"
@@ -189,14 +164,14 @@ def _rank_models(history_df: pd.DataFrame, *, metric_column: str, top_n: int) ->
     )
 
     rows: list[dict[str, object]] = []
-    for _, row in grouped.head(max(1, int(top_n))).iterrows():
+    for row in grouped.head(max(1, int(top_n))).itertuples(index=False):
         rows.append(
             {
-                "model_name": str(row["model_name"]),
-                "model_type": str(row["model_type"]),
-                "mean_metric": float(row["mean_metric"]),
-                "best_metric": float(row["best_metric"]),
-                "run_count": int(row["run_count"]),
+                "model_name": str(row.model_name),
+                "model_type": str(row.model_type),
+                "mean_metric": float(row.mean_metric),
+                "best_metric": float(row.best_metric),
+                "run_count": int(row.run_count),
             }
         )
     return rows
@@ -249,10 +224,10 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
     best_result = _best_result_row(results)
     analysis_dir = run_dir / "analysis" if run_dir and run_dir.exists() else None
 
-    drift_summary = _safe_read_json(analysis_dir / "data_drift_summary.json") if analysis_dir is not None else {}
-    friction_summary = _safe_read_json(analysis_dir / "friction_proxy_summary.json") if analysis_dir is not None else {}
-    moonshot_summary = _safe_read_json(analysis_dir / "moonshot_summary.json") if analysis_dir is not None else {}
-    robustness_summary = _safe_read_json(analysis_dir / "robustness_summary.json") if analysis_dir is not None else {}
+    drift_summary = _safe_read_json(analysis_dir / "data_drift_summary.json", default=None) if analysis_dir is not None else {}
+    friction_summary = _safe_read_json(analysis_dir / "friction_proxy_summary.json", default=None) if analysis_dir is not None else {}
+    moonshot_summary = _safe_read_json(analysis_dir / "moonshot_summary.json", default=None) if analysis_dir is not None else {}
+    robustness_summary = _safe_read_json(analysis_dir / "robustness_summary.json", default=None) if analysis_dir is not None else {}
     confidence_summary = (
         _resolve_confidence_summary(run_dir=run_dir, manifest=manifest, results=results)
         if run_dir is not None and run_dir.exists()
@@ -324,10 +299,32 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "stress_worst_skip_scenario": str(moonshot_summary.get("stress_worst_skip_scenario", "")) if isinstance(moonshot_summary, dict) else "",
         "stress_worst_skip_risk": _safe_float(moonshot_summary.get("stress_worst_skip_risk")) if isinstance(moonshot_summary, dict) else float("nan"),
     }
+    missing_summaries = [
+        filename
+        for filename, available in (
+            ("run_results.json", bool(results)),
+            ("analysis/data_drift_summary.json", isinstance(drift_summary, dict) and bool(drift_summary)),
+            ("analysis/friction_proxy_summary.json", isinstance(friction_summary, dict) and bool(friction_summary)),
+            ("analysis/robustness_summary.json", isinstance(robustness_summary, list) and bool(robustness_summary)),
+            ("analysis/moonshot_summary.json", isinstance(moonshot_summary, dict) and bool(moonshot_summary)),
+            ("analysis/*_confidence_summary.json", isinstance(confidence_summary, dict) and bool(confidence_summary)),
+        )
+        if not available
+    ]
+    available_summary_count = int(6 - len(missing_summaries))
+    ops_coverage = {
+        "run_dir_exists": bool(run_dir and run_dir.exists()),
+        "analysis_dir_exists": bool(analysis_dir and analysis_dir.exists()),
+        "available_summary_count": int(available_summary_count),
+        "expected_summary_count": 6,
+        "coverage_ratio": float(available_summary_count / 6.0),
+        "missing_summaries": missing_summaries,
+    }
     return {
         "run": run,
         "safety": safety,
         "qoe": qoe,
+        "ops_coverage": ops_coverage,
     }
 
 
@@ -488,9 +485,29 @@ def _build_review_actions(
     latest_run: dict[str, object],
     safety: dict[str, object],
     qoe: dict[str, object],
+    ops_coverage: dict[str, object],
     baseline_comparison: dict[str, object],
 ) -> list[dict[str, object]]:
     actions: list[dict[str, object]] = []
+
+    coverage_ratio = _safe_float(ops_coverage.get("coverage_ratio"))
+    missing_summaries = ops_coverage.get("missing_summaries", [])
+    missing_summaries = [str(item) for item in missing_summaries if str(item).strip()] if isinstance(missing_summaries, list) else []
+    if math.isfinite(coverage_ratio) and coverage_ratio < 0.8:
+        preview = ", ".join(missing_summaries[:4]) if missing_summaries else "required analysis outputs"
+        actions.append(
+            {
+                "priority": "high",
+                "area": "instrumentation",
+                "title": "Backfill missing ops artifacts before trusting this run",
+                "detail": (
+                    f"Latest run only has `{_safe_int(ops_coverage.get('available_summary_count'), default=0)}` of "
+                    f"`{_safe_int(ops_coverage.get('expected_summary_count'), default=0)}` expected summaries. "
+                    f"Missing: {preview}."
+                ),
+                "inspect": missing_summaries or ["outputs/runs/<run_id>/analysis/"],
+            }
+        )
 
     if not bool(latest_run.get("promoted")):
         regression = _safe_float(safety.get("champion_gate_regression"))
@@ -585,11 +602,361 @@ def _build_review_actions(
     return actions[:6]
 
 
+def _snapshot_sort_frame(history_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty:
+        return history_df.copy()
+
+    frame = history_df.copy()
+    for column in (
+        "promoted",
+        "best_model_val_top1",
+        "best_model_test_top1",
+        "champion_gate_regression",
+        "target_drift_jsd",
+        "test_ece",
+        "test_selective_risk",
+        "test_abstention_rate",
+        "robustness_gap",
+        "stress_skip_risk",
+        "ops_coverage_ratio",
+        "available_summary_count",
+        "expected_summary_count",
+        "review_action_count",
+        "high_priority_review_actions",
+        "medium_priority_review_actions",
+        "next_bet_count",
+    ):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    run_ts = pd.to_datetime(frame.get("run_timestamp"), errors="coerce", utc=True)
+    generated_ts = pd.to_datetime(frame.get("generated_at"), errors="coerce", utc=True)
+    frame["_snapshot_ts"] = run_ts.fillna(generated_ts)
+    frame["_generated_ts"] = generated_ts
+    return frame.sort_values(
+        ["_snapshot_ts", "_generated_ts", "run_id"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
+    latest_run = report.get("latest_run", {})
+    latest_run = latest_run if isinstance(latest_run, dict) else {}
+    safety = report.get("safety", {})
+    safety = safety if isinstance(safety, dict) else {}
+    qoe = report.get("qoe", {})
+    qoe = qoe if isinstance(qoe, dict) else {}
+    ops_coverage = report.get("ops_coverage", {})
+    ops_coverage = ops_coverage if isinstance(ops_coverage, dict) else {}
+    review_actions = report.get("review_actions", [])
+    review_actions = review_actions if isinstance(review_actions, list) else []
+    baseline = report.get("baseline_comparison", {})
+    baseline = baseline if isinstance(baseline, dict) else {}
+    baseline_run = baseline.get("baseline_run", {})
+    baseline_run = baseline_run if isinstance(baseline_run, dict) else {}
+
+    areas = sorted(
+        {
+            str(action.get("area", "")).strip().lower()
+            for action in review_actions
+            if isinstance(action, dict) and str(action.get("area", "")).strip()
+        }
+    )
+    high_count = sum(
+        1
+        for action in review_actions
+        if isinstance(action, dict) and str(action.get("priority", "")).strip().lower() == "high"
+    )
+    medium_count = sum(
+        1
+        for action in review_actions
+        if isinstance(action, dict) and str(action.get("priority", "")).strip().lower() == "medium"
+    )
+
+    return {
+        "generated_at": str(report.get("generated_at", "")),
+        "run_id": str(latest_run.get("run_id", "")),
+        "run_timestamp": str(latest_run.get("timestamp", "")),
+        "profile": str(latest_run.get("profile", "")),
+        "promoted": int(bool(latest_run.get("promoted"))),
+        "promotion_status": str(latest_run.get("promotion_status", "")),
+        "best_model_name": str(latest_run.get("best_model_name", "")),
+        "best_model_type": str(latest_run.get("best_model_type", "")),
+        "best_model_val_top1": _safe_float(latest_run.get("best_model_val_top1")),
+        "best_model_test_top1": _safe_float(latest_run.get("best_model_test_top1")),
+        "champion_gate_regression": _safe_float(safety.get("champion_gate_regression")),
+        "target_drift_jsd": _safe_float(safety.get("test_jsd_target_drift")),
+        "test_ece": _safe_float(safety.get("test_ece")),
+        "test_selective_risk": _safe_float(safety.get("test_selective_risk")),
+        "test_abstention_rate": _safe_float(safety.get("test_abstention_rate")),
+        "robustness_gap": _safe_float(safety.get("robustness_max_top1_gap")),
+        "stress_skip_risk": _safe_float(qoe.get("stress_worst_skip_risk")),
+        "ops_coverage_ratio": _safe_float(ops_coverage.get("coverage_ratio")),
+        "available_summary_count": _safe_int(ops_coverage.get("available_summary_count"), default=0),
+        "expected_summary_count": _safe_int(ops_coverage.get("expected_summary_count"), default=0),
+        "review_action_count": int(len(review_actions)),
+        "high_priority_review_actions": int(high_count),
+        "medium_priority_review_actions": int(medium_count),
+        "review_action_areas": "|".join(areas),
+        "baseline_run_id": str(baseline_run.get("run_id", "")),
+        "next_bet_count": int(len(report.get("next_bets", []))),
+    }
+
+
+def _write_control_room_history(analytics_dir: Path, report: dict[str, object]) -> tuple[Path, pd.DataFrame]:
+    history_path = analytics_dir / "control_room_history.csv"
+    existing = _safe_read_csv(history_path)
+    row_df = pd.DataFrame([_control_room_snapshot_row(report)])
+    combined = pd.concat([existing, row_df], ignore_index=True, sort=False) if not existing.empty else row_df
+
+    if "run_id" in combined.columns:
+        generated_ts = pd.to_datetime(combined.get("generated_at"), errors="coerce", utc=True)
+        combined["_generated_ts"] = generated_ts
+        combined = (
+            combined.sort_values(["run_id", "_generated_ts"], ascending=[True, False], na_position="last")
+            .drop_duplicates(subset=["run_id"], keep="first")
+            .drop(columns=["_generated_ts"])
+        )
+
+    sorted_frame = _snapshot_sort_frame(combined)
+    for helper_column in ("_snapshot_ts", "_generated_ts"):
+        if helper_column in sorted_frame.columns:
+            sorted_frame = sorted_frame.drop(columns=[helper_column])
+    sorted_frame.to_csv(history_path, index=False)
+    return history_path, sorted_frame
+
+
+def _build_ops_trends(report: dict[str, object], history_df: pd.DataFrame) -> dict[str, object]:
+    if history_df.empty:
+        return {
+            "history_available": False,
+            "summary": ["No prior control-room snapshots are available yet."],
+            "metric_deltas": [],
+        }
+
+    frame = _snapshot_sort_frame(history_df)
+    current_run_id = str((report.get("latest_run", {}) if isinstance(report.get("latest_run", {}), dict) else {}).get("run_id", ""))
+    current_row = frame[frame["run_id"].astype(str) == current_run_id].head(1)
+    previous_rows = frame[frame["run_id"].astype(str) != current_run_id].head(1)
+    recent_window = frame.head(min(5, len(frame.index))).copy()
+
+    summary: list[str] = []
+    metric_deltas: list[dict[str, object]] = []
+    previous_snapshot: dict[str, object] = {}
+    if not previous_rows.empty:
+        previous = previous_rows.iloc[0].to_dict()
+        previous_snapshot = {
+            "run_id": str(previous.get("run_id", "")),
+            "run_timestamp": str(previous.get("run_timestamp", "")),
+            "profile": str(previous.get("profile", "")),
+            "promotion_status": str(previous.get("promotion_status", "")),
+        }
+        current = current_row.iloc[0].to_dict() if not current_row.empty else {}
+        metric_deltas = [
+            _metric_delta_row(
+                key="best_model_test_top1",
+                label="Best model test top1",
+                current=current.get("best_model_test_top1"),
+                baseline=previous.get("best_model_test_top1"),
+                higher_is_better=True,
+            ),
+            _metric_delta_row(
+                key="robustness_gap",
+                label="Worst robustness gap",
+                current=current.get("robustness_gap"),
+                baseline=previous.get("robustness_gap"),
+                higher_is_better=False,
+            ),
+            _metric_delta_row(
+                key="target_drift_jsd",
+                label="Target drift JSD",
+                current=current.get("target_drift_jsd"),
+                baseline=previous.get("target_drift_jsd"),
+                higher_is_better=False,
+            ),
+            _metric_delta_row(
+                key="stress_skip_risk",
+                label="Worst stress skip risk",
+                current=current.get("stress_skip_risk"),
+                baseline=previous.get("stress_skip_risk"),
+                higher_is_better=False,
+            ),
+            _metric_delta_row(
+                key="selective_risk",
+                label="Selective risk",
+                current=current.get("test_selective_risk"),
+                baseline=previous.get("test_selective_risk"),
+                higher_is_better=False,
+            ),
+        ]
+        summary.append(
+            f"Previous snapshot was `{previous_snapshot['run_id']}` at `{previous_snapshot['run_timestamp']}`."
+        )
+        for row in metric_deltas:
+            if str(row.get("status")) in ("flat", "unknown"):
+                continue
+            direction_word = "improved" if str(row.get("status")) == "better" else "worsened"
+            summary.append(
+                f"{row['label']} {direction_word} from {_format_metric(row['baseline'])} to {_format_metric(row['current'])}."
+            )
+    else:
+        summary.append("Only one run snapshot is available, so trend comparisons will start on the next run.")
+
+    promoted_count = int(pd.to_numeric(recent_window.get("promoted"), errors="coerce").fillna(0).sum()) if not recent_window.empty else 0
+    failed_promotions = int(len(recent_window.index) - promoted_count)
+    high_issue_runs = int(
+        (pd.to_numeric(recent_window.get("high_priority_review_actions"), errors="coerce").fillna(0) > 0).sum()
+    ) if not recent_window.empty else 0
+    summary.append(
+        f"In the last `{len(recent_window.index)}` run snapshots, promotions passed `{promoted_count}` times and failed `{failed_promotions}` times."
+    )
+    if high_issue_runs > 0:
+        summary.append(f"High-priority review actions appeared in `{high_issue_runs}` of the last `{len(recent_window.index)}` snapshots.")
+
+    area_counts: dict[str, int] = {}
+    for raw_value in recent_window.get("review_action_areas", pd.Series(dtype="object")).fillna("").astype(str):
+        for area in [item for item in raw_value.split("|") if item]:
+            area_counts[area] = int(area_counts.get(area, 0) + 1)
+    recurring_areas = [f"{area} ({count})" for area, count in sorted(area_counts.items(), key=lambda item: (-item[1], item[0])) if count >= 2]
+    if recurring_areas:
+        summary.append(f"Recurring ops areas across recent runs: {', '.join(recurring_areas[:3])}.")
+
+    return {
+        "history_available": True,
+        "snapshot_count": int(len(frame.index)),
+        "recent_window_count": int(len(recent_window.index)),
+        "previous_snapshot": previous_snapshot,
+        "summary": summary[:6],
+        "metric_deltas": metric_deltas,
+    }
+
+
+def _write_weekly_ops_summary(
+    analytics_dir: Path,
+    report: dict[str, object],
+    history_df: pd.DataFrame,
+    *,
+    lookback_days: int = 7,
+) -> tuple[Path, Path, dict[str, object]]:
+    history_frame = _snapshot_sort_frame(history_df)
+    if history_frame.empty:
+        window_frame = history_frame.copy()
+    else:
+        latest_ts = history_frame["_snapshot_ts"].dropna().max()
+        if pd.isna(latest_ts):
+            window_frame = history_frame.head(min(7, len(history_frame.index))).copy()
+        else:
+            cutoff = latest_ts - pd.Timedelta(days=max(1, int(lookback_days)))
+            window_frame = history_frame[history_frame["_snapshot_ts"] >= cutoff].copy()
+            if window_frame.empty:
+                window_frame = history_frame.head(min(7, len(history_frame.index))).copy()
+
+    promoted_runs = int(pd.to_numeric(window_frame.get("promoted"), errors="coerce").fillna(0).sum()) if not window_frame.empty else 0
+    failed_promotions = int(len(window_frame.index) - promoted_runs)
+    avg_test_top1 = _safe_float(pd.to_numeric(window_frame.get("best_model_test_top1"), errors="coerce").mean()) if not window_frame.empty else float("nan")
+    worst_robustness_gap = _safe_float(pd.to_numeric(window_frame.get("robustness_gap"), errors="coerce").max()) if not window_frame.empty else float("nan")
+    worst_stress_skip_risk = _safe_float(pd.to_numeric(window_frame.get("stress_skip_risk"), errors="coerce").max()) if not window_frame.empty else float("nan")
+    worst_selective_risk = _safe_float(pd.to_numeric(window_frame.get("test_selective_risk"), errors="coerce").max()) if not window_frame.empty else float("nan")
+
+    area_counts: dict[str, int] = {}
+    for raw_value in window_frame.get("review_action_areas", pd.Series(dtype="object")).fillna("").astype(str):
+        for area in [item for item in raw_value.split("|") if item]:
+            area_counts[area] = int(area_counts.get(area, 0) + 1)
+    recurring_areas = [
+        {"area": area, "count": count}
+        for area, count in sorted(area_counts.items(), key=lambda item: (-item[1], item[0]))
+        if count >= 2
+    ]
+
+    review_actions = report.get("review_actions", [])
+    review_actions = review_actions if isinstance(review_actions, list) else []
+    current_focus = [
+        {
+            "priority": str(action.get("priority", "")).strip().lower(),
+            "area": str(action.get("area", "")).strip().lower(),
+            "title": str(action.get("title", "")).strip(),
+        }
+        for action in review_actions[:5]
+        if isinstance(action, dict)
+    ]
+
+    summary_lines = [
+        f"Runs in window: `{len(window_frame.index)}` with `{promoted_runs}` promotions and `{failed_promotions}` failed promotions.",
+        f"Average best-model test top1 across the window is `{_format_metric(avg_test_top1)}`.",
+        f"Worst observed robustness gap is `{_format_metric(worst_robustness_gap)}` and worst stress skip risk is `{_format_metric(worst_stress_skip_risk)}`.",
+    ]
+    if recurring_areas:
+        recurring_labels = [f"{row['area']} ({row['count']})" for row in recurring_areas[:3]]
+        summary_lines.append(
+            f"Recurring ops areas this week: {', '.join(recurring_labels)}."
+        )
+    else:
+        summary_lines.append("No ops area repeated often enough yet to count as a weekly recurring pattern.")
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "lookback_days": int(max(1, int(lookback_days))),
+        "snapshots_considered": int(len(window_frame.index)),
+        "promoted_runs": int(promoted_runs),
+        "failed_promotions": int(failed_promotions),
+        "average_best_model_test_top1": avg_test_top1,
+        "worst_robustness_gap": worst_robustness_gap,
+        "worst_stress_skip_risk": worst_stress_skip_risk,
+        "worst_selective_risk": worst_selective_risk,
+        "recurring_areas": recurring_areas,
+        "current_focus": current_focus,
+        "summary": summary_lines,
+        "window_runs": [
+            {
+                "run_id": str(row.get("run_id", "")),
+                "run_timestamp": str(row.get("run_timestamp", "")),
+                "promotion_status": str(row.get("promotion_status", "")),
+                "best_model_name": str(row.get("best_model_name", "")),
+                "best_model_test_top1": _safe_float(row.get("best_model_test_top1")),
+                "robustness_gap": _safe_float(row.get("robustness_gap")),
+                "stress_skip_risk": _safe_float(row.get("stress_skip_risk")),
+            }
+            for row in window_frame.to_dict(orient="records")
+        ],
+    }
+
+    json_path = analytics_dir / "control_room_weekly_summary.json"
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines = [
+        "# Weekly Ops Summary",
+        "",
+        f"- Generated: `{payload['generated_at']}`",
+        f"- Lookback days: `{payload['lookback_days']}`",
+        f"- Snapshots considered: `{payload['snapshots_considered']}`",
+        "",
+        "## Summary",
+        "",
+    ]
+    for item in payload["summary"]:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Current Focus", ""])
+    if current_focus:
+        for item in current_focus:
+            lines.append(f"- [{item['priority'].upper()}] {item['title']} ({item['area']})")
+    else:
+        lines.append("- No current review actions are open.")
+
+    md_path = analytics_dir / "control_room_weekly_summary.md"
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path, payload
+
+
 def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, object]:
     output_root = output_dir.expanduser().resolve()
     manifests = _collect_run_manifests(output_root)
     latest_manifest = _latest_manifest(manifests)
-    latest_snapshot = _build_run_health_snapshot(latest_manifest) if latest_manifest else {"run": {}, "safety": {}, "qoe": {}}
+    latest_snapshot = (
+        _build_run_health_snapshot(latest_manifest)
+        if latest_manifest
+        else {"run": {}, "safety": {}, "qoe": {}, "ops_coverage": {}}
+    )
 
     experiment_history = _safe_read_csv(output_root / "history" / "experiment_history.csv")
     backtest_history = _safe_read_csv(output_root / "history" / "backtest_history.csv")
@@ -607,6 +974,7 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
     latest_run = latest_snapshot["run"]
     safety = latest_snapshot["safety"]
     qoe = latest_snapshot["qoe"]
+    ops_coverage = latest_snapshot["ops_coverage"]
 
     baseline_manifest = _latest_promoted_manifest(
         manifests,
@@ -622,6 +990,7 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
         latest_run=latest_run,
         safety=safety,
         qoe=qoe,
+        ops_coverage=ops_coverage,
         baseline_comparison=baseline_comparison,
     )
 
@@ -641,6 +1010,7 @@ def build_control_room_report(output_dir: Path, *, top_n: int = 5) -> dict[str, 
         "latest_run": latest_run,
         "safety": safety,
         "qoe": qoe,
+        "ops_coverage": ops_coverage,
         "leaderboards": {
             "experiment_top_models": _rank_models(experiment_history, metric_column="val_top1", top_n=top_n),
             "backtest_top_models": _rank_models(backtest_history, metric_column="top1", top_n=top_n),
@@ -675,6 +1045,33 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     analytics_dir = output_root / "analytics"
     analytics_dir.mkdir(parents=True, exist_ok=True)
     report = build_control_room_report(output_root, top_n=top_n)
+    history_path, history_df = _write_control_room_history(analytics_dir, report)
+    ops_trends = _build_ops_trends(report, history_df)
+    weekly_json_path, weekly_md_path, weekly_payload = _write_weekly_ops_summary(
+        analytics_dir,
+        report,
+        history_df,
+    )
+    report["ops_history"] = {
+        "csv_path": str(history_path),
+        "snapshot_count": int(len(history_df.index)),
+    }
+    report["ops_trends"] = ops_trends
+    report["weekly_ops_summary"] = {
+        "json_path": str(weekly_json_path),
+        "markdown_path": str(weekly_md_path),
+        "generated_at": str(weekly_payload.get("generated_at", "")),
+        "lookback_days": _safe_int(weekly_payload.get("lookback_days"), default=7),
+        "snapshots_considered": _safe_int(weekly_payload.get("snapshots_considered"), default=0),
+        "summary": [
+            str(item)
+            for item in weekly_payload.get("summary", [])
+            if str(item).strip()
+        ]
+        if isinstance(weekly_payload.get("summary", []), list)
+        else [],
+        "current_focus": weekly_payload.get("current_focus", []),
+    }
 
     json_path = analytics_dir / "control_room.json"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -683,7 +1080,15 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     latest_run = report["latest_run"]
     safety = report["safety"]
     qoe = report["qoe"]
+    ops_coverage = report.get("ops_coverage", {})
+    ops_coverage = ops_coverage if isinstance(ops_coverage, dict) else {}
     baseline = report.get("baseline_comparison", {})
+    ops_history = report.get("ops_history", {})
+    ops_history = ops_history if isinstance(ops_history, dict) else {}
+    ops_trends = report.get("ops_trends", {})
+    ops_trends = ops_trends if isinstance(ops_trends, dict) else {}
+    weekly_summary = report.get("weekly_ops_summary", {})
+    weekly_summary = weekly_summary if isinstance(weekly_summary, dict) else {}
     review_actions = report.get("review_actions", [])
 
     lines = [
@@ -707,6 +1112,12 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
         f"- Promotion: `{latest_run['promotion_status']}`",
         f"- Best model: `{latest_run['best_model_name']}` [{latest_run['best_model_type']}] val_top1=`{_format_metric(latest_run['best_model_val_top1'])}` test_top1=`{_format_metric(latest_run['best_model_test_top1'])}`",
         f"- Champion alias: `{latest_run['champion_model_name']}` [{latest_run['champion_model_type']}]",
+        "",
+        "## Ops Coverage",
+        "",
+        f"- Available summaries: `{_safe_int(ops_coverage.get('available_summary_count'), default=0)}` / `{_safe_int(ops_coverage.get('expected_summary_count'), default=0)}`",
+        f"- Coverage ratio: `{_format_metric(ops_coverage.get('coverage_ratio'))}`",
+        f"- Missing summaries: `{', '.join(ops_coverage.get('missing_summaries', [])) if isinstance(ops_coverage.get('missing_summaries', []), list) and ops_coverage.get('missing_summaries', []) else 'none'}`",
         "",
         "## Safety",
         "",
@@ -744,6 +1155,31 @@ def write_control_room_report(output_dir: Path, *, top_n: int = 5) -> tuple[Path
     else:
         for item in baseline.get("summary", []):
             lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
+            "## Recent Trends",
+            "",
+            f"- Snapshots tracked: `{_safe_int(ops_history.get('snapshot_count'), default=0)}`",
+            "- History artifact: `outputs/analytics/control_room_history.csv`",
+            "- Weekly summary artifact: `outputs/analytics/control_room_weekly_summary.md`",
+            "",
+        ]
+    )
+    for item in ops_trends.get("summary", []):
+        lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
+            "## Weekly Window",
+            "",
+            f"- Snapshots considered: `{_safe_int(weekly_summary.get('snapshots_considered'), default=0)}` over `{_safe_int(weekly_summary.get('lookback_days'), default=7)}` day(s)",
+        ]
+    )
+    for item in weekly_summary.get("summary", []):
+        lines.append(f"- {item}")
 
     lines.extend(
         [
@@ -810,12 +1246,20 @@ def main() -> int:
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
-    report = build_control_room_report(output_dir, top_n=max(1, int(args.top_n)))
     json_path, md_path = write_control_room_report(output_dir, top_n=max(1, int(args.top_n)))
+    report = _safe_read_json(json_path, default={})
+    if not report:
+        report = build_control_room_report(output_dir, top_n=max(1, int(args.top_n)))
 
     latest_run = report["latest_run"]
     print(f"Control room written to {json_path}")
     print(f"Markdown summary written to {md_path}")
+    history_path = output_dir / "analytics" / "control_room_history.csv"
+    weekly_md_path = output_dir / "analytics" / "control_room_weekly_summary.md"
+    if history_path.exists():
+        print(f"Ops history written to {history_path}")
+    if weekly_md_path.exists():
+        print(f"Weekly ops summary written to {weekly_md_path}")
     print(f"Latest run: {latest_run['run_id']} ({latest_run['profile']})")
     print(f"Best model: {latest_run['best_model_name']} val_top1={_format_metric(latest_run['best_model_val_top1'])}")
     print("Next bets:")

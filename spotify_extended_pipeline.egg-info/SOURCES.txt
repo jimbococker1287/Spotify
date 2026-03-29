@@ -50,6 +50,7 @@ spotify/session_knn.py
 spotify/storage_report.py
 spotify/stress_test.py
 spotify/taste_os_demo.py
+spotify/taste_os_showcase.py
 spotify/tracking.py
 spotify/training.py
 spotify/tuning.py
@@ -71,6 +72,7 @@ tests/test_compare_public_cli_smoke.py
 tests/test_config_smoke.py
 tests/test_control_room.py
 tests/test_control_room_cli_smoke.py
+tests/test_control_room_guard.py
 tests/test_creator_label_intelligence.py
 tests/test_data_discovery.py
 tests/test_data_quality_gate.py
@@ -83,6 +85,7 @@ tests/test_lastfm.py
 tests/test_moonshot_lab.py
 tests/test_packaging_smoke.py
 tests/test_predict_cli_smoke.py
+tests/test_predict_next_context.py
 tests/test_predict_service_cli_smoke.py
 tests/test_predict_service_validation.py
 tests/test_profiles_and_ensemble.py
@@ -91,6 +94,7 @@ tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
 tests/test_ranking_metrics.py
 tests/test_recommender_safety_platform.py
+tests/test_regression_alert.py
 tests/test_research_platform.py
 tests/test_retrieval_and_friction.py
 tests/test_runtime_acceleration.py
@@ -98,6 +102,9 @@ tests/test_serving_analytics_and_session_knn.py
 tests/test_storage_report.py
 tests/test_taste_os_demo.py
 tests/test_taste_os_demo_cli_smoke.py
+tests/test_taste_os_showcase.py
+tests/test_taste_os_showcase_cli_smoke.py
+tests/test_tracking.py
 tests/test_training_helpers.py
 tests/test_tuning_helpers.py
 tests/test_uncertainty.py

@@ -464,6 +464,11 @@ Control room:
 
 - `outputs/analytics/control_room.json`
 - `outputs/analytics/control_room.md`
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
 
 Generate the control-room summary:
 
@@ -493,7 +498,19 @@ make taste-os-demo EXTRA_ARGS='--mode commute --scenario friction_spike'
 
 The command now writes both JSON and Markdown artifacts under `outputs/analysis/taste_os_demo/` and supports adaptive scenarios such as `skip_recovery`, `repeat_request`, `friction_spike`, and `mixed_session`.
 
-The contract lives in `docs/taste_os_demo_contract.md`, and a short usage guide lives in `docs/taste_os_demo_walkthrough.md`.
+Build the Week 3-4 showcase pack with canonical adaptive examples plus a steady-mode comparison:
+
+```bash
+spotify-taste-os-showcase --top-k 5
+```
+
+Or via Make:
+
+```bash
+make taste-os-showcase EXTRA_ARGS='--top-k 5'
+```
+
+The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
 ## Prediction CLI
 
@@ -756,13 +773,13 @@ GitHub Actions CI is defined in `.github/workflows/ci.yml` and runs on push/PR:
 
 ## Scheduling + Alerts
 
-Run scheduled-style jobs (fast/full) and alert on champion-gate regression:
+Run scheduled-style jobs (fast/full) and alert on champion-gate regression plus control-room ops thresholds:
 
 ```bash
 bash scripts/run_scheduled.sh fast
 ```
 
-Check latest run gate manually:
+Check the latest run manually:
 
 ```bash
 python scripts/regression_alert.py
@@ -773,6 +790,45 @@ Optional webhook alerts:
 ```bash
 SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regression_alert.py
 ```
+
+By default, the alert path refreshes `outputs/analytics/control_room.json`, includes the top review actions in stdout/webhooks, and returns a non-zero exit code for:
+
+- champion-gate failure
+- control-room actions at `high` priority or above
+
+Tune that threshold with:
+
+```bash
+SPOTIFY_ALERT_REVIEW_THRESHOLD=medium python scripts/regression_alert.py
+SPOTIFY_ALERT_REVIEW_THRESHOLD=off python scripts/regression_alert.py
+```
+
+The scheduled wrapper also runs a dedicated control-room guard with these default thresholds:
+
+- `SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP=0.35`
+- `SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK=0.45`
+- `SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD=0.20`
+- `SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK=0.50`
+
+You can run that guard directly:
+
+```bash
+python scripts/control_room_guard.py \
+  --max-robustness-gap 0.35 \
+  --max-stress-skip-risk 0.45 \
+  --max-target-drift-jsd 0.20 \
+  --max-selective-risk 0.50
+```
+
+That guard also writes:
+
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
+
+The history artifact keeps one snapshot per run, the weekly summary rolls recent runs into a trend view, the control room now calls out missing analysis coverage explicitly, and the triage artifacts expand the current review actions into inspect/fix/rerun steps so the next ops move is explicit after a failed scheduled run.
 
 ## Spotify API Credentials
 

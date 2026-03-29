@@ -382,9 +382,109 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
 
     assert json_path.exists()
     assert md_path.exists()
+    assert (output_dir / "analytics" / "control_room_history.csv").exists()
+    assert (output_dir / "analytics" / "control_room_weekly_summary.json").exists()
+    assert (output_dir / "analytics" / "control_room_weekly_summary.md").exists()
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["latest_run"]["run_id"] == "run_a"
+    assert payload["ops_coverage"]["available_summary_count"] == 1
+    assert payload["ops_coverage"]["expected_summary_count"] == 6
+    assert any(action["area"] == "instrumentation" for action in payload["review_actions"])
+    assert payload["ops_history"]["snapshot_count"] == 1
+    assert payload["ops_trends"]["history_available"] is True
+    assert payload["weekly_ops_summary"]["snapshots_considered"] == 1
     markdown = md_path.read_text(encoding="utf-8")
     assert "Control Room" in markdown
+    assert "Ops Coverage" in markdown
     assert "Since Last Strong Run" in markdown
+    assert "Recent Trends" in markdown
+    assert "Weekly Window" in markdown
     assert "Review Actions" in markdown
+
+
+def test_control_room_history_and_weekly_summary_track_multiple_runs(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_b", "model_name": "blended_ensemble", "model_type": "ensemble", "val_top1": 0.54},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+            {"run_id": "run_b", "model_name": "blended_ensemble", "model_type": "ensemble", "top1": 0.49},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-03-20T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.02,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.11,
+        stress_skip_risk=0.22,
+        stress_scenario="steady_evening",
+    )
+
+    write_control_room_report(output_dir, top_n=3)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-03-22T20:00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="blended_ensemble",
+        best_model_type="ensemble",
+        val_top1=0.54,
+        test_top1=0.49,
+        gate_regression=0.03,
+        drift_jsd=0.19,
+        ece=0.09,
+        selective_risk=0.61,
+        abstention_rate=0.0,
+        robustness_gap=0.27,
+        stress_skip_risk=0.44,
+        stress_scenario="evening_drift",
+    )
+
+    json_path, md_path = write_control_room_report(output_dir, top_n=3)
+
+    history_path = output_dir / "analytics" / "control_room_history.csv"
+    weekly_json_path = output_dir / "analytics" / "control_room_weekly_summary.json"
+    weekly_md_path = output_dir / "analytics" / "control_room_weekly_summary.md"
+
+    history_frame = pd.read_csv(history_path)
+    assert set(history_frame["run_id"].astype(str)) == {"run_a", "run_b"}
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["ops_history"]["snapshot_count"] == 2
+    assert payload["ops_trends"]["snapshot_count"] == 2
+    assert payload["ops_trends"]["previous_snapshot"]["run_id"] == "run_a"
+    assert any("Previous snapshot was" in item for item in payload["ops_trends"]["summary"])
+
+    weekly_payload = json.loads(weekly_json_path.read_text(encoding="utf-8"))
+    assert weekly_payload["snapshots_considered"] == 2
+    assert weekly_payload["failed_promotions"] == 1
+    assert weekly_md_path.exists()
+
+    markdown = md_path.read_text(encoding="utf-8")
+    assert "Recent Trends" in markdown
+    assert "Weekly Window" in markdown
+    assert "Previous snapshot was `run_a`" in markdown

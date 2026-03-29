@@ -244,6 +244,17 @@ def _first_nonempty_value(record: dict[str, Any], columns: tuple[str, ...]) -> s
     return ""
 
 
+def _first_nonempty_tuple_value(row: tuple[object, ...], index_by_column: dict[str, int], columns: tuple[str, ...]) -> str:
+    for column in columns:
+        column_idx = index_by_column.get(column)
+        if column_idx is None:
+            continue
+        text = _clean_text(row[column_idx])
+        if text:
+            return text
+    return ""
+
+
 def _entity_key(prefix: str, *, uri: str, name: str) -> str:
     stable = _clean_text(uri) or _clean_text(name).casefold()
     return f"{prefix}:{stable}"
@@ -289,23 +300,28 @@ def _cross_media_history_frame(
         )
 
     rows: list[dict[str, Any]] = []
-    for record in recent.to_dict(orient="records"):
-        artist_name = _first_nonempty_value(record, ("master_metadata_album_artist_name",))
-        track_name = _first_nonempty_value(record, ("master_metadata_track_name",))
-        track_uri = _first_nonempty_value(record, ("spotify_track_uri",))
+    index_by_column = {column: idx for idx, column in enumerate(recent.columns)}
+    ts_idx = index_by_column.get("ts")
+    ms_played_idx = index_by_column.get("ms_played")
 
-        show_name = _first_nonempty_value(record, ("episode_show_name", "show_name"))
-        show_uri = _first_nonempty_value(record, ("spotify_show_uri", "show_uri"))
-        episode_name = _first_nonempty_value(record, ("episode_name", "episode_title"))
-        episode_uri = _first_nonempty_value(record, ("spotify_episode_uri", "episode_uri"))
+    for row in recent.itertuples(index=False, name=None):
+        artist_name = _first_nonempty_tuple_value(row, index_by_column, ("master_metadata_album_artist_name",))
+        track_name = _first_nonempty_tuple_value(row, index_by_column, ("master_metadata_track_name",))
+        track_uri = _first_nonempty_tuple_value(row, index_by_column, ("spotify_track_uri",))
 
-        audiobook_name = _first_nonempty_value(record, ("audiobook_title", "audiobook_name"))
-        audiobook_uri = _first_nonempty_value(record, ("audiobook_uri", "spotify_audiobook_uri"))
-        chapter_name = _first_nonempty_value(
-            record,
+        show_name = _first_nonempty_tuple_value(row, index_by_column, ("episode_show_name", "show_name"))
+        show_uri = _first_nonempty_tuple_value(row, index_by_column, ("spotify_show_uri", "show_uri"))
+        episode_name = _first_nonempty_tuple_value(row, index_by_column, ("episode_name", "episode_title"))
+        episode_uri = _first_nonempty_tuple_value(row, index_by_column, ("spotify_episode_uri", "episode_uri"))
+
+        audiobook_name = _first_nonempty_tuple_value(row, index_by_column, ("audiobook_title", "audiobook_name"))
+        audiobook_uri = _first_nonempty_tuple_value(row, index_by_column, ("audiobook_uri", "spotify_audiobook_uri"))
+        chapter_name = _first_nonempty_tuple_value(
+            row,
+            index_by_column,
             ("audiobook_chapter_title", "chapter_name", "chapter_title"),
         )
-        chapter_uri = _first_nonempty_value(record, ("audiobook_chapter_uri", "chapter_uri"))
+        chapter_uri = _first_nonempty_tuple_value(row, index_by_column, ("audiobook_chapter_uri", "chapter_uri"))
 
         event: dict[str, Any] | None = None
         if audiobook_name:
@@ -313,7 +329,7 @@ def _cross_media_history_frame(
             item_uri = chapter_uri or episode_uri or audiobook_uri
             item_type = "chapter" if item_name and item_name.casefold() != audiobook_name.casefold() else "audiobook"
             event = {
-                "ts": record.get("ts"),
+                "ts": row[ts_idx] if ts_idx is not None else None,
                 "media_family": "audiobook",
                 "node_type": "audiobook",
                 "node_key": _entity_key("audiobook", uri=audiobook_uri, name=audiobook_name),
@@ -330,7 +346,7 @@ def _cross_media_history_frame(
             item_uri = episode_uri or show_uri
             item_type = "episode" if episode_name else "show"
             event = {
-                "ts": record.get("ts"),
+                "ts": row[ts_idx] if ts_idx is not None else None,
                 "media_family": "podcast",
                 "node_type": "show",
                 "node_key": _entity_key("show", uri=show_uri, name=canonical_show_name),
@@ -347,7 +363,7 @@ def _cross_media_history_frame(
             item_uri = track_uri
             item_type = "track" if track_name else "artist"
             event = {
-                "ts": record.get("ts"),
+                "ts": row[ts_idx] if ts_idx is not None else None,
                 "media_family": "music",
                 "node_type": "artist",
                 "node_key": _entity_key("artist", uri="", name=canonical_artist_name),
@@ -361,7 +377,7 @@ def _cross_media_history_frame(
 
         if event is None:
             continue
-        ms_played = pd.to_numeric(record.get("ms_played"), errors="coerce")
+        ms_played = pd.to_numeric(row[ms_played_idx], errors="coerce") if ms_played_idx is not None else float("nan")
         event["ms_played"] = float(ms_played) if pd.notna(ms_played) else 0.0
         rows.append(event)
 
@@ -412,15 +428,15 @@ def _node_top_items(group: pd.DataFrame, *, limit: int = 3) -> list[dict[str, An
         .sort_values(["play_count", "total_ms_played", "item_name"], ascending=[False, False, True])
     )
     rows: list[dict[str, Any]] = []
-    for _, row in item_rows.head(max(1, int(limit))).iterrows():
+    for row in item_rows.head(max(1, int(limit))).itertuples(index=False):
         rows.append(
             {
-                "item_key": str(row.get("item_key", "")).strip(),
-                "item_name": str(row.get("item_name", "")).strip(),
-                "item_type": str(row.get("item_type", "")).strip(),
-                "play_count": int(row.get("play_count", 0) or 0),
-                "total_ms_played": int(float(row.get("total_ms_played", 0.0) or 0.0)),
-                "last_seen": pd.Timestamp(row.get("last_seen")).isoformat() if pd.notna(row.get("last_seen")) else None,
+                "item_key": str(row.item_key).strip(),
+                "item_name": str(row.item_name).strip(),
+                "item_type": str(row.item_type).strip(),
+                "play_count": int(row.play_count or 0),
+                "total_ms_played": int(float(row.total_ms_played or 0.0)),
+                "last_seen": pd.Timestamp(row.last_seen).isoformat() if pd.notna(row.last_seen) else None,
             }
         )
     return rows
@@ -637,19 +653,19 @@ def _cross_media_graph_payload(
         )
         edge_rows = [
             {
-                "source_key": str(row.get("source_key", "")).strip(),
-                "source_name": str(row.get("source_name", "")).strip(),
-                "source_type": str(row.get("source_type", "")).strip(),
-                "source_media_family": str(row.get("source_media_family", "")).strip(),
-                "target_key": str(row.get("target_key", "")).strip(),
-                "target_name": str(row.get("target_name", "")).strip(),
-                "target_type": str(row.get("target_type", "")).strip(),
-                "target_media_family": str(row.get("target_media_family", "")).strip(),
-                "cross_media": bool(row.get("cross_media", False)),
-                "transition_count": int(row.get("transition_count", 0) or 0),
-                "target_ms_played": int(float(row.get("target_ms_played", 0.0) or 0.0)),
+                "source_key": str(row.source_key).strip(),
+                "source_name": str(row.source_name).strip(),
+                "source_type": str(row.source_type).strip(),
+                "source_media_family": str(row.source_media_family).strip(),
+                "target_key": str(row.target_key).strip(),
+                "target_name": str(row.target_name).strip(),
+                "target_type": str(row.target_type).strip(),
+                "target_media_family": str(row.target_media_family).strip(),
+                "cross_media": bool(row.cross_media),
+                "transition_count": int(row.transition_count or 0),
+                "target_ms_played": int(float(row.target_ms_played or 0.0)),
             }
-            for _, row in edge_frame.iterrows()
+            for row in edge_frame.itertuples(index=False)
         ]
     else:
         edge_rows = []

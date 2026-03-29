@@ -144,6 +144,25 @@ def test_cross_media_history_frame_classifies_music_podcast_and_audiobook_rows()
     assert frame["session_id"].tolist() == [0, 0, 0, 1]
 
 
+def test_cross_media_history_frame_supports_alternate_podcast_columns() -> None:
+    history = pd.DataFrame(
+        {
+            "ts": ["2026-03-01T10:00:00Z"],
+            "show_name": ["Deep Cuts"],
+            "episode_title": ["Episode 7"],
+            "episode_uri": ["spotify:episode:ep7"],
+            "ms_played": [240000],
+        }
+    )
+
+    frame = _cross_media_history_frame(history, lookback_days=30, session_gap_minutes=30)
+
+    assert frame["media_family"].tolist() == ["podcast"]
+    assert frame["node_name"].tolist() == ["Deep Cuts"]
+    assert frame["item_name"].tolist() == ["Episode 7"]
+    assert frame["item_uri"].tolist() == ["spotify:episode:ep7"]
+
+
 def test_cross_media_graph_payload_summarizes_mixed_sessions_and_transitions() -> None:
     history = pd.DataFrame(
         {
