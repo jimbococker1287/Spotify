@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 
+from .benchmark_contract import describe_canonical_benchmark_contract
+
 
 def _safe_float(value) -> float:
     try:
@@ -87,6 +89,7 @@ def write_benchmark_protocol(
         "val": int(len(data.X_seq_val)),
         "test": int(len(data.X_seq_test)),
     }
+    contract = describe_canonical_benchmark_contract()
     payload = {
         "run_id": str(run_id).strip(),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -98,6 +101,7 @@ def write_benchmark_protocol(
         "num_context_features": int(data.num_ctx),
         "split_rows": split_rows,
         "prepared_cache": dict(cache_info),
+        "benchmark_contract": contract,
         "protocol": {
             "split_rule": "time_ordered_prefix_holdout_after_sequence_alignment",
             "primary_metrics": ["top1", "top5", "ndcg_at5", "mrr_at5", "coverage_at5", "diversity_at5"],
@@ -110,6 +114,15 @@ def write_benchmark_protocol(
             "reproducibility": {
                 "data_fingerprint": str(cache_info.get("fingerprint", "")),
                 "source_file_count": int(cache_info.get("source_file_count", 0) or 0),
+            },
+            "benchmark_lock": {
+                "canonical_profile": str(contract.get("canonical_profile", "")),
+                "comparison_mode": str(contract.get("comparison_mode", "")),
+                "minimum_repeated_runs": int(contract.get("minimum_repeated_runs", 0) or 0),
+                "required_run_artifacts": list(contract.get("required_run_artifacts", [])),
+                "required_benchmark_lock_artifacts": list(contract.get("required_benchmark_lock_artifacts", [])),
+                "significance_policy": dict(contract.get("significance_policy", {})),
+                "stability_rules": list(contract.get("stability_rules", [])),
             },
         },
     }
@@ -135,7 +148,22 @@ def write_benchmark_protocol(
         "- Keep `sequence_length`, `max_artists`, and `random_seed` fixed.",
         "- Compare models on the same holdout split and temporal backtest folds.",
         "- Report both ranking quality and risk metrics.",
+        "",
+        "## Benchmark Lock",
+        "",
+        f"- Contract version: `{contract['contract_version']}`",
+        f"- Canonical profile: `{contract['canonical_profile']}`",
+        f"- Comparison mode: `{contract['comparison_mode']}` with at least `{contract['minimum_repeated_runs']}` repeated runs.",
+        f"- Significance metric: `{contract['significance_policy']['metric']}` at `{contract['significance_policy']['confidence_level']}` confidence with z >= `{contract['significance_policy']['z_threshold']}`.",
+        "",
+        "## Locked Artifact Set",
+        "",
     ]
+    for item in contract["required_run_artifacts"]:
+        md_lines.append(f"- `{item}`")
+    md_lines.extend(["", "## Stability Rules", ""])
+    for item in contract["stability_rules"]:
+        md_lines.append(f"- {item}")
     md_path.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
     return [json_path, md_path]
 

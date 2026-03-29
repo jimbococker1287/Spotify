@@ -2,6 +2,8 @@
 
 Week 9 turns the safety layer into a reusable platform surface instead of leaving it implied inside the Spotify training pipeline.
 
+Week 10 then freezes the comparison side of that platform with the benchmark contract in `docs/benchmark_contract.md`, so safety claims and benchmark claims use the same stable operating language.
+
 ## Platform Split
 
 The reusable core lives in:

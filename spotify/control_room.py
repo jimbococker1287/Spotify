@@ -11,6 +11,8 @@ from .run_artifacts import collect_run_manifests as _collect_run_manifests
 from .run_artifacts import safe_read_csv as _safe_read_csv
 from .run_artifacts import safe_read_json as _safe_read_json
 
+_OPERATIONAL_REVIEW_AREAS = frozenset({"instrumentation", "cadence"})
+
 
 def _safe_float(value) -> float:
     try:
@@ -130,6 +132,20 @@ def _age_hours(timestamp: object, *, reference_time: datetime) -> float:
         return float("nan")
     delta_hours = (reference_time - parsed).total_seconds() / 3600.0
     return max(delta_hours, 0.0)
+
+
+def _split_review_actions(review_actions: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    operational: list[dict[str, object]] = []
+    strategic: list[dict[str, object]] = []
+    for action in review_actions:
+        if not isinstance(action, dict):
+            continue
+        area = str(action.get("area", "")).strip().lower()
+        if area in _OPERATIONAL_REVIEW_AREAS:
+            operational.append(action)
+        else:
+            strategic.append(action)
+    return operational, strategic
 
 
 def _freshness_rank(age_hours: float) -> int:
@@ -659,7 +675,7 @@ def _build_operating_rhythm(
     fast_lane = _build_cadence_lane(
         manifests=manifests,
         lane="fast",
-        profiles={"fast", "small", "core", "experimental", "dev"},
+        profiles={"fast", "small", "core", "experimental"},
         target_interval_hours=24,
         reference_time=reference_time,
     )
@@ -911,14 +927,17 @@ def _build_review_actions(
 
     latest_observed = run_selection.get("latest_observed_run", {})
     latest_observed = latest_observed if isinstance(latest_observed, dict) else {}
+    selection_gap_note = ""
     if bool(operating_rhythm.get("selection_gap")):
-        cadence_notes.append(
+        selection_gap_note = (
             f"Latest observed run `{latest_observed.get('run_id', '')}` is newer than the ops-selected run "
             f"`{latest_run.get('run_id', '')}` because {run_selection.get('selection_reason', 'the newer run is not review-ready yet')}."
         )
 
     if cadence_notes:
         cadence_priority = "high" if str(full_lane.get("status", "")) in {"missing", "stale"} else "medium"
+        if selection_gap_note:
+            cadence_notes.append(selection_gap_note)
         actions.append(
             {
                 "priority": cadence_priority,
@@ -926,6 +945,16 @@ def _build_review_actions(
                 "title": "Restore the recurring run cadence",
                 "detail": " ".join(note for note in cadence_notes if note),
                 "inspect": ["outputs/analytics/control_room_history.csv", "scripts/run_scheduled.sh"],
+            }
+        )
+    elif selection_gap_note:
+        actions.append(
+            {
+                "priority": "low",
+                "area": "selection",
+                "title": "Keep the freshest run legible while the fuller review pack stays anchored",
+                "detail": selection_gap_note,
+                "inspect": ["outputs/analytics/control_room.md", "outputs/analytics/control_room_history.csv"],
             }
         )
 
@@ -1022,6 +1051,85 @@ def _build_review_actions(
     return actions[:6]
 
 
+def _build_ops_health(
+    *,
+    review_actions: list[dict[str, object]],
+    operating_rhythm: dict[str, object],
+    ops_coverage: dict[str, object],
+) -> dict[str, object]:
+    operational_actions, strategic_actions = _split_review_actions(review_actions)
+    operational_high = sum(
+        1
+        for action in operational_actions
+        if str(action.get("priority", "")).strip().lower() == "high"
+    )
+    operational_medium = sum(
+        1
+        for action in operational_actions
+        if str(action.get("priority", "")).strip().lower() == "medium"
+    )
+    strategic_high = sum(
+        1
+        for action in strategic_actions
+        if str(action.get("priority", "")).strip().lower() == "high"
+    )
+    coverage_ratio = _safe_float(ops_coverage.get("coverage_ratio"))
+    cadence_status = str(operating_rhythm.get("overall_status", "")).strip().lower()
+
+    if math.isfinite(coverage_ratio) and coverage_ratio < 0.8:
+        status = "blocked"
+        headline = "Operational review is blocked until the latest run has a complete artifact pack."
+    elif cadence_status in {"missing", "stale", "attention"} or operational_high > 0 or operational_medium > 0:
+        status = "attention"
+        headline = "Operational review is usable, but cadence or instrumentation still needs attention."
+    else:
+        status = "healthy"
+        headline = "Operational review is healthy; remaining findings are strategic rather than tooling or cadence blockers."
+
+    summary: list[str] = []
+    if operational_actions:
+        summary.append(
+            f"Operational blockers: `{len(operational_actions)}` total with `{operational_high}` high and `{operational_medium}` medium priority."
+        )
+    else:
+        summary.append("No cadence or instrumentation blockers are currently open.")
+    if strategic_actions:
+        summary.append(
+            f"Strategic findings still open: `{len(strategic_actions)}` total with `{strategic_high}` high priority."
+        )
+    cadence_command = str(operating_rhythm.get("recommended_run_command", "")).strip()
+    if cadence_command and cadence_status in {"missing", "stale", "attention"}:
+        summary.append(f"Next ops move: `{cadence_command}`.")
+    elif cadence_status == "healthy":
+        summary.append("Cadence is healthy enough that the next move is review and prioritization, not an immediate rerun.")
+
+    return {
+        "status": status,
+        "headline": headline,
+        "operational_action_count": int(len(operational_actions)),
+        "operational_high_priority_count": int(operational_high),
+        "operational_medium_priority_count": int(operational_medium),
+        "strategic_action_count": int(len(strategic_actions)),
+        "strategic_high_priority_count": int(strategic_high),
+        "cadence_status": cadence_status,
+        "operational_areas": sorted(
+            {
+                str(action.get("area", "")).strip().lower()
+                for action in operational_actions
+                if str(action.get("area", "")).strip()
+            }
+        ),
+        "strategic_areas": sorted(
+            {
+                str(action.get("area", "")).strip().lower()
+                for action in strategic_actions
+                if str(action.get("area", "")).strip()
+            }
+        ),
+        "summary": summary[:4],
+    }
+
+
 def _build_async_handoff(
     *,
     latest_run: dict[str, object],
@@ -1030,22 +1138,26 @@ def _build_async_handoff(
     operating_rhythm: dict[str, object],
     run_selection: dict[str, object],
     ops_coverage: dict[str, object],
+    ops_health: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    ops_health = ops_health if isinstance(ops_health, dict) else {}
     top_action = review_actions[0] if review_actions and isinstance(review_actions[0], dict) else {}
     top_priority = str(top_action.get("priority", "")).strip().lower()
     coverage_ratio = _safe_float(ops_coverage.get("coverage_ratio"))
     recommended_run_command = str(operating_rhythm.get("recommended_run_command", "")).strip()
     recommended_review_command = str(operating_rhythm.get("recommended_review_command", "make control-room")).strip()
+    ops_status = str(ops_health.get("status", "")).strip().lower()
+    strategic_high = _safe_int(ops_health.get("strategic_high_priority_count"), default=0)
 
-    if math.isfinite(coverage_ratio) and coverage_ratio < 0.8:
+    if math.isfinite(coverage_ratio) and coverage_ratio < 0.8 or ops_status == "blocked":
         status = "blocked"
         headline = "Async review is blocked until the missing ops artifacts are backfilled."
-    elif top_priority == "high":
+    elif ops_status == "attention":
         status = "attention"
-        headline = "Async review can proceed, but high-priority actions should close before another full run."
-    elif str(operating_rhythm.get("overall_status", "")) in {"missing", "stale", "attention"}:
-        status = "attention"
-        headline = "Async review is usable, but the recurring cadence still needs attention."
+        headline = "Async review is usable, but cadence or instrumentation still needs attention."
+    elif strategic_high > 0 or top_priority == "high":
+        status = "ready"
+        headline = "Async review is ready; strategic safety findings remain open before promotion."
     else:
         status = "ready"
         headline = "Async review is ready; the current report is enough for a teammate handoff."
@@ -1056,6 +1168,10 @@ def _build_async_handoff(
         f"Start with `{recommended_review_command}` and review ops-selected run `{latest_run.get('run_id', '')}` (`{latest_run.get('profile', '')}`).",
         f"Promotion is `{latest_run.get('promotion_status', '')}` and the top open action is `{top_action.get('title', 'none')}`.",
     ]
+    for item in ops_health.get("summary", []):
+        text = str(item).strip()
+        if text:
+            summary.append(text)
     if bool(operating_rhythm.get("selection_gap")) and latest_observed.get("run_id"):
         summary.append(
             f"Latest observed run `{latest_observed.get('run_id', '')}` is newer than the selected run, so include the run-selection note in the handoff."
@@ -1071,7 +1187,11 @@ def _build_async_handoff(
         "outputs/analytics/control_room.md",
         "outputs/analytics/control_room_weekly_summary.md",
     ]
-    if top_priority in {"high", "medium"}:
+    if any(
+        isinstance(action, dict)
+        and str(action.get("priority", "")).strip().lower() in {"high", "medium"}
+        for action in review_actions
+    ):
         share_artifacts.append("outputs/analytics/control_room_triage.md")
 
     return {
@@ -1105,6 +1225,8 @@ def _snapshot_sort_frame(history_df: pd.DataFrame) -> pd.DataFrame:
         "expected_summary_count",
         "review_action_count",
         "high_priority_review_actions",
+        "operational_high_priority_review_actions",
+        "strategic_high_priority_review_actions",
         "medium_priority_review_actions",
         "next_bet_count",
     ):
@@ -1135,6 +1257,8 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
     operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
     async_handoff = report.get("async_handoff", {})
     async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
+    ops_health = report.get("ops_health", {})
+    ops_health = ops_health if isinstance(ops_health, dict) else {}
     review_actions = report.get("review_actions", [])
     review_actions = review_actions if isinstance(review_actions, list) else []
     baseline = report.get("baseline_comparison", {})
@@ -1182,12 +1306,21 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
         "available_summary_count": _safe_int(ops_coverage.get("available_summary_count"), default=0),
         "expected_summary_count": _safe_int(ops_coverage.get("expected_summary_count"), default=0),
         "operating_status": str(operating_rhythm.get("overall_status", "")),
+        "ops_health_status": str(ops_health.get("status", "")),
         "fast_cadence_status": str(_operating_lane(operating_rhythm, "fast").get("status", "")),
         "full_cadence_status": str(_operating_lane(operating_rhythm, "full").get("status", "")),
         "async_handoff_status": str(async_handoff.get("status", "")),
         "recommended_run_command": str(operating_rhythm.get("recommended_run_command", "")),
         "review_action_count": int(len(review_actions)),
         "high_priority_review_actions": int(high_count),
+        "operational_high_priority_review_actions": _safe_int(
+            ops_health.get("operational_high_priority_count"),
+            default=0,
+        ),
+        "strategic_high_priority_review_actions": _safe_int(
+            ops_health.get("strategic_high_priority_count"),
+            default=0,
+        ),
         "medium_priority_review_actions": int(medium_count),
         "review_action_areas": "|".join(areas),
         "baseline_run_id": str(baseline_run.get("run_id", "")),
@@ -1309,11 +1442,18 @@ def _build_ops_trends(report: dict[str, object], history_df: pd.DataFrame) -> di
     high_issue_runs = int(
         (pd.to_numeric(recent_window.get("high_priority_review_actions"), errors="coerce").fillna(0) > 0).sum()
     ) if not recent_window.empty else 0
+    operational_issue_runs = int(
+        (pd.to_numeric(recent_window.get("operational_high_priority_review_actions"), errors="coerce").fillna(0) > 0).sum()
+    ) if not recent_window.empty else 0
     summary.append(
         f"In the last `{len(recent_window.index)}` run snapshots, promotions passed `{promoted_count}` times and failed `{failed_promotions}` times."
     )
     if high_issue_runs > 0:
         summary.append(f"High-priority review actions appeared in `{high_issue_runs}` of the last `{len(recent_window.index)}` snapshots.")
+    if operational_issue_runs > 0:
+        summary.append(
+            f"Operational blockers specifically appeared in `{operational_issue_runs}` of the last `{len(recent_window.index)}` snapshots."
+        )
 
     area_counts: dict[str, int] = {}
     for raw_value in recent_window.get("review_action_areas", pd.Series(dtype="object")).fillna("").astype(str):
@@ -1377,6 +1517,9 @@ def _write_weekly_ops_summary(
     async_blocked_snapshots = int(
         window_frame.get("async_handoff_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["blocked"]).sum()
     ) if not window_frame.empty else 0
+    operational_issue_snapshots = int(
+        (pd.to_numeric(window_frame.get("operational_high_priority_review_actions"), errors="coerce").fillna(0) > 0).sum()
+    ) if not window_frame.empty else 0
     fast_cadence_issue_snapshots = int(
         window_frame.get("fast_cadence_status", pd.Series(dtype="object")).fillna("").astype(str).isin(["attention", "stale", "missing"]).sum()
     ) if not window_frame.empty else 0
@@ -1412,6 +1555,10 @@ def _write_weekly_ops_summary(
         f"Worst observed robustness gap is `{_format_metric(worst_robustness_gap)}` and worst stress skip risk is `{_format_metric(worst_stress_skip_risk)}`.",
         f"Async handoff was blocked in `{async_blocked_snapshots}` snapshot(s); fast cadence needed attention in `{fast_cadence_issue_snapshots}` and full cadence in `{full_cadence_issue_snapshots}`.",
     ]
+    if operational_issue_snapshots > 0:
+        summary_lines.append(
+            f"Operational blockers appeared in `{operational_issue_snapshots}` snapshot(s) during the weekly window."
+        )
     if recurring_areas:
         recurring_labels = [f"{row['area']} ({row['count']})" for row in recurring_areas[:3]]
         summary_lines.append(
@@ -1431,6 +1578,7 @@ def _write_weekly_ops_summary(
         "worst_stress_skip_risk": worst_stress_skip_risk,
         "worst_selective_risk": worst_selective_risk,
         "async_handoff_blocked_snapshots": int(async_blocked_snapshots),
+        "operational_issue_snapshots": int(operational_issue_snapshots),
         "fast_cadence_issue_snapshots": int(fast_cadence_issue_snapshots),
         "full_cadence_issue_snapshots": int(full_cadence_issue_snapshots),
         "recurring_areas": recurring_areas,
@@ -1554,6 +1702,11 @@ def build_control_room_report(
         run_selection=run_selection,
         operating_rhythm=operating_rhythm,
     )
+    ops_health = _build_ops_health(
+        review_actions=review_actions,
+        operating_rhythm=operating_rhythm,
+        ops_coverage=ops_coverage,
+    )
 
     report = {
         "generated_at": now.isoformat(timespec="seconds"),
@@ -1576,6 +1729,7 @@ def build_control_room_report(
         "ops_coverage": ops_coverage,
         "run_selection": run_selection,
         "operating_rhythm": operating_rhythm,
+        "ops_health": ops_health,
         "leaderboards": {
             "experiment_top_models": _rank_models(experiment_history, metric_column="val_top1", top_n=top_n),
             "backtest_top_models": _rank_models(backtest_history, metric_column="top1", top_n=top_n),
@@ -1585,7 +1739,7 @@ def build_control_room_report(
         "review_ritual": [
             "Open this control room first after every meaningful run.",
             "Compare the latest run to the last promoted baseline before interpreting regressions.",
-            "Work through every high-priority review action before scheduling another full run.",
+            "Clear cadence or instrumentation blockers first, then triage any remaining strategic high-priority findings before the next full run.",
             "If only medium and low priorities remain, capture decisions asynchronously and keep the operating cadence moving.",
         ],
     }
@@ -1604,6 +1758,7 @@ def build_control_room_report(
         operating_rhythm=operating_rhythm,
         run_selection=run_selection,
         ops_coverage=ops_coverage,
+        ops_health=ops_health,
     )
     return report
 
@@ -1654,6 +1809,7 @@ def write_control_room_report(
         else [],
         "current_focus": weekly_payload.get("current_focus", []),
         "async_handoff_blocked_snapshots": _safe_int(weekly_payload.get("async_handoff_blocked_snapshots"), default=0),
+        "operational_issue_snapshots": _safe_int(weekly_payload.get("operational_issue_snapshots"), default=0),
         "fast_cadence_issue_snapshots": _safe_int(weekly_payload.get("fast_cadence_issue_snapshots"), default=0),
         "full_cadence_issue_snapshots": _safe_int(weekly_payload.get("full_cadence_issue_snapshots"), default=0),
     }
@@ -1671,6 +1827,8 @@ def write_control_room_report(
     run_selection = run_selection if isinstance(run_selection, dict) else {}
     operating_rhythm = report.get("operating_rhythm", {})
     operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
+    ops_health = report.get("ops_health", {})
+    ops_health = ops_health if isinstance(ops_health, dict) else {}
     async_handoff = report.get("async_handoff", {})
     async_handoff = async_handoff if isinstance(async_handoff, dict) else {}
     baseline = report.get("baseline_comparison", {})
@@ -1710,6 +1868,19 @@ def write_control_room_report(
         f"- Full lane: `{_operating_lane(operating_rhythm, 'full').get('status', '')}` latest=`{(_operating_lane(operating_rhythm, 'full').get('latest_run', {}) if isinstance(_operating_lane(operating_rhythm, 'full').get('latest_run', {}), dict) else {}).get('run_id', '')}` age_h=`{_format_metric(_operating_lane(operating_rhythm, 'full').get('hours_since_run'))}`",
         f"- Recommended next run: `{operating_rhythm.get('recommended_run_command', '') or 'none'}`",
         "",
+        "## Ops Health",
+        "",
+        f"- Status: `{ops_health.get('status', '')}`",
+        f"- Operational blockers: `{_safe_int(ops_health.get('operational_action_count'), default=0)}` total with high=`{_safe_int(ops_health.get('operational_high_priority_count'), default=0)}` medium=`{_safe_int(ops_health.get('operational_medium_priority_count'), default=0)}`",
+        f"- Strategic findings: `{_safe_int(ops_health.get('strategic_action_count'), default=0)}` total with high=`{_safe_int(ops_health.get('strategic_high_priority_count'), default=0)}`",
+        "",
+    ]
+    for item in ops_health.get("summary", []):
+        lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
         "## Latest Run",
         "",
         f"- Run: `{latest_run['run_id']}` (`{latest_run['profile']}`)",
@@ -1743,7 +1914,8 @@ def write_control_room_report(
         "",
         "## Since Last Strong Run",
         "",
-    ]
+        ]
+    )
 
     if isinstance(baseline, dict) and bool(baseline.get("baseline_available")):
         baseline_run = baseline.get("baseline_run", {})

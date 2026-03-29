@@ -206,7 +206,10 @@ def _build_control_room_status(root: Path) -> dict[str, Any]:
         root / "outputs/analytics/control_room_triage.md",
     ]
     high_priority_actions = 0
+    operational_high_priority_actions = 0
+    strategic_high_priority_actions = 0
     cadence_status = ""
+    ops_health_status = ""
     recommended_review_command = ""
     latest_run_id = ""
     async_share_count = 0
@@ -222,6 +225,11 @@ def _build_control_room_status(root: Path) -> dict[str, Any]:
         operating_rhythm = payload.get("operating_rhythm", {})
         operating_rhythm = operating_rhythm if isinstance(operating_rhythm, dict) else {}
         cadence_status = str(operating_rhythm.get("overall_status", "")).strip()
+        ops_health = payload.get("ops_health", {})
+        ops_health = ops_health if isinstance(ops_health, dict) else {}
+        ops_health_status = str(ops_health.get("status", "")).strip()
+        operational_high_priority_actions = int(ops_health.get("operational_high_priority_count", 0) or 0)
+        strategic_high_priority_actions = int(ops_health.get("strategic_high_priority_count", 0) or 0)
         recommended_review_command = str(operating_rhythm.get("recommended_review_command", "")).strip()
         latest_run = payload.get("latest_run", {})
         latest_run = latest_run if isinstance(latest_run, dict) else {}
@@ -232,13 +240,18 @@ def _build_control_room_status(root: Path) -> dict[str, Any]:
         async_share_count = len(share_artifacts) if isinstance(share_artifacts, list) else 0
 
     completeness = "ready" if not _missing_paths(doc_paths + artifact_paths, root) else "missing"
-    operational = "ready" if high_priority_actions == 0 and cadence_status == "healthy" else "attention"
+    if ops_health_status:
+        operational = "ready" if ops_health_status == "healthy" else "attention"
+    else:
+        operational = "ready" if high_priority_actions == 0 and cadence_status == "healthy" else "attention"
     efficiency = "ready" if async_share_count >= 3 else "attention"
     recommended_actions: list[str] = []
-    if high_priority_actions > 0:
-        recommended_actions.append("Work through the high-priority control-room review actions before treating the ops lane as healthy.")
+    if operational_high_priority_actions > 0:
+        recommended_actions.append("Clear the cadence or instrumentation blockers before treating the ops lane as healthy.")
     if cadence_status and cadence_status != "healthy":
         recommended_actions.append("Restore the recurring fast/full cadence so the control room reflects a current operating rhythm.")
+    if strategic_high_priority_actions > 0:
+        recommended_actions.append("Strategic safety findings are still open, but they should not be confused with core ops-health blockers.")
     if async_share_count < 3:
         recommended_actions.append("Keep the weekly summary and triage artifacts fresh so async review stays lightweight.")
 
@@ -254,13 +267,16 @@ def _build_control_room_status(root: Path) -> dict[str, Any]:
         "artifact_summary": _artifact_summary(artifact_paths),
         "metrics": {
             "high_priority_review_actions": high_priority_actions,
+            "operational_high_priority_review_actions": operational_high_priority_actions,
+            "strategic_high_priority_review_actions": strategic_high_priority_actions,
             "cadence_status": cadence_status,
+            "ops_health_status": ops_health_status,
             "async_share_artifact_count": async_share_count,
             "latest_run_id": latest_run_id,
         },
         "summary": (
-            f"Control room covers run `{latest_run_id or 'n/a'}` with cadence status `{cadence_status or 'unknown'}` "
-            f"and `{high_priority_actions}` high-priority review action(s)."
+            f"Control room covers run `{latest_run_id or 'n/a'}` with cadence status `{cadence_status or 'unknown'}`, "
+            f"ops-health `{ops_health_status or 'unknown'}`, and `{strategic_high_priority_actions}` strategic high-priority finding(s)."
         ),
         "recommended_actions": recommended_actions,
         "share_artifacts": [

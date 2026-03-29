@@ -24,15 +24,34 @@ else
   PYTHON_CMD="python3"
 fi
 
+if [[ "$MODE" == "fast" ]]; then
+  CONTROL_ROOM_MAX_ROBUSTNESS_GAP="${SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP_FAST:-0.40}"
+  CONTROL_ROOM_MAX_STRESS_SKIP_RISK="${SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK_FAST:-off}"
+  CONTROL_ROOM_MAX_TARGET_DRIFT_JSD="${SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD_FAST:-0.25}"
+  CONTROL_ROOM_MAX_SELECTIVE_RISK="${SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK_FAST:-off}"
+else
+  CONTROL_ROOM_MAX_ROBUSTNESS_GAP="${SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP:-0.35}"
+  CONTROL_ROOM_MAX_STRESS_SKIP_RISK="${SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK:-0.45}"
+  CONTROL_ROOM_MAX_TARGET_DRIFT_JSD="${SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD:-0.20}"
+  CONTROL_ROOM_MAX_SELECTIVE_RISK="${SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK:-0.50}"
+fi
+
 ALERT_EXIT=0
 GUARD_EXIT=0
+LATEST_RUN_DIR="$(ls -td outputs/runs/* 2>/dev/null | head -1 || true)"
 
-"$PYTHON_CMD" scripts/regression_alert.py --review-threshold off || ALERT_EXIT=$?
+if [[ -z "$LATEST_RUN_DIR" || ! -d "$LATEST_RUN_DIR" ]]; then
+  echo "Unable to resolve the latest run directory under outputs/runs" >&2
+  exit 1
+fi
+
+"$PYTHON_CMD" scripts/regression_alert.py --run-dir "$LATEST_RUN_DIR" --review-threshold off || ALERT_EXIT=$?
 "$PYTHON_CMD" scripts/control_room_guard.py \
-  --max-robustness-gap "${SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP:-0.35}" \
-  --max-stress-skip-risk "${SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK:-0.45}" \
-  --max-target-drift-jsd "${SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD:-0.20}" \
-  --max-selective-risk "${SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK:-0.50}" \
+  --run-dir "$LATEST_RUN_DIR" \
+  --max-robustness-gap "$CONTROL_ROOM_MAX_ROBUSTNESS_GAP" \
+  --max-stress-skip-risk "$CONTROL_ROOM_MAX_STRESS_SKIP_RISK" \
+  --max-target-drift-jsd "$CONTROL_ROOM_MAX_TARGET_DRIFT_JSD" \
+  --max-selective-risk "$CONTROL_ROOM_MAX_SELECTIVE_RISK" \
   || GUARD_EXIT=$?
 
 if [[ "$ALERT_EXIT" -ne 0 ]]; then

@@ -92,6 +92,58 @@ def _refresh_control_room(outputs_dir: Path) -> Path:
     return json_path
 
 
+def _parse_timestamp(raw_value: object) -> datetime | None:
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _run_timestamp(run_dir: Path) -> datetime | None:
+    manifest = _read_json(run_dir / "run_manifest.json")
+    parsed = _parse_timestamp(manifest.get("timestamp"))
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.fromtimestamp(run_dir.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _load_requested_run_snapshot(run_dir: Path) -> dict[str, dict[str, object]]:
+    manifest = _read_json(run_dir / "run_manifest.json")
+    if not manifest:
+        return {}
+    manifest["run_dir"] = str(run_dir.resolve())
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from spotify.control_room import _build_run_health_snapshot
+
+    payload = _build_run_health_snapshot(manifest)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _requested_run_pending_control_room(control_room: dict[str, object], run_dir: Path) -> bool:
+    latest_run = control_room.get("latest_run", {})
+    if not isinstance(latest_run, dict):
+        return False
+    latest_run_id = str(latest_run.get("run_id", "")).strip()
+    if not latest_run_id or latest_run_id == run_dir.name:
+        return False
+    latest_timestamp = _parse_timestamp(latest_run.get("timestamp"))
+    requested_timestamp = _run_timestamp(run_dir)
+    if latest_timestamp is None or requested_timestamp is None:
+        return False
+    return requested_timestamp >= latest_timestamp
+
+
 def _violation_row(*, key: str, label: str, current: object, maximum: float | None) -> dict[str, object] | None:
     if maximum is None:
         return None
@@ -403,7 +455,22 @@ def main() -> int:
     latest_run_id = str(latest_run.get("run_id", "")).strip()
     requested_run_id = run_dir.name if run_dir is not None else latest_run_id
     status = "ok"
-    if requested_run_id and latest_run_id and requested_run_id != latest_run_id:
+    if run_dir is not None and _requested_run_pending_control_room(control_room, run_dir):
+        requested_snapshot = _load_requested_run_snapshot(run_dir)
+        requested_run = requested_snapshot.get("run", {})
+        requested_run = requested_run if isinstance(requested_run, dict) else {}
+        latest_run = requested_run or latest_run
+        safety = requested_snapshot.get("safety", {})
+        safety = safety if isinstance(safety, dict) else {}
+        qoe = requested_snapshot.get("qoe", {})
+        qoe = qoe if isinstance(qoe, dict) else {}
+        control_room = dict(control_room)
+        control_room["latest_run"] = latest_run
+        control_room["safety"] = safety
+        control_room["qoe"] = qoe
+        control_room["review_actions"] = []
+        status = f"pending_control_room:{latest_run_id}" if latest_run_id else "explicit_run"
+    elif requested_run_id and latest_run_id and requested_run_id != latest_run_id:
         status = f"stale:{latest_run_id}"
 
     max_robustness_gap = _parse_threshold(args.max_robustness_gap)

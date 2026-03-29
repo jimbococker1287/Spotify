@@ -239,3 +239,65 @@ def test_control_room_guard_triage_includes_instrumentation_playbook_when_analys
     instrumentation_item = next(item for item in triage_payload["triage_items"] if item["area"] == "instrumentation")
     assert any("analysis generation was skipped" in step for step in instrumentation_item["inspect_steps"])
     assert any("coverage section shows the expected artifacts" in step for step in instrumentation_item["rerun_steps"])
+
+
+def test_control_room_guard_allows_newer_explicit_run_pending_control_room(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-03-20T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="retrieval_reranker",
+        model_type="retrieval_reranker",
+        val_top1=0.59,
+        test_top1=0.56,
+        regression=-0.01,
+        robustness_gap=0.09,
+        stress_skip_risk=0.22,
+    )
+    run_pending = _write_run(
+        output_dir,
+        run_id="run_pending",
+        timestamp="2026-03-22T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="blended_ensemble",
+        model_type="ensemble",
+        val_top1=0.61,
+        test_top1=0.58,
+        regression=-0.01,
+        robustness_gap=0.12,
+        stress_skip_risk=0.24,
+    )
+    (run_pending / "run_results.json").unlink()
+    (run_pending / "analysis" / "friction_proxy_summary.json").unlink()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--run-dir",
+            str(run_pending),
+            "--max-robustness-gap",
+            "0.20",
+            "--max-stress-skip-risk",
+            "0.40",
+            "--max-target-drift-jsd",
+            "0.20",
+            "--max-selective-risk",
+            "0.50",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0
+    assert "run=run_pending" in result.stdout
+    assert "control_room_status=pending_control_room:run_full" in result.stdout
+    assert "violations=0" in result.stdout

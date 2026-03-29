@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from datetime import datetime, timezone
 import urllib.request
 
 
@@ -51,10 +52,44 @@ def _find_latest_run(outputs_dir: Path) -> Path:
     runs_dir = outputs_dir / "runs"
     if not runs_dir.exists():
         raise FileNotFoundError(f"Run directory root not found: {runs_dir}")
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from spotify.run_artifacts import collect_run_manifests
+
+        manifests = collect_run_manifests(outputs_dir)
+    except Exception:
+        manifests = []
+
+    ranked_manifest_runs: list[tuple[int, str, Path]] = []
+    for manifest in manifests:
+        run_id = str(manifest.get("run_id", "")).strip()
+        if not run_id:
+            continue
+        run_dir = runs_dir / run_id
+        timestamp = str(manifest.get("timestamp", "")).strip()
+        ranked_manifest_runs.append(
+            (
+                int((run_dir / "champion_gate.json").exists()),
+                timestamp,
+                run_dir,
+            )
+        )
+    if ranked_manifest_runs:
+        ranked_manifest_runs.sort(reverse=True)
+        return ranked_manifest_runs[0][2]
+
     run_dirs = [path for path in runs_dir.iterdir() if path.is_dir()]
     if not run_dirs:
         raise FileNotFoundError(f"No run directories found in {runs_dir}")
-    run_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    run_dirs.sort(
+        key=lambda path: (
+            int((path / "champion_gate.json").exists()),
+            path.stat().st_mtime,
+        ),
+        reverse=True,
+    )
     return run_dirs[0]
 
 
@@ -81,9 +116,17 @@ def _notify_macos(title: str, message: str) -> None:
 
 def _read_json(path: Path) -> dict[str, object]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        repo_root = Path(__file__).resolve().parents[1]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from spotify.run_artifacts import safe_read_json
+
+        payload = safe_read_json(path, default={})
     except Exception:
-        return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
     return payload if isinstance(payload, dict) else {}
 
 
@@ -135,6 +178,13 @@ def _resolve_run_dir_from_control_room(outputs_dir: Path, control_room: dict[str
         return None
     run_dir = outputs_dir / "runs" / run_id
     return run_dir if run_dir.exists() else None
+
+
+def _resolve_default_run_dir(outputs_dir: Path, control_room: dict[str, object]) -> Path:
+    selected = _resolve_run_dir_from_control_room(outputs_dir, control_room)
+    if selected is not None and (selected / "champion_gate.json").exists():
+        return selected
+    return _find_latest_run(outputs_dir)
 
 
 def _review_actions_for_run(
@@ -189,6 +239,44 @@ def _review_action_summary(action: dict[str, object]) -> str:
     return f"[{priority}] {title}"
 
 
+def _parse_timestamp(raw_value: object) -> datetime | None:
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _run_timestamp(run_dir: Path) -> datetime | None:
+    manifest = _read_json(run_dir / "run_manifest.json")
+    parsed = _parse_timestamp(manifest.get("timestamp"))
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.fromtimestamp(run_dir.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _requested_run_pending_control_room(control_room: dict[str, object], run_dir: Path) -> bool:
+    latest_run = control_room.get("latest_run", {})
+    if not isinstance(latest_run, dict):
+        return False
+    latest_run_id = str(latest_run.get("run_id", "")).strip()
+    if not latest_run_id or latest_run_id == run_dir.name:
+        return False
+    latest_timestamp = _parse_timestamp(latest_run.get("timestamp"))
+    requested_timestamp = _run_timestamp(run_dir)
+    if latest_timestamp is None or requested_timestamp is None:
+        return False
+    return requested_timestamp >= latest_timestamp
+
+
 def main() -> int:
     args = _parse_args()
     outputs_dir = Path(args.outputs_dir).expanduser().resolve()
@@ -196,7 +284,7 @@ def main() -> int:
     if args.run_dir:
         run_dir = Path(args.run_dir).expanduser().resolve()
     else:
-        run_dir = _resolve_run_dir_from_control_room(outputs_dir, control_room) or _find_latest_run(outputs_dir)
+        run_dir = _resolve_default_run_dir(outputs_dir, control_room)
 
     gate_path = run_dir / "champion_gate.json"
     if not gate_path.exists():
@@ -210,11 +298,17 @@ def main() -> int:
     threshold = gate.get("threshold", "")
     model_name = str(gate.get("challenger_model_name", ""))
     review_threshold = _normalize_review_threshold(args.review_threshold)
-    review_actions, control_room_status = _review_actions_for_run(
-        control_room=control_room,
-        run_id=run_dir.name,
-        max_actions=max(0, int(args.max_review_actions)),
-    )
+    if args.run_dir and _requested_run_pending_control_room(control_room, run_dir):
+        latest_run = control_room.get("latest_run", {})
+        latest_run = latest_run if isinstance(latest_run, dict) else {}
+        review_actions = []
+        control_room_status = f"pending_control_room:{str(latest_run.get('run_id', '')).strip() or 'none'}"
+    else:
+        review_actions, control_room_status = _review_actions_for_run(
+            control_room=control_room,
+            run_id=run_dir.name,
+            max_actions=max(0, int(args.max_review_actions)),
+        )
     highest_review_priority = _highest_review_priority(review_actions)
     async_handoff = control_room.get("async_handoff", {})
     async_handoff = async_handoff if isinstance(async_handoff, dict) else {}

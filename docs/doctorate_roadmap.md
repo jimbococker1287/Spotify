@@ -133,6 +133,7 @@ Primary verification anchors:
 
 - Produce publication-grade tables, ablations, and figures.
 - Freeze a canonical benchmark split and reproducibility protocol.
+- Keep the benchmark contract in `docs/benchmark_contract.md` stable until a new version is explicitly published.
 - Package the system as a reproducible research asset with benchmark scripts and paper-ready outputs.
 
 ## Concrete Build Map

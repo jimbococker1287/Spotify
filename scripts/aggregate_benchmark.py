@@ -8,8 +8,13 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -155,6 +160,8 @@ def _paired_significance(rows: list[dict[str, str]]) -> list[dict[str, object]]:
 
 
 def main() -> int:
+    from spotify.benchmark_contract import write_benchmark_lock_manifest
+
     args = _parse_args()
     history_csv = Path(args.history_csv).expanduser().resolve()
     if not history_csv.exists():
@@ -274,6 +281,14 @@ def main() -> int:
             ],
             significance_rows,
         )
+    manifest_json, manifest_md = write_benchmark_lock_manifest(
+        output_dir=output_dir,
+        benchmark_id=args.benchmark_id,
+        run_name_prefix=prefix,
+        summary_rows=summary_rows,
+        significance_rows=significance_rows,
+        raw_rows=filtered,
+    )
 
     history_append_rows = [
         {
@@ -297,6 +312,8 @@ def main() -> int:
     print(f"benchmark_rows={raw_path}")
     print(f"benchmark_summary={summary_csv}")
     print(f"benchmark_ci_plot={ci_plot}")
+    print(f"benchmark_manifest={manifest_json}")
+    print(f"benchmark_manifest_md={manifest_md}")
     if significance_rows:
         print(f"benchmark_significance={significance_csv}")
     return 0

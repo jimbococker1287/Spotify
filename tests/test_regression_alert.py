@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import scripts.regression_alert as regression_alert
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "regression_alert.py"
 
@@ -285,3 +287,83 @@ def test_regression_alert_defaults_to_control_room_selected_run(tmp_path: Path) 
     assert "run=run_full" in result.stdout
     assert "promoted=True" in result.stdout
     assert "next_step=" in result.stdout
+
+
+def test_find_latest_run_prefers_latest_manifest_with_gate_over_mtime_only_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    chosen_run = _write_run(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-03-29T12:43:13",
+        promoted=False,
+        status="fail",
+        model_name="extra_trees",
+        model_type="classical",
+        val_top1=0.61,
+        test_top1=0.58,
+        regression=0.02,
+        robustness_gap=0.27,
+        stress_skip_risk=0.24,
+    )
+    stale_dir = output_dir / "runs" / "run_mtime_only"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "scratch.txt").write_text("latest mtime only", encoding="utf-8")
+
+    selected = regression_alert._find_latest_run(output_dir)
+
+    assert selected == chosen_run
+
+
+def test_regression_alert_allows_newer_explicit_run_pending_control_room(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-03-20T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="retrieval_reranker",
+        model_type="retrieval_reranker",
+        val_top1=0.59,
+        test_top1=0.56,
+        regression=-0.01,
+        robustness_gap=0.09,
+        stress_skip_risk=0.22,
+    )
+    run_pending = _write_run(
+        output_dir,
+        run_id="run_pending",
+        timestamp="2026-03-22T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="blended_ensemble",
+        model_type="ensemble",
+        val_top1=0.61,
+        test_top1=0.58,
+        regression=-0.01,
+        robustness_gap=0.12,
+        stress_skip_risk=0.24,
+    )
+    (run_pending / "run_results.json").unlink()
+    (run_pending / "analysis" / "friction_proxy_summary.json").unlink()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--run-dir",
+            str(run_pending),
+            "--review-threshold",
+            "off",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0
+    assert "run=run_pending" in result.stdout
+    assert "review_status=pending_control_room:run_full" in result.stdout

@@ -24,6 +24,10 @@ def safe_read_json(path: Path, *, default: Any) -> Any:
     try:
         if orjson is not None:
             return orjson.loads(path.read_bytes())
+    except Exception:
+        pass
+
+    try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return _clone_default(default)

@@ -83,6 +83,11 @@ def test_phase_readiness_reports_built_surfaces_even_with_ops_attention(tmp_path
         {
             "review_actions": [{"priority": "high"}],
             "operating_rhythm": {"overall_status": "attention", "recommended_review_command": "make control-room"},
+            "ops_health": {
+                "status": "attention",
+                "operational_high_priority_count": 1,
+                "strategic_high_priority_count": 0,
+            },
             "latest_run": {"run_id": "run_001"},
             "async_handoff": {"share_artifacts": ["a.md", "b.md", "c.md"]},
         },
@@ -115,6 +120,7 @@ def test_phase_readiness_reports_built_surfaces_even_with_ops_attention(tmp_path
     assert report["overall"]["operational_status"] == "attention"
     assert report["sections"][0]["metrics"]["unique_opening_artists"] == 3
     assert report["sections"][1]["metrics"]["high_priority_review_actions"] == 1
+    assert report["sections"][1]["metrics"]["ops_health_status"] == "attention"
     assert report["sections"][2]["metrics"]["report_family_count"] == 3
 
     artifacts = write_weeks_1_8_readiness_report(report, output_dir=tmp_path / "outputs/analytics")
@@ -153,6 +159,11 @@ def test_phase_readiness_blocks_progress_when_creator_surface_is_incomplete(tmp_
         {
             "review_actions": [],
             "operating_rhythm": {"overall_status": "healthy", "recommended_review_command": "make control-room"},
+            "ops_health": {
+                "status": "healthy",
+                "operational_high_priority_count": 0,
+                "strategic_high_priority_count": 0,
+            },
             "latest_run": {"run_id": "run_002"},
             "async_handoff": {"share_artifacts": ["a.md", "b.md", "c.md"]},
         },

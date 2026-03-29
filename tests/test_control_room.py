@@ -395,10 +395,12 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert payload["ops_trends"]["history_available"] is True
     assert payload["weekly_ops_summary"]["snapshots_considered"] == 1
     assert payload["operating_rhythm"]["overall_status"]
+    assert payload["ops_health"]["status"] == "blocked"
     assert payload["async_handoff"]["status"]
     markdown = md_path.read_text(encoding="utf-8")
     assert "Control Room" in markdown
     assert "Operating Rhythm" in markdown
+    assert "Ops Health" in markdown
     assert "Ops Coverage" in markdown
     assert "Since Last Strong Run" in markdown
     assert "Recent Trends" in markdown
@@ -636,3 +638,143 @@ def test_control_room_operating_rhythm_flags_stale_full_lane_and_async_handoff(t
     assert any(action["area"] == "cadence" for action in report["review_actions"])
     assert report["async_handoff"]["status"] == "attention"
     assert any("make schedule-run MODE=full" in item for item in report["async_handoff"]["summary"])
+
+
+def test_control_room_distinguishes_ops_health_from_strategic_findings(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_recent", "model_name": "blended_ensemble", "model_type": "ensemble", "val_top1": 0.63},
+            {"run_id": "run_fast_recent", "model_name": "mlp", "model_type": "classical", "val_top1": 0.57},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_recent", "model_name": "blended_ensemble", "model_type": "ensemble", "top1": 0.60},
+            {"run_id": "run_fast_recent", "model_name": "mlp", "model_type": "classical", "top1": 0.55},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full_recent",
+        timestamp="2026-03-29T11:00:00+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="blended_ensemble",
+        best_model_type="ensemble",
+        val_top1=0.63,
+        test_top1=0.58,
+        gate_regression=0.02,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.18,
+        abstention_rate=0.08,
+        robustness_gap=0.22,
+        stress_skip_risk=0.29,
+        stress_scenario="evening_drift",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_fast_recent",
+        timestamp="2026-03-29T08:00:00+00:00",
+        profile="fast",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="mlp",
+        best_model_type="classical",
+        val_top1=0.57,
+        test_top1=0.55,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.15,
+        abstention_rate=0.09,
+        robustness_gap=0.09,
+        stress_skip_risk=0.18,
+        stress_scenario="quick_probe",
+    )
+
+    report = build_control_room_report(
+        output_dir,
+        top_n=3,
+        reference_time=datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["operating_rhythm"]["overall_status"] == "healthy"
+    assert report["ops_health"]["status"] == "healthy"
+    assert report["ops_health"]["strategic_high_priority_count"] >= 1
+    assert report["ops_health"]["operational_high_priority_count"] == 0
+    assert report["async_handoff"]["status"] == "ready"
+
+
+def test_control_room_fast_lane_ignores_dev_runs_for_cadence(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_recent", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_dev_recent", "model_name": "dense", "model_type": "deep", "val_top1": 0.57},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_recent", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+            {"run_id": "run_dev_recent", "model_name": "dense", "model_type": "deep", "top1": 0.54},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full_recent",
+        timestamp="2026-03-29T10:00:00+00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.15,
+        abstention_rate=0.09,
+        robustness_gap=0.09,
+        stress_skip_risk=0.18,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_dev_recent",
+        timestamp="2026-03-29T11:30:00+00:00",
+        profile="dev",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="dense",
+        best_model_type="deep",
+        val_top1=0.57,
+        test_top1=0.54,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.15,
+        abstention_rate=0.09,
+        robustness_gap=0.09,
+        stress_skip_risk=0.18,
+        stress_scenario="quick_probe",
+    )
+
+    report = build_control_room_report(
+        output_dir,
+        top_n=3,
+        reference_time=datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["operating_rhythm"]["lanes"]["fast"]["status"] == "missing"

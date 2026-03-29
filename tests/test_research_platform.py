@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,6 +113,9 @@ def test_research_artifact_writers_emit_expected_files(tmp_path: Path) -> None:
     assert registry_path.exists()
     assert all(path.exists() for path in ablation_paths)
     assert all(path.exists() for path in significance_paths)
+    protocol_payload = json.loads((tmp_path / "benchmark_protocol.json").read_text(encoding="utf-8"))
+    assert protocol_payload["benchmark_contract"]["contract_version"] == "2026-week10-v1"
+    assert protocol_payload["protocol"]["benchmark_lock"]["minimum_repeated_runs"] == 3
 
 
 def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
