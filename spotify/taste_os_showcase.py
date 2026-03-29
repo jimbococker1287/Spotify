@@ -10,7 +10,8 @@ import numpy as np
 
 from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
-from .predict_next import _prepare_inputs, load_prediction_input_context
+from .predict_next import _prepare_inputs, load_prediction_input_context, prediction_signature_fingerprint
+from .run_artifacts import safe_read_json, write_json, write_markdown
 from .serving import load_predictor, resolve_model_row
 from .taste_os_demo import _load_artifact, build_taste_os_demo_payload, write_taste_os_demo_artifacts
 
@@ -58,6 +59,8 @@ NARRATIVE_GUARDRAILS: tuple[str, ...] = (
     "Do not add creator, control-room, or research material into the Taste OS share pack unless it directly strengthens the product narrative.",
     "Prefer one clear comparison artifact over many raw run dumps; readability matters more than exhaustiveness here.",
 )
+
+_SHOWCASE_REUSE_VERSION = 1
 
 
 def _parse_args() -> argparse.Namespace:
@@ -126,6 +129,68 @@ def _top_candidate_summary(payload: dict[str, object]) -> dict[str, object]:
         "adaptive_replans": int(adaptive_session.get("replan_count", 0)),
         "adaptive_safe_route_steps": int(adaptive_session.get("safe_route_steps", 0)),
     }
+
+
+def _demo_stem(*, mode: str, scenario: str) -> str:
+    mode_slug = str(mode).strip().lower().replace(" ", "-")
+    scenario_slug = str(scenario).strip().lower().replace("_", "-").replace(" ", "-")
+    return f"taste_os_demo_{mode_slug}_{scenario_slug}"
+
+
+def _showcase_cache_identity(
+    *,
+    run_dir: Path,
+    model_name: str,
+    model_type: str,
+    sequence_names: list[str],
+    mode: str,
+    scenario: str,
+    top_k: int,
+    artifact_paths: dict[str, str],
+    context_fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "showcase_reuse_version": _SHOWCASE_REUSE_VERSION,
+        "run_dir": str(run_dir.resolve()),
+        "model_name": str(model_name),
+        "model_type": str(model_type),
+        "sequence_tail": list(sequence_names),
+        "mode": str(mode),
+        "scenario": str(scenario),
+        "top_k": int(top_k),
+        "artifact_paths": dict(artifact_paths),
+        "context_fingerprint": str(context_fingerprint or ""),
+    }
+
+
+def load_reusable_showcase_demo_payload(
+    demo_json_path: Path,
+    *,
+    cache_identity: dict[str, object],
+) -> dict[str, object] | None:
+    payload = safe_read_json(demo_json_path, default={})
+    payload = payload if isinstance(payload, dict) else {}
+    request = payload.get("request", {})
+    request = request if isinstance(request, dict) else {}
+    current_session = payload.get("current_session", {})
+    current_session = current_session if isinstance(current_session, dict) else {}
+    artifacts_used = payload.get("artifacts_used", {})
+    artifacts_used = artifacts_used if isinstance(artifacts_used, dict) else {}
+    actual = {
+        "showcase_reuse_version": int(current_session.get("showcase_reuse_version", 0) or 0),
+        "run_dir": str(current_session.get("run_dir", "")).strip(),
+        "model_name": str(current_session.get("model_name", "")).strip(),
+        "model_type": str(current_session.get("model_type", "")).strip(),
+        "sequence_tail": list(current_session.get("sequence_tail", []))
+        if isinstance(current_session.get("sequence_tail", []), list)
+        else [],
+        "mode": str(request.get("mode", "")).strip(),
+        "scenario": str(request.get("scenario", "")).strip(),
+        "top_k": int(request.get("top_k", 0) or 0),
+        "artifact_paths": dict(artifacts_used),
+        "context_fingerprint": str(current_session.get("context_fingerprint", "")).strip(),
+    }
+    return payload if actual == dict(cache_identity) else None
 
 
 def build_mode_comparison_rows(payloads: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -214,16 +279,13 @@ def write_taste_os_showcase_artifacts(
     )
     run_context = payload.get("run_context", {}) if isinstance(payload, dict) else {}
 
-    showcase_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    comparison_json.write_text(
-        json.dumps(
-            {
-                "scenario": "steady",
-                "rows": comparison_rows,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    showcase_json = write_json(showcase_json, payload)
+    comparison_json = write_json(
+        comparison_json,
+        {
+            "scenario": "steady",
+            "rows": comparison_rows,
+        },
     )
 
     showcase_lines = [
@@ -266,7 +328,7 @@ def write_taste_os_showcase_artifacts(
     for item in payload.get("narrative_guardrails", []) if isinstance(payload, dict) else []:
         showcase_lines.append(f"- {item}")
 
-    showcase_md.write_text("\n".join(showcase_lines) + "\n", encoding="utf-8")
+    showcase_md = write_markdown(showcase_md, showcase_lines)
 
     comparison_lines = [
         "# Taste OS Mode Comparison",
@@ -284,7 +346,7 @@ def write_taste_os_showcase_artifacts(
         )
         comparison_lines.append(str(row.get("opening_summary", "")))
 
-    comparison_md.write_text("\n".join(comparison_lines) + "\n", encoding="utf-8")
+    comparison_md = write_markdown(comparison_md, comparison_lines)
 
     return {
         "showcase_json": showcase_json,
@@ -329,6 +391,7 @@ def main() -> int:
         row=model_row,
         artist_labels=list(prediction_context.artist_labels),
     )
+    context_fingerprint = prediction_signature_fingerprint(prediction_context.source_signature)
 
     artifact_paths = {
         "multimodal_space": str((run_dir / "analysis" / "multimodal" / "multimodal_artist_space.joblib").resolve()),
@@ -362,14 +425,32 @@ def main() -> int:
         "safe_policy": safe_policy,
         "top_k": max(1, int(args.top_k)),
         "artifact_paths": artifact_paths,
+        "run_dir": run_dir,
+        "context_fingerprint": context_fingerprint,
     }
 
     for example in CANONICAL_SHOWCASE_EXAMPLES:
-        payload = build_taste_os_demo_payload(
-            mode_name=example.mode,
-            scenario_name=example.scenario,
-            **common_kwargs,
+        demo_json_path = examples_dir / f"{_demo_stem(mode=example.mode, scenario=example.scenario)}.json"
+        cache_identity = _showcase_cache_identity(
+            run_dir=run_dir,
+            model_name=str(predictor.model_name),
+            model_type=str(predictor.model_type),
+            sequence_names=sequence_names,
+            mode=example.mode,
+            scenario=example.scenario,
+            top_k=max(1, int(args.top_k)),
+            artifact_paths=artifact_paths,
+            context_fingerprint=context_fingerprint,
         )
+        payload = load_reusable_showcase_demo_payload(demo_json_path, cache_identity=cache_identity)
+        if payload is None:
+            payload = build_taste_os_demo_payload(
+                mode_name=example.mode,
+                scenario_name=example.scenario,
+                **common_kwargs,
+            )
+        else:
+            logger.info("Reused cached showcase demo artifact: %s", demo_json_path)
         demo_json, demo_md = write_taste_os_demo_artifacts(payload, output_dir=examples_dir)
         summary = _top_candidate_summary(payload)
         canonical_examples.append(
@@ -397,11 +478,28 @@ def main() -> int:
     for mode_name in STEADY_MODE_COMPARISON_ORDER:
         payload = steady_payload_by_mode.get(mode_name)
         if payload is None:
-            payload = build_taste_os_demo_payload(
-                mode_name=mode_name,
-                scenario_name="steady",
-                **common_kwargs,
+            demo_json_path = examples_dir / f"{_demo_stem(mode=mode_name, scenario='steady')}.json"
+            cache_identity = _showcase_cache_identity(
+                run_dir=run_dir,
+                model_name=str(predictor.model_name),
+                model_type=str(predictor.model_type),
+                sequence_names=sequence_names,
+                mode=mode_name,
+                scenario="steady",
+                top_k=max(1, int(args.top_k)),
+                artifact_paths=artifact_paths,
+                context_fingerprint=context_fingerprint,
             )
+            payload = load_reusable_showcase_demo_payload(demo_json_path, cache_identity=cache_identity)
+            if payload is None:
+                payload = build_taste_os_demo_payload(
+                    mode_name=mode_name,
+                    scenario_name="steady",
+                    **common_kwargs,
+                )
+                write_taste_os_demo_artifacts(payload, output_dir=examples_dir)
+            else:
+                logger.info("Reused cached steady-mode demo artifact: %s", demo_json_path)
         steady_mode_payloads.append(payload)
 
     mode_comparison_rows = build_mode_comparison_rows(steady_mode_payloads)

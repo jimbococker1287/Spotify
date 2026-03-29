@@ -6,6 +6,7 @@ from pathlib import Path
 from spotify.taste_os_showcase import (
     build_mode_comparison_rows,
     build_taste_os_showcase_payload,
+    load_reusable_showcase_demo_payload,
     write_taste_os_showcase_artifacts,
 )
 
@@ -144,3 +145,38 @@ def test_write_taste_os_showcase_artifacts_creates_showcase_and_comparison_files
     assert "focus" in artifacts["comparison_md"].read_text(encoding="utf-8")
     comparison_payload = json.loads(artifacts["comparison_json"].read_text(encoding="utf-8"))
     assert comparison_payload["rows"][0]["mode"] == "focus"
+
+
+def test_load_reusable_showcase_demo_payload_requires_matching_identity(tmp_path: Path) -> None:
+    payload = {
+        "request": {"mode": "focus", "scenario": "steady", "top_k": 5},
+        "current_session": {
+            "showcase_reuse_version": 1,
+            "run_dir": "/tmp/run_a",
+            "model_name": "retrieval_reranker",
+            "model_type": "retrieval_reranker",
+            "sequence_tail": ["Artist A", "Artist B"],
+            "context_fingerprint": "abc123",
+        },
+        "artifacts_used": {"safe_policy": "/tmp/policy.joblib"},
+    }
+    path = tmp_path / "taste_os_demo_focus_steady.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    identity = {
+        "showcase_reuse_version": 1,
+        "run_dir": "/tmp/run_a",
+        "model_name": "retrieval_reranker",
+        "model_type": "retrieval_reranker",
+        "sequence_tail": ["Artist A", "Artist B"],
+        "mode": "focus",
+        "scenario": "steady",
+        "top_k": 5,
+        "artifact_paths": {"safe_policy": "/tmp/policy.joblib"},
+        "context_fingerprint": "abc123",
+    }
+
+    assert load_reusable_showcase_demo_payload(path, cache_identity=identity) == payload
+    mismatched = dict(identity)
+    mismatched["top_k"] = 7
+    assert load_reusable_showcase_demo_payload(path, cache_identity=mismatched) is None

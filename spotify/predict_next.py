@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
@@ -30,9 +31,10 @@ class PredictionInputContext:
     friction_reference: dict[str, object] | None = None
     scaler_mean: np.ndarray | None = None
     scaler_scale: np.ndarray | None = None
+    source_signature: tuple[tuple[str, int, int], ...] | None = None
 
 
-_PREDICTION_CONTEXT_CACHE_VERSION = 3
+_PREDICTION_CONTEXT_CACHE_VERSION = 4
 
 
 def _parse_args() -> argparse.Namespace:
@@ -128,6 +130,12 @@ def prediction_source_signature(
         ]
     )
     return _signature_for_paths(paths)
+
+
+def prediction_signature_fingerprint(signature: tuple[tuple[str, int, int], ...] | None) -> str:
+    if not signature:
+        return ""
+    return hashlib.sha1(repr(tuple(signature)).encode("utf-8")).hexdigest()
 
 
 def _prediction_context_cache_path(run_dir: Path, *, include_video: bool) -> Path:
@@ -316,6 +324,7 @@ def load_prediction_input_context(
         friction_reference=friction_reference,
         scaler_mean=np.asarray(scaler_mean, dtype="float32") if scaler_mean is not None else None,
         scaler_scale=np.asarray(scaler_scale, dtype="float32") if scaler_scale is not None else None,
+        source_signature=signature,
     )
     _store_prediction_input_context_cache(
         cache_path=cache_path,

@@ -15,8 +15,9 @@ from .champion_alias import resolve_prediction_run_dir
 from .digital_twin import ListenerDigitalTwinArtifact
 from .env import load_local_env
 from .multimodal import MultimodalArtistSpace
-from .predict_next import _prepare_inputs, load_prediction_input_context
+from .predict_next import _prepare_inputs, load_prediction_input_context, prediction_signature_fingerprint
 from .ranking import topk_indices_1d
+from .run_artifacts import write_json, write_markdown
 from .safe_policy import POLICY_TEMPLATES, SafeBanditPolicyArtifact
 from .serving import load_predictor, resolve_model_row
 
@@ -1150,6 +1151,8 @@ def build_taste_os_demo_payload(
     scenario_name: str = "steady",
     top_k: int,
     artifact_paths: dict[str, str] | None = None,
+    run_dir: Path | None = None,
+    context_fingerprint: str = "",
 ) -> dict[str, object]:
     mode = MODE_CONFIGS[str(mode_name).strip().lower()]
     scenario = SCENARIOS[str(scenario_name).strip().lower()]
@@ -1210,8 +1213,11 @@ def build_taste_os_demo_payload(
         "current_session": {
             "model_name": predictor.model_name,
             "model_type": predictor.model_type,
+            "showcase_reuse_version": 1,
+            "run_dir": str(run_dir.resolve()) if run_dir is not None else "",
             "sequence_length": int(len(seq_arr)),
             "sequence_tail": list(sequence_names),
+            "context_fingerprint": str(context_fingerprint or ""),
         },
         "mode": {
             "name": mode.name,
@@ -1252,8 +1258,7 @@ def write_taste_os_demo_artifacts(
     scenario = _slugify(str(request.get("scenario", "steady")))
     stem = f"taste_os_demo_{mode}_{scenario}"
 
-    json_path = output_root / f"{stem}.json"
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    json_path = write_json(output_root / f"{stem}.json", payload)
 
     current_session = payload.get("current_session", {}) if isinstance(payload, dict) else {}
     mode_block = payload.get("mode", {}) if isinstance(payload, dict) else {}
@@ -1344,8 +1349,7 @@ def write_taste_os_demo_artifacts(
         if event_applied:
             lines.append(f"  Event after step: `{event_applied}` - {row.get('event_summary', '')}")
 
-    md_path = output_root / f"{stem}.md"
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    md_path = write_markdown(output_root / f"{stem}.md", lines)
     return json_path, md_path
 
 
@@ -1396,6 +1400,7 @@ def main() -> int:
     multimodal_space = _load_artifact(Path(artifact_paths["multimodal_space"]), label="multimodal artist space")
     digital_twin = _load_artifact(Path(artifact_paths["digital_twin"]), label="listener digital twin")
     safe_policy = _load_artifact(Path(artifact_paths["safe_policy"]), label="safe policy")
+    context_fingerprint = prediction_signature_fingerprint(prediction_context.source_signature)
 
     payload = build_taste_os_demo_payload(
         predictor=predictor,
@@ -1415,6 +1420,8 @@ def main() -> int:
         scenario_name=str(args.scenario),
         top_k=max(1, int(args.top_k)),
         artifact_paths=artifact_paths,
+        run_dir=run_dir,
+        context_fingerprint=context_fingerprint,
     )
     json_path, md_path = write_taste_os_demo_artifacts(
         payload,

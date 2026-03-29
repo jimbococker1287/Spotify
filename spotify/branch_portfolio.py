@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .run_artifacts import safe_read_json, write_json, write_markdown
+from .portfolio_artifacts import PortfolioArtifactBundle, load_portfolio_artifact_bundle
+from .run_artifacts import write_json, write_markdown
 
 
 BRANCH_DEFINITIONS: tuple[dict[str, object], ...] = (
@@ -106,26 +107,8 @@ def _status_bucket(*, ready: bool, attention: bool = False, gaps: bool = False) 
     return "missing"
 
 
-def _latest_creator_report_family_path(output_root: Path) -> Path | None:
-    base_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
-    manifests = sorted(base_dir.glob("*_report_family.json"))
-    if not manifests:
-        return None
-    return max(manifests, key=lambda path: path.stat().st_mtime)
-
-
-def _latest_benchmark_manifest_paths(output_root: Path) -> tuple[Path | None, Path | None]:
-    json_paths = sorted((output_root / "history").glob("benchmark_lock_*_manifest.json"))
-    md_paths = sorted((output_root / "history").glob("benchmark_lock_*_manifest.md"))
-    json_path = max(json_paths, key=lambda path: path.stat().st_mtime) if json_paths else None
-    md_path = max(md_paths, key=lambda path: path.stat().st_mtime) if md_paths else None
-    return json_path, md_path
-
-
-def _build_taste_os_branch(output_root: Path, definition: dict[str, object]) -> dict[str, object]:
-    showcase_json = output_root / "analysis" / "taste_os_demo" / "showcase" / "taste_os_showcase.json"
-    showcase_md = output_root / "analysis" / "taste_os_demo" / "showcase" / "taste_os_showcase.md"
-    payload = _coerce_dict(safe_read_json(showcase_json, default={}))
+def _build_taste_os_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
+    payload = bundle.taste_os_showcase_payload
     canonical_examples = _coerce_list(payload.get("canonical_examples"))
     mode_rows = _coerce_list(_coerce_dict(payload.get("mode_comparison")).get("rows"))
     unique_openings = {
@@ -133,9 +116,13 @@ def _build_taste_os_branch(output_root: Path, definition: dict[str, object]) -> 
         for row in mode_rows
         if isinstance(row, dict) and str(row.get("top_artist", "")).strip()
     }
-    ready = showcase_md.exists() and len(canonical_examples) >= 4 and len(mode_rows) >= 4
+    ready = bundle.taste_os_showcase_md.exists() and len(canonical_examples) >= 4 and len(mode_rows) >= 4
     distinct_modes = len(unique_openings) >= 3
-    status = _status_bucket(ready=ready and distinct_modes, attention=showcase_md.exists(), gaps=ready and not distinct_modes)
+    status = _status_bucket(
+        ready=ready and distinct_modes,
+        attention=bundle.taste_os_showcase_md.exists(),
+        gaps=ready and not distinct_modes,
+    )
     summary = (
         f"Showcase pack has `{len(canonical_examples)}` canonical examples, `{len(mode_rows)}` steady-mode comparisons, "
         f"and `{len(unique_openings)}` distinct opening artists."
@@ -146,19 +133,17 @@ def _build_taste_os_branch(output_root: Path, definition: dict[str, object]) -> 
         **definition,
         "status": status,
         "live_signal": summary,
-        "artifacts": [str(showcase_md), str(showcase_json)],
+        "artifacts": [str(bundle.taste_os_showcase_md), str(bundle.taste_os_showcase_json)],
     }
 
 
-def _build_control_room_branch(output_root: Path, definition: dict[str, object]) -> dict[str, object]:
-    control_json = output_root / "analytics" / "control_room.json"
-    control_md = output_root / "analytics" / "control_room.md"
-    payload = _coerce_dict(safe_read_json(control_json, default={}))
+def _build_control_room_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
+    payload = bundle.control_room_payload
     ops_health = _coerce_dict(payload.get("ops_health"))
     rhythm = _coerce_dict(payload.get("operating_rhythm"))
-    ready = control_md.exists() and str(ops_health.get("status", "")).strip() == "healthy"
+    ready = bundle.control_room_md.exists() and str(ops_health.get("status", "")).strip() == "healthy"
     gaps = ready and str(rhythm.get("overall_status", "")).strip() != "healthy"
-    status = _status_bucket(ready=ready, attention=control_md.exists(), gaps=gaps)
+    status = _status_bucket(ready=ready, attention=bundle.control_room_md.exists(), gaps=gaps)
     summary = str(ops_health.get("headline", "")).strip() or "Control-room artifacts are missing."
     if ready:
         recommended_review = str(rhythm.get("recommended_review_command", "")).strip() or "make control-room"
@@ -168,30 +153,27 @@ def _build_control_room_branch(output_root: Path, definition: dict[str, object])
         "status": status,
         "live_signal": summary,
         "artifacts": [
-            str(control_md),
-            str(output_root / "analytics" / "control_room_weekly_summary.md"),
-            str(output_root / "analytics" / "control_room_triage.md"),
+            str(bundle.control_room_md),
+            str(bundle.output_root / "analytics" / "control_room_weekly_summary.md"),
+            str(bundle.output_root / "analytics" / "control_room_triage.md"),
         ],
     }
 
 
-def _build_creator_branch(output_root: Path, definition: dict[str, object]) -> dict[str, object]:
-    manifest_path = _latest_creator_report_family_path(output_root)
-    manifest = _coerce_dict(safe_read_json(manifest_path, default={})) if manifest_path is not None else {}
-    comparison_views = _coerce_dict(manifest.get("comparison_view_markdown"))
-    primary_report = Path(str(manifest.get("primary_report", "")).strip()) if manifest.get("primary_report") else None
-    existing_views = [path for path in comparison_views.values() if Path(str(path)).exists()]
+def _build_creator_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
+    existing_views = [path for path in bundle.creator_comparison_markdown_paths.values() if path.exists()]
+    primary_report = bundle.creator_primary_report_path
     ready = primary_report is not None and primary_report.exists() and len(existing_views) >= 4
-    status = _status_bucket(ready=ready, attention=manifest_path is not None)
+    status = _status_bucket(ready=ready, attention=bundle.creator_manifest_path is not None)
     summary = (
         f"Latest creator family exposes `{len(existing_views)}` comparison views plus a primary strategy brief."
-        if manifest
+        if bundle.creator_manifest
         else "Creator-intelligence report-family artifacts are missing."
     )
     artifacts = [str(primary_report)] if primary_report is not None else []
     artifacts.extend(str(path) for path in existing_views)
-    if manifest_path is not None:
-        artifacts.append(str(manifest_path))
+    if bundle.creator_manifest_path is not None:
+        artifacts.append(str(bundle.creator_manifest_path))
     return {
         **definition,
         "status": status,
@@ -200,17 +182,15 @@ def _build_creator_branch(output_root: Path, definition: dict[str, object]) -> d
     }
 
 
-def _build_safety_research_branch(output_root: Path, definition: dict[str, object]) -> dict[str, object]:
-    claims_json = output_root / "analysis" / "research_claims" / "research_claims.json"
-    claims_md = output_root / "analysis" / "research_claims" / "research_claims.md"
-    payload = _coerce_dict(safe_read_json(claims_json, default={}))
+def _build_safety_research_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
+    payload = bundle.research_claims_payload
     benchmark_lock = _coerce_dict(payload.get("benchmark_lock"))
     primary_claim = _coerce_dict(payload.get("primary_claim"))
     primary_status = str(primary_claim.get("status", "")).strip()
     believable = bool(payload.get("believable_submission_path"))
     benchmark_ready = bool(benchmark_lock.get("comparison_ready"))
-    ready = claims_md.exists() and believable and primary_status in {"analysis_ready", "submission_candidate"}
-    status = _status_bucket(ready=ready, attention=claims_md.exists(), gaps=ready and not benchmark_ready)
+    ready = bundle.research_claims_md.exists() and believable and primary_status in {"analysis_ready", "submission_candidate"}
+    status = _status_bucket(ready=ready, attention=bundle.research_claims_md.exists(), gaps=ready and not benchmark_ready)
     summary = "Research-claim artifacts are missing."
     if payload:
         benchmark_id = str(benchmark_lock.get("benchmark_id", "")).strip() or "n/a"
@@ -218,12 +198,11 @@ def _build_safety_research_branch(output_root: Path, definition: dict[str, objec
             f"Primary claim `{primary_claim.get('key', '')}` is `{primary_status or 'unknown'}` and benchmark "
             f"`{benchmark_id}` is `{('comparison-ready' if benchmark_ready else 'not comparison-ready')}`."
         )
-    benchmark_json, benchmark_md = _latest_benchmark_manifest_paths(output_root)
-    artifacts = [str(claims_md), str(claims_json)]
-    if benchmark_md is not None:
-        artifacts.append(str(benchmark_md))
-    if benchmark_json is not None:
-        artifacts.append(str(benchmark_json))
+    artifacts = [str(bundle.research_claims_md), str(bundle.research_claims_json)]
+    if bundle.benchmark_manifest_md is not None:
+        artifacts.append(str(bundle.benchmark_manifest_md))
+    if bundle.benchmark_manifest_json is not None:
+        artifacts.append(str(bundle.benchmark_manifest_json))
     return {
         **definition,
         "status": status,
@@ -232,14 +211,19 @@ def _build_safety_research_branch(output_root: Path, definition: dict[str, objec
     }
 
 
-def build_branch_portfolio_report(output_dir: Path | str = "outputs") -> dict[str, object]:
+def build_branch_portfolio_report(
+    output_dir: Path | str = "outputs",
+    *,
+    artifact_bundle: PortfolioArtifactBundle | None = None,
+) -> dict[str, object]:
     output_root = Path(output_dir).expanduser().resolve()
+    bundle = artifact_bundle or load_portfolio_artifact_bundle(output_root)
     definitions = {str(item["key"]): item for item in BRANCH_DEFINITIONS}
     branches = [
-        _build_taste_os_branch(output_root, definitions["taste_os"]),
-        _build_control_room_branch(output_root, definitions["control_room"]),
-        _build_creator_branch(output_root, definitions["creator_intelligence"]),
-        _build_safety_research_branch(output_root, definitions["safety_research"]),
+        _build_taste_os_branch(bundle, definitions["taste_os"]),
+        _build_control_room_branch(bundle, definitions["control_room"]),
+        _build_creator_branch(bundle, definitions["creator_intelligence"]),
+        _build_safety_research_branch(bundle, definitions["safety_research"]),
     ]
     ready_count = sum(1 for branch in branches if str(branch.get("status", "")).startswith("ready"))
     return {
@@ -354,4 +338,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
