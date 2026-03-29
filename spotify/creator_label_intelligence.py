@@ -23,6 +23,16 @@ _TRANSITION_COLUMNS = [
     "target_artist",
 ]
 _NEIGHBOR_ARGPARTITION_MIN_SIZE = 192
+_OPPORTUNITY_RANKING_WEIGHTS = {
+    "seed_adjacency": 0.30,
+    "fan_migration": 0.18,
+    "release_freshness": 0.12,
+    "release_whitespace": 0.10,
+    "scene_momentum": 0.08,
+    "label_concentration": 0.06,
+    "local_gap": 0.10,
+    "popularity_tail": 0.06,
+}
 
 
 def _normalize_name(value: str) -> str:
@@ -230,9 +240,9 @@ def _seed_transition_helpers(
 
 def _opportunity_band(score: float) -> str:
     normalized = _safe_float(score)
-    if normalized >= 0.65:
+    if normalized >= 0.28:
         return "priority_now"
-    if normalized >= 0.50:
+    if normalized >= 0.18:
         return "watchlist"
     return "explore"
 
@@ -243,6 +253,8 @@ def _primary_opportunity_driver(
     migration_score: float,
     freshness_score: float,
     whitespace_score: float,
+    scene_momentum_score: float,
+    label_concentration_score: float,
     local_gap: float,
     popularity_tail: float,
 ) -> str:
@@ -251,6 +263,8 @@ def _primary_opportunity_driver(
         "fan_migration": 0.20 * _safe_float(migration_score),
         "recent_release": 0.20 * _safe_float(freshness_score),
         "release_whitespace": 0.15 * _safe_float(whitespace_score),
+        "scene_momentum": 0.10 * _safe_float(scene_momentum_score),
+        "label_concentration": 0.05 * _safe_float(label_concentration_score),
         "long_tail_fit": 0.10 * min(_safe_float(local_gap), _safe_float(popularity_tail)),
     }
     return max(weighted_scores, key=weighted_scores.get)
@@ -283,6 +297,11 @@ def _opportunity_why_now(
     if primary_driver == "release_whitespace":
         label_suffix = f" across `{label_text}`" if label_text else ""
         return f"{artist_name} shows whitespace in `{scene_name}`{label_suffix}, which makes the lane feel under-served."
+    if primary_driver == "scene_momentum":
+        return f"{artist_name} sits inside `{scene_name}`, which is already the strongest active listening lane."
+    if primary_driver == "label_concentration":
+        label_suffix = f" around `{label_text}`" if label_text else ""
+        return f"{artist_name} sits in a concentrated label lane{label_suffix}, which makes the scene easier to act on."
     if rationale:
         return f"{artist_name} combines {'; '.join(rationale[:2])} in `{scene_name}`."
     return f"{artist_name} is the strongest current explore candidate in `{scene_name}`."
@@ -696,13 +715,25 @@ def build_creator_label_intelligence(
         scene_nodes = scene_nodes_by_id[scene_id]
         genre_counter: Counter[str] = Counter()
         label_counter: Counter[str] = Counter()
+        seed_names_in_scene: list[str] = []
+        release_pressure_values: list[float] = []
         for row in scene_nodes:
             genre_counter.update(str(item) for item in row.get("genres", []) if str(item).strip())
             label_counter.update(str(item) for item in row.get("dominant_release_labels", []) if str(item).strip())
+            if row.get("seed"):
+                seed_names_in_scene.append(str(row.get("artist_name", "")).strip())
+            if row.get("latest_release_date"):
+                release_pressure_values.append(_safe_float(row.get("release_whitespace_score")))
         top_genres = [item for item, _count in genre_counter.most_common(3)]
         top_labels = [item for item, _count in label_counter.most_common(3)]
         scene_name = " / ".join(top_genres[:2]) or " / ".join(top_labels[:2]) or f"scene-{int(scene_id) + 1}"
         scene_names[int(scene_id)] = scene_name
+        label_mentions = sum(label_counter.values())
+        label_concentration = (
+            float(label_counter.most_common(1)[0][1] / label_mentions)
+            if label_counter and label_mentions > 0
+            else 0.0
+        )
         popularity_values = [
             _safe_float(row.get("public_popularity"), default=float("nan"))
             for row in scene_nodes
@@ -720,6 +751,9 @@ def build_creator_label_intelligence(
                 "dominant_labels": top_labels,
                 "scene_local_play_share": round(sum(_safe_float(row.get("local_play_share")) for row in scene_nodes), 6),
                 "scene_avg_public_popularity": round(float(np.mean(popularity_values)), 2) if popularity_values else None,
+                "scene_release_pressure": round(float(np.mean(release_pressure_values)), 4) if release_pressure_values else 0.0,
+                "scene_label_concentration": round(label_concentration, 4),
+                "scene_seed_artists": sorted({name for name in seed_names_in_scene if name}),
                 "scene_whitespace_artist_count": int(
                     sum(1 for row in scene_nodes if _safe_float(row.get("release_whitespace_score")) >= 1.0)
                 ),
@@ -733,6 +767,15 @@ def build_creator_label_intelligence(
         int(row["scene_id"]): _safe_float(row.get("scene_local_play_share"))
         for row in scene_rows
     }
+    scene_release_pressure_lookup = {
+        int(row["scene_id"]): _safe_float(row.get("scene_release_pressure"))
+        for row in scene_rows
+    }
+    scene_label_concentration_lookup = {
+        int(row["scene_id"]): _safe_float(row.get("scene_label_concentration"))
+        for row in scene_rows
+    }
+    max_scene_share = max(scene_share_lookup.values() or [0.0])
 
     release_whitespace_rows = [
         {
@@ -773,12 +816,36 @@ def build_creator_label_intelligence(
         else:
             freshness_score = max(0.0, 1.0 - (float(days_since_latest) / 180.0))
         whitespace_score = min(_safe_float(row.get("release_whitespace_score")) / 2.0, 1.0)
+        scene_id = row.get("scene_id")
+        scene_momentum_score = (
+            min(scene_share_lookup.get(int(scene_id), 0.0) / max(max_scene_share, 1e-6), 1.0)
+            if scene_id is not None and max_scene_share > 0.0
+            else 0.0
+        )
+        label_concentration_score = (
+            scene_label_concentration_lookup.get(int(scene_id), 0.0)
+            if scene_id is not None
+            else 0.0
+        )
+        adjacency_component = _OPPORTUNITY_RANKING_WEIGHTS["seed_adjacency"] * adjacency_score
+        migration_component = _OPPORTUNITY_RANKING_WEIGHTS["fan_migration"] * migration_score
+        freshness_component = _OPPORTUNITY_RANKING_WEIGHTS["release_freshness"] * freshness_score
+        whitespace_component = _OPPORTUNITY_RANKING_WEIGHTS["release_whitespace"] * whitespace_score
+        scene_momentum_component = _OPPORTUNITY_RANKING_WEIGHTS["scene_momentum"] * scene_momentum_score
+        label_concentration_component = (
+            _OPPORTUNITY_RANKING_WEIGHTS["label_concentration"] * label_concentration_score
+        )
+        local_gap_component = _OPPORTUNITY_RANKING_WEIGHTS["local_gap"] * local_gap
+        popularity_tail_component = _OPPORTUNITY_RANKING_WEIGHTS["popularity_tail"] * popularity_tail
         opportunity_score = (
-            0.35 * adjacency_score
-            + 0.20 * migration_score
-            + 0.20 * freshness_score
-            + 0.15 * local_gap
-            + 0.10 * popularity_tail
+            adjacency_component
+            + migration_component
+            + freshness_component
+            + whitespace_component
+            + scene_momentum_component
+            + label_concentration_component
+            + local_gap_component
+            + popularity_tail_component
         )
         rationale: list[str] = []
         if adjacency_score >= 0.45:
@@ -789,6 +856,10 @@ def build_creator_label_intelligence(
             rationale.append("recent release activity")
         if whitespace_score >= 0.7:
             rationale.append("release cadence suggests whitespace")
+        if scene_momentum_score >= 0.5:
+            rationale.append("scene momentum is already strong")
+        if label_concentration_score >= 0.5:
+            rationale.append("label concentration makes the lane easier to package")
         if local_gap >= 0.5 and popularity_tail >= 0.25:
             rationale.append("under-penetrated long-tail fit")
         if not rationale:
@@ -798,6 +869,8 @@ def build_creator_label_intelligence(
             migration_score=migration_score,
             freshness_score=freshness_score,
             whitespace_score=whitespace_score,
+            scene_momentum_score=scene_momentum_score,
+            label_concentration_score=label_concentration_score,
             local_gap=local_gap,
             popularity_tail=popularity_tail,
         )
@@ -822,11 +895,29 @@ def build_creator_label_intelligence(
                 "fan_migration_score": round(migration_score, 4),
                 "freshness_score": round(float(freshness_score), 4),
                 "release_whitespace_score": round(_safe_float(row.get("release_whitespace_score")), 4),
+                "scene_momentum_score": round(float(scene_momentum_score), 4),
+                "scene_release_pressure": round(
+                    scene_release_pressure_lookup.get(int(scene_id), 0.0),
+                    4,
+                )
+                if scene_id is not None
+                else 0.0,
+                "scene_label_concentration": round(float(label_concentration_score), 4),
                 "local_play_share": round(local_play_share, 6),
+                "local_gap_score": round(float(local_gap), 4),
                 "public_popularity": popularity,
+                "popularity_tail_score": round(float(popularity_tail), 4),
                 "days_since_latest_release": row.get("days_since_latest_release"),
                 "dominant_release_labels": row["dominant_release_labels"],
                 "connected_seed_artists": connected_seed_artists,
+                "adjacency_component": round(float(adjacency_component), 4),
+                "migration_component": round(float(migration_component), 4),
+                "freshness_component": round(float(freshness_component), 4),
+                "whitespace_component": round(float(whitespace_component), 4),
+                "scene_momentum_component": round(float(scene_momentum_component), 4),
+                "label_concentration_component": round(float(label_concentration_component), 4),
+                "local_gap_component": round(float(local_gap_component), 4),
+                "popularity_tail_component": round(float(popularity_tail_component), 4),
                 "rationale": rationale,
                 "why_now": _opportunity_why_now(
                     artist_name=str(row["artist_name"]),
@@ -872,5 +963,10 @@ def build_creator_label_intelligence(
             "fan_migration_count": int(len(fan_migration_rows)),
             "release_whitespace_count": int(len(release_whitespace_rows)),
             "opportunity_count": int(len(opportunity_rows)),
+        },
+        "ranking_rubric": {
+            "version": "week8_creator_intelligence_v1",
+            "weights": dict(_OPPORTUNITY_RANKING_WEIGHTS),
+            "packaging": "standalone_report_family_nested_under_public_insights",
         },
     }

@@ -264,6 +264,7 @@ def test_build_creator_label_intelligence_fuses_adjacency_scenes_and_opportuniti
         row["artist_name"] == "Emerging E" and "Indie Arc" in row["dominant_release_labels"]
         for row in payload["nodes"]
     )
+    assert payload["ranking_rubric"]["version"] == "week8_creator_intelligence_v1"
     assert payload["opportunities"][0]["opportunity_rank"] == 1
     assert all(row["opportunity_band"] in {"priority_now", "watchlist", "explore"} for row in payload["opportunities"][:3])
     assert all(row["primary_driver"] for row in payload["opportunities"][:3])
@@ -271,7 +272,14 @@ def test_build_creator_label_intelligence_fuses_adjacency_scenes_and_opportuniti
     emerging_row = next(row for row in payload["opportunities"] if row["artist_name"] == "Emerging E")
     assert isinstance(emerging_row["connected_seed_artists"], list)
     assert emerging_row["connected_seed_artists"]
+    assert emerging_row["adjacency_component"] > 0.0
+    assert emerging_row["scene_momentum_component"] >= 0.0
+    assert emerging_row["label_concentration_component"] >= 0.0
+    assert emerging_row["local_gap_component"] >= 0.0
     assert emerging_row["why_now"]
+    scene_row = next(row for row in payload["scenes"] if row["scene_name"])
+    assert "scene_label_concentration" in scene_row
+    assert "scene_release_pressure" in scene_row
 
 
 def test_seed_transition_helpers_preserve_top_routes_and_shares() -> None:
