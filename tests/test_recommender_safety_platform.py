@@ -189,3 +189,36 @@ def test_build_conformal_abstention_summary_returns_generic_payload() -> None:
     assert float(payload["calibration"]["threshold"]) > 0.0
     assert "abstention_rate" in payload["val"]
     assert "abstention_rate" in payload["test"]
+
+
+def test_build_conformal_abstention_summary_honors_env_operating_point(monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_CONFORMAL_TARGET_SELECTIVE_RISK", "0.25")
+    monkeypatch.setenv("SPOTIFY_CONFORMAL_MIN_ACCEPTED_RATE", "0.50")
+    payload = build_conformal_abstention_summary(
+        tag="video_home_feed",
+        val_proba=np.array(
+            [
+                [0.95, 0.03, 0.02],
+                [0.92, 0.05, 0.03],
+                [0.55, 0.35, 0.10],
+                [0.52, 0.38, 0.10],
+                [0.51, 0.39, 0.10],
+            ],
+            dtype="float32",
+        ),
+        val_y=np.array([0, 0, 1, 1, 2], dtype="int32"),
+        test_proba=np.array(
+            [
+                [0.94, 0.04, 0.02],
+                [0.53, 0.37, 0.10],
+            ],
+            dtype="float32",
+        ),
+        test_y=np.array([0, 1], dtype="int32"),
+        alpha=0.10,
+    )
+
+    assert payload is not None
+    assert payload["operating_point"]["target_selective_risk"] == 0.25
+    assert payload["operating_point"]["min_accepted_rate"] == 0.5
+    assert payload["calibration"]["operating_threshold"] >= payload["calibration"]["threshold"]

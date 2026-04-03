@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import csv
 import json
 
 import joblib
@@ -14,6 +13,7 @@ from sklearn.preprocessing import StandardScaler
 
 from .benchmarks import build_serving_tabular_features
 from .data import PreparedData
+from .run_artifacts import write_csv_rows
 
 
 @dataclass(frozen=True)
@@ -26,13 +26,7 @@ class CausalSkipDecompositionArtifact:
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:

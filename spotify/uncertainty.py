@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 
 import numpy as np
 
@@ -14,9 +15,23 @@ class SplitConformalCalibration:
     sample_count: int
     empirical_coverage: float
     mean_set_size: float
+    operating_threshold: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    @property
+    def abstention_threshold(self) -> float:
+        value = self.operating_threshold
+        if value is None:
+            return float(self.threshold)
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            return float(self.threshold)
+        if math.isnan(threshold):
+            return float(self.threshold)
+        return threshold
 
 
 def _as_2d_float_array(proba: np.ndarray) -> np.ndarray:
@@ -73,6 +88,59 @@ def fit_split_conformal_classifier(
         empirical_coverage=empirical_coverage,
         mean_set_size=mean_set_size,
     )
+
+
+def fit_operating_abstention_threshold(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    base_threshold: float,
+    target_selective_risk: float = 0.50,
+    min_accepted_rate: float = 0.10,
+    min_risk_drop: float = 0.02,
+) -> float:
+    proba_arr = _as_2d_float_array(proba)
+    y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
+    if proba_arr.shape[0] == 0 or proba_arr.shape[0] != y_arr.shape[0]:
+        return float(base_threshold)
+
+    valid = _valid_label_mask(y_arr, proba_arr.shape[1])
+    if not np.any(valid):
+        return float(base_threshold)
+
+    y_valid = y_arr[valid]
+    max_confidence = np.max(proba_arr[valid], axis=1).astype("float64", copy=False)
+    predicted = np.argmax(proba_arr[valid], axis=1).astype("int64", copy=False)
+    correct = (predicted == y_valid).astype("float64", copy=False)
+    if max_confidence.size == 0:
+        return float(base_threshold)
+
+    order = np.argsort(max_confidence)[::-1]
+    sorted_conf = max_confidence[order]
+    sorted_correct = correct[order]
+    counts = np.arange(1, len(sorted_conf) + 1, dtype="float64")
+    accepted_rate = counts / float(len(sorted_conf))
+    selective_accuracy = np.cumsum(sorted_correct, dtype="float64") / counts
+    selective_risk = 1.0 - selective_accuracy
+    full_selective_risk = float(selective_risk[-1]) if selective_risk.size else float("nan")
+
+    eligible = np.flatnonzero(accepted_rate >= max(1e-6, float(min_accepted_rate)))
+    if eligible.size == 0:
+        return float(base_threshold)
+
+    target = min(0.99, max(0.0, float(target_selective_risk)))
+    satisfying = eligible[selective_risk[eligible] <= target]
+    if satisfying.size:
+        best_idx = int(satisfying[-1])
+    else:
+        improvements = full_selective_risk - selective_risk[eligible]
+        utility = improvements - (0.20 * (1.0 - accepted_rate[eligible]))
+        best_offset = int(np.argmax(utility))
+        best_idx = int(eligible[best_offset])
+        if not np.isfinite(improvements[best_offset]) or improvements[best_offset] < float(min_risk_drop):
+            return float(base_threshold)
+
+    return float(max(float(base_threshold), float(sorted_conf[best_idx])))
 
 
 def conformal_prediction_mask(
@@ -139,7 +207,8 @@ def summarize_prediction_sets(
     mask = conformal_prediction_mask(proba_arr, calibration=calibration)
     set_sizes = np.sum(mask, axis=1).astype("int64")
     max_confidence = np.max(proba_arr, axis=1) if proba_arr.shape[1] > 0 else np.zeros(len(proba_arr), dtype="float64")
-    abstained = max_confidence < (float(calibration.threshold) - 1e-12)
+    abstention_threshold = float(calibration.abstention_threshold)
+    abstained = max_confidence < (abstention_threshold - 1e-12)
 
     valid = _valid_label_mask(y_arr, proba_arr.shape[1])
     if np.any(valid):
@@ -169,6 +238,7 @@ def summarize_prediction_sets(
         "selective_accuracy": selective_accuracy,
         "selective_risk": selective_risk,
         "top1_confidence_mean": float(np.mean(max_confidence)) if max_confidence.size else float("nan"),
+        "abstention_threshold": abstention_threshold,
     }
 
 
@@ -184,6 +254,12 @@ def calibration_from_payload(payload: dict[str, object] | None) -> SplitConforma
         sample_count = int(payload.get("sample_count", 0))
         empirical_coverage = float(payload.get("empirical_coverage", float("nan")))
         mean_set_size = float(payload.get("mean_set_size", float("nan")))
+        operating_threshold_raw = payload.get("operating_threshold")
+        operating_threshold = (
+            None
+            if operating_threshold_raw is None
+            else float(operating_threshold_raw)
+        )
     except (TypeError, ValueError):
         return None
 
@@ -198,4 +274,5 @@ def calibration_from_payload(payload: dict[str, object] | None) -> SplitConforma
         sample_count=sample_count,
         empirical_coverage=empirical_coverage,
         mean_set_size=mean_set_size,
+        operating_threshold=operating_threshold,
     )

@@ -5,6 +5,7 @@ import numpy as np
 from spotify.uncertainty import (
     calibration_from_payload,
     conformal_prediction_sets,
+    fit_operating_abstention_threshold,
     fit_split_conformal_classifier,
     summarize_prediction_sets,
 )
@@ -90,10 +91,37 @@ def test_calibration_from_payload_rehydrates_dataclass() -> None:
         "sample_count": 12,
         "empirical_coverage": 0.91,
         "mean_set_size": 1.6,
+        "operating_threshold": 0.72,
     }
 
     calibration = calibration_from_payload(payload)
 
     assert calibration is not None
     assert calibration.threshold == 0.6
+    assert calibration.operating_threshold == 0.72
+    assert calibration.abstention_threshold == 0.72
     assert calibration.sample_count == 12
+
+
+def test_fit_operating_abstention_threshold_can_raise_threshold_when_risk_is_concentrated() -> None:
+    proba = np.array(
+        [
+            [0.95, 0.03, 0.02],
+            [0.92, 0.05, 0.03],
+            [0.55, 0.35, 0.10],
+            [0.52, 0.38, 0.10],
+            [0.51, 0.39, 0.10],
+        ],
+        dtype="float32",
+    )
+    y_true = np.array([0, 0, 1, 1, 2], dtype="int32")
+
+    threshold = fit_operating_abstention_threshold(
+        proba,
+        y_true,
+        base_threshold=0.10,
+        target_selective_risk=0.20,
+        min_accepted_rate=0.20,
+    )
+
+    assert threshold > 0.10

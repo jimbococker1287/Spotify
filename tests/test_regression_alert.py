@@ -25,6 +25,7 @@ def _write_run(
     regression: float,
     robustness_gap: float,
     stress_skip_risk: float,
+    optuna_rows: int = 0,
 ) -> Path:
     run_dir = output_dir / "runs" / run_id
     analysis_dir = run_dir / "analysis"
@@ -50,6 +51,8 @@ def _write_run(
                 "data_records": 1234,
                 "num_artists": 80,
                 "num_context_features": 12,
+                "backtest_rows": 12,
+                "optuna_rows": optuna_rows,
                 "champion_gate": gate_payload,
                 "champion_alias": champion_alias,
             },
@@ -77,6 +80,8 @@ def _write_run(
                 "test_ece": 0.05,
                 "test_selective_risk": 0.20,
                 "test_abstention_rate": 0.08,
+                "test_accepted_rate": 0.92,
+                "conformal_operating_threshold": 0.55,
             },
             indent=2,
         ),
@@ -116,10 +121,43 @@ def _write_run(
                 {
                     "model_name": model_name,
                     "max_top1_gap": robustness_gap,
+                    "global_top1": test_top1,
                     "worst_segment": "repeat_from_prev",
                     "worst_bucket": "new",
+                    "guardrail_segment": "repeat_from_prev",
+                    "guardrail_bucket": "new",
+                    "guardrail_top1": max(test_top1 - robustness_gap, 0.0),
+                    "guardrail_gap": robustness_gap,
+                    "guardrail_bucket_count": 120,
                 }
             ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "robustness_guardrails.json").write_text(
+        json.dumps(
+            {
+                "segment": "repeat_from_prev",
+                "bucket": "new",
+                "model_count": 1,
+                "available_model_count": 1,
+                "worst_model_name": model_name,
+                "worst_gap": robustness_gap,
+                "worst_top1": max(test_top1 - robustness_gap, 0.0),
+                "worst_bucket_count": 120,
+                "models": [
+                    {
+                        "model_name": model_name,
+                        "segment": "repeat_from_prev",
+                        "bucket": "new",
+                        "slice_top1": max(test_top1 - robustness_gap, 0.0),
+                        "slice_gap": robustness_gap,
+                        "slice_count": 120,
+                        "global_top1": test_top1,
+                    }
+                ],
+            },
             indent=2,
         ),
         encoding="utf-8",
@@ -131,6 +169,39 @@ def _write_run(
                 "causal_test_auc_total": 0.69,
                 "stress_worst_skip_scenario": "evening_drift",
                 "stress_worst_skip_risk": stress_skip_risk,
+                "stress_benchmark_scenario": "evening_drift",
+                "stress_benchmark_policy_name": "safe_global",
+                "stress_benchmark_reference_policy_name": "baseline_exploit",
+                "stress_benchmark_skip_risk": stress_skip_risk,
+                "stress_benchmark_end_risk": 0.10,
+                "stress_benchmark_skip_delta_vs_reference": 0.02,
+                "stress_benchmark_scenario_rank": 5,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    stress_dir = analysis_dir / "stress_test"
+    stress_dir.mkdir(parents=True, exist_ok=True)
+    (stress_dir / "stress_test_benchmark.json").write_text(
+        json.dumps(
+            {
+                "benchmark_scenario": "evening_drift",
+                "benchmark_policy_name": "safe_global",
+                "reference_policy_name": "baseline_exploit",
+                "available": True,
+                "reference_available": True,
+                "skip_risk": stress_skip_risk,
+                "end_risk": 0.10,
+                "reference_skip_risk": max(stress_skip_risk - 0.02, 0.0),
+                "reference_end_risk": 0.11,
+                "skip_risk_delta_vs_reference": 0.02,
+                "end_risk_delta_vs_reference": -0.01,
+                "scenario_rank_by_skip_risk": 5,
+                "scenario_count_for_policy": 5,
+                "evaluated_sessions": 2500,
+                "total_test_sessions": 10000,
+                "sample_fraction": 0.25,
             },
             indent=2,
         ),
@@ -367,3 +438,57 @@ def test_regression_alert_allows_newer_explicit_run_pending_control_room(tmp_pat
     assert result.returncode == 0
     assert "run=run_pending" in result.stdout
     assert "review_status=pending_control_room:run_full" in result.stdout
+
+
+def test_regression_alert_prefers_latest_completed_full_run_over_older_richer_optuna_history(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run(
+        output_dir,
+        run_id="run_older",
+        timestamp="2026-03-29T12:43:13",
+        promoted=False,
+        status="fail",
+        model_name="extra_trees",
+        model_type="classical",
+        val_top1=0.60,
+        test_top1=0.31,
+        regression=0.01,
+        robustness_gap=0.22,
+        stress_skip_risk=0.29,
+        optuna_rows=6,
+    )
+    _write_run(
+        output_dir,
+        run_id="run_newer",
+        timestamp="2026-03-29T17:03:03",
+        promoted=False,
+        status="fail",
+        model_name="mlp",
+        model_type="classical",
+        val_top1=0.59,
+        test_top1=0.30,
+        regression=0.02,
+        robustness_gap=0.23,
+        stress_skip_risk=0.30,
+        optuna_rows=3,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--review-threshold",
+            "off",
+            "--allow-fail",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0
+    assert "run=run_newer" in result.stdout
+    assert "review_status=ok" in result.stdout

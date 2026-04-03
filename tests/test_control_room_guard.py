@@ -59,7 +59,7 @@ def test_control_room_guard_returns_four_on_threshold_violation(tmp_path: Path) 
     assert len(triage_payload["violations"]) == 2
     assert any(item["area"] == "robustness" for item in triage_payload["triage_items"])
     markdown = triage_md.read_text(encoding="utf-8")
-    assert "Inspect: Open analysis/robustness_summary.json" in markdown
+    assert "Inspect: Open analysis/robustness_guardrails.json and analysis/robustness_summary.json" in markdown
     assert "Fix: Add slice-aware safeguards" in markdown
     assert "Rerun: Re-run the fast schedule" in markdown
 
@@ -170,6 +170,49 @@ def test_control_room_guard_triage_includes_promotion_playbook(tmp_path: Path) -
     promotion_item = next(item for item in triage_payload["triage_items"] if item["area"] == "promotion")
     assert "run_manifest.json" in promotion_item["inspect_files"]
     assert any("Compare the challenger" in step for step in promotion_item["inspect_steps"])
+
+
+def test_control_room_guard_supports_slice_and_standing_benchmark_thresholds(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    run_b = _write_run(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-03-22T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="blended_ensemble",
+        model_type="ensemble",
+        val_top1=0.61,
+        test_top1=0.58,
+        regression=-0.01,
+        robustness_gap=0.27,
+        stress_skip_risk=0.44,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--run-dir",
+            str(run_b),
+            "--max-repeat-from-prev-new-gap",
+            "0.20",
+            "--max-stress-benchmark-skip-risk",
+            "0.40",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 4
+    assert "repeat_from_prev_new_gap=0.270" in result.stdout
+    assert "stress_benchmark_skip_risk=0.440" in result.stdout
+    assert "violation[1]=repeat_from_prev_new_gap" in result.stdout
+    assert "violation[2]=stress_benchmark_skip_risk" in result.stdout
 
 
 def test_control_room_guard_triage_includes_instrumentation_playbook_when_analysis_missing(tmp_path: Path) -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
 
 import numpy as np
@@ -10,6 +9,7 @@ from .benchmarks import build_serving_tabular_features
 from .data import PreparedData
 from .digital_twin import ListenerDigitalTwinArtifact
 from .multimodal import MultimodalArtistSpace
+from .run_artifacts import write_csv_rows
 from .safe_policy import POLICY_TEMPLATES, SafeBanditPolicyArtifact
 
 
@@ -66,13 +66,7 @@ GROUP_SCENARIOS: dict[str, dict[str, float | int | str]] = {
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _session_pool(data: PreparedData) -> tuple[np.ndarray, np.ndarray]:

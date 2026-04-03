@@ -466,7 +466,8 @@ class PredictionService:
             )[0]
             prediction_set_total = int(prediction_set.size)
             top1_confidence = float(np.max(artist_probs)) if artist_probs.size else float("nan")
-            would_abstain = bool(top1_confidence < (float(self._conformal_calibration.threshold) - 1e-12))
+            abstention_threshold = float(self._conformal_calibration.abstention_threshold)
+            would_abstain = bool(top1_confidence < (abstention_threshold - 1e-12))
             if allow_abstain and would_abstain:
                 decision = "abstain"
 
@@ -475,6 +476,7 @@ class PredictionService:
                 "method": self._conformal_calibration.method,
                 "alpha": float(self._conformal_calibration.alpha),
                 "threshold": float(self._conformal_calibration.threshold),
+                "operating_threshold": abstention_threshold,
                 "top1_confidence": top1_confidence,
                 "would_abstain": would_abstain,
                 "abstained": bool(allow_abstain and would_abstain),

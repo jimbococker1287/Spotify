@@ -66,6 +66,7 @@ def test_run_drift_diagnostics_writes_expected_artifacts(tmp_path: Path) -> None
         tmp_path / "data_drift_summary.json",
         tmp_path / "context_feature_drift.csv",
         tmp_path / "segment_drift.csv",
+        tmp_path / "context_feature_drift_by_group.csv",
         tmp_path / "context_feature_drift.png",
         tmp_path / "segment_drift.png",
     }
@@ -74,6 +75,8 @@ def test_run_drift_diagnostics_writes_expected_artifacts(tmp_path: Path) -> None
     assert summary["train_rows"] == 4
     assert summary["context_feature_count"] == 2
     assert "target_drift" in summary
+    assert "context_drift_by_group" in summary
+    assert "drift_interpretation" in summary
 
 
 def test_run_temporal_backtest_supports_deep_models_via_injected_runner(tmp_path: Path, monkeypatch) -> None:
@@ -115,3 +118,97 @@ def test_run_temporal_backtest_supports_deep_models_via_injected_runner(tmp_path
     csv_payload = (tmp_path / "temporal_backtest.csv").read_text(encoding="utf-8")
     assert "model_type" in csv_payload
     assert "gru_artist" in csv_payload
+
+
+def test_run_temporal_backtest_honors_env_sample_caps(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    captured: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(backtesting, "_build_expanding_windows", lambda _n_rows, _folds: [(4, 8)])
+
+    def _fake_backtest_job(**kwargs) -> BacktestFoldResult:
+        captured.append((len(kwargs["X_train"]), len(kwargs["X_test"])))
+        return BacktestFoldResult(
+            model_name=str(kwargs["model_name"]),
+            model_type="classical",
+            model_family="linear",
+            fold=int(kwargs["fold_idx"]),
+            train_rows=len(kwargs["X_train"]),
+            test_rows=len(kwargs["X_test"]),
+            fit_seconds=0.01,
+            top1=0.5,
+            top5=1.0,
+        )
+
+    monkeypatch.setattr(backtesting, "_run_backtest_job", _fake_backtest_job)
+    monkeypatch.setenv("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", "2")
+    monkeypatch.setenv("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", "1")
+
+    rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path,
+        selected_models=("logreg",),
+        random_seed=42,
+        folds=1,
+        max_train_samples=10,
+        max_eval_samples=10,
+        logger=_logger("spotify.test.backtest_caps"),
+    )
+
+    assert captured == [(2, 1)]
+    assert len(rows) == 1
+    assert rows[0].train_rows == 2
+    assert rows[0].test_rows == 1
+
+
+def test_run_temporal_backtest_scores_each_classical_eval_split_once(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    predict_proba_calls: list[int] = []
+
+    monkeypatch.setattr(backtesting, "_build_expanding_windows", lambda _n_rows, _folds: [(4, 6)])
+
+    class _CountingEstimator:
+        classes_ = np.array([0, 1, 2], dtype="int32")
+
+        def fit(self, X: np.ndarray, y: np.ndarray) -> "_CountingEstimator":
+            return self
+
+        def predict_proba(self, X: np.ndarray) -> np.ndarray:
+            predict_proba_calls.append(len(X))
+            return np.array(
+                [
+                    [0.1, 0.1, 0.8],
+                    [0.1, 0.8, 0.1],
+                ],
+                dtype="float32",
+            )[: len(X)]
+
+    monkeypatch.setattr(
+        backtesting,
+        "build_classical_estimator",
+        lambda _model_name, _seed, estimator_n_jobs=-1: ("linear", _CountingEstimator()),
+    )
+
+    rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path,
+        selected_models=("logreg",),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_predict_proba"),
+    )
+
+    assert len(rows) == 1
+    assert predict_proba_calls == [2]
+    assert rows[0].top1 == 1.0
+
+
+def test_resolve_backtest_workers_defaults_to_two_jobs_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(backtesting.os, "cpu_count", lambda: 8)
+
+    assert backtesting._resolve_backtest_workers(None, job_count=1) == 1
+    assert backtesting._resolve_backtest_workers("", job_count=2) == 2
+    assert backtesting._resolve_backtest_workers("auto", job_count=4) == 2
+    assert backtesting._resolve_backtest_workers("1", job_count=4) == 1

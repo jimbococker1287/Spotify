@@ -132,6 +132,7 @@ def run_moonshot_lab(
     journey_summary = _read_json(journey_dir / "journey_plans_summary.json")
     group_auto_dj_summary = _read_json(group_auto_dj_dir / "group_auto_dj_summary.json")
     stress_summary = _read_json(stress_dir / "stress_test_summary.json")
+    stress_benchmark = _read_json(stress_dir / "stress_test_benchmark.json")
 
     journey_rows = journey_summary if isinstance(journey_summary, list) else []
     journey_horizons = [_safe_float(row.get("planned_horizon")) for row in journey_rows if isinstance(row, dict)]
@@ -147,14 +148,20 @@ def run_moonshot_lab(
     )
 
     stress_rows = stress_summary if isinstance(stress_summary, list) else []
-    safe_stress_rows = [
-        row for row in stress_rows if isinstance(row, dict) and str(row.get("policy_name", "")).strip() == "safe_global"
-    ]
-    worst_safe_row = max(
-        safe_stress_rows,
-        key=lambda row: _safe_float(row.get("mean_skip_risk")),
-        default={},
-    )
+    safe_best_by_scenario: dict[str, dict[str, object]] = {}
+    for row in stress_rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("policy_family", "")).strip() != "safe" and not str(row.get("policy_name", "")).strip().startswith("safe_"):
+            continue
+        scenario_name = str(row.get("scenario", "")).strip()
+        if not scenario_name:
+            continue
+        current = safe_best_by_scenario.get(scenario_name)
+        if current is None or _safe_float(row.get("mean_skip_risk")) < _safe_float(current.get("mean_skip_risk")):
+            safe_best_by_scenario[scenario_name] = row
+    safe_stress_rows = list(safe_best_by_scenario.values())
+    worst_safe_row = max(safe_stress_rows, key=lambda row: _safe_float(row.get("mean_skip_risk")), default={})
 
     summary_payload = {
         "multimodal_artist_count": int(len(multimodal_space.artist_labels)),
@@ -190,8 +197,18 @@ def run_moonshot_lab(
             len({str(row.get("scenario", "")).strip() for row in stress_rows if isinstance(row, dict)})
         ),
         "stress_worst_skip_scenario": str(worst_safe_row.get("scenario", "")),
+        "stress_worst_safe_policy": str(worst_safe_row.get("policy_name", "")),
         "stress_worst_skip_risk": _safe_float(worst_safe_row.get("mean_skip_risk")),
         "stress_worst_end_risk": _safe_float(worst_safe_row.get("mean_end_risk")),
+        "stress_benchmark_scenario": str((stress_benchmark or {}).get("benchmark_scenario", "")),
+        "stress_benchmark_policy_name": str((stress_benchmark or {}).get("benchmark_policy_name", "")),
+        "stress_benchmark_reference_policy_name": str((stress_benchmark or {}).get("reference_policy_name", "")),
+        "stress_benchmark_skip_risk": _safe_float((stress_benchmark or {}).get("skip_risk")),
+        "stress_benchmark_end_risk": _safe_float((stress_benchmark or {}).get("end_risk")),
+        "stress_benchmark_skip_delta_vs_reference": _safe_float(
+            (stress_benchmark or {}).get("skip_risk_delta_vs_reference")
+        ),
+        "stress_benchmark_scenario_rank": int((stress_benchmark or {}).get("scenario_rank_by_skip_risk", 0) or 0),
         "artifact_count": int(len(artifact_paths) + 1),
     }
     summary_path = analysis_dir / "moonshot_summary.json"

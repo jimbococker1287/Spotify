@@ -345,9 +345,12 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK` (optional absolute ceiling for conformal selective risk)
 - `SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE` (optional absolute ceiling for abstention rate)
 - `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail,contrastive_session`)
+- `SPOTIFY_PRETRAIN_MAX_PAIRS` (default `1000000`; cap self-supervised pretraining pairs per objective, use `0` for no cap)
 - `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
 - `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
 - `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
+- `SPOTIFY_STRESS_TEST_MAX_SESSIONS` (default `2500`; cap held-out sessions evaluated per stress-test scenario/policy, use `0` for full sweep)
+- `SPOTIFY_STRESS_TEST_PROGRESS_EVERY` (default `500`; progress-log interval inside the stress-test lab)
 
 The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
 
@@ -540,6 +543,32 @@ Or via Make:
 make taste-os-showcase EXTRA_ARGS='--top-k 5'
 ```
 
+Serve Taste OS session plans over HTTP:
+
+```bash
+python -m spotify.taste_os_service --host 127.0.0.1 --port 8010
+```
+
+Then open [http://127.0.0.1:8010/taste-os](http://127.0.0.1:8010/taste-os) for the built-in session studio.
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8010/taste-os/session \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"focus","scenario":"skip_recovery","top_k":5,"persist_artifacts":true,"use_feedback_memory":true}'
+```
+
+That service exposes a browser UI at `GET /taste-os`, plus:
+
+- `GET /health`
+- `GET /taste-os/catalog`
+- `GET /taste-os/history`
+- `POST /taste-os/session`
+- `POST /taste-os/feedback`
+
+It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now keeps a lightweight feedback-memory store that can seed future sessions when `use_feedback_memory` is enabled.
+
 The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
 ## Prediction CLI
@@ -718,6 +747,8 @@ Creator / label intelligence graph:
 python -m spotify.public_insights creator-label-intelligence --top-n 8 --lookback-days 365 --neighbor-k 5
 ```
 
+That report now reads more like a strategy brief: it starts with an executive summary, adds scene and seed comparison views, and writes comparison CSVs alongside the core adjacency, scene, migration, whitespace, and opportunity outputs.
+
 Release inbox:
 
 ```bash
@@ -839,6 +870,8 @@ The scheduled wrapper also runs a dedicated control-room guard with these defaul
 - `SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK=0.45`
 - `SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD=0.20`
 - `SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK=0.50`
+
+The scheduled `full` wrapper is now intentionally more opinionated than the raw profile defaults: it seeds retrieval pretraining with `cooccurrence,masked_tail`, caps pretraining pairs at `1000000`, and tunes only `logreg,extra_trees,mlp` unless you override `SPOTIFY_PRETRAIN_OBJECTIVES`, `SPOTIFY_PRETRAIN_MAX_PAIRS`, or `OPTUNA_MODELS`.
 
 You can run that guard directly:
 

@@ -201,4 +201,5 @@ def test_prediction_service_can_abstain_with_conformal_summary(tmp_path: Path, m
     assert result["uncertainty"]["conformal_enabled"] is True
     assert result["uncertainty"]["would_abstain"] is True
     assert result["uncertainty"]["abstained"] is True
+    assert result["uncertainty"]["operating_threshold"] == pytest.approx(0.65)
     assert result["uncertainty"]["prediction_set_size"] == 0

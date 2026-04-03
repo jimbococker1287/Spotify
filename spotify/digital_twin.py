@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import csv
 import json
 
 import joblib
@@ -15,6 +14,7 @@ from .benchmarks import build_serving_tabular_features
 from .causal_friction import CausalSkipDecompositionArtifact
 from .data import PreparedData
 from .multimodal import MultimodalArtistSpace
+from .run_artifacts import write_csv_rows
 
 
 @dataclass(frozen=True)
@@ -27,13 +27,7 @@ class ListenerDigitalTwinArtifact:
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _aligned_frames(data: PreparedData, sequence_length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -65,6 +59,65 @@ def _end_labels(frame) -> np.ndarray:
 def _sigmoid(value: np.ndarray | float) -> np.ndarray | float:
     arr = np.asarray(value, dtype="float64")
     return 1.0 / (1.0 + np.exp(-np.clip(arr, -18.0, 18.0)))
+
+
+def _decision_scores_batch(estimator, X: np.ndarray) -> np.ndarray:
+    if hasattr(estimator, "decision_function"):
+        return np.asarray(estimator.decision_function(X), dtype="float32").reshape(-1)
+    proba = np.asarray(estimator.predict_proba(X), dtype="float32")
+    clipped = np.clip(proba[:, 1], 1e-6, 1.0 - 1e-6)
+    return np.log(clipped / (1.0 - clipped)).astype("float32", copy=False)
+
+
+_SEQUENCE_FEATURE_COUNT = 9
+_ROLLOUT_STATIC_CACHE: dict[
+    tuple[int, int, int, tuple[str, ...]],
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+] = {}
+
+
+def _rollout_static_inputs(
+    twin: ListenerDigitalTwinArtifact,
+    multimodal_space: MultimodalArtistSpace,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    cache_key = (
+        id(twin.transition_matrix),
+        id(multimodal_space.embeddings),
+        id(multimodal_space.popularity),
+        tuple(str(name) for name in twin.context_features),
+    )
+    cached = _ROLLOUT_STATIC_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    artist_ids = np.arange(len(twin.artist_labels), dtype="int32")
+    transition_log = np.log(np.clip(np.asarray(twin.transition_matrix, dtype="float32"), 1e-6, 1.0)).astype("float32", copy=False)
+    embeddings = np.asarray(multimodal_space.embeddings, dtype="float32")
+    similarity_matrix = (embeddings @ embeddings.T).astype("float32", copy=False)
+    novelty = (1.0 - np.asarray(multimodal_space.popularity, dtype="float32")).astype("float32", copy=False)
+    friction_indices = np.asarray(
+        [idx for idx, name in enumerate(twin.context_features) if str(name).startswith("tech_") or str(name) == "offline"],
+        dtype="int64",
+    )
+    cached = (artist_ids, transition_log, similarity_matrix, novelty, friction_indices)
+    _ROLLOUT_STATIC_CACHE[cache_key] = cached
+    return cached
+
+
+def _causal_feature_views(
+    context_width: int,
+    causal_artifact: CausalSkipDecompositionArtifact,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    total_features = _SEQUENCE_FEATURE_COUNT + int(context_width)
+    friction_keep = _SEQUENCE_FEATURE_COUNT + np.asarray(causal_artifact.friction_feature_indices, dtype="int64")
+    needs_friction_padding = friction_keep.size == 0
+    if needs_friction_padding:
+        friction_keep = np.asarray([total_features], dtype="int64")
+        total_features += 1
+    keep_mask = np.ones(total_features, dtype=bool)
+    keep_mask[friction_keep] = False
+    preference_keep = np.flatnonzero(keep_mask).astype("int64", copy=False)
+    return preference_keep, friction_keep, needs_friction_padding
 
 
 def fit_listener_digital_twin(
@@ -150,6 +203,156 @@ def _safe_numeric(frame, column: str) -> np.ndarray:
     return np.asarray(frame[column], dtype="float32")
 
 
+def simulate_rollout_batch_summary(
+    *,
+    twin: ListenerDigitalTwinArtifact,
+    multimodal_space: MultimodalArtistSpace,
+    causal_artifact: CausalSkipDecompositionArtifact | None,
+    start_sequences: np.ndarray,
+    start_contexts: np.ndarray,
+    horizon: int,
+    policy_weights: dict[str, float],
+    scenario: dict[str, float] | None = None,
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    scenario = dict(scenario or {})
+    sequences = np.asarray(start_sequences, dtype="int32")
+    contexts = np.asarray(start_contexts, dtype="float32")
+    if sequences.ndim != 2:
+        sequences = sequences.reshape(0, 0)
+    if contexts.ndim != 2:
+        contexts = contexts.reshape(len(sequences), -1)
+
+    batch_size = int(len(sequences))
+    if batch_size == 0:
+        empty_float = np.empty(0, dtype="float32")
+        empty_int = np.empty(0, dtype="int32")
+        return {
+            "session_length": empty_int,
+            "mean_skip_risk": empty_float,
+            "mean_end_risk": empty_float,
+            "first_choice": empty_int,
+        }
+
+    sequence_state = sequences.copy()
+    context_state = contexts.copy()
+    session_length = np.zeros(batch_size, dtype="int32")
+    skip_sum = np.zeros(batch_size, dtype="float32")
+    end_sum = np.zeros(batch_size, dtype="float32")
+    first_choice = np.full(batch_size, -1, dtype="int32")
+    active_mask = np.ones(batch_size, dtype=bool)
+
+    artist_ids, transition_log, similarity_matrix, novelty, friction_indices = _rollout_static_inputs(
+        twin,
+        multimodal_space,
+    )
+    artist_count = int(len(artist_ids))
+    novelty_row = novelty.reshape(1, artist_count)
+
+    friction_scale = float(scenario.get("friction_scale", 1.0))
+    hour_shift = float(scenario.get("hour_shift", 0.0))
+    fatigue_bias = float(scenario.get("fatigue_bias", 0.0))
+    repeat_bias = float(scenario.get("repeat_bias", 0.0))
+    repeat_weight = float(policy_weights.get("repeat", 0.6)) + repeat_bias
+    transition_weight = float(policy_weights.get("transition", 1.0))
+    continuity_weight = float(policy_weights.get("continuity", 0.2))
+    novelty_weight = float(policy_weights.get("novelty", 0.0))
+
+    preference_keep: np.ndarray | None = None
+    friction_keep: np.ndarray | None = None
+    needs_friction_padding = False
+    if causal_artifact is not None:
+        preference_keep, friction_keep, needs_friction_padding = _causal_feature_views(
+            context_state.shape[1],
+            causal_artifact,
+        )
+
+    for _step in range(max(1, int(horizon))):
+        active_idx = np.flatnonzero(active_mask)
+        if active_idx.size == 0:
+            break
+
+        active_seq = sequence_state[active_idx]
+        active_ctx = context_state[active_idx]
+        last_artist = active_seq[:, -1]
+        repeat_penalty = np.zeros((len(active_idx), artist_count), dtype="float32")
+        repeat_penalty[np.arange(len(active_idx))[:, None], active_seq] = 1.0
+        scores = (
+            transition_weight * transition_log[last_artist]
+            + continuity_weight * similarity_matrix[last_artist]
+            + novelty_weight * novelty_row
+            - repeat_weight * repeat_penalty
+        )
+        chosen = np.argmax(scores, axis=1).astype("int32", copy=False)
+        first_choice_mask = session_length[active_idx] == 0
+        if np.any(first_choice_mask):
+            first_choice[active_idx[first_choice_mask]] = chosen[first_choice_mask]
+        session_length[active_idx] += 1
+
+        next_context = active_ctx.copy()
+        if next_context.shape[1] >= 1:
+            next_context[:, 0] = (next_context[:, 0] + hour_shift + 1.0) % 24.0
+        if friction_indices.size:
+            next_context[:, friction_indices] = np.maximum(0.0, next_context[:, friction_indices] * friction_scale)
+
+        serving_features = build_serving_tabular_features(active_seq, next_context)
+        if causal_artifact is not None:
+            skip_features = (
+                np.pad(serving_features, ((0, 0), (0, 1)), constant_values=0.0)
+                if needs_friction_padding
+                else serving_features
+            )
+            preference_scores = _decision_scores_batch(
+                causal_artifact.preference_estimator,
+                skip_features[:, preference_keep],
+            )
+            friction_scores = _decision_scores_batch(
+                causal_artifact.friction_estimator,
+                skip_features[:, friction_keep],
+            )
+            total_skip = np.asarray(
+                causal_artifact.meta_estimator.predict_proba(
+                    np.column_stack([preference_scores, friction_scores]).astype("float32", copy=False)
+                ),
+                dtype="float32",
+            )[:, 1]
+        else:
+            total_skip = np.full(len(active_idx), 0.1, dtype="float32")
+        skip_sum[active_idx] += total_skip
+
+        end_risk = np.asarray(twin.end_estimator.predict_proba(serving_features), dtype="float32")[:, 1]
+        end_risk = np.clip(end_risk + fatigue_bias, 0.0, 0.99).astype("float32", copy=False)
+        end_sum[active_idx] += end_risk
+
+        sequence_state[active_idx, :-1] = active_seq[:, 1:]
+        sequence_state[active_idx, -1] = chosen
+        context_state[active_idx] = next_context
+
+        ended = rng.random(len(active_idx)) < end_risk
+        if np.any(ended):
+            active_mask[active_idx[ended]] = False
+
+    mean_skip_risk = np.divide(
+        skip_sum,
+        np.maximum(session_length, 1),
+        out=np.full(batch_size, np.nan, dtype="float32"),
+        where=session_length > 0,
+    ).astype("float32", copy=False)
+    mean_end_risk = np.divide(
+        end_sum,
+        np.maximum(session_length, 1),
+        out=np.full(batch_size, np.nan, dtype="float32"),
+        where=session_length > 0,
+    ).astype("float32", copy=False)
+
+    return {
+        "session_length": session_length,
+        "mean_skip_risk": mean_skip_risk,
+        "mean_end_risk": mean_end_risk,
+        "first_choice": first_choice,
+    }
+
+
 def simulate_rollout(
     *,
     twin: ListenerDigitalTwinArtifact,
@@ -198,30 +401,28 @@ def simulate_rollout(
                 next_context[idx] = float(max(0.0, next_context[idx] * friction_scale))
 
         if causal_artifact is not None:
-            full_features = build_serving_tabular_features(
+            serving_features = build_serving_tabular_features(
                 np.asarray([sequence], dtype="int32"),
                 np.asarray([next_context], dtype="float32"),
             )
-            seq_feature_count = full_features.shape[1] - len(causal_artifact.context_features)
-            friction_keep = np.asarray([seq_feature_count + idx for idx in causal_artifact.friction_feature_indices], dtype="int64")
-            if friction_keep.size == 0:
-                friction_keep = np.asarray([full_features.shape[1] - 1], dtype="int64")
-            preference_keep = np.asarray(
-                [idx for idx in range(full_features.shape[1]) if idx not in set(friction_keep.tolist())],
-                dtype="int64",
+            preference_keep, friction_keep, needs_friction_padding = _causal_feature_views(
+                len(next_context),
+                causal_artifact,
             )
-            pref_logit = np.asarray(causal_artifact.preference_estimator.decision_function(full_features[:, preference_keep]), dtype="float32").reshape(-1)[0]
-            friction_logit = np.asarray(causal_artifact.friction_estimator.decision_function(full_features[:, friction_keep]), dtype="float32").reshape(-1)[0]
+            skip_features = np.pad(serving_features, ((0, 0), (0, 1)), constant_values=0.0) if needs_friction_padding else serving_features
+            pref_logit = _decision_scores_batch(causal_artifact.preference_estimator, skip_features[:, preference_keep])[0]
+            friction_logit = _decision_scores_batch(causal_artifact.friction_estimator, skip_features[:, friction_keep])[0]
             total_skip = float(causal_artifact.meta_estimator.predict_proba(np.asarray([[pref_logit, friction_logit]], dtype="float32"))[:, 1][0])
         else:
             total_skip = 0.1
         skip_risks.append(total_skip)
 
-        end_features = build_serving_tabular_features(
-            np.asarray([sequence], dtype="int32"),
-            np.asarray([next_context], dtype="float32"),
-        )
-        end_risk = float(np.asarray(twin.end_estimator.predict_proba(end_features), dtype="float32")[:, 1][0] + fatigue_bias)
+        if causal_artifact is None:
+            serving_features = build_serving_tabular_features(
+                np.asarray([sequence], dtype="int32"),
+                np.asarray([next_context], dtype="float32"),
+            )
+        end_risk = float(np.asarray(twin.end_estimator.predict_proba(serving_features), dtype="float32")[:, 1][0] + fatigue_bias)
         end_risk = float(min(0.99, max(0.0, end_risk)))
         end_risks.append(end_risk)
 

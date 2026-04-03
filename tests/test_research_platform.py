@@ -144,10 +144,15 @@ def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
     )
 
     assert (run_dir / "analysis" / "robustness_summary.json").exists()
+    assert (run_dir / "analysis" / "robustness_guardrails.json").exists()
     assert (run_dir / "analysis" / "policy_simulation_summary.json").exists()
     assert robustness_artifacts
     assert policy_artifacts
-
+    robustness_summary = json.loads((run_dir / "analysis" / "robustness_summary.json").read_text(encoding="utf-8"))
+    assert robustness_summary[0]["raw_max_top1_gap"] >= robustness_summary[0]["max_top1_gap"]
+    guardrail_payload = json.loads((run_dir / "analysis" / "robustness_guardrails.json").read_text(encoding="utf-8"))
+    assert guardrail_payload["segment"] == "repeat_from_prev"
+    assert guardrail_payload["bucket"] == "new"
 
 def test_backtest_warm_adaptation_reuses_previous_weights(tmp_path: Path, monkeypatch) -> None:
     data = _prepared_data()

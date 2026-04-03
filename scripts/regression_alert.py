@@ -62,6 +62,17 @@ def _find_latest_run(outputs_dir: Path) -> Path:
     except Exception:
         manifests = []
 
+    def _review_pack_ready(run_dir: Path) -> bool:
+        analysis_dir = run_dir / "analysis"
+        required = (
+            run_dir / "run_results.json",
+            analysis_dir / "data_drift_summary.json",
+            analysis_dir / "friction_proxy_summary.json",
+            analysis_dir / "robustness_summary.json",
+            analysis_dir / "moonshot_summary.json",
+        )
+        return all(path.exists() for path in required) and any(analysis_dir.glob("*_confidence_summary.json"))
+
     ranked_manifest_runs: list[tuple[int, str, Path]] = []
     for manifest in manifests:
         run_id = str(manifest.get("run_id", "")).strip()
@@ -71,6 +82,7 @@ def _find_latest_run(outputs_dir: Path) -> Path:
         timestamp = str(manifest.get("timestamp", "")).strip()
         ranked_manifest_runs.append(
             (
+                int(_review_pack_ready(run_dir)),
                 int((run_dir / "champion_gate.json").exists()),
                 timestamp,
                 run_dir,
@@ -78,13 +90,14 @@ def _find_latest_run(outputs_dir: Path) -> Path:
         )
     if ranked_manifest_runs:
         ranked_manifest_runs.sort(reverse=True)
-        return ranked_manifest_runs[0][2]
+        return ranked_manifest_runs[0][3]
 
     run_dirs = [path for path in runs_dir.iterdir() if path.is_dir()]
     if not run_dirs:
         raise FileNotFoundError(f"No run directories found in {runs_dir}")
     run_dirs.sort(
         key=lambda path: (
+            int(_review_pack_ready(path)),
             int((path / "champion_gate.json").exists()),
             path.stat().st_mtime,
         ),

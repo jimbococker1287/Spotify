@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
 
 import numpy as np
@@ -11,6 +10,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from .data import PreparedData
+from .run_artifacts import write_csv_rows
 
 
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -24,11 +24,7 @@ def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _healthy_reference_value(feature_name: str, values: np.ndarray) -> float:

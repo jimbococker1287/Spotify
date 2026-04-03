@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
 
 import numpy as np
@@ -9,16 +8,11 @@ import numpy as np
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
 from .ranking import topk_indices_2d
+from .run_artifacts import write_csv_rows
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _train_transition_matrix(data: PreparedData) -> np.ndarray:

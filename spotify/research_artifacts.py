@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-import csv
 import json
 import math
 
 import numpy as np
 
 from .benchmark_contract import describe_canonical_benchmark_contract
+from .run_artifacts import write_csv_rows
 
 
 def _safe_float(value) -> float:
@@ -22,13 +22,7 @@ def _safe_float(value) -> float:
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _paired_significance_rows(backtest_rows: list[dict[str, object]], top_models: list[str]) -> list[dict[str, object]]:

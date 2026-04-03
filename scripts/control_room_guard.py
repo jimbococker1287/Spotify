@@ -22,10 +22,22 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum allowed worst robustness gap. Use off to disable.",
     )
     parser.add_argument(
+        "--max-repeat-from-prev-new-gap",
+        type=str,
+        default="off",
+        help="Maximum allowed gap for the repeat_from_prev=new guardrail slice. Use off to disable.",
+    )
+    parser.add_argument(
         "--max-stress-skip-risk",
         type=str,
         default="off",
         help="Maximum allowed worst stress skip risk. Use off to disable.",
+    )
+    parser.add_argument(
+        "--max-stress-benchmark-skip-risk",
+        type=str,
+        default="off",
+        help="Maximum allowed skip risk for the standing stress benchmark. Use off to disable.",
     )
     parser.add_argument(
         "--max-target-drift-jsd",
@@ -170,9 +182,9 @@ def _violation_row(*, key: str, label: str, current: object, maximum: float | No
 
 
 def _violation_area(key: str) -> str:
-    if key == "robustness_gap":
+    if key in {"robustness_gap", "repeat_from_prev_new_gap"}:
         return "robustness"
-    if key == "stress_skip_risk":
+    if key in {"stress_skip_risk", "stress_benchmark_skip_risk"}:
         return "stress_test"
     if key == "target_drift_jsd":
         return "drift"
@@ -201,7 +213,7 @@ def _triage_playbook(area: str) -> dict[str, list[str]]:
     if normalized == "robustness":
         return {
             "inspect": [
-                "Open analysis/robustness_summary.json and isolate the worst segment and bucket.",
+                "Open analysis/robustness_guardrails.json and analysis/robustness_summary.json to isolate the failing slice.",
                 "Compare the latest run to the promoted baseline on that slice before changing global defaults.",
             ],
             "fix": [
@@ -231,7 +243,7 @@ def _triage_playbook(area: str) -> dict[str, list[str]]:
     if normalized == "stress_test":
         return {
             "inspect": [
-                "Open analysis/moonshot_summary.json and analysis/stress_test/stress_test_summary.json for the worst scenario.",
+                "Open analysis/moonshot_summary.json plus analysis/stress_test/stress_test_benchmark.json for the standing benchmark.",
                 "Check whether the safe policy actually routes early enough under that scenario.",
             ],
             "fix": [
@@ -474,12 +486,16 @@ def main() -> int:
         status = f"stale:{latest_run_id}"
 
     max_robustness_gap = _parse_threshold(args.max_robustness_gap)
+    max_repeat_from_prev_new_gap = _parse_threshold(args.max_repeat_from_prev_new_gap)
     max_stress_skip_risk = _parse_threshold(args.max_stress_skip_risk)
+    max_stress_benchmark_skip_risk = _parse_threshold(args.max_stress_benchmark_skip_risk)
     max_target_drift_jsd = _parse_threshold(args.max_target_drift_jsd)
     max_selective_risk = _parse_threshold(args.max_selective_risk)
     thresholds = {
         "max_robustness_gap": max_robustness_gap,
+        "max_repeat_from_prev_new_gap": max_repeat_from_prev_new_gap,
         "max_stress_skip_risk": max_stress_skip_risk,
+        "max_stress_benchmark_skip_risk": max_stress_benchmark_skip_risk,
         "max_target_drift_jsd": max_target_drift_jsd,
         "max_selective_risk": max_selective_risk,
     }
@@ -494,10 +510,22 @@ def main() -> int:
                 maximum=max_robustness_gap,
             ),
             _violation_row(
+                key="repeat_from_prev_new_gap",
+                label="repeat_from_prev=new guardrail gap",
+                current=safety.get("repeat_from_prev_new_gap"),
+                maximum=max_repeat_from_prev_new_gap,
+            ),
+            _violation_row(
                 key="stress_skip_risk",
                 label="Worst stress skip risk",
                 current=qoe.get("stress_worst_skip_risk"),
                 maximum=max_stress_skip_risk,
+            ),
+            _violation_row(
+                key="stress_benchmark_skip_risk",
+                label="Standing stress benchmark skip risk",
+                current=qoe.get("stress_benchmark_skip_risk"),
+                maximum=max_stress_benchmark_skip_risk,
             ),
             _violation_row(
                 key="target_drift_jsd",
@@ -526,7 +554,9 @@ def main() -> int:
         "run="
         f"{requested_run_id} control_room_status={status} violations={len(violations)} "
         f"robustness_gap={_format_metric(safety.get('robustness_max_top1_gap'))} "
+        f"repeat_from_prev_new_gap={_format_metric(safety.get('repeat_from_prev_new_gap'))} "
         f"stress_skip_risk={_format_metric(qoe.get('stress_worst_skip_risk'))} "
+        f"stress_benchmark_skip_risk={_format_metric(qoe.get('stress_benchmark_skip_risk'))} "
         f"target_drift_jsd={_format_metric(safety.get('test_jsd_target_drift'))} "
         f"selective_risk={_format_metric(safety.get('test_selective_risk'))}"
     )

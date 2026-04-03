@@ -100,6 +100,7 @@ def test_moonshot_lab_writes_component_artifacts_and_root_summary(tmp_path: Path
     assert (run_dir / "analysis" / "safe_policy" / "safe_bandit_policy_summary.json").exists()
     assert (run_dir / "analysis" / "group_auto_dj" / "group_auto_dj_summary.json").exists()
     assert (run_dir / "analysis" / "stress_test" / "stress_test_summary.json").exists()
+    assert (run_dir / "analysis" / "stress_test" / "stress_test_benchmark.json").exists()
 
     payload = json.loads(moonshot_summary.read_text(encoding="utf-8"))
     assert payload["multimodal_retrieval_fusion_enabled"] is True
@@ -110,6 +111,9 @@ def test_moonshot_lab_writes_component_artifacts_and_root_summary(tmp_path: Path
     assert 0.0 <= payload["group_auto_dj_mean_safe_route_rate"] <= 1.0
     assert payload["group_auto_dj_mean_fairness"] > 0.0
     assert payload["stress_scenario_count"] == 5
+    assert str(payload["stress_worst_safe_policy"]).startswith("safe_")
+    assert payload["stress_benchmark_scenario"] == "evening_drift"
+    assert payload["stress_benchmark_policy_name"] == "safe_global"
 
 
 def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:

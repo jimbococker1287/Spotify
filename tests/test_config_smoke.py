@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from spotify.cli import build_parser
-from spotify.config import build_config
+from spotify.config import FAST_BACKTEST_MODEL_NAMES, build_config
 
 
 def test_default_config_paths() -> None:
@@ -33,7 +33,7 @@ def test_default_config_paths() -> None:
     assert config.classical_max_train_samples == 50_000
     assert config.classical_max_eval_samples == 25_000
     assert set(config.optuna_model_names) == set(config.classical_model_names)
-    assert set(config.temporal_backtest_model_names) == set(config.classical_model_names)
+    assert config.temporal_backtest_model_names == FAST_BACKTEST_MODEL_NAMES
 
 
 def test_model_subset_parsing() -> None:
@@ -79,6 +79,7 @@ def test_fast_profile_defaults_are_applied() -> None:
     assert config.enable_mlflow is True
     assert config.enable_optuna is True
     assert config.enable_temporal_backtest is True
+    assert config.temporal_backtest_model_names == FAST_BACKTEST_MODEL_NAMES
 
 
 def test_cli_overrides_profile_defaults() -> None:

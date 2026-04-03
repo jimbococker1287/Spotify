@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import csv
 import json
 import math
 
@@ -10,8 +9,9 @@ import joblib
 import numpy as np
 
 from .data import PreparedData
-from .digital_twin import ListenerDigitalTwinArtifact, simulate_rollout
+from .digital_twin import ListenerDigitalTwinArtifact, simulate_rollout_batch_summary
 from .multimodal import MultimodalArtistSpace
+from .run_artifacts import write_csv_rows
 
 
 @dataclass(frozen=True)
@@ -30,25 +30,47 @@ POLICY_TEMPLATES: dict[str, dict[str, float]] = {
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
+
+
+def _friction_feature_indices(data: PreparedData) -> np.ndarray:
+    preferred_names = {
+        "offline",
+        "skipped",
+        "session_skip_rate_so_far",
+        "recent_skip_rate_5",
+        "recent_skip_rate_20",
+    }
+    return np.asarray(
+        [
+            idx
+            for idx, feature_name in enumerate(data.context_features)
+            if str(feature_name).startswith("tech_") or str(feature_name) in preferred_names
+        ],
+        dtype="int64",
+    )
 
 
 def _friction_bucket(data: PreparedData) -> np.ndarray:
     if data.num_ctx == 0:
         return np.full(len(data.X_ctx_val), "default", dtype=object)
-    score = np.sum(np.maximum(np.asarray(data.X_ctx_val, dtype="float32"), 0.0), axis=1)
-    threshold = float(np.quantile(score, 0.75)) if len(score) else 0.0
-    return np.where(score >= threshold, "high_friction", "normal_friction")
-
-
-def _reward(hit: float, novelty: float, skip_risk: float, end_risk: float) -> float:
-    return float((1.0 * hit) + (0.15 * novelty) - (0.35 * skip_risk) - (0.40 * end_risk))
+    friction_idx = _friction_feature_indices(data)
+    if friction_idx.size == 0:
+        return np.full(len(data.X_ctx_val), "default", dtype=object)
+    ctx = np.asarray(data.X_ctx_val, dtype="float32")
+    friction_values = ctx[:, friction_idx]
+    if friction_values.size == 0:
+        return np.full(len(data.X_ctx_val), "default", dtype=object)
+    positive_pressure = np.maximum(friction_values, 0.0)
+    score = np.sum(positive_pressure, axis=1)
+    if len(score) <= 1:
+        return np.full(len(score), "normal_friction", dtype=object)
+    low_threshold = float(np.quantile(score, 0.25))
+    high_threshold = float(np.quantile(score, 0.75))
+    buckets = np.full(len(score), "normal_friction", dtype=object)
+    buckets[score <= low_threshold] = "low_friction"
+    buckets[score >= high_threshold] = "high_friction"
+    return buckets
 
 
 def learn_safe_bandit_policy(
@@ -65,38 +87,39 @@ def learn_safe_bandit_policy(
     buckets = _friction_bucket(data)
     rows: list[dict[str, object]] = []
     policy_map: dict[str, dict[str, float]] = {}
+    novelty_values = 1.0 - np.asarray(multimodal_space.popularity, dtype="float32")
 
     for bucket in sorted({str(item) for item in buckets.tolist()}):
         mask = buckets == bucket
+        bucket_seq = np.asarray(data.X_seq_val[mask], dtype="int32")
+        bucket_ctx = np.asarray(data.X_ctx_val[mask], dtype="float32")
+        bucket_targets = np.asarray(data.y_val[mask], dtype="int32")
+        if bucket_targets.size == 0:
+            continue
         best_name = "safe_balance"
         best_lcb = float("-inf")
         for policy_name, weights in POLICY_TEMPLATES.items():
-            rewards: list[float] = []
-            for seq, ctx, y_true in zip(data.X_seq_val[mask], data.X_ctx_val[mask], data.y_val[mask], strict=False):
-                rollout = simulate_rollout(
-                    twin=digital_twin,
-                    multimodal_space=multimodal_space,
-                    causal_artifact=None,
-                    start_sequence=seq,
-                    start_context=ctx,
-                    horizon=1,
-                    policy_weights=weights,
-                    scenario=None,
-                    rng=rng,
-                )
-                predicted = int(rollout["planned_sequence"][0]) if rollout["planned_sequence"] else int(seq[-1])
-                novelty = float(1.0 - multimodal_space.popularity[predicted])
-                rewards.append(
-                    _reward(
-                        hit=float(predicted == int(y_true)),
-                        novelty=novelty,
-                        skip_risk=float(rollout["mean_skip_risk"]),
-                        end_risk=float(rollout["mean_end_risk"]),
-                    )
-                )
-            if not rewards:
+            batch_summary = simulate_rollout_batch_summary(
+                twin=digital_twin,
+                multimodal_space=multimodal_space,
+                causal_artifact=None,
+                start_sequences=bucket_seq,
+                start_contexts=bucket_ctx,
+                horizon=1,
+                policy_weights=weights,
+                scenario=None,
+                rng=rng,
+            )
+            predictions = np.asarray(batch_summary["first_choice"], dtype="int32")
+            if predictions.size == 0:
                 continue
-            arr = np.asarray(rewards, dtype="float64")
+            predicted_novelty = novelty_values[np.clip(predictions, 0, len(novelty_values) - 1)]
+            arr = (
+                (predictions == bucket_targets).astype("float64")
+                + (0.15 * predicted_novelty.astype("float64", copy=False))
+                - (0.35 * np.asarray(batch_summary["mean_skip_risk"], dtype="float64"))
+                - (0.40 * np.asarray(batch_summary["mean_end_risk"], dtype="float64"))
+            )
             mean = float(np.mean(arr))
             stderr = float(np.std(arr, ddof=1) / math.sqrt(len(arr))) if len(arr) > 1 else 0.0
             lcb = mean - (1.96 * stderr)
@@ -115,9 +138,13 @@ def learn_safe_bandit_policy(
                 best_name = policy_name
         policy_map[bucket] = dict(POLICY_TEMPLATES[best_name])
 
+    policy_means = {
+        name: [float(row["mean_reward"]) for row in rows if row["policy_name"] == name]
+        for name in POLICY_TEMPLATES
+    }
     global_name = max(
         POLICY_TEMPLATES,
-        key=lambda name: float(np.mean([row["mean_reward"] for row in rows if row["policy_name"] == name])) if any(row["policy_name"] == name for row in rows) else float("-inf"),
+        key=lambda name: float(np.mean(policy_means[name])) if policy_means[name] else float("-inf"),
     )
     artifact = SafeBanditPolicyArtifact(
         policy_map=policy_map,

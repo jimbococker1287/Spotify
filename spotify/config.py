@@ -62,6 +62,11 @@ CORE_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "session_knn",
     "catboost",
 )
+FAST_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
+    "logreg",
+    "extra_trees",
+    "mlp",
+)
 EXPERIMENTAL_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "hist_gbm",
     "knn",
@@ -72,7 +77,7 @@ DEFAULT_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     *EXPERIMENTAL_CLASSICAL_MODEL_NAMES,
 )
 DEFAULT_OPTUNA_MODEL_NAMES: tuple[str, ...] = DEFAULT_CLASSICAL_MODEL_NAMES
-DEFAULT_BACKTEST_MODEL_NAMES: tuple[str, ...] = DEFAULT_CLASSICAL_MODEL_NAMES
+DEFAULT_BACKTEST_MODEL_NAMES: tuple[str, ...] = FAST_BACKTEST_MODEL_NAMES
 
 PROFILE_PRESETS: dict[str, dict[str, object]] = {
     "dev": {
@@ -193,7 +198,7 @@ PROFILE_PRESETS: dict[str, dict[str, object]] = {
         "optuna_model_names": CORE_CLASSICAL_MODEL_NAMES,
         "enable_temporal_backtest": True,
         "temporal_backtest_folds": 4,
-        "temporal_backtest_model_names": CORE_CLASSICAL_MODEL_NAMES,
+        "temporal_backtest_model_names": FAST_BACKTEST_MODEL_NAMES,
     },
     "experimental": {
         "batch_size": DEFAULT_BATCH_SIZE,

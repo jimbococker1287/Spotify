@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
 import math
 import re
@@ -13,6 +12,7 @@ from .benchmarks import ClassicalFeatureBundle, build_classical_estimator, build
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
 from .recommender_safety import build_conformal_abstention_summary
+from .run_artifacts import write_csv_rows
 
 
 def _slugify(raw: str) -> str:
@@ -355,11 +355,7 @@ def _build_split_frames(data: PreparedData, sequence_length: int) -> tuple[pd.Da
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _save_prediction_diagnostics(
@@ -452,6 +448,7 @@ def _save_prediction_diagnostics(
             summary_payload.update(
                 {
                     "conformal_threshold": _to_float(calibration.get("threshold")),
+                    "conformal_operating_threshold": _to_float(calibration.get("operating_threshold")),
                     "conformal_alpha": _to_float(calibration.get("alpha")),
                     "val_conformal_coverage": _to_float(val_conformal["coverage"]),
                     "test_conformal_coverage": _to_float(test_conformal["coverage"]),

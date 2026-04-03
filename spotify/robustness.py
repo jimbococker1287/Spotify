@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
+import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -10,16 +11,14 @@ import pandas as pd
 from .data import PreparedData
 from .evaluation import _build_split_frames, _segment_bucket_frames
 from .probability_bundles import load_prediction_bundle
+from .run_artifacts import write_csv_rows
+
+DEFAULT_GUARDRAIL_SEGMENT = "repeat_from_prev"
+DEFAULT_GUARDRAIL_BUCKET = "new"
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _topk_accuracy(proba: np.ndarray, y_true: np.ndarray, k: int) -> float:
@@ -108,6 +107,96 @@ def _segment_metrics(
     return rows
 
 
+def _support_floor(n_rows: int) -> int:
+    floor_raw = os.getenv("SPOTIFY_ROBUSTNESS_MIN_BUCKET_COUNT", "").strip()
+    if floor_raw:
+        try:
+            return max(1, int(floor_raw))
+        except ValueError:
+            pass
+    return max(25, int(math.ceil(max(1, n_rows) * 0.005)))
+
+
+def _safe_metric(value) -> float:
+    try:
+        metric = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not math.isfinite(metric):
+        return float("nan")
+    return metric
+
+
+def _resolve_guardrail_target() -> tuple[str, str]:
+    segment = os.getenv("SPOTIFY_ROBUSTNESS_GUARDRAIL_SEGMENT", DEFAULT_GUARDRAIL_SEGMENT).strip()
+    bucket = os.getenv("SPOTIFY_ROBUSTNESS_GUARDRAIL_BUCKET", DEFAULT_GUARDRAIL_BUCKET).strip()
+    return (
+        segment or DEFAULT_GUARDRAIL_SEGMENT,
+        bucket or DEFAULT_GUARDRAIL_BUCKET,
+    )
+
+
+def _find_slice_row(
+    rows: list[dict[str, object]],
+    *,
+    segment: str,
+    bucket: str,
+) -> dict[str, object]:
+    return next(
+        (
+            row
+            for row in rows
+            if str(row.get("segment", "")).strip() == segment
+            and str(row.get("bucket", "")).strip() == bucket
+        ),
+        {},
+    )
+
+
+def _build_guardrail_payload(
+    summary_rows: list[dict[str, object]],
+    *,
+    segment: str,
+    bucket: str,
+) -> dict[str, object]:
+    per_model: list[dict[str, object]] = []
+    for row in summary_rows:
+        gap = _safe_metric(row.get("guardrail_gap"))
+        top1 = _safe_metric(row.get("guardrail_top1"))
+        global_top1 = _safe_metric(row.get("global_top1"))
+        per_model.append(
+            {
+                "model_name": str(row.get("model_name", "")),
+                "segment": segment,
+                "bucket": bucket,
+                "slice_top1": top1,
+                "slice_gap": gap,
+                "slice_count": int(row.get("guardrail_bucket_count", 0) or 0),
+                "global_top1": global_top1,
+            }
+        )
+    per_model.sort(
+        key=lambda row: (
+            _safe_metric(row.get("slice_gap")),
+            -_safe_metric(row.get("slice_top1")),
+        ),
+        reverse=True,
+    )
+    available_rows = [row for row in per_model if math.isfinite(_safe_metric(row.get("slice_gap")))]
+    worst_row = available_rows[0] if available_rows else {}
+    return {
+        "segment": segment,
+        "bucket": bucket,
+        "model_count": int(len(per_model)),
+        "available_model_count": int(len(available_rows)),
+        "worst_model_name": str(worst_row.get("model_name", "")),
+        "worst_gap": _safe_metric(worst_row.get("slice_gap")),
+        "worst_top1": _safe_metric(worst_row.get("slice_top1")),
+        "worst_bucket_count": int(worst_row.get("slice_count", 0) or 0),
+        "models": per_model,
+    }
+
+
 def _plot_max_gaps(summary_rows: list[dict[str, object]], output_path: Path) -> Path | None:
     if not summary_rows:
         return None
@@ -141,6 +230,9 @@ def run_robustness_slice_evaluation(
 
     val_frame, test_frame = _build_split_frames(data, sequence_length=sequence_length)
     slice_rows: list[dict[str, object]] = []
+    test_global_top1: dict[str, float] = {}
+    test_row_counts: dict[str, int] = {}
+    guardrail_segment, guardrail_bucket = _resolve_guardrail_target()
 
     for row in results:
         model_name = str(row.get("model_name", "")).strip()
@@ -155,24 +247,28 @@ def run_robustness_slice_evaluation(
         except Exception as exc:
             logger.warning("Robustness slices skipped for %s: %s", model_name, exc)
             continue
-        slice_rows.extend(
-            _segment_metrics(
-                model_name=model_name,
-                split="val",
-                frame=val_frame,
-                proba=val_proba,
-                y_true=data.y_val,
-            )
+        test_pred = np.argmax(np.asarray(test_proba, dtype="float32"), axis=1)
+        test_truth = np.asarray(data.y_test).reshape(-1)
+        aligned_n = min(len(test_pred), len(test_truth))
+        if aligned_n > 0:
+            test_global_top1[model_name] = float(np.mean(test_pred[:aligned_n] == test_truth[:aligned_n]))
+            test_row_counts[model_name] = int(aligned_n)
+        val_metrics = _segment_metrics(
+            model_name=model_name,
+            split="val",
+            frame=val_frame,
+            proba=val_proba,
+            y_true=data.y_val,
         )
-        slice_rows.extend(
-            _segment_metrics(
-                model_name=model_name,
-                split="test",
-                frame=test_frame,
-                proba=test_proba,
-                y_true=data.y_test,
-            )
+        test_metrics = _segment_metrics(
+            model_name=model_name,
+            split="test",
+            frame=test_frame,
+            proba=test_proba,
+            y_true=data.y_test,
         )
+        slice_rows.extend(val_metrics)
+        slice_rows.extend(test_metrics)
 
     if not slice_rows:
         return []
@@ -185,17 +281,53 @@ def run_robustness_slice_evaluation(
         top1_values = [float(row["top1"]) for row in model_rows]
         max_top1 = max(top1_values)
         min_top1 = min(top1_values)
-        worst = min(model_rows, key=lambda row: float(row["top1"]))
+        total_rows = int(test_row_counts.get(model_name, 0))
+        support_floor = _support_floor(total_rows)
+        supported_rows = [row for row in model_rows if int(row.get("count", 0) or 0) >= support_floor]
+        actionable_rows = supported_rows or model_rows
+        worst = min(actionable_rows, key=lambda row: float(row["top1"]))
+        global_top1 = float(test_global_top1.get(model_name, float("nan")))
+        actionable_gap = (
+            float(global_top1 - float(worst["top1"]))
+            if math.isfinite(global_top1)
+            else float(max_top1 - float(worst["top1"]))
+        )
+        guardrail_row = _find_slice_row(model_rows, segment=guardrail_segment, bucket=guardrail_bucket)
+        guardrail_top1 = _safe_metric(guardrail_row.get("top1"))
+        guardrail_gap = (
+            float(max(global_top1 - guardrail_top1, 0.0))
+            if math.isfinite(global_top1) and math.isfinite(guardrail_top1)
+            else float("nan")
+        )
         summary_rows.append(
             {
                 "model_name": model_name,
-                "max_top1_gap": float(max_top1 - min_top1),
+                "max_top1_gap": float(max(actionable_gap, 0.0)),
+                "raw_max_top1_gap": float(max_top1 - min_top1),
+                "global_top1": global_top1,
+                "support_floor_count": support_floor,
                 "worst_segment": str(worst["segment"]),
                 "worst_bucket": str(worst["bucket"]),
                 "worst_top1": float(worst["top1"]),
+                "worst_bucket_count": int(worst.get("count", 0) or 0),
+                "worst_bucket_share": (
+                    float((int(worst.get("count", 0) or 0)) / total_rows)
+                    if total_rows > 0
+                    else float("nan")
+                ),
+                "guardrail_segment": guardrail_segment,
+                "guardrail_bucket": guardrail_bucket,
+                "guardrail_top1": guardrail_top1,
+                "guardrail_gap": guardrail_gap,
+                "guardrail_bucket_count": int(guardrail_row.get("count", 0) or 0),
             }
         )
     summary_rows.sort(key=lambda row: float(row["max_top1_gap"]), reverse=True)
+    guardrail_payload = _build_guardrail_payload(
+        summary_rows,
+        segment=guardrail_segment,
+        bucket=guardrail_bucket,
+    )
 
     csv_path = _write_csv(
         analysis_dir / "robustness_slices.csv",
@@ -205,11 +337,42 @@ def run_robustness_slice_evaluation(
     summary_csv = _write_csv(
         analysis_dir / "robustness_summary.csv",
         summary_rows,
-        ["model_name", "max_top1_gap", "worst_segment", "worst_bucket", "worst_top1"],
+        [
+            "model_name",
+            "max_top1_gap",
+            "raw_max_top1_gap",
+            "global_top1",
+            "support_floor_count",
+            "worst_segment",
+            "worst_bucket",
+            "worst_top1",
+            "worst_bucket_count",
+            "worst_bucket_share",
+            "guardrail_segment",
+            "guardrail_bucket",
+            "guardrail_top1",
+            "guardrail_gap",
+            "guardrail_bucket_count",
+        ],
     )
     summary_json = analysis_dir / "robustness_summary.json"
     summary_json.write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
-    artifacts: list[Path] = [csv_path, summary_csv, summary_json]
+    guardrail_csv = _write_csv(
+        analysis_dir / "robustness_guardrails.csv",
+        list(guardrail_payload.get("models", [])),
+        [
+            "model_name",
+            "segment",
+            "bucket",
+            "slice_top1",
+            "slice_gap",
+            "slice_count",
+            "global_top1",
+        ],
+    )
+    guardrail_json = analysis_dir / "robustness_guardrails.json"
+    guardrail_json.write_text(json.dumps(guardrail_payload, indent=2), encoding="utf-8")
+    artifacts: list[Path] = [csv_path, summary_csv, summary_json, guardrail_csv, guardrail_json]
     plot_path = _plot_max_gaps(summary_rows, analysis_dir / "robustness_gap.png")
     if plot_path is not None:
         artifacts.append(plot_path)

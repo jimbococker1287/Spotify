@@ -3,7 +3,6 @@ from __future__ import annotations
 from heapq import nlargest
 import os
 from pathlib import Path
-import csv
 import json
 
 import numpy as np
@@ -12,16 +11,11 @@ from .data import PreparedData
 from .digital_twin import ListenerDigitalTwinArtifact
 from .multimodal import MultimodalArtistSpace
 from .ranking import topk_indices_1d
+from .run_artifacts import write_csv_rows
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _expand_beam(

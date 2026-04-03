@@ -90,17 +90,29 @@ def test_run_stress_test_lab_samples_sessions_and_logs_progress(
             random_seed=7,
         )
 
-    assert len(calls) == len(stress_test.SCENARIOS) * 2 * 3
+    assert len(calls) == len(stress_test.SCENARIOS) * 3 * 3
     assert tmp_path / "stress_test_summary.csv" in paths
     assert tmp_path / "stress_test_summary.json" in paths
+    assert tmp_path / "stress_test_benchmark.csv" in paths
+    assert tmp_path / "stress_test_benchmark.json" in paths
 
     payload = json.loads((tmp_path / "stress_test_summary.json").read_text(encoding="utf-8"))
-    assert len(payload) == len(stress_test.SCENARIOS) * 2
+    assert len(payload) == len(stress_test.SCENARIOS) * 3
     assert all(row["evaluated_sessions"] == 3 for row in payload)
     assert all(row["total_test_sessions"] == 6 for row in payload)
     assert all(row["sample_fraction"] == 0.5 for row in payload)
     assert all(row["elapsed_seconds"] >= 0.0 for row in payload)
+    assert {row["policy_family"] for row in payload} == {"baseline", "safe"}
+    benchmark = json.loads((tmp_path / "stress_test_benchmark.json").read_text(encoding="utf-8"))
+    assert benchmark["benchmark_scenario"] == "evening_drift"
+    assert benchmark["benchmark_policy_name"] == "safe_global"
+    assert benchmark["available"] is True
+    assert benchmark["reference_available"] is True
+    assert benchmark["skip_risk"] == 0.25
+    assert benchmark["skip_risk_delta_vs_reference"] == 0.0
+    assert benchmark["scenario_count_for_policy"] == len(stress_test.SCENARIOS)
 
     assert "Stress-test lab evaluating 3/6 held-out sessions" in caplog.text
+    assert "Stress-test benchmark scenario=evening_drift policy=safe_global" in caplog.text
     assert "Stress-test progress scenario=baseline policy=baseline_exploit processed=2/3" in caplog.text
     assert "Ran stress-test lab across 5 scenarios using 3/6 sessions." in caplog.text

@@ -3,12 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 import csv
 import filecmp
+import importlib
 import json
 from pathlib import Path
 import shutil
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 try:
     import orjson
@@ -18,6 +20,10 @@ except Exception:  # pragma: no cover - exercised through the stdlib fallback.
 
 def _clone_default(default: Any) -> Any:
     return deepcopy(default)
+
+
+def _pandas():
+    return importlib.import_module("pandas")
 
 
 def safe_read_json(path: Path, *, default: Any) -> Any:
@@ -36,7 +42,8 @@ def safe_read_json(path: Path, *, default: Any) -> Any:
         return _clone_default(default)
 
 
-def safe_read_csv(path: Path) -> pd.DataFrame:
+def safe_read_csv(path: Path) -> "pd.DataFrame":
+    pd = _pandas()
     if not path.exists():
         return pd.DataFrame()
     try:
@@ -175,5 +182,6 @@ def collect_run_analysis_rows(output_dir: Path, filename: str) -> list[dict[str,
     return rows
 
 
-def rows_to_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+def rows_to_frame(rows: list[dict[str, object]]) -> "pd.DataFrame":
+    pd = _pandas()
     return pd.json_normalize(rows) if rows else pd.DataFrame()

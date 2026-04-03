@@ -29,6 +29,8 @@ def _write_run_fixture(
     robustness_gap: float,
     stress_skip_risk: float,
     stress_scenario: str,
+    backtest_rows: int = 4,
+    optuna_rows: int = 0,
 ) -> None:
     run_dir = output_dir / "runs" / run_id
     analysis_dir = run_dir / "analysis"
@@ -49,6 +51,8 @@ def _write_run_fixture(
                 "data_records": 1234,
                 "num_artists": 87,
                 "num_context_features": 12,
+                "backtest_rows": backtest_rows,
+                "optuna_rows": optuna_rows,
                 "champion_gate": {
                     "status": promotion_status,
                     "promoted": promoted,
@@ -81,6 +85,8 @@ def _write_run_fixture(
                 "test_ece": ece,
                 "test_selective_risk": selective_risk,
                 "test_abstention_rate": abstention_rate,
+                "test_accepted_rate": max(0.0, 1.0 - abstention_rate),
+                "conformal_operating_threshold": 0.55,
             },
             indent=2,
         ),
@@ -120,10 +126,43 @@ def _write_run_fixture(
                 {
                     "model_name": best_model_name,
                     "max_top1_gap": robustness_gap,
+                    "global_top1": test_top1,
                     "worst_segment": "repeat_from_prev",
                     "worst_bucket": "new",
+                    "guardrail_segment": "repeat_from_prev",
+                    "guardrail_bucket": "new",
+                    "guardrail_top1": max(test_top1 - robustness_gap, 0.0),
+                    "guardrail_gap": robustness_gap,
+                    "guardrail_bucket_count": 120,
                 }
             ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "robustness_guardrails.json").write_text(
+        json.dumps(
+            {
+                "segment": "repeat_from_prev",
+                "bucket": "new",
+                "model_count": 1,
+                "available_model_count": 1,
+                "worst_model_name": best_model_name,
+                "worst_gap": robustness_gap,
+                "worst_top1": max(test_top1 - robustness_gap, 0.0),
+                "worst_bucket_count": 120,
+                "models": [
+                    {
+                        "model_name": best_model_name,
+                        "segment": "repeat_from_prev",
+                        "bucket": "new",
+                        "slice_top1": max(test_top1 - robustness_gap, 0.0),
+                        "slice_gap": robustness_gap,
+                        "slice_count": 120,
+                        "global_top1": test_top1,
+                    }
+                ],
+            },
             indent=2,
         ),
         encoding="utf-8",
@@ -135,6 +174,39 @@ def _write_run_fixture(
                 "causal_test_auc_total": 0.69,
                 "stress_worst_skip_scenario": stress_scenario,
                 "stress_worst_skip_risk": stress_skip_risk,
+                "stress_benchmark_scenario": stress_scenario,
+                "stress_benchmark_policy_name": "safe_global",
+                "stress_benchmark_reference_policy_name": "baseline_exploit",
+                "stress_benchmark_skip_risk": stress_skip_risk,
+                "stress_benchmark_end_risk": 0.10,
+                "stress_benchmark_skip_delta_vs_reference": 0.02,
+                "stress_benchmark_scenario_rank": 5,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    stress_dir = analysis_dir / "stress_test"
+    stress_dir.mkdir(parents=True, exist_ok=True)
+    (stress_dir / "stress_test_benchmark.json").write_text(
+        json.dumps(
+            {
+                "benchmark_scenario": stress_scenario,
+                "benchmark_policy_name": "safe_global",
+                "reference_policy_name": "baseline_exploit",
+                "available": True,
+                "reference_available": True,
+                "skip_risk": stress_skip_risk,
+                "end_risk": 0.10,
+                "reference_skip_risk": max(stress_skip_risk - 0.02, 0.0),
+                "reference_end_risk": 0.11,
+                "skip_risk_delta_vs_reference": 0.02,
+                "end_risk_delta_vs_reference": -0.01,
+                "scenario_rank_by_skip_risk": 5,
+                "scenario_count_for_policy": 5,
+                "evaluated_sessions": 2500,
+                "total_test_sessions": 10000,
+                "sample_fraction": 0.25,
             },
             indent=2,
         ),
@@ -360,6 +432,9 @@ def test_control_room_compares_latest_run_to_last_promoted_baseline(tmp_path: Pa
         row["key"] == "best_model_test_top1" and row["status"] == "worse"
         for row in report["baseline_comparison"]["metric_deltas"]
     )
+    assert report["safety"]["repeat_from_prev_new_gap"] == 0.27
+    assert report["qoe"]["stress_benchmark_scenario"] == "evening_drift"
+    assert report["qoe"]["stress_benchmark_skip_risk"] == 0.44
     assert any("worsened" in item for item in report["baseline_comparison"]["summary"])
     assert any(action["area"] == "promotion" for action in report["review_actions"])
     assert any(action["area"] == "robustness" for action in report["review_actions"])
@@ -565,6 +640,108 @@ def test_control_room_prefers_high_signal_ops_run_over_newer_smoke_run(tmp_path:
     assert "smoke/check run" in report["run_selection"]["selection_reason"]
 
 
+def test_control_room_prefers_newest_full_anchor_when_newest_observed_is_smoke(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_older", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.57},
+            {"run_id": "run_full_newer", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_smoke_check", "model_name": "dense", "model_type": "deep", "val_top1": 0.61},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_older", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.55},
+            {"run_id": "run_full_newer", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.58},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full_older", "model_name": "mlp_optuna", "base_model_name": "mlp", "val_top1": 0.56},
+            {"run_id": "run_full_older", "model_name": "logreg_optuna", "base_model_name": "logreg", "val_top1": 0.55},
+            {"run_id": "run_full_newer", "model_name": "mlp_optuna", "base_model_name": "mlp", "val_top1": 0.57},
+        ]
+    ).to_csv(history_dir / "optuna_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full_older",
+        timestamp="2026-03-29T12:43:13+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.57,
+        test_top1=0.29,
+        gate_regression=0.01,
+        drift_jsd=0.18,
+        ece=0.08,
+        selective_risk=0.68,
+        abstention_rate=0.0,
+        robustness_gap=0.24,
+        stress_skip_risk=0.61,
+        stress_scenario="evening_drift",
+        backtest_rows=12,
+        optuna_rows=2,
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full_newer",
+        timestamp="2026-03-29T17:03:03+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.31,
+        gate_regression=0.01,
+        drift_jsd=0.16,
+        ece=0.05,
+        selective_risk=0.52,
+        abstention_rate=0.14,
+        robustness_gap=0.15,
+        stress_skip_risk=0.60,
+        stress_scenario="evening_drift",
+        backtest_rows=12,
+        optuna_rows=1,
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_smoke_check",
+        timestamp="2026-03-29T18:17:53+00:00",
+        profile="small",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="dense",
+        best_model_type="deep",
+        val_top1=0.61,
+        test_top1=0.32,
+        gate_regression=0.01,
+        drift_jsd=0.15,
+        ece=0.04,
+        selective_risk=0.20,
+        abstention_rate=0.10,
+        robustness_gap=0.10,
+        stress_skip_risk=0.22,
+        stress_scenario="quick_probe",
+        backtest_rows=0,
+        optuna_rows=0,
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["latest_run"]["run_id"] == "run_full_newer"
+    assert report["run_selection"]["latest_observed_run"]["run_id"] == "run_smoke_check"
+    assert report["run_selection"]["selected_run"]["run_id"] == "run_full_newer"
+    assert report["run_selection"]["observed_matches_selected"] is False
+    assert "smoke/check run" in report["run_selection"]["selection_reason"]
+
+
 def test_control_room_operating_rhythm_flags_stale_full_lane_and_async_handoff(tmp_path: Path) -> None:
     output_dir = tmp_path / "outputs"
     history_dir = output_dir / "history"
@@ -630,7 +807,9 @@ def test_control_room_operating_rhythm_flags_stale_full_lane_and_async_handoff(t
         reference_time=datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc),
     )
 
-    assert report["latest_run"]["run_id"] == "run_fast_recent"
+    assert report["latest_run"]["run_id"] == "run_full_old"
+    assert report["run_selection"]["latest_observed_run"]["run_id"] == "run_fast_recent"
+    assert report["run_selection"]["selected_run"]["run_id"] == "run_full_old"
     assert report["operating_rhythm"]["overall_status"] in {"attention", "stale"}
     assert report["operating_rhythm"]["lanes"]["fast"]["status"] == "healthy"
     assert report["operating_rhythm"]["lanes"]["full"]["status"] == "stale"
@@ -778,3 +957,75 @@ def test_control_room_fast_lane_ignores_dev_runs_for_cadence(tmp_path: Path) -> 
     )
 
     assert report["operating_rhythm"]["lanes"]["fast"]["status"] == "missing"
+
+
+def test_control_room_prefers_latest_completed_full_run_as_review_anchor(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_older", "model_name": "extra_trees", "model_type": "classical", "val_top1": 0.60},
+            {"run_id": "run_newer", "model_name": "mlp", "model_type": "classical", "val_top1": 0.59},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_older", "model_name": "extra_trees", "model_type": "classical", "top1": 0.31},
+            {"run_id": "run_newer", "model_name": "mlp", "model_type": "classical", "top1": 0.30},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_older",
+        timestamp="2026-03-29T12:43:13+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="extra_trees",
+        best_model_type="classical",
+        val_top1=0.60,
+        test_top1=0.31,
+        gate_regression=0.01,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.20,
+        abstention_rate=0.08,
+        robustness_gap=0.22,
+        stress_skip_risk=0.29,
+        stress_scenario="evening_drift",
+        backtest_rows=12,
+        optuna_rows=6,
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_newer",
+        timestamp="2026-03-29T17:03:03+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="mlp",
+        best_model_type="classical",
+        val_top1=0.59,
+        test_top1=0.30,
+        gate_regression=0.02,
+        drift_jsd=0.12,
+        ece=0.05,
+        selective_risk=0.21,
+        abstention_rate=0.08,
+        robustness_gap=0.23,
+        stress_skip_risk=0.30,
+        stress_scenario="evening_drift",
+        backtest_rows=12,
+        optuna_rows=3,
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["latest_run"]["run_id"] == "run_newer"
+    assert report["run_selection"]["latest_observed_run"]["run_id"] == "run_newer"
+    assert report["run_selection"]["selected_run"]["run_id"] == "run_newer"
+    assert report["run_selection"]["observed_matches_selected"] is True
+    assert "fully completed production run" in report["run_selection"]["selection_reason"]

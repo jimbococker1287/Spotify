@@ -14,7 +14,6 @@ from .benchmarks import (
     ClassicalFeatureBundle,
     build_classical_estimator,
     build_full_tabular_dataset,
-    evaluate_classical_estimator,
     get_classical_model_registry,
     resolve_classical_parallelism,
 )
@@ -36,14 +35,17 @@ class BacktestFoldResult:
     adaptation_mode: str = "cold"
 
 
+@dataclass(frozen=True)
+class _BacktestWindowSlices:
+    fold: int
+    train_slice: slice
+    test_slice: slice
+    raw_test_start: int
+    raw_test_end: int
+
+
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
     return [(window.test_start, window.test_end) for window in build_temporal_backtest_windows(n_rows, folds)]
-
-
-def _tail_cap(X: np.ndarray, y: np.ndarray, max_rows: int) -> tuple[np.ndarray, np.ndarray]:
-    if max_rows <= 0 or len(X) <= max_rows:
-        return X, y
-    return X[-max_rows:], y[-max_rows:]
 
 
 def _run_backtest_job(
@@ -64,7 +66,7 @@ def _run_backtest_job(
     started = time.perf_counter()
     estimator.fit(X_train, y_train)
     fit_seconds = float(time.perf_counter() - started)
-    _, _, top1, top5, _, _ = evaluate_classical_estimator(estimator, X_test, y_test, X_test, y_test)
+    top1, top5 = _score_backtest_estimator(estimator, X_test, y_test)
     return BacktestFoldResult(
         model_name=model_name,
         model_type="classical",
@@ -101,10 +103,46 @@ def _topk_accuracy_from_proba(proba: np.ndarray, y_true: np.ndarray, *, k: int) 
     return float(np.mean(hits))
 
 
-def _tail_slice(n_rows: int, max_rows: int) -> slice:
-    if max_rows <= 0 or n_rows <= max_rows:
-        return slice(0, n_rows)
-    return slice(n_rows - max_rows, n_rows)
+def _topk_accuracy_from_labeled_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    k: int,
+    class_labels: np.ndarray | None = None,
+) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    labels = None if class_labels is None else np.asarray(class_labels).reshape(-1)
+    if labels is not None and labels.size == proba_arr.shape[1]:
+        kk = max(1, min(int(k), int(proba_arr.shape[1])))
+        topk_idx = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+        topk_labels = labels[topk_idx]
+        return float(np.mean(np.any(topk_labels == y_arr.reshape(-1, 1), axis=1)))
+    return _topk_accuracy_from_proba(proba_arr, y_arr, k=k)
+
+
+def _score_backtest_estimator(estimator, X_test: np.ndarray, y_test: np.ndarray) -> tuple[float, float]:
+    y_arr = np.asarray(y_test).reshape(-1)
+    if len(y_arr) == 0:
+        return float("nan"), float("nan")
+    if hasattr(estimator, "predict_proba"):
+        try:
+            proba = np.asarray(estimator.predict_proba(X_test))
+        except Exception:
+            proba = np.empty((0, 0), dtype="float32")
+        if proba.ndim == 2 and len(proba) == len(y_arr):
+            classes = np.asarray(getattr(estimator, "classes_", []))
+            if classes.size == proba.shape[1]:
+                pred = classes[np.argmax(proba, axis=1)]
+                top5 = _topk_accuracy_from_labeled_proba(proba, y_arr, k=5, class_labels=classes)
+            else:
+                pred = np.argmax(proba, axis=1)
+                top5 = _topk_accuracy_from_proba(proba, y_arr, k=5)
+            return float(np.mean(pred == y_arr)), top5
+    pred = estimator.predict(X_test)
+    return float(np.mean(np.asarray(pred).reshape(-1) == y_arr)), float("nan")
 
 
 def _deep_train_validation_split(n_rows: int, reference_rows: int) -> tuple[slice, slice] | None:
@@ -188,6 +226,60 @@ def _resolve_backtest_adaptation_mode(raw: str | None) -> str:
     if value not in ("cold", "warm", "continual"):
         return "cold"
     return value
+
+
+def _resolve_backtest_sample_cap(env_name: str, fallback: int) -> int:
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return max(0, int(fallback))
+    try:
+        return max(0, int(raw_value))
+    except Exception:
+        return max(0, int(fallback))
+
+
+def _tail_slice_between(start: int, end: int, max_rows: int) -> slice:
+    if max_rows <= 0 or end - start <= max_rows:
+        return slice(start, end)
+    return slice(end - max_rows, end)
+
+
+def _resolve_backtest_windows(
+    windows: list[tuple[int, int]],
+    *,
+    max_train_samples: int,
+    max_eval_samples: int,
+) -> list[_BacktestWindowSlices]:
+    resolved: list[_BacktestWindowSlices] = []
+    for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
+        train_slice = _tail_slice_between(0, test_start, max_train_samples)
+        test_slice = _tail_slice_between(test_start, test_end, max_eval_samples)
+        if train_slice.stop <= train_slice.start or test_slice.stop <= test_slice.start:
+            continue
+        resolved.append(
+            _BacktestWindowSlices(
+                fold=fold_idx,
+                train_slice=train_slice,
+                test_slice=test_slice,
+                raw_test_start=test_start,
+                raw_test_end=test_end,
+            )
+        )
+    return resolved
+
+
+def _resolve_backtest_workers(raw_value: str | None, *, job_count: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    capped_jobs = max(1, int(job_count))
+    raw = str(raw_value or "").strip().lower()
+    if raw and raw != "auto":
+        try:
+            return min(cpu_count, capped_jobs, max(1, int(raw)))
+        except Exception:
+            return 1
+    if capped_jobs <= 1:
+        return 1
+    return min(cpu_count, capped_jobs, 2)
 
 
 def _run_deep_backtest_job(
@@ -385,40 +477,6 @@ def run_temporal_backtest(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
-    X_all_ctx = np.concatenate(
-        [
-            data.X_ctx_train.astype("float32", copy=False),
-            data.X_ctx_val.astype("float32", copy=False),
-            data.X_ctx_test.astype("float32", copy=False),
-        ],
-        axis=0,
-    )
-    if feature_bundle is None:
-        X_all_seq = np.concatenate(
-            [
-                data.X_seq_train.astype("int32"),
-                data.X_seq_val.astype("int32"),
-                data.X_seq_test.astype("int32"),
-            ],
-            axis=0,
-        )
-    else:
-        X_all_seq = np.concatenate(
-            [
-                feature_bundle.X_train_seq,
-                feature_bundle.X_val_seq,
-                feature_bundle.X_test_seq,
-            ],
-            axis=0,
-        )
-    y_skip_all = np.concatenate(
-        [
-            np.asarray(data.y_skip_train),
-            np.asarray(data.y_skip_val),
-            np.asarray(data.y_skip_test),
-        ],
-        axis=0,
-    )
     windows = _build_expanding_windows(len(X_all), folds)
     if not windows:
         logger.warning("Unable to build temporal backtest windows from %d rows.", len(X_all))
@@ -430,42 +488,98 @@ def run_temporal_backtest(
         len(X_all),
     )
 
-    workers_raw = os.getenv("SPOTIFY_BACKTEST_WORKERS", "1").strip()
-    try:
-        backtest_workers = max(1, int(workers_raw))
-    except Exception:
-        backtest_workers = 1
-    cpu_count = os.cpu_count() or 1
-    backtest_workers = min(backtest_workers, cpu_count)
-    _, estimator_n_jobs = resolve_classical_parallelism()
-    if backtest_workers > 1:
-        estimator_n_jobs = 1
+    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
+    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
     logger.info(
-        "Backtest parallelism: workers=%d estimator_n_jobs=%d",
-        backtest_workers,
-        estimator_n_jobs,
+        "Temporal backtesting caps: train_rows=%d eval_rows=%d",
+        resolved_max_train_samples,
+        resolved_max_eval_samples,
     )
+    resolved_windows = _resolve_backtest_windows(
+        windows,
+        max_train_samples=resolved_max_train_samples,
+        max_eval_samples=resolved_max_eval_samples,
+    )
+    if not resolved_windows:
+        logger.warning("Temporal backtesting resolved to zero runnable folds after sampling caps.")
+        return []
+
+    needs_session_sequences = "session_knn" in classical_models
+    needs_deep_inputs = bool(deep_models)
+    X_all_seq = None
+    if needs_session_sequences or needs_deep_inputs:
+        if feature_bundle is None:
+            X_all_seq = np.concatenate(
+                [
+                    data.X_seq_train.astype("int32", copy=False),
+                    data.X_seq_val.astype("int32", copy=False),
+                    data.X_seq_test.astype("int32", copy=False),
+                ],
+                axis=0,
+            )
+        else:
+            X_all_seq = np.concatenate(
+                [
+                    np.asarray(feature_bundle.X_train_seq, dtype="int32"),
+                    np.asarray(feature_bundle.X_val_seq, dtype="int32"),
+                    np.asarray(feature_bundle.X_test_seq, dtype="int32"),
+                ],
+                axis=0,
+            )
+    X_all_ctx = None
+    y_skip_all = None
+    if needs_deep_inputs:
+        X_all_ctx = np.concatenate(
+            [
+                data.X_ctx_train.astype("float32", copy=False),
+                data.X_ctx_val.astype("float32", copy=False),
+                data.X_ctx_test.astype("float32", copy=False),
+            ],
+            axis=0,
+        )
+        y_skip_all = np.concatenate(
+            [
+                np.asarray(data.y_skip_train),
+                np.asarray(data.y_skip_val),
+                np.asarray(data.y_skip_test),
+            ],
+            axis=0,
+        )
 
     results: list[BacktestFoldResult] = []
     jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-    for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
-        X_train_tab, y_train = X_all[:test_start], y_all[:test_start]
-        X_test_tab, y_test = X_all[test_start:test_end], y_all[test_start:test_end]
-        X_train_seq = X_all_seq[:test_start]
-        X_test_seq = X_all_seq[test_start:test_end]
-        X_train_tab, y_train = _tail_cap(X_train_tab, y_train, max_train_samples)
-        X_test_tab, y_test = _tail_cap(X_test_tab, y_test, max_eval_samples)
-        X_train_seq, _ = _tail_cap(X_train_seq, y_all[:test_start], max_train_samples)
-        X_test_seq, _ = _tail_cap(X_test_seq, y_all[test_start:test_end], max_eval_samples)
-
-        if len(X_train_tab) == 0 or len(X_test_tab) == 0:
-            continue
-
+    for window in resolved_windows:
+        X_train_tab = X_all[window.train_slice]
+        y_train = y_all[window.train_slice]
+        X_test_tab = X_all[window.test_slice]
+        y_test = y_all[window.test_slice]
         for model_name in classical_models:
             if model_name == "session_knn":
-                jobs.append((fold_idx, model_name, X_train_seq, y_train, X_test_seq, y_test))
+                assert X_all_seq is not None
+                jobs.append(
+                    (
+                        window.fold,
+                        model_name,
+                        X_all_seq[window.train_slice],
+                        y_train,
+                        X_all_seq[window.test_slice],
+                        y_test,
+                    )
+                )
             else:
-                jobs.append((fold_idx, model_name, X_train_tab, y_train, X_test_tab, y_test))
+                jobs.append((window.fold, model_name, X_train_tab, y_train, X_test_tab, y_test))
+
+    workers_raw = os.getenv("SPOTIFY_BACKTEST_WORKERS", "")
+    _, estimator_n_jobs = resolve_classical_parallelism()
+    backtest_workers = _resolve_backtest_workers(workers_raw, job_count=len(jobs))
+    if backtest_workers > 1:
+        estimator_n_jobs = 1
+    logger.info(
+        "Backtest parallelism: workers=%d estimator_n_jobs=%d jobs=%d",
+        backtest_workers,
+        estimator_n_jobs,
+        len(jobs),
+    )
 
     if backtest_workers > 1 and len(jobs) > 1:
         with ThreadPoolExecutor(max_workers=backtest_workers) as executor:
@@ -560,18 +674,18 @@ def run_temporal_backtest(
         prior_weights: dict[str, object] = {}
         previous_test_end = 0
 
-        for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
-            train_slice = _tail_slice(test_start, max_train_samples)
-            test_slice = _tail_slice(test_end - test_start, max_eval_samples)
+        assert X_all_seq is not None
+        assert X_all_ctx is not None
+        assert y_skip_all is not None
+        for window in resolved_windows:
+            X_train_seq = X_all_seq[window.train_slice]
+            X_train_ctx = X_all_ctx[window.train_slice]
+            y_train = y_all[window.train_slice]
+            y_skip_train = y_skip_all[window.train_slice]
 
-            X_train_seq = X_all_seq[:test_start][train_slice]
-            X_train_ctx = X_all_ctx[:test_start][train_slice]
-            y_train = y_all[:test_start][train_slice]
-            y_skip_train = y_skip_all[:test_start][train_slice]
-
-            X_test_seq = X_all_seq[test_start:test_end][test_slice]
-            X_test_ctx = X_all_ctx[test_start:test_end][test_slice]
-            y_test = y_all[test_start:test_end][test_slice]
+            X_test_seq = X_all_seq[window.test_slice]
+            X_test_ctx = X_all_ctx[window.test_slice]
+            y_test = y_all[window.test_slice]
 
             if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
                 continue
@@ -586,11 +700,15 @@ def run_temporal_backtest(
                 incremental_fit_ctx = X_train_ctx[fit_slice]
                 incremental_y = y_train[fit_slice]
                 incremental_skip = y_skip_train[fit_slice]
-                if resolved_adaptation_mode == "continual" and model_name in prior_weights and previous_test_end < test_start:
-                    inc_seq_all = X_all_seq[previous_test_end:test_start]
-                    inc_ctx_all = X_all_ctx[previous_test_end:test_start]
-                    inc_y_all = y_all[previous_test_end:test_start]
-                    inc_skip_all = y_skip_all[previous_test_end:test_start]
+                if (
+                    resolved_adaptation_mode == "continual"
+                    and model_name in prior_weights
+                    and previous_test_end < window.raw_test_start
+                ):
+                    inc_seq_all = X_all_seq[previous_test_end : window.raw_test_start]
+                    inc_ctx_all = X_all_ctx[previous_test_end : window.raw_test_start]
+                    inc_y_all = y_all[previous_test_end : window.raw_test_start]
+                    inc_skip_all = y_skip_all[previous_test_end : window.raw_test_start]
                     if len(inc_seq_all) > 1:
                         incremental_fit_seq = inc_seq_all
                         incremental_fit_ctx = inc_ctx_all
@@ -600,8 +718,8 @@ def run_temporal_backtest(
                 try:
                     row = _run_deep_backtest_job(
                         model_name=model_name,
-                        fold_idx=fold_idx,
-                        random_seed=random_seed + fold_idx,
+                        fold_idx=window.fold,
+                        random_seed=random_seed + window.fold,
                         model_builder=deep_builders[model_name],
                         strategy=resolved_strategy,
                         batch_size=deep_batch_size,
@@ -636,7 +754,20 @@ def run_temporal_backtest(
                     row.top1,
                     f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
                 )
-            previous_test_end = test_end
+            previous_test_end = window.raw_test_end
+
+    if results:
+        runtime_by_model: dict[str, list[float]] = {}
+        for row in results:
+            runtime_by_model.setdefault(row.model_name, []).append(float(row.fit_seconds))
+        summary_parts = []
+        for model_name, timings in sorted(
+            runtime_by_model.items(),
+            key=lambda item: (float(np.mean(item[1])), item[0]),
+            reverse=True,
+        ):
+            summary_parts.append(f"{model_name}={float(np.mean(timings)):.2f}s")
+        logger.info("Backtest runtime summary: %s", ", ".join(summary_parts))
 
     write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
 

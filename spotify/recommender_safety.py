@@ -6,12 +6,19 @@ from pathlib import Path
 import csv
 import json
 import math
+import os
 import re
 
 import numpy as np
 import pandas as pd
 
-from .uncertainty import fit_split_conformal_classifier, summarize_prediction_sets
+from .run_artifacts import write_csv_rows
+from .uncertainty import (
+    SplitConformalCalibration,
+    fit_operating_abstention_threshold,
+    fit_split_conformal_classifier,
+    summarize_prediction_sets,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,19 @@ def _safe_float(value) -> float:
     return out
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if math.isnan(value):
+        return float(default)
+    return float(min(maximum, max(minimum, value)))
+
+
 def _slugify(raw: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw).strip())
     value = re.sub(r"_{2,}", "_", value).strip("_")
@@ -57,23 +77,7 @@ def _coerce_row(row: Mapping[str, object] | object) -> dict[str, object]:
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str] | None = None) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_fieldnames = list(fieldnames or [])
-    if not resolved_fieldnames:
-        seen: set[str] = set()
-        for row in rows:
-            for key in row:
-                if key in seen:
-                    continue
-                resolved_fieldnames.append(key)
-                seen.add(key)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=resolved_fieldnames)
-        if resolved_fieldnames:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _sample_stats(scores: list[float]) -> dict[str, float]:
@@ -468,14 +472,58 @@ def build_conformal_abstention_summary(
     test_proba: np.ndarray | None = None,
     test_y: np.ndarray | None = None,
     alpha: float = 0.10,
+    target_selective_risk: float = 0.50,
+    min_accepted_rate: float = 0.10,
 ) -> dict[str, object] | None:
+    target_selective_risk = _env_float(
+        "SPOTIFY_CONFORMAL_TARGET_SELECTIVE_RISK",
+        target_selective_risk,
+        minimum=0.0,
+        maximum=0.99,
+    )
+    min_accepted_rate = _env_float(
+        "SPOTIFY_CONFORMAL_MIN_ACCEPTED_RATE",
+        min_accepted_rate,
+        minimum=0.01,
+        maximum=0.99,
+    )
+    min_risk_drop = _env_float(
+        "SPOTIFY_CONFORMAL_MIN_RISK_DROP",
+        0.02,
+        minimum=0.0,
+        maximum=0.99,
+    )
     calibration = fit_split_conformal_classifier(val_proba, val_y, alpha=alpha)
     if calibration is None:
         return None
+    operating_threshold = fit_operating_abstention_threshold(
+        val_proba,
+        val_y,
+        base_threshold=calibration.threshold,
+        target_selective_risk=target_selective_risk,
+        min_accepted_rate=min_accepted_rate,
+        min_risk_drop=min_risk_drop,
+    )
+    calibration = SplitConformalCalibration(
+        method=calibration.method,
+        alpha=calibration.alpha,
+        qhat=calibration.qhat,
+        threshold=calibration.threshold,
+        sample_count=calibration.sample_count,
+        empirical_coverage=calibration.empirical_coverage,
+        mean_set_size=calibration.mean_set_size,
+        operating_threshold=operating_threshold,
+    )
 
     payload: dict[str, object] = {
         "tag": str(tag).strip(),
         "calibration": calibration.to_dict(),
+        "operating_point": {
+            "target_selective_risk": float(target_selective_risk),
+            "min_accepted_rate": float(min_accepted_rate),
+            "min_risk_drop": float(min_risk_drop),
+            "abstention_threshold": float(calibration.abstention_threshold),
+        },
         "val": summarize_prediction_sets(val_proba, val_y, calibration=calibration),
     }
     if test_proba is not None and test_y is not None:

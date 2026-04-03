@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import csv
 import json
 
 import joblib
@@ -10,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .ranking import topk_indices_2d
+from .run_artifacts import write_csv_rows
 
 
 @dataclass(frozen=True)
@@ -31,13 +31,7 @@ def _safe_series(df: pd.DataFrame, column: str, *, default: float = 0.0) -> pd.S
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
+    return write_csv_rows(path, rows, fieldnames=fieldnames)
 
 
 def _normalize_rows(values: np.ndarray) -> np.ndarray:

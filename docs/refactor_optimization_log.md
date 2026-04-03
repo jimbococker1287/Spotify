@@ -272,3 +272,181 @@ Interpretation:
 - The strongest end-to-end gains are in policy simulation and journey planning, while multimodal neighbor lookup also benefits substantially from the shared 2D top-k helper.
 - `multimodal._transition_features` is a smaller speedup in this benchmark, but it removes the dense `num_artists x num_artists` intermediate allocation, which should scale more safely as artist catalogs grow.
 - These numbers describe the targeted research/moonshot/uncertainty surfaces, not every project command. They do support a concrete claim that these subsystems now run faster.
+
+### Digital Twin, Stress Test, Safe Policy, And Run Startup
+
+Scope:
+- Added a batched digital-twin rollout path that caches static transition/similarity tensors, avoids the large broadcasted repeat-penalty allocation, and reuses serving features within each rollout step.
+- Switched the stress-test lab to execute rollouts in batches when the default simulator is in use, while keeping the old per-session path available for monkeypatched tests.
+- Refactored safe-policy learning to score whole validation buckets with vectorized reward math instead of looping row-by-row through single-session rollouts.
+- Deferred the `pandas` import inside `run_artifacts.py` so `pipeline.py` can import `write_json` and related helpers without violating the repo's TensorFlow-first import ordering on macOS.
+- Added regression coverage for batched digital-twin rollouts and reran the moonshot, stress-test, and run-artifact tests.
+
+Cleanup:
+- Current cumulative diff in the touched runtime files relative to `HEAD`: `4 files changed, 364 insertions(+), 104 deletions(-)`.
+- Runtime code:
+  - `spotify/digital_twin.py` `+224/-23`
+  - `spotify/stress_test.py` `+94/-38`
+  - `spotify/safe_policy.py` `+34/-39`
+  - `spotify/run_artifacts.py` `+12/-4`
+- Tests:
+  - `tests/test_digital_twin.py` new file, `99` lines
+
+Benchmark method:
+- Baseline: committed `HEAD` version of the affected modules in a detached worktree rooted at `/tmp/spotify-head-current.drnj2I`.
+- Current: working-tree version after the batching, vectorization, and lazy-import changes.
+- Targeted hotspot benchmark:
+  - Synthetic `run_stress_test_lab` workload with `3,200` held-out sessions, `30`-track histories, `120` artists, a causal skip artifact, and the default `2,500`-session sampling cap.
+  - Each side ran `3` repeats with identical seeded inputs.
+- Bounded full-script benchmark:
+  - Real `scripts/run_everything.sh` flow using the local Spotify export under `/Users/akashponugoti/Documents/Spotify/data/raw`.
+  - Shared bounded settings to keep the comparison tractable: `EPOCHS=2`, `OPTUNA_TRIALS=1`, `BACKTEST_FOLDS=2`, `CLASSICAL_MAX_TRAIN_SAMPLES=5000`, `CLASSICAL_MAX_EVAL_SAMPLES=2500`, `SPOTIFY_STRESS_TEST_PROGRESS_EVERY=0`, plus CLI overrides `--models dense --classical-models logreg --optuna-models logreg --backtest-models logreg --max-artists 120 --no-shap --no-mlflow`.
+  - Baseline run dir: `/tmp/spotify-fullbench-baseline.iGnqgJ/runs/20260329_180709_bench-baseline`
+  - Current run dir: `/tmp/spotify-fullbench-current.hFw9Go/runs/20260329_181426_bench-current`
+- Validation gate:
+  - `simulate_rollout_batch_summary` matched the single-session rollout outputs exactly in a deterministic no-early-end regression test.
+  - `tests/test_digital_twin.py`, `tests/test_stress_test.py`, `tests/test_moonshot_lab.py`, and `tests/test_run_artifacts.py` all passed.
+  - `ruff` passed on the touched modules and tests.
+
+Measured impact:
+- `run_stress_test_lab` targeted benchmark:
+  - Baseline median: `3.0513s`
+  - Current median: `0.0514s`
+  - Improvement: `59.34x` faster, `98.3%` lower median runtime
+- Bounded `scripts/run_everything.sh` benchmark:
+  - Baseline total from run log: `144.700s`
+  - Current total from run log / phase timing: `78.783s`
+  - Improvement: `1.84x` faster, `45.6%` lower end-to-end runtime
+- Moonshot tail within the bounded full run, measured from the first post-journey-planning log to moonshot completion:
+  - Baseline: `67.421s`
+  - Current: `0.369s`
+  - Improvement: `182.7x` faster, `99.5%` lower runtime
+- Safe-policy learning inside the full run:
+  - Baseline: about `11.22s`
+  - Current: about `0.05s`
+  - Improvement: about `229x` faster, `99.6%` lower runtime
+- Stress-test scenarios inside the full run:
+  - Baseline: about `56.2s` total across `10` scenario/policy evaluations
+  - Current: about `0.31s` total
+  - Improvement: about `181x` faster, `99.4%` lower runtime
+
+Interpretation:
+- This pass turns the moonshot lab from a major full-run bottleneck into a comparatively small tail stage, and that change is large enough to move the bounded end-to-end launcher runtime by nearly half.
+- The biggest raw speedup comes from batch execution in the stress-test lab, but vectorized safe-policy scoring and cached digital-twin rollout inputs also contribute materially.
+- The lazy `pandas` import in `run_artifacts.py` is not just a cleanup; it preserves the repository's TensorFlow-before-pandas/sklearn startup rule and prevents the current pipeline from deadlocking during the first training epoch on macOS.
+- These results come from the bounded full-script benchmark configuration above, not the unconstrained default full launcher, but they are still real end-to-end measurements on the actual local export data and launcher script.
+
+### Retrieval Stack Acceleration
+
+Scope:
+- Vectorized the self-supervised retrieval pretraining loop in `spotify/retrieval.py` by replacing the per-example Python embedding updates with batched scatter updates via `np.add.at`.
+- Switched retrieval softmax and sigmoid math to stay in `float32`, which reduces conversion overhead inside the inner training loops.
+- Reused cached validation and test retrieval scores/session vectors instead of rescoring the same splits multiple times for retrieval metrics, ANN diagnostics, and reranker evaluation.
+- Added a default cap for ANN recall/latency diagnostics so the summary metrics evaluate a deterministic sample instead of the full validation and test splits every run.
+
+Cleanup:
+- Current cumulative diff in the touched runtime file relative to `HEAD`: `1 file changed, 67 insertions(+), 35 deletions(-)`.
+- Runtime code:
+  - `spotify/retrieval.py` `+67/-35`
+
+Benchmark method:
+- Main-worktree caveat:
+  - The shared workspace currently has an unrelated deletion of `spotify/data.py`, which prevents imports like `spotify.data` from resolving cleanly.
+  - To avoid stepping on that in-progress refactor, validation and benchmarking for this pass were run in clean detached worktrees rather than the dirty main worktree.
+- Retrieval hotspot benchmark:
+  - Baseline worktree: `/tmp/spotify-head-current.drnj2I`
+  - Candidate worktree with only the retrieval patch: `/tmp/spotify-retrieval-cand.wrmz1z`
+  - Shared dataset: the prepared-data cache bundle at `/tmp/spotify-fullbench-current.hFw9Go/cache/prepared_data/161ca5021d30d1f4dda7ae51/prepared_bundle.joblib`
+  - Command shape: direct `train_retrieval_stack(...)` and direct `train_self_supervised_artist_embeddings(..., objective_name="cooccurrence")` timing with the same random seed and default retrieval env settings.
+- Bounded launcher benchmark for the retrieval patch in isolation:
+  - Baseline run dir: `/tmp/spotify-retrieval-full-baseline.aCR7v6/runs/20260402_175700_bench-retrieval-baseline`
+  - Candidate run dir: `/tmp/spotify-retrieval-full-candidate.XYFAaC/runs/20260402_180010_bench-retrieval-candidate`
+  - Shared bounded settings: `EPOCHS=2`, `OPTUNA_TRIALS=1`, `BACKTEST_FOLDS=2`, `CLASSICAL_MAX_TRAIN_SAMPLES=5000`, `CLASSICAL_MAX_EVAL_SAMPLES=2500`, `SPOTIFY_STRESS_TEST_PROGRESS_EVERY=0`, plus CLI overrides `--models dense --classical-models logreg --optuna-models logreg --backtest-models logreg --max-artists 120 --no-shap --no-mlflow`.
+- Validation gate:
+  - `ruff` passed on `spotify/retrieval.py` and `tests/test_retrieval_and_friction.py`.
+  - `tests/test_retrieval_and_friction.py` passed in the clean candidate worktree.
+
+Measured impact:
+- Direct `train_retrieval_stack(...)` benchmark on the shared prepared bundle:
+  - Baseline: `103.96s`
+  - Candidate: `27.04s`
+  - Improvement: `3.85x` faster, `74.0%` lower runtime
+- Direct `train_self_supervised_artist_embeddings(..., "cooccurrence")` benchmark on the same bundle:
+  - Baseline: `24.79s`
+  - Candidate: `3.13s`
+  - Improvement: `7.93x` faster, `87.4%` lower runtime
+- Bounded `scripts/run_everything.sh` benchmark for this retrieval patch in isolation:
+  - Baseline total from run log: `150.42s`
+  - Candidate total from run log: `120.94s`
+  - Improvement: `1.24x` faster, `19.6%` lower end-to-end runtime
+- Retrieval model fit time reported in the bounded launcher logs:
+  - Baseline `retrieval_dual_encoder` / `retrieval_reranker`: `36.04s`
+  - Candidate `retrieval_dual_encoder` / `retrieval_reranker`: `7.77s`
+  - Improvement: `4.64x` faster, `78.4%` lower retrieval fit time in the full launcher
+
+Interpretation:
+- This pass materially accelerates the retrieval stack itself; the dominant win comes from eliminating the inner Python update loop in self-supervised pretraining.
+- Even without the separate moonshot/stress-test optimizations that only exist in the dirty workspace, the retrieval patch alone trims about one-fifth off the bounded full launcher on clean `HEAD`.
+- Using the last instrumented dirty-worktree phase timings together with the measured retrieval-fit reduction, the likely top remaining bottlenecks in that optimized tree are now:
+  - `tensorflow_runtime_init` at about `10.09s`
+  - `retrieval_stack` at about `7.34s` (inferred from the measured retrieval-fit reduction)
+  - `temporal_backtest` at about `5.83s`
+  - `deep_model_training` at about `3.13s`
+  - `robustness_slice_evaluation` at about `2.33s`
+- Because the dirty main workspace currently has the unrelated `spotify/data.py` deletion, that final bottleneck ranking is an informed inference from the last instrumented dirty run rather than a freshly rerun dirty-workspace measurement.
+
+### Temporal Backtest Fold Reuse + Auto Parallelism
+
+Scope:
+- Added a dedicated single-pass classical backtest scorer in `spotify/backtesting.py` so temporal backtesting no longer calls the full benchmark evaluator with the same test matrix twice.
+- Refactored temporal backtest window resolution around reusable capped slices, which removes repeated tail-cap array churn and makes the classical and deep fold loops share the same fold bookkeeping.
+- Deferred sequence/context/skip-array concatenation until a selected backtest model actually needs those modalities.
+- Added a small auto-worker heuristic for classical temporal backtests: when `SPOTIFY_BACKTEST_WORKERS` is unset and there is more than one independent classical job, temporal backtesting now defaults to up to `2` workers while still forcing estimator-internal `n_jobs=1` to avoid oversubscription.
+
+Cleanup:
+- Runtime/test files touched for this pass:
+  - `spotify/backtesting.py`
+  - `tests/test_drift_and_backtesting.py`
+- Added regression coverage for:
+  - single-pass classical eval scoring
+  - auto backtest worker resolution
+
+Benchmark method:
+- Baseline worktree: `/tmp/spotify-backtest-base.jOt1QM`
+- Candidate worktree: `/tmp/spotify-backtest-cand.UUJka4`
+- Shared dataset: `/tmp/spotify-fullbench-current.hFw9Go/cache/prepared_data/161ca5021d30d1f4dda7ae51/prepared_bundle.joblib`
+- Shared workload: direct `run_temporal_backtest(...)` on the real prepared bundle with `selected_models=("logreg",)`, `folds=2`, `feature_bundle=build_classical_feature_bundle(prepared)`, and BLAS/OpenMP thread env vars pinned to `1` for repeatability.
+
+Measured impact:
+- Baseline `HEAD` direct backtest median:
+  - `30.94s`
+- Candidate median after the first backtest refactor, with `SPOTIFY_BACKTEST_WORKERS=1`:
+  - `29.17s`
+  - Improvement vs baseline: `1.06x` faster, `5.7%` lower runtime
+- Candidate median after enabling the new default auto-worker heuristic:
+  - `26.79s`
+  - Improvement vs baseline: `1.16x` faster, `13.4%` lower runtime
+  - Improvement vs the single-worker candidate: `1.09x` faster, `8.2%` lower runtime
+
+Validation gate:
+- `ruff` passed on `spotify/backtesting.py`, `spotify/robustness.py`, `tests/test_drift_and_backtesting.py`, and `tests/test_research_platform.py`.
+- `tests/test_drift_and_backtesting.py` and `tests/test_research_platform.py` passed in the main workspace.
+
+Interpretation:
+- The first backtest cleanup removed measurable waste, but the larger win came from auto-parallelizing the independent classical folds.
+- This should lower the instrumented `temporal_backtest` phase from roughly `5.83s` to about `5.04s` on the previously measured bounded full run, based on the direct benchmark ratio.
+- `tensorflow_runtime_init` and `retrieval_stack` remain the largest likely end-to-end bottlenecks after this pass.
+
+### Rejected Robustness Slice Refactor
+
+Scope:
+- Prototyped a `spotify/robustness.py` refactor that precomputed split bucket maps and reused top-k hit masks across models.
+
+Measured impact:
+- Direct replay of `run_robustness_slice_evaluation(...)` on the real cached run artifacts was slightly worse:
+  - Baseline median: `1.106s`
+  - Prototype median: `1.133s`
+  - Result: about `2.4%` slower
+
+Outcome:
+- Reverted that prototype instead of keeping a cleanup that did not pay for itself.
