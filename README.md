@@ -831,6 +831,18 @@ Check the latest run manually:
 python scripts/regression_alert.py
 ```
 
+Refresh the champion gate for an already-completed run without retraining:
+
+```bash
+python -m spotify.champion_gate_refresh --run-dir outputs/runs/<run_id>
+```
+
+Or via Make:
+
+```bash
+make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
+```
+
 Optional webhook alerts:
 
 ```bash

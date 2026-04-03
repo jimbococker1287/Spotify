@@ -86,7 +86,7 @@ class RetrievalServingArtifact:
         session_vec, scores = self.score_items(seq_batch, ctx_batch)
         if self.reranker is None:
             return _softmax_rows(scores)
-        from .retrieval_core import _predict_reranked_probabilities
+        from .retrieval_stack import _predict_reranked_probabilities
 
         return _predict_reranked_probabilities(
             seq_batch=np.asarray(seq_batch, dtype="int32"),

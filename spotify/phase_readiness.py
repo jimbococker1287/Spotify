@@ -55,7 +55,9 @@ def _latest_run_dir(outputs_root: Path) -> Path | None:
     candidates = [path for path in runs_dir.iterdir() if path.is_dir()]
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    manifest_backed = [path for path in candidates if (path / "run_manifest.json").exists()]
+    ranked_candidates = manifest_backed or candidates
+    return max(ranked_candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _artifact_summary(paths: list[Path]) -> dict[str, Any]:
@@ -408,10 +410,14 @@ def _build_platform_research_status(root: Path, *, artifact_bundle: PortfolioArt
 
 def _build_integration_status(root: Path, *, artifact_bundle: PortfolioArtifactBundle) -> dict[str, Any]:
     doc_paths = [
+        root / "docs/claim_to_demo.md",
         root / "docs/higher_level_branches.md",
         root / "docs/outward_package.md",
     ]
     artifact_paths = [
+        root / "outputs/analysis/claim_to_demo/claim_to_demo.json",
+        root / "outputs/analysis/claim_to_demo/claim_to_demo.md",
+        root / "outputs/analysis/claim_to_demo/claim_to_demo_talk_track.md",
         root / "outputs/analysis/portfolio_branches/portfolio_branches.json",
         root / "outputs/analysis/portfolio_branches/portfolio_branches.md",
         root / "outputs/analysis/outward_package/outward_package.json",
@@ -428,6 +434,8 @@ def _build_integration_status(root: Path, *, artifact_bundle: PortfolioArtifactB
     completeness = "ready" if not _missing_paths(doc_paths + artifact_paths, root) else "missing"
     operational = "ready" if ready_branch_count == len(branches) and len(branches) == 4 else "attention"
     copied_assets = [
+        root / "outputs/analysis/outward_package/flagship/claim_to_demo.md",
+        root / "outputs/analysis/outward_package/flagship/claim_to_demo_talk_track.md",
         root / "outputs/analysis/outward_package/taste_os/taste_os_showcase.md",
         root / "outputs/analysis/outward_package/control_room/control_room.md",
         root / "outputs/analysis/outward_package/creator_intelligence/creator_label_intelligence.md",
@@ -436,7 +444,7 @@ def _build_integration_status(root: Path, *, artifact_bundle: PortfolioArtifactB
         root / "outputs/analysis/outward_package/safety_research/benchmark_lock_manifest.md",
     ]
     packaged_asset_count = sum(1 for path in copied_assets if path.exists())
-    efficiency = "ready" if packaged_asset_count >= 5 else "attention"
+    efficiency = "ready" if packaged_asset_count >= 7 else "attention"
     recommended_actions: list[str] = []
     if ready_branch_count < len(branches):
         recommended_actions.append("Keep tightening the four-branch hierarchy until every branch is at least ready-with-gaps.")
@@ -464,6 +472,7 @@ def _build_integration_status(root: Path, *, artifact_bundle: PortfolioArtifactB
         ),
         "recommended_actions": recommended_actions,
         "share_artifacts": [
+            _relative(root / "outputs/analysis/claim_to_demo/claim_to_demo.md", root),
             _relative(root / "outputs/analysis/portfolio_branches/portfolio_branches.md", root),
             _relative(root / "outputs/analysis/outward_package/outward_package.md", root),
             _relative(root / "outputs/analysis/outward_package/four_branch_summary.md", root),
@@ -557,6 +566,7 @@ def build_weeks_1_13_readiness_report(root: Path) -> dict[str, Any]:
         "sections": sections,
         "next_actions": next_actions,
         "fast_review_path": [
+            "outputs/analysis/claim_to_demo/claim_to_demo.md",
             "outputs/analysis/taste_os_demo/showcase/taste_os_showcase.md",
             "outputs/analytics/control_room.md",
             "outputs/analysis/public_spotify/creator_label_intelligence/creator_label_intelligence_tame-impala-arctic-monkeys-phoebe-bridgers.md",

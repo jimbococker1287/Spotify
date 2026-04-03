@@ -309,8 +309,11 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `OPTUNA_TRIALS` (default `18`)
 - `OPTUNA_TIMEOUT_SECONDS` (default `1200`)
 - `BACKTEST_FOLDS` (default `4`)
+- `BACKTEST_MODELS` (default `logreg,extra_trees,mlp`)
 - `CLASSICAL_MAX_TRAIN_SAMPLES` (default `50000`)
 - `CLASSICAL_MAX_EVAL_SAMPLES` (default `25000`)
+- `BACKTEST_MAX_TRAIN_SAMPLES` (default `30000`)
+- `BACKTEST_MAX_EVAL_SAMPLES` (default `12000`)
 - `PYTHON_BIN` (override Python executable)
 - `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
@@ -344,15 +347,25 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_BACKTEST_ADAPTATION_MODE` (`cold`, `warm`, `continual`; default `cold`)
 - `SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK` (optional absolute ceiling for conformal selective risk)
 - `SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE` (optional absolute ceiling for abstention rate)
-- `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail,contrastive_session`)
+- `SPOTIFY_CONFORMAL_TARGET_SELECTIVE_RISK` (launcher defaults: `0.40` full / `0.45` fast; target selective-risk operating point for abstention tuning)
+- `SPOTIFY_CONFORMAL_MIN_ACCEPTED_RATE` (launcher defaults: `0.25` full / `0.20` fast; minimum accepted-rate floor while tuning abstention)
+- `SPOTIFY_CONFORMAL_MIN_RISK_DROP` (default `0.02`; minimum selective-risk improvement required before raising abstention)
+- `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail`)
 - `SPOTIFY_PRETRAIN_MAX_PAIRS` (default `1000000`; cap self-supervised pretraining pairs per objective, use `0` for no cap)
+- `SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES` (default launcher value `30000`; backtest-only train cap, use `0` for full slice)
+- `SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES` (default launcher value `12000`; backtest-only eval cap, use `0` for full slice)
 - `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
 - `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
 - `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
 - `SPOTIFY_STRESS_TEST_MAX_SESSIONS` (default `2500`; cap held-out sessions evaluated per stress-test scenario/policy, use `0` for full sweep)
 - `SPOTIFY_STRESS_TEST_PROGRESS_EVERY` (default `500`; progress-log interval inside the stress-test lab)
+- `SPOTIFY_STRESS_BENCHMARK_SCENARIO` (launcher default `evening_drift`; standing stress benchmark scenario)
+- `SPOTIFY_STRESS_BENCHMARK_POLICY` (launcher default `safe_global`; standing stress benchmark policy)
+- `SPOTIFY_STRESS_BENCHMARK_REFERENCE_POLICY` (launcher default `baseline_exploit`; comparison policy for the benchmark)
+- `SPOTIFY_ROBUSTNESS_GUARDRAIL_SEGMENT` (launcher default `repeat_from_prev`; named slice promoted into the robustness guardrail)
+- `SPOTIFY_ROBUSTNESS_GUARDRAIL_BUCKET` (launcher default `new`; bucket within the named robustness guardrail segment)
 
-The launcher still includes all deep and classical model families, but runs lighter deep models first so progress appears sooner.
+The launcher still trains the full deep and classical slate, but it now backtests the lighter governance subset by default and runs lighter deep models first so progress appears sooner.
 
 For memory-constrained devices, keep the same model/training-set definitions but reduce peak RAM:
 
@@ -507,7 +520,7 @@ Generate the control-room summary:
 make control-room
 ```
 
-The control room now ranks runs by ops signal instead of blindly taking the newest folder, so newer `dev` or smoke/check runs do not automatically replace the main ops candidate if an older production-style run has stronger review coverage.
+The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
 
 ## Taste OS Demo
 
@@ -846,6 +859,18 @@ Check the latest run manually:
 python scripts/regression_alert.py
 ```
 
+Refresh the champion gate for an already-completed run without retraining:
+
+```bash
+python -m spotify.champion_gate_refresh --run-dir outputs/runs/<run_id>
+```
+
+Or via Make:
+
+```bash
+make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
+```
+
 Optional webhook alerts:
 
 ```bash
@@ -867,18 +892,22 @@ SPOTIFY_ALERT_REVIEW_THRESHOLD=off python scripts/regression_alert.py
 The scheduled wrapper also runs a dedicated control-room guard with these default thresholds:
 
 - `SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP=0.35`
+- `SPOTIFY_CONTROL_ROOM_MAX_REPEAT_FROM_PREV_NEW_GAP=0.35`
 - `SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK=0.45`
+- `SPOTIFY_CONTROL_ROOM_MAX_STRESS_BENCHMARK_SKIP_RISK=0.45`
 - `SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD=0.20`
 - `SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK=0.50`
 
-The scheduled `full` wrapper is now intentionally more opinionated than the raw profile defaults: it seeds retrieval pretraining with `cooccurrence,masked_tail`, caps pretraining pairs at `1000000`, and tunes only `logreg,extra_trees,mlp` unless you override `SPOTIFY_PRETRAIN_OBJECTIVES`, `SPOTIFY_PRETRAIN_MAX_PAIRS`, or `OPTUNA_MODELS`.
+The scheduled `full` wrapper is now intentionally more opinionated than the raw profile defaults: it seeds retrieval pretraining with `cooccurrence,masked_tail`, caps pretraining pairs at `1000000`, tunes only `logreg,extra_trees,mlp`, promotes `repeat_from_prev=new` into the named robustness guardrail, evaluates a standing `evening_drift` stress benchmark, and tunes conformal abstention toward lower selective risk unless you override the corresponding env vars.
 
 You can run that guard directly:
 
 ```bash
 python scripts/control_room_guard.py \
   --max-robustness-gap 0.35 \
+  --max-repeat-from-prev-new-gap 0.35 \
   --max-stress-skip-risk 0.45 \
+  --max-stress-benchmark-skip-risk 0.45 \
   --max-target-drift-jsd 0.20 \
   --max-selective-risk 0.50
 ```
@@ -892,6 +921,11 @@ That guard also writes:
 - `outputs/analytics/control_room_triage.md`
 
 The history artifact keeps one snapshot per run, the weekly summary rolls recent runs into a trend view, the control room now calls out missing analysis coverage explicitly, and the triage artifacts expand the current review actions into inspect/fix/rerun steps so the next ops move is explicit after a failed scheduled run.
+
+New runs also leave behind two more ops-facing artifacts that the guard and control room understand:
+
+- `analysis/robustness_guardrails.json` for the named slice benchmark (default `repeat_from_prev=new`)
+- `analysis/stress_test/stress_test_benchmark.json` for the standing stress benchmark (default `evening_drift` under `safe_global`)
 
 ## Spotify API Credentials
 

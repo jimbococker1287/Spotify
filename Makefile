@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims branch-portfolio outward-package regression-guard regression-alert control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo branch-portfolio outward-package regression-guard regression-alert refresh-champion-gate control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -85,6 +85,10 @@ research-claims:
 	mkdir -p outputs
 	$(RUN_PY) -m spotify.research_claims $(EXTRA_ARGS)
 
+claim-to-demo:
+	mkdir -p outputs
+	$(RUN_PY) -m spotify.claim_to_demo $(EXTRA_ARGS)
+
 branch-portfolio:
 	mkdir -p outputs
 	$(RUN_PY) -m spotify.branch_portfolio $(EXTRA_ARGS)
@@ -99,6 +103,9 @@ regression-guard:
 
 regression-alert:
 	$(RUN_PY) scripts/regression_alert.py $(EXTRA_ARGS)
+
+refresh-champion-gate:
+	$(RUN_PY) -m spotify.champion_gate_refresh $(EXTRA_ARGS)
 
 control-room-guard:
 	$(RUN_PY) scripts/control_room_guard.py $(EXTRA_ARGS)

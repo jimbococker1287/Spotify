@@ -44,11 +44,13 @@ spotify-public-insights = "spotify.public_insights:main"
 spotify-compare-public = "spotify.compare_public:main"
 spotify-control-room = "spotify.control_room:main"
 spotify-research-claims = "spotify.research_claims:main"
+spotify-claim-to-demo = "spotify.claim_to_demo:main"
 spotify-branch-portfolio = "spotify.branch_portfolio:main"
 spotify-outward-package = "spotify.outward_package:main"
 spotify-taste-os-demo = "spotify.taste_os_demo:main"
 spotify-taste-os-showcase = "spotify.taste_os_showcase:main"
 spotify-taste-os-serve = "spotify.taste_os_service:main"
+spotify-refresh-champion-gate = "spotify.champion_gate_refresh:main"
 
 [tool.setuptools]
 include-package-data = true

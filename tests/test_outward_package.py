@@ -17,18 +17,53 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _build_sample_outputs(output_root: Path) -> None:
+    commute_demo_md = output_root / "analysis" / "taste_os_demo" / "showcase" / "examples" / "commute.md"
+    _write_text(commute_demo_md, "# Commute\n")
     _write_json(
         output_root / "analysis" / "taste_os_demo" / "showcase" / "taste_os_showcase.json",
         {
-            "canonical_examples": [{}, {}, {}, {}],
-            "mode_comparison": {"rows": [{"mode": "focus", "top_artist": "Tame Impala"}]},
+            "run_context": {
+                "run_dir": str((output_root / "runs" / "run_full_anchor").resolve()),
+                "model_name": "retrieval_reranker",
+                "model_type": "retrieval_reranker",
+            },
+            "canonical_examples": [
+                {
+                    "label": "Commute / Friction Spike",
+                    "mode": "commute",
+                    "scenario": "friction_spike",
+                    "top_artist": "Kid Cudi",
+                    "fallback_policy_name": "safe_bucket_normal_friction",
+                    "adaptive_replans": 1,
+                    "adaptive_safe_route_steps": 4,
+                    "demo_md_path": str(commute_demo_md),
+                },
+                {},
+                {},
+                {},
+            ],
+            "mode_comparison": {
+                "rows": [
+                    {"mode": "focus", "top_artist": "Tame Impala"},
+                    {"mode": "commute", "top_artist": "Kid Cudi"},
+                    {"mode": "discovery", "top_artist": "Arctic Monkeys"},
+                ]
+            },
         },
     )
     _write_text(output_root / "analysis" / "taste_os_demo" / "showcase" / "taste_os_showcase.md", "# Taste OS\n")
     _write_json(
         output_root / "analytics" / "control_room.json",
         {
+            "latest_run": {"run_id": "run_full_anchor"},
             "ops_health": {"status": "healthy", "headline": "Operational review is healthy."},
+            "safety": {
+                "robustness_max_top1_gap": 0.158,
+                "test_jsd_target_drift": 0.218,
+                "test_selective_risk": 0.657,
+                "test_abstention_rate": 0.137,
+            },
+            "qoe": {"stress_worst_skip_risk": 0.613},
             "operating_rhythm": {"overall_status": "healthy", "recommended_review_command": "make control-room"},
         },
     )
@@ -60,12 +95,20 @@ def _build_sample_outputs(output_root: Path) -> None:
     _write_json(
         output_root / "analysis" / "research_claims" / "research_claims.json",
         {
+            "run": {"run_id": "run_full_anchor"},
             "primary_claim": {
                 "key": "shift_robustness",
                 "status": "analysis_ready",
                 "summary": "Shift is measurable.",
                 "missing_checks": ["Repeat seeds."],
                 "supporting_artifacts": ["/tmp/a.json"],
+                "metrics": {
+                    "worst_robustness_gap": 0.158,
+                    "target_drift_jsd": 0.218,
+                    "selective_risk": 0.500,
+                    "abstention_rate": 0.391,
+                    "stress_skip_risk": 0.613,
+                },
             },
             "backup_claim": {
                 "key": "candidate_ranking",
@@ -97,6 +140,7 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert paths["safety_research_showcase_md"].exists()
 
     package_root = output_root / "analysis" / "outward_package"
+    assert (package_root / "flagship" / "claim_to_demo.md").exists()
     assert (package_root / "taste_os" / "taste_os_showcase.md").exists()
     assert (package_root / "control_room" / "control_room.md").exists()
     assert (package_root / "creator_intelligence" / "creator_label_intelligence.md").exists()
@@ -104,6 +148,7 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
 
     package_payload = json.loads(paths["json"].read_text(encoding="utf-8"))
     assert "copied_artifacts" in package_payload
+    assert package_payload["copied_artifacts"]["claim_to_demo_md"]
     assert package_payload["copied_artifacts"]["taste_os_md"]
     safety_showcase = paths["safety_research_showcase_md"].read_text(encoding="utf-8")
     assert "Believable submission path: `True`" in safety_showcase

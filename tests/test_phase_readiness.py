@@ -53,6 +53,7 @@ def _create_creator_family(root: Path, stem: str, *, scene_seed_rows: int = 2) -
 
 def test_phase_readiness_reports_built_surfaces_even_with_ops_attention(tmp_path: Path) -> None:
     for relative in (
+        "docs/claim_to_demo.md",
         "docs/personal_taste_os.md",
         "docs/taste_os_demo_contract.md",
         "docs/taste_os_demo_walkthrough.md",
@@ -136,6 +137,7 @@ def test_phase_readiness_reports_built_surfaces_even_with_ops_attention(tmp_path
 
 def test_phase_readiness_blocks_progress_when_creator_surface_is_incomplete(tmp_path: Path) -> None:
     for relative in (
+        "docs/claim_to_demo.md",
         "docs/personal_taste_os.md",
         "docs/taste_os_demo_contract.md",
         "docs/taste_os_demo_walkthrough.md",
@@ -196,6 +198,7 @@ def test_phase_readiness_blocks_progress_when_creator_surface_is_incomplete(tmp_
 
 def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_path: Path) -> None:
     for relative in (
+        "docs/claim_to_demo.md",
         "docs/personal_taste_os.md",
         "docs/taste_os_demo_contract.md",
         "docs/taste_os_demo_walkthrough.md",
@@ -277,6 +280,7 @@ def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_p
     _write_json(
         tmp_path / "outputs/analysis/research_claims/research_claims.json",
         {
+            "run": {"run_id": "run_003"},
             "primary_claim": {"key": "shift_robustness", "status": "analysis_ready"},
             "backup_claim": {"key": "candidate_ranking", "status": "promising_but_unlocked"},
             "benchmark_lock": {"benchmark_id": "smokebench", "comparison_ready": True},
@@ -291,15 +295,20 @@ def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_p
     _touch(tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.md")
 
     for relative in (
-        "outputs/analysis/portfolio_branches/portfolio_branches.json",
+        "outputs/analysis/claim_to_demo/claim_to_demo.json",
         "outputs/analysis/outward_package/outward_package.json",
+        "outputs/analysis/portfolio_branches/portfolio_branches.json",
     ):
         _write_json(tmp_path / relative, {})
     for relative in (
+        "outputs/analysis/claim_to_demo/claim_to_demo.md",
+        "outputs/analysis/claim_to_demo/claim_to_demo_talk_track.md",
         "outputs/analysis/portfolio_branches/portfolio_branches.md",
         "outputs/analysis/outward_package/outward_package.md",
         "outputs/analysis/outward_package/four_branch_summary.md",
         "outputs/analysis/outward_package/safety_research/safety_research_showcase.md",
+        "outputs/analysis/outward_package/flagship/claim_to_demo.md",
+        "outputs/analysis/outward_package/flagship/claim_to_demo_talk_track.md",
         "outputs/analysis/outward_package/taste_os/taste_os_showcase.md",
         "outputs/analysis/outward_package/control_room/control_room.md",
         "outputs/analysis/outward_package/creator_intelligence/creator_label_intelligence.md",
@@ -319,8 +328,105 @@ def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_p
     assert len(report["sections"]) == 5
     assert report["sections"][3]["metrics"]["benchmark_comparison_ready"] is True
     assert report["sections"][4]["metrics"]["primary_branch_count"] == 4
+    assert report["sections"][4]["metrics"]["packaged_asset_count"] >= 7
 
     artifacts = write_weeks_1_13_readiness_report(report, output_dir=tmp_path / "outputs/analytics")
     assert artifacts["json"].exists()
     assert artifacts["md"].exists()
     assert "Weeks 1-13 Readiness" in artifacts["md"].read_text(encoding="utf-8")
+
+
+def test_phase_readiness_prefers_manifest_backed_run_dir_over_partial_newer_directory(tmp_path: Path) -> None:
+    for relative in (
+        "docs/claim_to_demo.md",
+        "docs/personal_taste_os.md",
+        "docs/taste_os_demo_contract.md",
+        "docs/taste_os_demo_walkthrough.md",
+        "docs/taste_os_product_story.md",
+        "docs/control_room_operating_rhythm.md",
+        "docs/creator_label_intelligence_brief.md",
+        "docs/recommender_safety_platform.md",
+        "docs/benchmark_contract.md",
+        "docs/publication_outline.md",
+        "docs/higher_level_branches.md",
+        "docs/outward_package.md",
+    ):
+        _touch(tmp_path / relative)
+
+    _write_json(
+        tmp_path / "outputs/analysis/taste_os_demo/showcase/taste_os_showcase.json",
+        {
+            "canonical_examples": [{}, {}, {}, {}],
+            "mode_comparison": {"rows": [{"top_artist": "Artist A"}, {"top_artist": "Artist B"}, {"top_artist": "Artist C"}]},
+            "showcase_summary": {"canonical_example_count": 4, "mode_comparison_count": 4},
+            "review_order": ["a", "b", "c", "d"],
+        },
+    )
+    _touch(tmp_path / "outputs/analysis/taste_os_demo/showcase/taste_os_showcase.md")
+    _write_json(tmp_path / "outputs/analysis/taste_os_demo/showcase/taste_os_mode_comparison.json", {"rows": [{"top_artist": "Artist A"}, {"top_artist": "Artist B"}, {"top_artist": "Artist C"}]})
+    _touch(tmp_path / "outputs/analysis/taste_os_demo/showcase/taste_os_mode_comparison.md")
+    _write_json(
+        tmp_path / "outputs/analytics/control_room.json",
+        {
+            "review_actions": [],
+            "operating_rhythm": {"overall_status": "healthy", "recommended_review_command": "make control-room"},
+            "ops_health": {"status": "healthy", "operational_high_priority_count": 0, "strategic_high_priority_count": 0},
+            "latest_run": {"run_id": "run_complete"},
+            "async_handoff": {"share_artifacts": ["a.md", "b.md", "c.md"]},
+        },
+    )
+    for relative in (
+        "outputs/analytics/control_room.md",
+        "outputs/analytics/control_room_weekly_summary.json",
+        "outputs/analytics/control_room_weekly_summary.md",
+        "outputs/analytics/control_room_triage.json",
+        "outputs/analytics/control_room_triage.md",
+        "outputs/analysis/claim_to_demo/claim_to_demo.json",
+        "outputs/analysis/claim_to_demo/claim_to_demo.md",
+        "outputs/analysis/claim_to_demo/claim_to_demo_talk_track.md",
+        "outputs/analysis/portfolio_branches/portfolio_branches.md",
+        "outputs/analysis/outward_package/outward_package.md",
+        "outputs/analysis/outward_package/four_branch_summary.md",
+        "outputs/analysis/outward_package/safety_research/safety_research_showcase.md",
+        "outputs/analysis/outward_package/flagship/claim_to_demo.md",
+        "outputs/analysis/outward_package/flagship/claim_to_demo_talk_track.md",
+        "outputs/analysis/outward_package/taste_os/taste_os_showcase.md",
+        "outputs/analysis/outward_package/control_room/control_room.md",
+        "outputs/analysis/outward_package/creator_intelligence/creator_label_intelligence.md",
+        "outputs/analysis/outward_package/creator_intelligence/scene_seed_view.md",
+        "outputs/analysis/outward_package/safety_research/research_claims.md",
+        "outputs/analysis/outward_package/safety_research/benchmark_lock_manifest.md",
+    ):
+        if relative.endswith(".json"):
+            _write_json(tmp_path / relative, {})
+        else:
+            _touch(tmp_path / relative)
+    _write_json(tmp_path / "outputs/analysis/portfolio_branches/portfolio_branches.json", {})
+    _write_json(tmp_path / "outputs/analysis/outward_package/outward_package.json", {})
+    _write_json(
+        tmp_path / "outputs/analysis/research_claims/research_claims.json",
+        {
+            "run": {"run_id": "run_complete"},
+            "primary_claim": {"key": "shift_robustness", "status": "analysis_ready"},
+            "backup_claim": {"key": "candidate_ranking", "status": "promising_but_unlocked"},
+            "benchmark_lock": {"benchmark_id": "smokebench", "comparison_ready": True},
+            "believable_submission_path": True,
+        },
+    )
+    _touch(tmp_path / "outputs/analysis/research_claims/research_claims.md")
+    _write_json(tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.json", {"benchmark_id": "smokebench", "comparison_ready": True})
+    _touch(tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.md")
+    _create_creator_family(tmp_path, "creator_label_intelligence_only")
+    _create_creator_family(tmp_path, "creator_label_intelligence_two")
+    _create_creator_family(tmp_path, "creator_label_intelligence_three")
+
+    complete_run = tmp_path / "outputs/runs/run_complete"
+    complete_run.mkdir(parents=True)
+    _write_json(complete_run / "run_manifest.json", {"run_id": "run_complete"})
+    partial_run = tmp_path / "outputs/runs/run_partial_newer"
+    partial_run.mkdir(parents=True)
+    _touch(partial_run / "train.log")
+
+    report = build_weeks_1_13_readiness_report(tmp_path)
+
+    assert report["latest_run_dir"].endswith("/outputs/runs/run_complete")

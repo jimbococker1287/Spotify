@@ -12,6 +12,7 @@ import spotify.backtesting as backtesting
 from spotify.backtesting import BacktestFoldResult, run_temporal_backtest
 from spotify.data import PreparedData
 from spotify.governance import evaluate_champion_gate
+from spotify.pipeline_helpers import _load_current_risk_metrics
 from spotify.policy_eval import run_policy_simulation
 from spotify.probability_bundles import save_prediction_bundle
 from spotify.research_artifacts import (
@@ -220,3 +221,68 @@ def test_champion_gate_can_block_on_selective_risk(tmp_path: Path) -> None:
 
     assert result["promoted"] is False
     assert result["status"] == "fail_selective_risk"
+
+
+def test_risk_metrics_backfill_from_prediction_bundle_for_missing_challenger_summary(tmp_path: Path) -> None:
+    data = _prepared_data()
+    run_dir = tmp_path / "run_a"
+    (run_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    bundle_path = save_prediction_bundle(
+        run_dir / "prediction_bundles" / "classical_extra_trees.npz",
+        val_proba=np.array(
+            [
+                [0.02, 0.03, 0.95],
+                [0.05, 0.92, 0.03],
+            ],
+            dtype="float32",
+        ),
+        test_proba=np.array(
+            [
+                [0.94, 0.04, 0.02],
+                [0.53, 0.37, 0.10],
+            ],
+            dtype="float32",
+        ),
+    )
+
+    result_rows = [
+        {
+            "model_name": "extra_trees",
+            "model_type": "classical",
+            "prediction_bundle_path": str(bundle_path),
+            "val_top1": 0.42,
+            "test_top1": 0.31,
+        }
+    ]
+
+    metrics = _load_current_risk_metrics(
+        run_dir,
+        result_rows,
+        val_y=data.y_val,
+        test_y=data.y_test,
+        conformal_alpha=0.10,
+    )
+
+    assert "extra_trees" in metrics
+    assert metrics["extra_trees"]["val_selective_risk"] == 0.0
+    assert metrics["extra_trees"]["test_selective_risk"] >= 0.0
+    summary_path = run_dir / "analysis" / "classical_extra_trees_confidence_summary.json"
+    conformal_path = run_dir / "analysis" / "classical_extra_trees_conformal_summary.json"
+    assert summary_path.exists()
+    assert conformal_path.exists()
+
+    history_csv = tmp_path / "history.csv"
+    history_csv.write_text("run_id,model_name,val_top1\nrun_prev,extra_trees,0.50\n", encoding="utf-8")
+    gate = evaluate_champion_gate(
+        history_csv=history_csv,
+        current_run_id="run_a",
+        current_results=[{"model_name": "extra_trees", "val_top1": 0.42}],
+        regression_threshold=0.20,
+        metric_source="val_top1",
+        require_profile_match=False,
+        current_risk_metrics=metrics,
+        max_selective_risk=0.0,
+    )
+
+    assert gate["challenger_model_name"] == "extra_trees"
+    assert gate["challenger_selective_risk"] == 0.0

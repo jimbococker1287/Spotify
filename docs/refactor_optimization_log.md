@@ -450,3 +450,42 @@ Measured impact:
 
 Outcome:
 - Reverted that prototype instead of keeping a cleanup that did not pay for itself.
+
+### Full Launcher Budgeting From Real Run
+
+Scope:
+- Added baseline-driven shortlist helpers in `spotify/pipeline_runtime.py` so the launcher can cap Optuna and temporal-backtest candidate sets using the already-computed untuned classical benchmark results.
+- Tightened the default `scripts/run_everything.sh` research footprint:
+  - deep default now uses a small core set unless `SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS=1`
+  - classical default drops `random_forest` and `hist_gbm`
+  - Optuna default narrows from `logreg,extra_trees,mlp` to `logreg,mlp`
+  - Optuna default trial/timeout budget drops from `18/1200s` to `10/600s`
+  - Optuna/backtest shortlist env defaults are now both `2`
+
+Motivation from the real 2026-04-02 overnight run:
+- Source run: `outputs/runs/20260402_181212_everything-20260402-181212`
+- Total measured runtime: `4075.04s` (`67m 55s`)
+- Largest phases:
+  - `optuna_tuning`: `1926.40s`
+  - `deep_model_training`: `1458.08s`
+  - `classical_benchmarks`: `534.14s`
+  - `temporal_backtest`: `89.72s`
+- Optuna wall-clock breakdown from `train.log`:
+  - `logreg`: about `340s`
+  - `extra_trees`: about `1405s`
+  - `mlp`: about `181s`
+- Deep-model fit breakdown from `run_results.json`:
+  - all `14` deep models combined: `1173.72s` fit time
+  - retained default core (`dense,gru,transformer`): `121.93s` fit time
+
+Projected impact:
+- Removing `extra_trees` from the default Optuna sweep and dropping to `10` trials should save about `27` wall-clock minutes on runs similar to the measured overnight run.
+- Dropping `random_forest` and `hist_gbm` from the default classical sweep should save about `7.5` minutes on that same run shape.
+- Restricting the default deep sweep to `dense,gru,transformer` should save roughly `17` to `22` minutes, depending on how much non-fit overhead remains fixed.
+- Total projected improvement for the default overnight launcher: roughly `45` to `55` minutes saved on runs shaped like `20260402_181212`, with the largest share coming from Optuna and deep-model budgeting.
+
+Validation gate:
+- `ruff` passed on `spotify/pipeline_runtime.py`, `tests/test_pipeline_runtime_shortlists.py`, and `tests/test_config_smoke.py`.
+- `compileall` passed for the touched Python runtime/test files.
+- `tests/test_pipeline_runtime_shortlists.py` and `tests/test_config_smoke.py` passed.
+- `bash -n scripts/run_everything.sh` passed.

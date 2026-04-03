@@ -35,9 +35,18 @@ Some systems are shared, but the branches should stay legible:
 - Control Room can summarize risks and regressions from Taste OS or research work without absorbing their storytelling role.
 - Safety and Research Platform can power the other branches without becoming the front-door product narrative.
 
+## Bridge Artifact
+
+Use `make claim-to-demo` when you need one review surface that crosses branches.
+
+That package is not a fifth branch. It is the bridge from:
+
+- Taste OS as product proof
+- Control Room as operating proof
+- Safety and Research as evidence proof
+
 ## Deprioritize For Now
 
 - Keep Group Auto-DJ as a moonshot extension unless it becomes a primary review surface.
 - Keep one-off public insight variants nested under Creator Intelligence.
 - Keep extra model-family expansion behind product, safety, or benchmark value.
-
