@@ -120,6 +120,139 @@ def _causal_feature_views(
     return preference_keep, friction_keep, needs_friction_padding
 
 
+def _context_feature_index_map(context_features: list[str]) -> dict[str, int]:
+    return {str(name): idx for idx, name in enumerate(context_features)}
+
+
+def _unique_count_per_row(sequences: np.ndarray) -> np.ndarray:
+    seq_arr = np.asarray(sequences, dtype="int32")
+    if seq_arr.ndim != 2 or seq_arr.shape[1] <= 0:
+        return np.zeros(len(seq_arr), dtype="float32")
+    sorted_seq = np.sort(seq_arr, axis=1)
+    unique_counts = np.ones(len(seq_arr), dtype="float32")
+    if seq_arr.shape[1] > 1:
+        unique_counts += np.count_nonzero(sorted_seq[:, 1:] != sorted_seq[:, :-1], axis=1).astype("float32")
+    return unique_counts
+
+
+def _recent_unique_ratio(sequences: np.ndarray, width: int) -> np.ndarray:
+    seq_arr = np.asarray(sequences, dtype="int32")
+    if seq_arr.ndim != 2 or seq_arr.shape[1] <= 0:
+        return np.zeros(len(seq_arr), dtype="float32")
+    resolved_width = min(max(1, int(width)), seq_arr.shape[1])
+    recent = seq_arr[:, -resolved_width:]
+    unique_counts = _unique_count_per_row(recent)
+    return (unique_counts / float(resolved_width)).astype("float32", copy=False)
+
+
+def _plays_since_last_occurrence(sequences: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    seq_arr = np.asarray(sequences, dtype="int32")
+    target_arr = np.asarray(targets, dtype="int32").reshape(-1)
+    if seq_arr.ndim != 2 or len(seq_arr) != len(target_arr) or seq_arr.shape[1] <= 0:
+        return np.zeros(len(target_arr), dtype="float32")
+    reversed_seq = seq_arr[:, ::-1]
+    matches = reversed_seq == target_arr[:, None]
+    has_match = np.any(matches, axis=1)
+    first_match = np.argmax(matches, axis=1).astype("float32") + 1.0
+    return np.where(has_match, first_match, float(seq_arr.shape[1] + 1)).astype("float32", copy=False)
+
+
+def _advance_rollout_context_batch(
+    *,
+    twin: ListenerDigitalTwinArtifact,
+    active_context: np.ndarray,
+    previous_sequences: np.ndarray,
+    next_sequences: np.ndarray,
+    last_artist: np.ndarray,
+    chosen: np.ndarray,
+    step_index: np.ndarray,
+    hour_shift: float,
+    friction_scale: float,
+    friction_indices: np.ndarray,
+) -> np.ndarray:
+    next_context = np.asarray(active_context, dtype="float32").copy()
+    if next_context.ndim != 2:
+        return next_context
+
+    feature_idx = _context_feature_index_map(twin.context_features)
+    next_hour = None
+    if "hour" in feature_idx:
+        hour_idx = feature_idx["hour"]
+        next_hour = np.mod(next_context[:, hour_idx] + hour_shift + 1.0, 24.0).astype("float32", copy=False)
+        next_context[:, hour_idx] = next_hour
+    if next_hour is not None:
+        if "hour_sin" in feature_idx:
+            next_context[:, feature_idx["hour_sin"]] = np.sin((2.0 * np.pi * next_hour) / 24.0).astype("float32", copy=False)
+        if "hour_cos" in feature_idx:
+            next_context[:, feature_idx["hour_cos"]] = np.cos((2.0 * np.pi * next_hour) / 24.0).astype("float32", copy=False)
+
+    track_seconds = float(max(1.0, twin.average_track_seconds))
+    step_arr = np.asarray(step_index, dtype="float32").reshape(-1)
+    if "session_position" in feature_idx:
+        current_position = next_context[:, feature_idx["session_position"]]
+        next_context[:, feature_idx["session_position"]] = np.maximum(current_position + 1.0, step_arr)
+    if "session_elapsed_seconds" in feature_idx:
+        next_context[:, feature_idx["session_elapsed_seconds"]] = np.maximum(
+            next_context[:, feature_idx["session_elapsed_seconds"]] + track_seconds,
+            step_arr * track_seconds,
+        )
+    if "time_diff" in feature_idx:
+        next_context[:, feature_idx["time_diff"]] = track_seconds
+
+    repeat_from_prev = (np.asarray(chosen, dtype="int32") == np.asarray(last_artist, dtype="int32")).astype("float32")
+    if "is_artist_repeat_from_prev" in feature_idx:
+        next_context[:, feature_idx["is_artist_repeat_from_prev"]] = repeat_from_prev
+    if "transition_repeat_count" in feature_idx:
+        next_context[:, feature_idx["transition_repeat_count"]] = (
+            next_context[:, feature_idx["transition_repeat_count"]] + repeat_from_prev
+        )
+    if "session_repeat_ratio_so_far" in feature_idx:
+        prior_position = np.maximum(1.0, step_arr - 1.0)
+        prior_ratio = np.clip(next_context[:, feature_idx["session_repeat_ratio_so_far"]], 0.0, 1.0)
+        prior_repeat_count = prior_ratio * prior_position
+        next_context[:, feature_idx["session_repeat_ratio_so_far"]] = (
+            (prior_repeat_count + repeat_from_prev) / np.maximum(step_arr, 1.0)
+        ).astype("float32", copy=False)
+
+    unique_after = _unique_count_per_row(next_sequences)
+    if "session_unique_artists_so_far" in feature_idx:
+        next_context[:, feature_idx["session_unique_artists_so_far"]] = np.maximum(
+            next_context[:, feature_idx["session_unique_artists_so_far"]],
+            unique_after,
+        )
+    if "recent_artist_unique_ratio_5" in feature_idx:
+        next_context[:, feature_idx["recent_artist_unique_ratio_5"]] = _recent_unique_ratio(next_sequences, 5)
+    if "recent_artist_unique_ratio_20" in feature_idx:
+        next_context[:, feature_idx["recent_artist_unique_ratio_20"]] = _recent_unique_ratio(next_sequences, 20)
+    if "artist_session_play_count" in feature_idx:
+        next_context[:, feature_idx["artist_session_play_count"]] = np.maximum(
+            next_context[:, feature_idx["artist_session_play_count"]],
+            np.sum(next_sequences == np.asarray(chosen, dtype="int32")[:, None], axis=1).astype("float32", copy=False),
+        )
+    if "plays_since_last_artist" in feature_idx:
+        next_context[:, feature_idx["plays_since_last_artist"]] = _plays_since_last_occurrence(
+            previous_sequences,
+            np.asarray(chosen, dtype="int32"),
+        )
+    if "hours_since_last_artist" in feature_idx:
+        matched_before = np.any(previous_sequences == np.asarray(chosen, dtype="int32")[:, None], axis=1)
+        hours_elapsed = (track_seconds / 3600.0) * np.maximum(step_arr, 1.0)
+        next_context[:, feature_idx["hours_since_last_artist"]] = np.where(
+            matched_before,
+            track_seconds / 3600.0,
+            np.maximum(next_context[:, feature_idx["hours_since_last_artist"]], hours_elapsed),
+        ).astype("float32", copy=False)
+    if "days_since_last" in feature_idx and "hours_since_last_artist" in feature_idx:
+        next_context[:, feature_idx["days_since_last"]] = (
+            next_context[:, feature_idx["hours_since_last_artist"]] / 24.0
+        ).astype("float32", copy=False)
+
+    if friction_indices.size:
+        next_context[:, friction_indices] = np.maximum(0.0, next_context[:, friction_indices] * friction_scale)
+
+    return next_context.astype("float32", copy=False)
+
+
 def fit_listener_digital_twin(
     *,
     data: PreparedData,
@@ -289,13 +422,23 @@ def simulate_rollout_batch_summary(
             first_choice[active_idx[first_choice_mask]] = chosen[first_choice_mask]
         session_length[active_idx] += 1
 
-        next_context = active_ctx.copy()
-        if next_context.shape[1] >= 1:
-            next_context[:, 0] = (next_context[:, 0] + hour_shift + 1.0) % 24.0
-        if friction_indices.size:
-            next_context[:, friction_indices] = np.maximum(0.0, next_context[:, friction_indices] * friction_scale)
+        next_sequence = active_seq.copy()
+        next_sequence[:, :-1] = active_seq[:, 1:]
+        next_sequence[:, -1] = chosen
+        next_context = _advance_rollout_context_batch(
+            twin=twin,
+            active_context=active_ctx,
+            previous_sequences=active_seq,
+            next_sequences=next_sequence,
+            last_artist=last_artist,
+            chosen=chosen,
+            step_index=session_length[active_idx],
+            hour_shift=hour_shift,
+            friction_scale=friction_scale,
+            friction_indices=friction_indices,
+        )
 
-        serving_features = build_serving_tabular_features(active_seq, next_context)
+        serving_features = build_serving_tabular_features(next_sequence, next_context)
         if causal_artifact is not None:
             skip_features = (
                 np.pad(serving_features, ((0, 0), (0, 1)), constant_values=0.0)
@@ -324,8 +467,7 @@ def simulate_rollout_batch_summary(
         end_risk = np.clip(end_risk + fatigue_bias, 0.0, 0.99).astype("float32", copy=False)
         end_sum[active_idx] += end_risk
 
-        sequence_state[active_idx, :-1] = active_seq[:, 1:]
-        sequence_state[active_idx, -1] = chosen
+        sequence_state[active_idx] = next_sequence
         context_state[active_idx] = next_context
 
         ended = rng.random(len(active_idx)) < end_risk
@@ -393,16 +535,31 @@ def simulate_rollout(
         choice = int(np.argmax(scores))
         planned.append(choice)
 
-        next_context = context.copy()
-        if len(next_context) >= 1:
-            next_context[0] = (next_context[0] + hour_shift + 1.0) % 24.0
-        for idx, feature_name in enumerate(twin.context_features):
-            if str(feature_name).startswith("tech_") or str(feature_name) == "offline":
-                next_context[idx] = float(max(0.0, next_context[idx] * friction_scale))
+        next_sequence = np.roll(sequence, -1)
+        next_sequence[-1] = choice
+        next_context = _advance_rollout_context_batch(
+            twin=twin,
+            active_context=np.asarray([context], dtype="float32"),
+            previous_sequences=np.asarray([sequence], dtype="int32"),
+            next_sequences=np.asarray([next_sequence], dtype="int32"),
+            last_artist=np.asarray([last_artist], dtype="int32"),
+            chosen=np.asarray([choice], dtype="int32"),
+            step_index=np.asarray([step + 1], dtype="int32"),
+            hour_shift=hour_shift,
+            friction_scale=friction_scale,
+            friction_indices=np.asarray(
+                [
+                    idx
+                    for idx, feature_name in enumerate(twin.context_features)
+                    if str(feature_name).startswith("tech_") or str(feature_name) == "offline"
+                ],
+                dtype="int64",
+            ),
+        )[0]
 
         if causal_artifact is not None:
             serving_features = build_serving_tabular_features(
-                np.asarray([sequence], dtype="int32"),
+                np.asarray([next_sequence], dtype="int32"),
                 np.asarray([next_context], dtype="float32"),
             )
             preference_keep, friction_keep, needs_friction_padding = _causal_feature_views(
@@ -419,15 +576,14 @@ def simulate_rollout(
 
         if causal_artifact is None:
             serving_features = build_serving_tabular_features(
-                np.asarray([sequence], dtype="int32"),
+                np.asarray([next_sequence], dtype="int32"),
                 np.asarray([next_context], dtype="float32"),
             )
         end_risk = float(np.asarray(twin.end_estimator.predict_proba(serving_features), dtype="float32")[:, 1][0] + fatigue_bias)
         end_risk = float(min(0.99, max(0.0, end_risk)))
         end_risks.append(end_risk)
 
-        sequence = np.roll(sequence, -1)
-        sequence[-1] = choice
+        sequence = next_sequence
         context = next_context
         if rng.random() < end_risk:
             break

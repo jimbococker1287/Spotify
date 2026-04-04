@@ -56,6 +56,14 @@ def _map_platform_gate(
         "max_abstention_rate": _to_float(gate.get("max_abstention_rate")),
         "challenger_selective_risk": _to_float(gate.get("challenger_selective_risk")),
         "challenger_abstention_rate": _to_float(gate.get("challenger_abstention_rate")),
+        "selected_candidate_rank": int(_to_float(gate.get("selected_candidate_rank")) or 0),
+        "eligible_candidate_count": int(_to_float(gate.get("eligible_candidate_count")) or 0),
+        "challenger_selection_reason": str(gate.get("challenger_selection_reason", "")).strip(),
+        "top_candidate_model_name": str(gate.get("top_candidate_model_name", "")).strip(),
+        "top_candidate_score": _to_float(gate.get("top_candidate_score")),
+        "top_candidate_risk_blockers": list(gate.get("top_candidate_risk_blockers", []))
+        if isinstance(gate.get("top_candidate_risk_blockers", []), list)
+        else [],
     }
 
 

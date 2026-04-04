@@ -91,6 +91,44 @@ def _fixture_outputs(tmp_path: Path) -> tuple[Path, Path]:
             "test": {"coverage": 0.86, "abstention_rate": 0.0, "selective_risk": 0.68},
         },
     )
+
+    for run_id, gap, drift in (
+        ("run_full_prev_1", 0.49, 0.20),
+        ("run_full_prev_2", 0.41, 0.19),
+    ):
+        prior_run_dir = outputs / "runs" / run_id
+        prior_analysis = prior_run_dir / "analysis"
+        prior_analysis.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            prior_run_dir / "run_manifest.json",
+            {
+                "run_id": run_id,
+                "profile": "full",
+                "timestamp": f"2026-03-28T12:00:0{1 if run_id.endswith('1') else 2}+00:00",
+            },
+        )
+        _write_json(
+            prior_analysis / "robustness_summary.json",
+            [
+                {
+                    "model_name": "retrieval_reranker",
+                    "max_top1_gap": gap,
+                    "worst_segment": "repeat_from_prev",
+                    "worst_bucket": "new",
+                    "worst_bucket_count": 1500,
+                    "worst_bucket_share": 0.44,
+                }
+            ],
+        )
+        _write_json(
+            prior_analysis / "data_drift_summary.json",
+            {
+                "target_drift": {"train_vs_test_jsd": drift},
+                "largest_segment_shift": {"segment": "repeat_from_prev", "bucket": "new", "abs_share_shift": 0.18},
+                "drift_interpretation": {"dominant_context_driver": "behavioral"},
+            },
+        )
+
     (analysis_dir / "ablation_summary.csv").write_text("group,model_name\n", encoding="utf-8")
     (analysis_dir / "backtest_significance.csv").write_text("left_model,right_model\n", encoding="utf-8")
 
@@ -145,6 +183,9 @@ def test_build_research_claims_report_ranks_primary_and_backup(tmp_path: Path) -
     assert report["backup_claim"]["status"] == "promising_but_unlocked"
     assert report["believable_submission_path"] is True
     assert any("repeated-seed benchmark lock" in item for item in report["claim_gaps"])
+    assert report["primary_claim"]["metrics"]["repeated_run_count"] == 3
+    assert report["primary_claim"]["metrics"]["consistent_slice_run_count"] == 3
+    assert report["primary_claim"]["metrics"]["dominant_context_driver"] == "behavioral"
 
 
 def test_write_research_claims_report_creates_brief_and_outline(tmp_path: Path) -> None:
@@ -166,3 +207,50 @@ def test_write_research_claims_report_creates_brief_and_outline(tmp_path: Path) 
     assert "Primary Claim" in markdown
     assert "Backup Claim" in markdown
     assert "Publication Outline" in outline
+
+
+def test_candidate_ranking_claim_uses_retrieval_benchmark_lock_when_available(tmp_path: Path) -> None:
+    outputs, _ = _fixture_outputs(tmp_path)
+    run_dir = outputs / "runs" / "run_full"
+    history_dir = outputs / "history"
+    benchmark_manifest = history_dir / "benchmark_lock_demo_ready_manifest.json"
+    _write_csv(
+        history_dir / "benchmark_lock_demo_ready_summary.csv",
+        [
+            {"model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "run_count": 3, "val_top1_mean": 0.24, "test_top1_mean": 0.29, "val_top1_ci95": 0.01},
+            {"model_name": "gru_artist", "model_type": "deep", "run_count": 3, "val_top1_mean": 0.16, "test_top1_mean": 0.15, "val_top1_ci95": 0.01},
+        ],
+    )
+    _write_csv(
+        history_dir / "benchmark_lock_demo_ready_significance.csv",
+        [
+            {
+                "left_model": "retrieval_reranker",
+                "right_model": "gru_artist",
+                "shared_runs": 3,
+                "mean_diff_val_top1": 0.08,
+                "ci95_diff_val_top1": 0.02,
+                "z_score": 3.1,
+                "significant_at_95": 1,
+            }
+        ],
+    )
+    _write_json(
+        benchmark_manifest,
+        {
+            "benchmark_id": "demo_ready",
+            "comparison_ready": True,
+            "summary": ["Benchmark lock is comparison ready."],
+        },
+    )
+
+    report = build_research_claims_report(
+        outputs,
+        run_dir=run_dir,
+        benchmark_manifest_path=benchmark_manifest,
+    )
+
+    candidate_claim = next(claim for claim in report["claims"] if claim["key"] == "candidate_ranking")
+    assert candidate_claim["metrics"]["benchmark_retrieval_model_name"] == "retrieval_reranker"
+    assert candidate_claim["metrics"]["benchmark_significant_lift"] is True
+    assert not any("Add retrieval and reranker models" in item for item in candidate_claim["missing_checks"])

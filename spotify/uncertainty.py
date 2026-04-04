@@ -50,6 +50,60 @@ def _valid_label_mask(y_true: np.ndarray, width: int) -> np.ndarray:
     return (y_arr >= 0) & (y_arr < width)
 
 
+def apply_temperature_scaling(proba: np.ndarray, temperature: float) -> np.ndarray:
+    proba_arr = _as_2d_float_array(proba)
+    if proba_arr.shape[0] == 0:
+        return proba_arr.astype("float32", copy=False)
+    temp = max(float(temperature), 1e-3)
+    clipped = np.clip(proba_arr, 1e-9, 1.0)
+    logits = np.log(clipped) / temp
+    logits -= logits.max(axis=1, keepdims=True)
+    exp = np.exp(logits)
+    denom = np.sum(exp, axis=1, keepdims=True)
+    denom[denom <= 0] = 1.0
+    return (exp / denom).astype("float32")
+
+
+def _negative_log_likelihood(proba: np.ndarray, y_true: np.ndarray) -> float:
+    proba_arr = _as_2d_float_array(proba)
+    y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
+    if proba_arr.shape[0] == 0 or proba_arr.shape[0] != y_arr.shape[0]:
+        return float("inf")
+    valid = _valid_label_mask(y_arr, proba_arr.shape[1])
+    if not np.any(valid):
+        return float("inf")
+    valid_idx = np.flatnonzero(valid)
+    y_valid = y_arr[valid]
+    clipped = np.clip(proba_arr[valid_idx, y_valid], 1e-9, 1.0)
+    return float(-np.mean(np.log(clipped)))
+
+
+def fit_temperature_scaling(proba: np.ndarray, y_true: np.ndarray) -> float:
+    proba_arr = _as_2d_float_array(proba)
+    y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
+    if proba_arr.shape[0] == 0 or proba_arr.shape[0] != y_arr.shape[0]:
+        return 1.0
+    valid = _valid_label_mask(y_arr, proba_arr.shape[1])
+    if not np.any(valid):
+        return 1.0
+
+    temperatures = np.concatenate(
+        [
+            np.array([0.65, 0.8, 1.0, 1.25, 1.6], dtype="float64"),
+            np.geomspace(0.5, 3.0, num=15, dtype="float64"),
+        ]
+    )
+    best_temp = 1.0
+    best_nll = float("inf")
+    for temp in sorted({round(float(item), 6) for item in temperatures.tolist()}):
+        calibrated = apply_temperature_scaling(proba_arr, temp)
+        nll = _negative_log_likelihood(calibrated, y_arr)
+        if nll < best_nll:
+            best_nll = nll
+            best_temp = float(temp)
+    return best_temp
+
+
 def fit_split_conformal_classifier(
     proba: np.ndarray,
     y_true: np.ndarray,

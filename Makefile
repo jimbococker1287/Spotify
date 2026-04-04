@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo branch-portfolio outward-package regression-guard regression-alert refresh-champion-gate control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package regression-guard regression-alert refresh-champion-gate control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -88,6 +88,10 @@ research-claims:
 claim-to-demo:
 	mkdir -p outputs
 	$(RUN_PY) -m spotify.claim_to_demo $(EXTRA_ARGS)
+
+front-door:
+	mkdir -p outputs
+	$(RUN_PY) -m spotify.front_door $(EXTRA_ARGS)
 
 branch-portfolio:
 	mkdir -p outputs

@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from .retrieval_common import SelfSupervisedPretrainingResult
+
+
+def build_retrieval_summary_payload(
+    *,
+    top_k: int,
+    embedding_dim: int,
+    enable_self_supervised_pretraining: bool,
+    pretrain_result: SelfSupervisedPretrainingResult,
+    retrieval_epochs: int,
+    val_candidate_hit: float,
+    test_candidate_hit: float,
+    objective_rows: list[dict[str, object]],
+    ann_metrics_val: dict[str, float],
+    ann_metrics_test: dict[str, float],
+    retrieval_metrics_val: dict[str, float],
+    retrieval_metrics_test: dict[str, float],
+    rerank_metrics_val: dict[str, float],
+    rerank_metrics_test: dict[str, float],
+) -> dict[str, object]:
+    return {
+        "candidate_k": top_k,
+        "embedding_dim": embedding_dim,
+        "enable_self_supervised_pretraining": bool(enable_self_supervised_pretraining),
+        "selected_pretraining_objective": str(pretrain_result.objective_name),
+        "pretraining_pairs": int(pretrain_result.pair_count),
+        "retrieval_epochs": int(retrieval_epochs),
+        "val_candidate_hit_rate": float(val_candidate_hit),
+        "test_candidate_hit_rate": float(test_candidate_hit),
+        "pretraining_objectives": objective_rows,
+        "ann_validation": ann_metrics_val,
+        "ann_test": ann_metrics_test,
+        "retrieval": {
+            "val": retrieval_metrics_val,
+            "test": retrieval_metrics_test,
+        },
+        "reranker": {
+            "val": rerank_metrics_val,
+            "test": rerank_metrics_test,
+        },
+    }
+
+
+def build_retrieval_result_rows(
+    *,
+    top_k: int,
+    fit_seconds: float,
+    retrieval_epochs: int,
+    pretrain_result: SelfSupervisedPretrainingResult,
+    pretrain_path: Path,
+    retrieval_bundle_path: Path,
+    retrieval_model_path: Path,
+    reranker_bundle_path: Path,
+    reranker_model_path: Path,
+    reranker_path: Path,
+    retrieval_metrics_val: dict[str, float],
+    retrieval_metrics_test: dict[str, float],
+    rerank_metrics_val: dict[str, float],
+    rerank_metrics_test: dict[str, float],
+    val_candidate_hit: float,
+    test_candidate_hit: float,
+    ann_metrics_val: dict[str, float],
+    ann_metrics_test: dict[str, float],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "model_name": "retrieval_dual_encoder",
+            "model_type": "retrieval",
+            "model_family": "dual_encoder",
+            "val_top1": float(retrieval_metrics_val["top1"]),
+            "val_top5": float(retrieval_metrics_val["top5"]),
+            "val_ndcg_at5": float(retrieval_metrics_val["ndcg_at5"]),
+            "val_mrr_at5": float(retrieval_metrics_val["mrr_at5"]),
+            "val_coverage_at5": float(retrieval_metrics_val["coverage_at5"]),
+            "val_diversity_at5": float(retrieval_metrics_val["diversity_at5"]),
+            "test_top1": float(retrieval_metrics_test["top1"]),
+            "test_top5": float(retrieval_metrics_test["top5"]),
+            "test_ndcg_at5": float(retrieval_metrics_test["ndcg_at5"]),
+            "test_mrr_at5": float(retrieval_metrics_test["mrr_at5"]),
+            "test_coverage_at5": float(retrieval_metrics_test["coverage_at5"]),
+            "test_diversity_at5": float(retrieval_metrics_test["diversity_at5"]),
+            "fit_seconds": fit_seconds,
+            "epochs": retrieval_epochs,
+            "prediction_bundle_path": str(retrieval_bundle_path),
+            "retrieval_artifact_path": str(retrieval_model_path),
+            "pretraining_artifact_path": str(pretrain_path),
+            "pretraining_objective": str(pretrain_result.objective_name),
+            f"val_recall_at{top_k}": float(val_candidate_hit),
+            f"test_recall_at{top_k}": float(test_candidate_hit),
+            f"val_ann_recall_at{top_k}": float(ann_metrics_val["ann_recall_at_k"]),
+            f"test_ann_recall_at{top_k}": float(ann_metrics_test["ann_recall_at_k"]),
+        },
+        {
+            "model_name": "retrieval_reranker",
+            "model_type": "retrieval_reranker",
+            "model_family": "candidate_reranker",
+            "val_top1": float(rerank_metrics_val["top1"]),
+            "val_top5": float(rerank_metrics_val["top5"]),
+            "val_ndcg_at5": float(rerank_metrics_val["ndcg_at5"]),
+            "val_mrr_at5": float(rerank_metrics_val["mrr_at5"]),
+            "val_coverage_at5": float(rerank_metrics_val["coverage_at5"]),
+            "val_diversity_at5": float(rerank_metrics_val["diversity_at5"]),
+            "test_top1": float(rerank_metrics_test["top1"]),
+            "test_top5": float(rerank_metrics_test["top5"]),
+            "test_ndcg_at5": float(rerank_metrics_test["ndcg_at5"]),
+            "test_mrr_at5": float(rerank_metrics_test["mrr_at5"]),
+            "test_coverage_at5": float(rerank_metrics_test["coverage_at5"]),
+            "test_diversity_at5": float(rerank_metrics_test["diversity_at5"]),
+            "fit_seconds": fit_seconds,
+            "epochs": retrieval_epochs,
+            "prediction_bundle_path": str(reranker_bundle_path),
+            "retrieval_artifact_path": str(reranker_model_path),
+            "estimator_artifact_path": str(reranker_path),
+            "pretraining_artifact_path": str(pretrain_path),
+            "pretraining_objective": str(pretrain_result.objective_name),
+            f"val_recall_at{top_k}": float(val_candidate_hit),
+            f"test_recall_at{top_k}": float(test_candidate_hit),
+            f"val_ann_recall_at{top_k}": float(ann_metrics_val["ann_recall_at_k"]),
+            f"test_ann_recall_at{top_k}": float(ann_metrics_test["ann_recall_at_k"]),
+        },
+    ]
+
+
+__all__ = [
+    "build_retrieval_result_rows",
+    "build_retrieval_summary_payload",
+]

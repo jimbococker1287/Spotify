@@ -93,6 +93,50 @@ def test_evaluate_promotion_gate_supports_custom_metric_name_and_risk_caps(tmp_p
     assert result["status"] == "fail_selective_risk"
 
 
+def test_evaluate_promotion_gate_selects_best_risk_eligible_candidate(tmp_path: Path) -> None:
+    history_csv = tmp_path / "top1_history.csv"
+    _write_history(
+        history_csv,
+        [
+            {"run_id": "run_a", "profile": "prod", "model_name": "champion", "top1": 0.42},
+        ],
+        fieldnames=["run_id", "profile", "model_name", "top1"],
+    )
+
+    result = evaluate_promotion_gate(
+        history_csv=history_csv,
+        current_run_id="run_b",
+        current_rows=[
+            {"model_name": "risky_candidate", "top1": 0.46},
+            {"model_name": "eligible_candidate", "top1": 0.44},
+        ],
+        metric_name="top1",
+        regression_threshold=0.0,
+        current_profile="prod",
+        current_risk_metrics={
+            "risky_candidate": {
+                "val_selective_risk": 0.28,
+                "val_abstention_rate": 0.08,
+            },
+            "eligible_candidate": {
+                "val_selective_risk": 0.10,
+                "val_abstention_rate": 0.04,
+            },
+        },
+        max_selective_risk=0.15,
+        max_abstention_rate=0.10,
+    )
+
+    assert result["champion_model_name"] == "champion"
+    assert result["challenger_model_name"] == "eligible_candidate"
+    assert result["promoted"] is True
+    assert result["status"] == "pass"
+    assert result["selected_candidate_rank"] == 2
+    assert result["challenger_selection_reason"] == "highest_scoring_risk_eligible_candidate"
+    assert result["top_candidate_model_name"] == "risky_candidate"
+    assert result["top_candidate_risk_blockers"] == ["selective_risk"]
+
+
 def test_generic_drift_helpers_support_custom_segments_and_targets() -> None:
     reference = SequenceSplitSnapshot(
         name="baseline",
@@ -222,3 +266,78 @@ def test_build_conformal_abstention_summary_honors_env_operating_point(monkeypat
     assert payload["operating_point"]["target_selective_risk"] == 0.25
     assert payload["operating_point"]["min_accepted_rate"] == 0.5
     assert payload["calibration"]["operating_threshold"] >= payload["calibration"]["threshold"]
+
+
+def test_build_conformal_abstention_summary_supports_scoped_env_and_temperature_scaling(monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_CLASSICAL_CONFORMAL_TARGET_SELECTIVE_RISK", "0.45")
+    monkeypatch.setenv("SPOTIFY_CLASSICAL_CONFORMAL_MIN_ACCEPTED_RATE", "0.70")
+    payload = build_conformal_abstention_summary(
+        tag="classical_mlp_optuna",
+        val_proba=np.array(
+            [
+                [0.42, 0.40, 0.18],
+                [0.30, 0.60, 0.10],
+                [0.25, 0.35, 0.40],
+                [0.34, 0.33, 0.33],
+                [0.41, 0.38, 0.21],
+            ],
+            dtype="float32",
+        ),
+        val_y=np.array([0, 1, 2, 1, 0], dtype="int32"),
+        test_proba=np.array(
+            [
+                [0.44, 0.39, 0.17],
+                [0.32, 0.55, 0.13],
+            ],
+            dtype="float32",
+        ),
+        test_y=np.array([0, 1], dtype="int32"),
+        alpha=0.10,
+        env_prefix="CLASSICAL",
+        enable_temperature_scaling=True,
+    )
+
+    assert payload is not None
+    assert payload["operating_point"]["target_selective_risk"] == 0.45
+    assert payload["operating_point"]["min_accepted_rate"] == 0.70
+    assert payload["probability_calibration"]["method"] == "temperature_scaling"
+    assert float(payload["probability_calibration"]["temperature"]) > 0.0
+
+
+def test_evaluate_promotion_gate_prefers_eligible_challenger_when_risk_caps_exist(tmp_path: Path) -> None:
+    history_csv = tmp_path / "history.csv"
+    _write_history(
+        history_csv,
+        [
+            {"run_id": "run_a", "profile": "prod", "model_name": "champion", "val_top1": 0.30},
+        ],
+        fieldnames=["run_id", "profile", "model_name", "val_top1"],
+    )
+
+    result = evaluate_promotion_gate(
+        history_csv=history_csv,
+        current_run_id="run_b",
+        current_rows=[
+            {"model_name": "high_risk_candidate", "val_top1": 0.33},
+            {"model_name": "eligible_candidate", "val_top1": 0.315},
+        ],
+        metric_name="val_top1",
+        regression_threshold=0.02,
+        current_profile="prod",
+        current_risk_metrics={
+            "high_risk_candidate": {
+                "val_selective_risk": 0.62,
+                "val_abstention_rate": 0.10,
+            },
+            "eligible_candidate": {
+                "val_selective_risk": 0.30,
+                "val_abstention_rate": 0.10,
+            },
+        },
+        max_selective_risk=0.50,
+        max_abstention_rate=0.30,
+    )
+
+    assert result["challenger_model_name"] == "eligible_candidate"
+    assert result["promoted"] is True
+    assert result["status"] == "pass"

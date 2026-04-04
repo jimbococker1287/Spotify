@@ -94,7 +94,11 @@ def _load_prepared_targets(manifest: dict[str, object]) -> tuple[np.ndarray | No
     return np.asarray(y_val), np.asarray(y_test)
 
 
-def _load_run_backtest_rows(outputs_dir: Path, run_id: str) -> list[dict[str, object]]:
+def _load_run_backtest_rows(outputs_dir: Path, run_id: str, *, run_dir: Path | None = None) -> list[dict[str, object]]:
+    if run_dir is not None:
+        local_backtest = safe_read_csv(run_dir / "backtest" / "temporal_backtest.csv")
+        if not local_backtest.empty:
+            return local_backtest.to_dict(orient="records")
     frame = safe_read_csv(outputs_dir / "history" / "backtest_history.csv")
     if frame.empty or "run_id" not in frame.columns:
         return []
@@ -154,7 +158,7 @@ def refresh_champion_gate(
         current_results=[dict(row) for row in current_results if isinstance(row, dict)],
         regression_threshold=threshold if threshold is not None else 0.005,
         backtest_history_csv=outputs_dir / "history" / "backtest_history.csv",
-        current_backtest_rows=_load_run_backtest_rows(outputs_dir, run_id),
+        current_backtest_rows=_load_run_backtest_rows(outputs_dir, run_id, run_dir=run_dir),
         metric_source=metric_source,
         current_profile=str(manifest.get("profile", "")).strip() or None,
         require_profile_match=profile_match,

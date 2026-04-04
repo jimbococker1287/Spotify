@@ -26,10 +26,18 @@ EPOCHS="${EPOCHS:-6}"
 BENCHMARK_ENABLE_MLFLOW="${BENCHMARK_ENABLE_MLFLOW:-1}"
 BENCHMARK_CLASSICAL_ONLY="${BENCHMARK_CLASSICAL_ONLY:-0}"
 BENCHMARK_RESUME="${BENCHMARK_RESUME:-1}"
+BENCHMARK_ENABLE_RETRIEVAL="${BENCHMARK_ENABLE_RETRIEVAL:-1}"
+BENCHMARK_TF_SAFE_MODE="${BENCHMARK_TF_SAFE_MODE:-1}"
 BENCHMARK_HISTORY_CSV="${BENCHMARK_HISTORY_CSV:-$ROOT_DIR/outputs/history/experiment_history.csv}"
 
 export SPOTIFY_FORCE_CPU="${SPOTIFY_FORCE_CPU:-1}"
-export SPOTIFY_RUN_EAGER="${SPOTIFY_RUN_EAGER:-0}"
+if [[ "$BENCHMARK_TF_SAFE_MODE" == "1" ]]; then
+  export SPOTIFY_RUN_EAGER="${SPOTIFY_RUN_EAGER:-1}"
+  export SPOTIFY_STEPS_PER_EXECUTION="${SPOTIFY_STEPS_PER_EXECUTION:-1}"
+  export SPOTIFY_TF_PREFETCH="${SPOTIFY_TF_PREFETCH:-1}"
+else
+  export SPOTIFY_RUN_EAGER="${SPOTIFY_RUN_EAGER:-0}"
+fi
 export SPOTIFY_DISABLE_MONITOR="${SPOTIFY_DISABLE_MONITOR:-1}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$ROOT_DIR/outputs/history/.mplconfig}"
@@ -42,6 +50,8 @@ echo "Seeds: $SEEDS"
 echo "Deep models: $DEEP_MODELS"
 echo "Classical models: $CLASSICAL_MODELS"
 echo "Classical only: $BENCHMARK_CLASSICAL_ONLY"
+echo "Retrieval enabled: $BENCHMARK_ENABLE_RETRIEVAL"
+echo "TensorFlow safe mode: $BENCHMARK_TF_SAFE_MODE"
 
 for seed in $SEEDS; do
   RUN_NAME="benchmark-lock-${BENCHMARK_ID}-seed-${seed}"
@@ -81,6 +91,11 @@ PY
   fi
   if [[ "$BENCHMARK_CLASSICAL_ONLY" == "1" ]]; then
     CMD+=("--classical-only")
+  fi
+  if [[ "$BENCHMARK_ENABLE_RETRIEVAL" == "1" ]]; then
+    CMD+=("--retrieval-stack")
+  else
+    CMD+=("--no-retrieval-stack")
   fi
   CMD+=("$@")
   "${CMD[@]}"

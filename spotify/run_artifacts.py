@@ -7,6 +7,7 @@ import importlib
 import json
 from pathlib import Path
 import shutil
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -141,6 +142,29 @@ def collect_run_manifests(output_dir: Path) -> list[dict[str, object]]:
         row["run_dir"] = str(path.parent.resolve())
         rows.append(row)
     return rows
+
+
+def _manifest_sort_key(manifest: dict[str, object]) -> tuple[str, str]:
+    timestamp_raw = str(manifest.get("timestamp", "")).strip()
+    normalized_timestamp = ""
+    if timestamp_raw:
+        try:
+            normalized_timestamp = datetime.fromisoformat(timestamp_raw).isoformat()
+        except Exception:
+            normalized_timestamp = timestamp_raw
+    run_id = str(manifest.get("run_id", "")).strip()
+    return normalized_timestamp, run_id
+
+
+def latest_manifest_run_dir(output_dir: Path) -> Path | None:
+    manifests = collect_run_manifests(output_dir)
+    if not manifests:
+        return None
+    latest = max(manifests, key=_manifest_sort_key)
+    run_dir = Path(str(latest.get("run_dir", "")).strip()).expanduser()
+    if run_dir.exists():
+        return run_dir.resolve()
+    return None
 
 
 def collect_run_results(output_dir: Path) -> list[dict[str, object]]:

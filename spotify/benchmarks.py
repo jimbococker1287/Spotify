@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+import hashlib
 from pathlib import Path
 from typing import Callable
 import json
@@ -13,6 +14,10 @@ import numpy as np
 from .data import PreparedData
 from .probability_bundles import align_proba_to_num_classes, save_prediction_bundle
 from .ranking import ranking_metrics_from_proba
+from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+
+
+CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v1"
 
 
 @dataclass
@@ -47,6 +52,16 @@ class ClassicalFeatureBundle:
     y_train: np.ndarray
     y_val: np.ndarray
     y_test: np.ndarray
+
+
+@dataclass(frozen=True)
+class ClassicalBenchmarkCachePaths:
+    cache_key: str
+    cache_dir: Path
+    result_path: Path
+    metadata_path: Path
+    estimator_artifact_path: Path
+    prediction_bundle_path: Path
 
 
 def _sequence_feature_block(seq: np.ndarray) -> np.ndarray:
@@ -136,6 +151,141 @@ def build_full_tabular_dataset(
     X = np.concatenate([bundle.X_train, bundle.X_val, bundle.X_test], axis=0)
     y = np.concatenate([bundle.y_train, bundle.y_val, bundle.y_test], axis=0)
     return X, y
+
+
+def _classical_cache_enabled_from_env() -> bool:
+    raw = os.getenv("SPOTIFY_CACHE_CLASSICAL", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _classical_benchmarks_source_digest() -> str:
+    sources = [Path(__file__).resolve()]
+    digest = hashlib.sha256()
+    for path in sources:
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def _build_classical_cache_payload(
+    *,
+    cache_fingerprint: str,
+    model_name: str,
+    random_seed: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    sequence_length: int,
+    num_artists: int,
+    num_ctx: int,
+) -> dict[str, object]:
+    return {
+        "cache_schema_version": CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION,
+        "prepared_fingerprint": str(cache_fingerprint).strip(),
+        "model_name": str(model_name),
+        "random_seed": int(random_seed),
+        "max_train_samples": int(max_train_samples),
+        "max_eval_samples": int(max_eval_samples),
+        "sequence_length": int(sequence_length),
+        "num_artists": int(num_artists),
+        "num_ctx": int(num_ctx),
+        "source_digest": _classical_benchmarks_source_digest(),
+    }
+
+
+def _build_classical_cache_key(payload: dict[str, object]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _resolve_classical_model_cache_paths(
+    *,
+    cache_root: Path,
+    cache_fingerprint: str,
+    model_name: str,
+    cache_key: str,
+) -> ClassicalBenchmarkCachePaths:
+    cache_dir = (cache_root / cache_fingerprint / model_name / cache_key).resolve()
+    return ClassicalBenchmarkCachePaths(
+        cache_key=cache_key,
+        cache_dir=cache_dir,
+        result_path=cache_dir / "result.json",
+        metadata_path=cache_dir / "cache_meta.json",
+        estimator_artifact_path=cache_dir / "estimators" / f"classical_{model_name}.joblib",
+        prediction_bundle_path=cache_dir / "prediction_bundles" / f"classical_{model_name}.npz",
+    )
+
+
+def _load_cached_classical_result(
+    *,
+    cache_paths: ClassicalBenchmarkCachePaths,
+    model_name: str,
+    output_dir: Path,
+    logger,
+) -> ClassicalBenchmarkResult | None:
+    try:
+        payload = safe_read_json(cache_paths.result_path, default=None)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("cache_schema_version") != CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION:
+            return None
+        result_payload = payload.get("result")
+        if not isinstance(result_payload, dict):
+            return None
+
+        estimator_output_path = output_dir / "estimators" / f"classical_{model_name}.joblib"
+        prediction_output_path = output_dir / "prediction_bundles" / f"classical_{model_name}.npz"
+
+        if result_payload.get("estimator_artifact_path"):
+            if not cache_paths.estimator_artifact_path.exists():
+                return None
+            copy_file_if_changed(cache_paths.estimator_artifact_path, estimator_output_path)
+            result_payload["estimator_artifact_path"] = str(estimator_output_path.resolve())
+        else:
+            result_payload["estimator_artifact_path"] = ""
+
+        if result_payload.get("prediction_bundle_path"):
+            if not cache_paths.prediction_bundle_path.exists():
+                return None
+            copy_file_if_changed(cache_paths.prediction_bundle_path, prediction_output_path)
+            result_payload["prediction_bundle_path"] = str(prediction_output_path.resolve())
+        else:
+            result_payload["prediction_bundle_path"] = ""
+
+        return ClassicalBenchmarkResult(**result_payload)
+    except Exception as exc:
+        logger.warning("Classical benchmark cache load failed for %s (%s). Rebuilding.", model_name, exc)
+        return None
+
+
+def _save_classical_result_to_cache(
+    *,
+    cache_paths: ClassicalBenchmarkCachePaths,
+    cache_payload: dict[str, object],
+    result: ClassicalBenchmarkResult,
+) -> None:
+    try:
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if result.estimator_artifact_path:
+            source_estimator_path = Path(result.estimator_artifact_path).expanduser()
+            if source_estimator_path.exists():
+                copy_file_if_changed(source_estimator_path, cache_paths.estimator_artifact_path)
+
+        if result.prediction_bundle_path:
+            source_bundle_path = Path(result.prediction_bundle_path).expanduser()
+            if source_bundle_path.exists():
+                copy_file_if_changed(source_bundle_path, cache_paths.prediction_bundle_path)
+
+        write_json(
+            cache_paths.result_path,
+            {
+                "cache_schema_version": CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION,
+                "result": asdict(result),
+            },
+            sort_keys=True,
+        )
+        write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+    except Exception:
+        return None
 
 
 def _encode_labels_to_local_indices(y_true: np.ndarray, class_labels: np.ndarray | None) -> np.ndarray:
@@ -583,9 +733,71 @@ def run_classical_benchmarks(
     max_eval_samples: int,
     logger,
     feature_bundle: ClassicalFeatureBundle | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+    cache_stats_out: dict[str, object] | None = None,
 ) -> list[ClassicalBenchmarkResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     validate_classical_models(selected_models, random_seed)
+
+    cache_enabled = _classical_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
+    cache_contexts: dict[str, tuple[ClassicalBenchmarkCachePaths, dict[str, object]]] = {}
+    cached_results_by_model: dict[str, ClassicalBenchmarkResult] = {}
+    uncached_models: list[str] = []
+    for model_name in selected_models:
+        if cache_enabled and cache_root is not None:
+            cache_payload = _build_classical_cache_payload(
+                cache_fingerprint=cache_fingerprint,
+                model_name=model_name,
+                random_seed=random_seed,
+                max_train_samples=max_train_samples,
+                max_eval_samples=max_eval_samples,
+                sequence_length=int(data.X_seq_train.shape[1]) if data.X_seq_train.ndim >= 2 else 0,
+                num_artists=int(data.num_artists),
+                num_ctx=int(data.num_ctx),
+            )
+            cache_key = _build_classical_cache_key(cache_payload)
+            cache_paths = _resolve_classical_model_cache_paths(
+                cache_root=cache_root,
+                cache_fingerprint=str(cache_fingerprint).strip(),
+                model_name=model_name,
+                cache_key=cache_key,
+            )
+            cache_contexts[model_name] = (cache_paths, cache_payload)
+            cached = _load_cached_classical_result(
+                cache_paths=cache_paths,
+                model_name=model_name,
+                output_dir=output_dir,
+                logger=logger,
+            )
+            if cached is not None:
+                cached_results_by_model[model_name] = cached
+                continue
+        uncached_models.append(model_name)
+
+    if cache_stats_out is not None:
+        cache_stats_out.clear()
+        cache_stats_out.update(
+            {
+                "enabled": bool(cache_enabled),
+                "fingerprint": (str(cache_fingerprint).strip() if cache_enabled else ""),
+                "hit_model_names": [name for name in selected_models if name in cached_results_by_model],
+                "miss_model_names": list(uncached_models),
+            }
+        )
+
+    logger.info(
+        "Classical benchmark cache status: enabled=%s fingerprint=%s hits=%d misses=%d",
+        cache_enabled,
+        (cache_fingerprint if cache_enabled else "disabled"),
+        len(cached_results_by_model),
+        len(uncached_models),
+    )
+
+    if not uncached_models:
+        ordered_results = [cached_results_by_model[name] for name in selected_models if name in cached_results_by_model]
+        write_json(output_dir / "classical_results.json", [asdict(r) for r in ordered_results])
+        return ordered_results
 
     bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
     X_train, X_val, X_test = bundle.X_train, bundle.X_val, bundle.X_test
@@ -625,7 +837,7 @@ def run_classical_benchmarks(
     estimator_output_dir.mkdir(parents=True, exist_ok=True)
 
     workers, estimator_n_jobs = resolve_classical_parallelism()
-    if workers > 1 and len(selected_models) > 1:
+    if workers > 1 and len(uncached_models) > 1:
         logger.info(
             "Classical model parallelism enabled: workers=%d estimator_n_jobs=%d",
             workers,
@@ -634,11 +846,11 @@ def run_classical_benchmarks(
     else:
         logger.info("Classical model parallelism: workers=1 estimator_n_jobs=%d", estimator_n_jobs)
 
-    results: list[ClassicalBenchmarkResult] = []
-    if workers > 1 and len(selected_models) > 1:
+    fresh_results_by_model: dict[str, ClassicalBenchmarkResult] = {}
+    if workers > 1 and len(uncached_models) > 1:
         futures = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            for name in selected_models:
+            for name in uncached_models:
                 logger.info("Training classical model %s", name)
                 future = executor.submit(
                     _fit_single_classical_model,
@@ -670,9 +882,9 @@ def run_classical_benchmarks(
                     result.test_top1,
                     f"{result.test_top5:.4f}" if not np.isnan(result.test_top5) else "n/a",
                 )
-            results = [ordered[name] for name in selected_models if name in ordered]
+            fresh_results_by_model = ordered
     else:
-        for name in selected_models:
+        for name in uncached_models:
             logger.info("Training classical model %s", name)
             result = _fit_single_classical_model(
                 model_name=name,
@@ -696,10 +908,24 @@ def run_classical_benchmarks(
                 result.test_top1,
                 f"{result.test_top5:.4f}" if not np.isnan(result.test_top5) else "n/a",
             )
-            results.append(result)
+            fresh_results_by_model[name] = result
 
-    payload = [asdict(r) for r in results]
-    with (output_dir / "classical_results.json").open("w", encoding="utf-8") as out:
-        json.dump(payload, out, indent=2)
+    if cache_enabled:
+        for model_name, result in fresh_results_by_model.items():
+            cache_context = cache_contexts.get(model_name)
+            if cache_context is None:
+                continue
+            cache_paths, cache_payload = cache_context
+            _save_classical_result_to_cache(
+                cache_paths=cache_paths,
+                cache_payload=cache_payload,
+                result=result,
+            )
 
-    return results
+    ordered_results = [
+        cached_results_by_model.get(model_name) or fresh_results_by_model.get(model_name)
+        for model_name in selected_models
+    ]
+    final_results = [result for result in ordered_results if result is not None]
+    write_json(output_dir / "classical_results.json", [asdict(r) for r in final_results])
+    return final_results

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import joblib
 import numpy as np
 
-from spotify.champion_gate_refresh import refresh_champion_gate
+from spotify.champion_gate_refresh import _load_run_backtest_rows, refresh_champion_gate
 from spotify.probability_bundles import save_prediction_bundle
 from spotify.run_artifacts import safe_read_json, write_json
 
@@ -168,3 +168,22 @@ def test_champion_gate_refresh_module_updates_existing_run(tmp_path: Path) -> No
     assert "challenger=extra_trees" in result.stdout
     assert "challenger_selective_risk=0.0" in result.stdout
     assert gate_payload["challenger_selective_risk"] == 0.0
+
+
+def test_load_run_backtest_rows_prefers_local_backtest_artifact(tmp_path: Path) -> None:
+    outputs_dir = tmp_path / "outputs"
+    run_dir, run_id = _build_completed_run(outputs_dir)
+    backtest_dir = run_dir / "backtest"
+    backtest_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(
+        backtest_dir / "temporal_backtest.csv",
+        ["model_name", "top1", "fold"],
+        [
+            {"model_name": "retrieval_reranker", "top1": 0.41, "fold": 1},
+            {"model_name": "retrieval_reranker", "top1": 0.39, "fold": 2},
+        ],
+    )
+
+    rows = _load_run_backtest_rows(outputs_dir, run_id, run_dir=run_dir)
+
+    assert [row["model_name"] for row in rows] == ["retrieval_reranker", "retrieval_reranker"]

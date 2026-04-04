@@ -3,6 +3,7 @@ spotify-branch-portfolio = spotify.branch_portfolio:main
 spotify-claim-to-demo = spotify.claim_to_demo:main
 spotify-compare-public = spotify.compare_public:main
 spotify-control-room = spotify.control_room:main
+spotify-front-door = spotify.front_door:main
 spotify-lab = spotify.cli:main
 spotify-outward-package = spotify.outward_package:main
 spotify-predict = spotify.predict_next:main

@@ -489,3 +489,150 @@ Validation gate:
 - `compileall` passed for the touched Python runtime/test files.
 - `tests/test_pipeline_runtime_shortlists.py` and `tests/test_config_smoke.py` passed.
 - `bash -n scripts/run_everything.sh` passed.
+
+### Persistent Optuna Cache Reuse
+
+Scope:
+- Added a persistent Optuna cache in `spotify/tuning.py` keyed by the prepared-data fingerprint plus the effective tuning budget for each model.
+- Wired the pipeline to pass the prepared-data fingerprint and cache root into `run_optuna_tuning(...)` from `spotify/pipeline_runtime.py`.
+- Added per-run phase metadata for cache hits and misses, and made the launcher explicitly opt into the new cache with `SPOTIFY_CACHE_OPTUNA=1`.
+
+What the cache reuses:
+- tuned estimator artifact
+- tuned prediction bundle
+- per-model Optuna trial log
+- per-model Optuna history plot
+- tuned metrics / params summary
+
+Behavioral goal:
+- if the prepared-data fingerprint and tuning settings have not changed, the next run should skip the Optuna search entirely for cached models and simply hydrate the current run directory from cache
+- this reuse happens before Optuna import and before classical feature-bundle construction, so the hot path avoids both tuning and most setup overhead
+
+Measured impact:
+- Direct live benchmark on a real `run_optuna_tuning(...)` call with `selected_models=("logreg",)` and `trials=4`:
+  - cold run (populate cache): `0.6904s`
+  - warm run (cache hit): `0.0011s`
+  - speedup: about `610.5x`
+- That micro-benchmark is intentionally tiny, but it confirms the hot path is effectively just artifact copy + JSON load.
+- Tiny end-to-end pipeline smoke on the real local dataset with `--profile dev --classical-only --classical-models logreg --optuna --optuna-models logreg --optuna-trials 2`:
+  - first run `optuna_tuning` phase: `8.7018s`
+  - second identical run `optuna_tuning` phase: `0.0030s`
+  - effective phase speedup: about `2900x`
+  - recorded cache stats on the second run: `cache_hit_count=1`, `cache_miss_count=0`
+
+Projected impact on the real overnight run:
+- Source run: `outputs/runs/20260402_181212_everything-20260402-181212`
+- Real measured `optuna_tuning` phase there: `1926.40s` (`32m 06s`)
+- On stable input data, a full Optuna cache hit would remove almost all of that phase, so the run would project from about `67m 55s` down to about `35m 49s` before accounting for the other launcher reductions already made.
+- In practice the savings will be slightly less than the raw phase time because of artifact hydration overhead, but that overhead is tiny relative to the original tuning cost.
+
+Validation gate:
+- `ruff` passed on `spotify/tuning.py`, `spotify/pipeline_runtime.py`, `tests/test_tuning_cache.py`, `tests/test_tuning_helpers.py`, and `tests/test_pipeline_runtime_shortlists.py`.
+- `compileall` passed on the touched runtime/test files.
+- `tests/test_tuning_cache.py`, `tests/test_tuning_helpers.py`, `tests/test_pipeline_runtime_shortlists.py`, and `tests/test_config_smoke.py` passed.
+- `bash -n scripts/run_everything.sh` passed.
+
+### Persistent Deep Training + SHAP Cache Reuse
+
+Scope:
+- Added a persistent per-model deep-training cache in `spotify/training.py` keyed by:
+  - prepared-data fingerprint
+  - model name
+  - random seed, batch size, epochs
+  - sequence length, artist count, context width
+  - selected runtime knobs such as eager/mixed-precision/distribution mode
+  - a source digest from `training.py` + `modeling.py`
+- Wired the pipeline to pass the prepared-data fingerprint into deep training from `spotify/pipeline_runtime.py` and record deep cache hit/miss metadata in the `deep_model_training` phase.
+- Added persistent SHAP cache reuse in `spotify/explainability.py`, keyed by:
+  - prepared-data fingerprint
+  - selected best-model name
+  - best-model checkpoint digest
+  - explainer source digest
+  - background/explain sample geometry
+- Updated the launchers so `SPOTIFY_CACHE_DEEP=1` and `SPOTIFY_CACHE_SHAP=1` are on by default.
+
+What gets reused:
+- `best_<model>.keras` checkpoints
+- deep prediction bundles in `prediction_bundles/deep_<model>.npz`
+- deep history/metric summaries used by reporting and evaluation
+- `shap_values.pkl` for the best deep model
+
+Validation and cache behavior:
+- Added `tests/test_training_cache.py` to prove deep cache hits can replay artifacts without importing TensorFlow.
+- Added an explainability cache regression in `tests/test_explainability.py` to prove SHAP cache hits return before importing `shap` or TensorFlow.
+
+Measured impact:
+- Real artifact-size deep-cache replay benchmark using the full 14-model artifact set from `outputs/runs/20260402_181212_everything-20260402-181212`:
+  - warm replay time for all 14 deep models: `0.4197s`
+- Real artifact-size SHAP-cache replay benchmark using the same run’s `shap_values.pkl`:
+  - warm replay time: `0.0048s`
+
+Impact grounded in the actual 2026-04-02 overnight run:
+- Actual `deep_model_training` phase: `1458.081s` (`24m 18s`)
+- Sum of deep-model fit times from `run_results.json`: `1173.716s`
+- Non-fit deep-phase overhead: `284.365s`
+- SHAP alone inside that phase, from `train.log`: about `186.385s`
+- Residual non-fit/non-SHAP overhead: about `97.980s`
+
+Projected identical-rerun deep-phase runtime:
+- residual plotting/sqlite/reporting overhead: `97.980s`
+- deep artifact replay: `0.4197s`
+- SHAP artifact replay: `0.0048s`
+- projected deep phase total on an identical rerun: about `98.405s` (`1m 38s`)
+
+Projected savings versus the measured overnight run:
+- deep phase improvement: about `14.8x` faster
+- deep phase reduction: about `93.3%`
+- deep phase wall-clock saved: about `22m 40s`
+
+Interpretation:
+- The big win is not making TensorFlow train 5% faster; it is avoiding repeated fitting and repeated SHAP work entirely when the prepared fingerprint and deep configuration have not changed.
+- After this pass, the remaining deep-stage cost on identical reruns is mostly plot regeneration, SQLite persistence, and other reporting work, not model fitting.
+
+Validation gate:
+- `compileall` passed on `spotify/training.py`, `spotify/explainability.py`, `spotify/pipeline_runtime.py`, `tests/test_training_cache.py`, and `tests/test_explainability.py`.
+- `ruff` passed on the touched runtime and test files.
+- `tests/test_training_cache.py`, `tests/test_training_helpers.py`, and `tests/test_explainability.py` passed.
+- `bash -n scripts/run_everything.sh` and `bash -n scripts/run_fast.sh` passed.
+
+### Persistent Classical Benchmark Cache Reuse
+
+Scope:
+- Added a persistent per-model classical benchmark cache in `spotify/benchmarks.py` keyed by:
+  - prepared-data fingerprint
+  - model name
+  - random seed
+  - train/eval sampling caps
+  - sequence length, artist count, context width
+  - a source digest from `benchmarks.py`
+- Wired the runtime to pass the prepared-data fingerprint into `run_classical_benchmarks(...)` from `spotify/pipeline_runtime_runner.py` and record classical cache hit/miss metadata in the `classical_benchmarks` phase.
+- Enabled the cache by default in `scripts/run_everything.sh` and `scripts/run_fast.sh` with `SPOTIFY_CACHE_CLASSICAL=1`.
+- Added regression coverage for the classical cache replay path and for the already-added deep reporting cache round trip.
+
+What gets reused:
+- classical estimator artifacts in `estimators/classical_<model>.joblib`
+- classical prediction bundles in `prediction_bundles/classical_<model>.npz`
+- per-model benchmark metrics
+- the assembled `classical_results.json` manifest for the current run
+
+Validation and cache behavior:
+- Added `tests/test_benchmarks_features.py` coverage proving a full classical cache hit replays results without rebuilding classical features or refitting estimators.
+- Added `tests/test_reporting_and_evaluation.py` coverage proving deep reporting artifacts can be saved to cache and restored into a fresh run directory.
+
+Measured impact:
+- Real prepared-data benchmark using `outputs/cache/prepared_data/07eb728b1f7b45a58b263785/prepared_bundle.joblib`
+- Model sweep: `logreg,extra_trees,knn,gaussian_nb,mlp`
+- Sampling caps: `max_train_samples=30000`, `max_eval_samples=12000`
+- Cold classical sweep: `71.221s`
+- Warm cache replay of the same sweep: `0.305s`
+- Speedup on identical reruns: about `233.3x` faster
+
+Projected pipeline impact:
+- On repeated nightlies where the prepared fingerprint is unchanged, the classical benchmark phase should now collapse from “fit every estimator again” to “copy cached artifacts into the new run dir”.
+- That does not make the whole pipeline `233x` faster, but it removes another minute-scale repeated-work block after the Optuna and deep-cache passes.
+
+Validation gate:
+- `compileall` passed on `spotify/benchmarks.py`, `spotify/pipeline_runtime_runner.py`, `spotify/reporting.py`, `tests/test_benchmarks_features.py`, and `tests/test_reporting_and_evaluation.py`.
+- `ruff` passed on the touched Python files.
+- `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
+- `tests/test_benchmarks_features.py`, `tests/test_reporting_and_evaluation.py`, `tests/test_training_cache.py`, `tests/test_explainability.py`, `tests/test_pipeline_runtime_shortlists.py`, and `tests/test_tuning_cache.py` passed.

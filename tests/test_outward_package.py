@@ -141,6 +141,7 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
 
     package_root = output_root / "analysis" / "outward_package"
     assert (package_root / "flagship" / "claim_to_demo.md").exists()
+    assert (package_root / "flagship" / "index.html").exists()
     assert (package_root / "taste_os" / "taste_os_showcase.md").exists()
     assert (package_root / "control_room" / "control_room.md").exists()
     assert (package_root / "creator_intelligence" / "creator_label_intelligence.md").exists()

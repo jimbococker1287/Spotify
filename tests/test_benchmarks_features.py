@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -8,6 +9,7 @@ import pandas as pd
 import spotify.benchmarks as benchmarks
 from spotify.benchmarks import _sequence_feature_block, build_classical_feature_bundle, build_tabular_features, run_classical_benchmarks
 from spotify.data import PreparedData
+from spotify.probability_bundles import save_prediction_bundle
 
 
 def _make_prepared_data() -> PreparedData:
@@ -141,6 +143,102 @@ def test_run_classical_benchmarks_reuses_provided_feature_bundle(tmp_path, monke
 
     assert len(results) == 1
     assert results[0].model_name == "dummy"
+
+
+def test_run_classical_benchmarks_reuses_cached_results_without_refitting(tmp_path: Path, monkeypatch) -> None:
+    data = _make_prepared_data()
+    logger = logging.getLogger("spotify.test.benchmarks.cache")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    cache_root = tmp_path / "cache"
+    output_dir = tmp_path / "run"
+    cache_fingerprint = "prepared123"
+    model_name = "logreg"
+    cache_payload = benchmarks._build_classical_cache_payload(
+        cache_fingerprint=cache_fingerprint,
+        model_name=model_name,
+        random_seed=7,
+        max_train_samples=0,
+        max_eval_samples=0,
+        sequence_length=int(data.X_seq_train.shape[1]),
+        num_artists=int(data.num_artists),
+        num_ctx=int(data.num_ctx),
+    )
+    cache_key = benchmarks._build_classical_cache_key(cache_payload)
+    cache_paths = benchmarks._resolve_classical_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        model_name=model_name,
+        cache_key=cache_key,
+    )
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_paths.estimator_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_paths.estimator_artifact_path.write_bytes(b"classical-estimator")
+    save_prediction_bundle(
+        cache_paths.prediction_bundle_path,
+        val_proba=np.asarray([[0.1, 0.8, 0.1], [0.7, 0.2, 0.1]], dtype="float32"),
+        test_proba=np.asarray([[0.6, 0.3, 0.1], [0.1, 0.2, 0.7]], dtype="float32"),
+    )
+    benchmarks.write_json(
+        cache_paths.result_path,
+        {
+            "cache_schema_version": benchmarks.CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION,
+            "result": {
+                "model_name": model_name,
+                "model_family": "linear",
+                "fit_seconds": 12.5,
+                "val_top1": 0.5,
+                "val_top5": 1.0,
+                "val_ndcg_at5": 0.6,
+                "val_mrr_at5": 0.55,
+                "val_coverage_at5": 1.0,
+                "val_diversity_at5": 1.0,
+                "test_top1": 0.4,
+                "test_top5": 1.0,
+                "test_ndcg_at5": 0.5,
+                "test_mrr_at5": 0.45,
+                "test_coverage_at5": 1.0,
+                "test_diversity_at5": 1.0,
+                "prediction_bundle_path": "cached-bundle",
+                "estimator_artifact_path": "cached-estimator",
+            },
+        },
+        sort_keys=True,
+    )
+    benchmarks.write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+
+    monkeypatch.setenv("SPOTIFY_CACHE_CLASSICAL", "1")
+    monkeypatch.setattr(benchmarks, "build_classical_feature_bundle", lambda _data: (_ for _ in ()).throw(AssertionError("features should not rebuild on a full cache hit")))
+    monkeypatch.setattr(benchmarks, "build_classical_estimator", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("estimator should not fit on a full cache hit")))
+    cache_stats: dict[str, object] = {}
+
+    results = run_classical_benchmarks(
+        data=data,
+        output_dir=output_dir,
+        selected_models=(model_name,),
+        random_seed=7,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=logger,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_stats_out=cache_stats,
+    )
+
+    assert len(results) == 1
+    assert results[0].model_name == model_name
+    assert results[0].fit_seconds == 12.5
+    assert results[0].val_top1 == 0.5
+    assert (output_dir / "estimators" / "classical_logreg.joblib").read_bytes() == b"classical-estimator"
+    assert (output_dir / "prediction_bundles" / "classical_logreg.npz").exists()
+    assert (output_dir / "classical_results.json").exists()
+    assert cache_stats == {
+        "enabled": True,
+        "fingerprint": cache_fingerprint,
+        "hit_model_names": [model_name],
+        "miss_model_names": [],
+    }
 
 
 def test_resolve_classical_parallelism_avoids_nested_jobs_by_default(monkeypatch) -> None:

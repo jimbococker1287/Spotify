@@ -39,6 +39,7 @@ spotify/env.py
 spotify/evaluation.py
 spotify/explainability.py
 spotify/friction.py
+spotify/front_door.py
 spotify/governance.py
 spotify/group_auto_dj.py
 spotify/journey_planner.py
@@ -53,6 +54,9 @@ spotify/phase_readiness.py
 spotify/pipeline.py
 spotify/pipeline_helpers.py
 spotify/pipeline_postrun.py
+spotify/pipeline_postrun_core.py
+spotify/pipeline_postrun_governance.py
+spotify/pipeline_postrun_reporting.py
 spotify/pipeline_runtime.py
 spotify/policy_eval.py
 spotify/portfolio_artifacts.py
@@ -75,7 +79,10 @@ spotify/retrieval.py
 spotify/retrieval_common.py
 spotify/retrieval_core.py
 spotify/retrieval_pretraining.py
+spotify/retrieval_reranking.py
+spotify/retrieval_runtime.py
 spotify/retrieval_stack.py
+spotify/retrieval_training.py
 spotify/robustness.py
 spotify/run_artifacts.py
 spotify/run_timing.py
@@ -132,6 +139,8 @@ tests/test_drift_and_backtesting.py
 tests/test_env_loader.py
 tests/test_explainability.py
 tests/test_feature_engineering_extended.py
+tests/test_front_door.py
+tests/test_front_door_cli_smoke.py
 tests/test_governance_gate.py
 tests/test_lastfm.py
 tests/test_moonshot_lab.py
@@ -139,6 +148,7 @@ tests/test_outward_package.py
 tests/test_outward_package_cli_smoke.py
 tests/test_packaging_smoke.py
 tests/test_phase_readiness.py
+tests/test_pipeline_runtime_shortlists.py
 tests/test_predict_cli_smoke.py
 tests/test_predict_next_context.py
 tests/test_predict_service_cli_smoke.py
@@ -160,6 +170,7 @@ tests/test_run_artifact_writes.py
 tests/test_run_artifacts.py
 tests/test_run_timing.py
 tests/test_runtime_acceleration.py
+tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
 tests/test_serving_analytics_and_session_knn.py
 tests/test_shared_helpers.py
@@ -173,5 +184,6 @@ tests/test_taste_os_showcase.py
 tests/test_taste_os_showcase_cli_smoke.py
 tests/test_tracking.py
 tests/test_training_helpers.py
+tests/test_tuning_cache.py
 tests/test_tuning_helpers.py
 tests/test_uncertainty.py

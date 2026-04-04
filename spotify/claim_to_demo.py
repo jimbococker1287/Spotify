@@ -213,6 +213,18 @@ def _evidence_scoreboard(
             "source": "research_claims",
         },
         {
+            "label": "Repeated-run slice support",
+            "value": _safe_float(primary_metrics.get("consistent_slice_rate")),
+            "formatted_value": (
+                f"{int(primary_metrics.get('consistent_slice_run_count', 0) or 0)}/"
+                f"{int(primary_metrics.get('repeated_run_count', 0) or 0)}"
+                if int(primary_metrics.get("repeated_run_count", 0) or 0) > 0
+                else "n/a"
+            ),
+            "why_it_matters": "Shows whether the same failure slice recurs across matching completed runs instead of only once.",
+            "source": "research_claims",
+        },
+        {
             "label": "Target drift JSD",
             "value": _safe_float(primary_metrics.get("target_drift_jsd", safety.get("test_jsd_target_drift"))),
             "formatted_value": _format_metric(primary_metrics.get("target_drift_jsd", safety.get("test_jsd_target_drift"))),

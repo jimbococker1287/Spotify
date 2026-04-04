@@ -13,6 +13,7 @@ from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
 from .recommender_safety import build_conformal_abstention_summary
 from .run_artifacts import write_csv_rows
+from .uncertainty import apply_temperature_scaling, fit_temperature_scaling
 
 
 def _slugify(raw: str) -> str:
@@ -372,12 +373,27 @@ def _save_prediction_diagnostics(
     class_labels: np.ndarray | None = None,
     enable_conformal: bool = True,
     conformal_alpha: float = 0.10,
+    conformal_env_prefix: str | None = None,
+    enable_temperature_scaling: bool = False,
+    conformal_target_selective_risk: float = 0.50,
+    conformal_min_accepted_rate: float = 0.10,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_tag = _slugify(tag)
 
-    val_stats = _prediction_stats(val_proba, val_y, class_labels=class_labels)
-    test_stats = _prediction_stats(test_proba, test_y, class_labels=class_labels)
+    val_eval_proba = np.asarray(val_proba, dtype="float32")
+    test_eval_proba = np.asarray(test_proba, dtype="float32")
+    calibration_temperature = 1.0
+    probability_calibration_method = "raw"
+    if enable_temperature_scaling:
+        val_y_local = _encode_labels_to_local_indices(np.asarray(val_y), class_labels)
+        calibration_temperature = fit_temperature_scaling(val_eval_proba, val_y_local)
+        val_eval_proba = apply_temperature_scaling(val_eval_proba, calibration_temperature)
+        test_eval_proba = apply_temperature_scaling(test_eval_proba, calibration_temperature)
+        probability_calibration_method = "temperature_scaling"
+
+    val_stats = _prediction_stats(val_eval_proba, val_y, class_labels=class_labels)
+    test_stats = _prediction_stats(test_eval_proba, test_y, class_labels=class_labels)
 
     reliability_rows: list[dict[str, object]] = []
     for split, rows in (("val", val_stats["reliability_rows"]), ("test", test_stats["reliability_rows"])):
@@ -421,6 +437,8 @@ def _save_prediction_diagnostics(
         "val_mean_confidence": _to_float(val_stats["mean_confidence"]),
         "test_mean_confidence": _to_float(test_stats["mean_confidence"]),
         "conformal_enabled": bool(enable_conformal),
+        "probability_calibration_method": probability_calibration_method,
+        "probability_calibration_temperature": float(calibration_temperature),
     }
 
     summary_path = output_dir / f"{safe_tag}_confidence_summary.json"
@@ -432,11 +450,14 @@ def _save_prediction_diagnostics(
         test_y_local = _encode_labels_to_local_indices(np.asarray(test_y), class_labels)
         conformal_payload = build_conformal_abstention_summary(
             tag=safe_tag,
-            val_proba=val_proba,
+            val_proba=val_eval_proba,
             val_y=val_y_local,
-            test_proba=test_proba,
+            test_proba=test_eval_proba,
             test_y=test_y_local,
             alpha=conformal_alpha,
+            target_selective_risk=conformal_target_selective_risk,
+            min_accepted_rate=conformal_min_accepted_rate,
+            env_prefix=conformal_env_prefix,
         )
         if conformal_payload is not None:
             calibration = dict(conformal_payload.get("calibration", {}))
@@ -614,6 +635,10 @@ def run_extended_evaluation(
                             class_labels=None,
                             enable_conformal=enable_conformal,
                             conformal_alpha=conformal_alpha,
+                            conformal_env_prefix="CLASSICAL",
+                            enable_temperature_scaling=True,
+                            conformal_target_selective_risk=0.45,
+                            conformal_min_accepted_rate=0.70,
                         )
                     )
                     logger.info("Saved extended diagnostics for classical model: %s", model_name)
@@ -650,6 +675,10 @@ def run_extended_evaluation(
                                 class_labels=(classes if classes.size else None),
                                 enable_conformal=enable_conformal,
                                 conformal_alpha=conformal_alpha,
+                                conformal_env_prefix="CLASSICAL",
+                                enable_temperature_scaling=True,
+                                conformal_target_selective_risk=0.45,
+                                conformal_min_accepted_rate=0.70,
                             )
                         )
                         logger.info("Saved extended diagnostics for classical model: %s", model_name)

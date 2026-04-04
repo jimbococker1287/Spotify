@@ -15,8 +15,10 @@ import pandas as pd
 from .run_artifacts import write_csv_rows
 from .uncertainty import (
     SplitConformalCalibration,
+    apply_temperature_scaling,
     fit_operating_abstention_threshold,
     fit_split_conformal_classifier,
+    fit_temperature_scaling,
     summarize_prediction_sets,
 )
 
@@ -49,6 +51,24 @@ def _safe_float(value) -> float:
     return out
 
 
+def _max_finite(*values: object) -> float:
+    finite_values: list[float] = []
+    for value in values:
+        resolved = _safe_float(value)
+        if not math.isnan(resolved):
+            finite_values.append(resolved)
+    if not finite_values:
+        return float("nan")
+    return float(max(finite_values))
+
+
+def _risk_metric_max(risk_payload: dict[str, object], *, base_name: str) -> float:
+    return _max_finite(
+        risk_payload.get(f"val_{base_name}"),
+        risk_payload.get(f"test_{base_name}"),
+    )
+
+
 def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -60,6 +80,22 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: floa
     if math.isnan(value):
         return float(default)
     return float(min(maximum, max(minimum, value)))
+
+
+def _env_float_with_prefix(
+    suffix: str,
+    default: float,
+    *,
+    env_prefix: str | None = None,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    if env_prefix:
+        scoped_name = f"SPOTIFY_{str(env_prefix).strip().upper()}_{suffix}"
+        scoped_raw = os.getenv(scoped_name, "").strip()
+        if scoped_raw:
+            return _env_float(scoped_name, default, minimum=minimum, maximum=maximum)
+    return _env_float(f"SPOTIFY_{suffix}", default, minimum=minimum, maximum=maximum)
 
 
 def _slugify(raw: str) -> str:
@@ -474,30 +510,47 @@ def build_conformal_abstention_summary(
     alpha: float = 0.10,
     target_selective_risk: float = 0.50,
     min_accepted_rate: float = 0.10,
+    min_risk_drop: float = 0.02,
+    env_prefix: str | None = None,
+    enable_temperature_scaling: bool = False,
 ) -> dict[str, object] | None:
-    target_selective_risk = _env_float(
-        "SPOTIFY_CONFORMAL_TARGET_SELECTIVE_RISK",
+    target_selective_risk = _env_float_with_prefix(
+        "CONFORMAL_TARGET_SELECTIVE_RISK",
         target_selective_risk,
+        env_prefix=env_prefix,
         minimum=0.0,
         maximum=0.99,
     )
-    min_accepted_rate = _env_float(
-        "SPOTIFY_CONFORMAL_MIN_ACCEPTED_RATE",
+    min_accepted_rate = _env_float_with_prefix(
+        "CONFORMAL_MIN_ACCEPTED_RATE",
         min_accepted_rate,
+        env_prefix=env_prefix,
         minimum=0.01,
         maximum=0.99,
     )
-    min_risk_drop = _env_float(
-        "SPOTIFY_CONFORMAL_MIN_RISK_DROP",
-        0.02,
+    min_risk_drop = _env_float_with_prefix(
+        "CONFORMAL_MIN_RISK_DROP",
+        min_risk_drop,
+        env_prefix=env_prefix,
         minimum=0.0,
         maximum=0.99,
     )
-    calibration = fit_split_conformal_classifier(val_proba, val_y, alpha=alpha)
+    val_proba_resolved = np.asarray(val_proba, dtype="float32")
+    test_proba_resolved = None if test_proba is None else np.asarray(test_proba, dtype="float32")
+    temperature = 1.0
+    calibration_method = "raw"
+    if enable_temperature_scaling:
+        temperature = fit_temperature_scaling(val_proba_resolved, val_y)
+        val_proba_resolved = apply_temperature_scaling(val_proba_resolved, temperature)
+        if test_proba_resolved is not None:
+            test_proba_resolved = apply_temperature_scaling(test_proba_resolved, temperature)
+        calibration_method = "temperature_scaling"
+
+    calibration = fit_split_conformal_classifier(val_proba_resolved, val_y, alpha=alpha)
     if calibration is None:
         return None
     operating_threshold = fit_operating_abstention_threshold(
-        val_proba,
+        val_proba_resolved,
         val_y,
         base_threshold=calibration.threshold,
         target_selective_risk=target_selective_risk,
@@ -524,11 +577,38 @@ def build_conformal_abstention_summary(
             "min_risk_drop": float(min_risk_drop),
             "abstention_threshold": float(calibration.abstention_threshold),
         },
-        "val": summarize_prediction_sets(val_proba, val_y, calibration=calibration),
+        "probability_calibration": {
+            "method": calibration_method,
+            "temperature": float(temperature),
+        },
+        "val": summarize_prediction_sets(val_proba_resolved, val_y, calibration=calibration),
     }
-    if test_proba is not None and test_y is not None:
-        payload["test"] = summarize_prediction_sets(test_proba, test_y, calibration=calibration)
+    if test_proba_resolved is not None and test_y is not None:
+        payload["test"] = summarize_prediction_sets(test_proba_resolved, test_y, calibration=calibration)
     return payload
+
+
+def _group_passes_risk_caps(
+    group_name: str,
+    current_risk_metrics: dict[str, dict[str, float]] | None,
+    *,
+    max_selective_risk: float | None,
+    max_abstention_rate: float | None,
+) -> bool:
+    if max_selective_risk is None and max_abstention_rate is None:
+        return True
+    risk_payload = (current_risk_metrics or {}).get(group_name, {})
+    if not isinstance(risk_payload, dict) or not risk_payload:
+        return False
+    selective_risk = _risk_metric_max(risk_payload, base_name="selective_risk")
+    abstention_rate = _risk_metric_max(risk_payload, base_name="abstention_rate")
+    if max_selective_risk is not None:
+        if math.isnan(selective_risk) or selective_risk > float(max_selective_risk):
+            return False
+    if max_abstention_rate is not None:
+        if math.isnan(abstention_rate) or abstention_rate > float(max_abstention_rate):
+            return False
+    return True
 
 
 def _group_score_lists(
@@ -562,12 +642,15 @@ def _best_current_group(
     metric_name: str,
     aggregate: str,
     higher_is_better: bool,
+    eligible_groups: set[str] | None = None,
 ) -> tuple[str, float, list[float]]:
     score_map = _group_score_lists(rows, group_key=group_key, metric_name=metric_name)
     best_group = ""
     best_score = float("-inf") if higher_is_better else float("inf")
     best_scores: list[float] = []
     for group_name, scores in score_map.items():
+        if eligible_groups is not None and group_name not in eligible_groups:
+            continue
         aggregated = _aggregate_scores(scores, aggregate)
         if math.isnan(aggregated):
             continue
@@ -577,6 +660,57 @@ def _best_current_group(
             best_score = aggregated
             best_scores = list(scores)
     return best_group, best_score, best_scores
+
+
+def _rank_current_groups(
+    rows: list[dict[str, object]],
+    *,
+    group_key: str,
+    metric_name: str,
+    aggregate: str,
+    higher_is_better: bool,
+    current_risk_metrics: dict[str, dict[str, float]] | None,
+    max_selective_risk: float | None,
+    max_abstention_rate: float | None,
+) -> list[dict[str, object]]:
+    score_map = _group_score_lists(rows, group_key=group_key, metric_name=metric_name)
+    ranked: list[dict[str, object]] = []
+    for group_name, scores in score_map.items():
+        aggregated = _aggregate_scores(scores, aggregate)
+        if math.isnan(aggregated):
+            continue
+        risk_payload = (current_risk_metrics or {}).get(group_name, {})
+        risk_payload = risk_payload if isinstance(risk_payload, dict) else {}
+        selective_risk = _risk_metric_max(risk_payload, base_name="selective_risk")
+        abstention_rate = _risk_metric_max(risk_payload, base_name="abstention_rate")
+        blockers: list[str] = []
+        if max_selective_risk is not None:
+            if math.isnan(selective_risk):
+                blockers.append("missing_selective_risk")
+            elif selective_risk > float(max_selective_risk):
+                blockers.append("selective_risk")
+        if max_abstention_rate is not None:
+            if math.isnan(abstention_rate):
+                blockers.append("missing_abstention_rate")
+            elif abstention_rate > float(max_abstention_rate):
+                blockers.append("abstention_rate")
+        ranked.append(
+            {
+                "group_name": group_name,
+                "score": aggregated,
+                "scores": list(scores),
+                "risk_eligible": not blockers,
+                "risk_blockers": blockers,
+                "selective_risk": selective_risk,
+                "abstention_rate": abstention_rate,
+            }
+        )
+
+    ranked.sort(
+        key=lambda row: _safe_float(row.get("score")),
+        reverse=bool(higher_is_better),
+    )
+    return ranked
 
 
 def _best_history_group(
@@ -667,6 +801,12 @@ def _no_current_result_payload(
         "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
         "challenger_selective_risk": float("nan"),
         "challenger_abstention_rate": float("nan"),
+        "selected_candidate_rank": 0,
+        "eligible_candidate_count": 0,
+        "challenger_selection_reason": "no_current_results",
+        "top_candidate_model_name": "",
+        "top_candidate_score": float("nan"),
+        "top_candidate_risk_blockers": [],
     }
 
 
@@ -700,12 +840,35 @@ def evaluate_promotion_gate(
         resolved_direction = "maximize"
     higher_is_better = resolved_direction == "maximize"
 
+    ranked_candidates = _rank_current_groups(
+        current_rows,
+        group_key=group_key,
+        metric_name=metric_name,
+        aggregate=resolved_aggregate,
+        higher_is_better=higher_is_better,
+        current_risk_metrics=current_risk_metrics,
+        max_selective_risk=max_selective_risk,
+        max_abstention_rate=max_abstention_rate,
+    )
+    score_map = _group_score_lists(current_rows, group_key=group_key, metric_name=metric_name)
+    eligible_groups = {
+        group_name
+        for group_name in score_map
+        if _group_passes_risk_caps(
+            group_name,
+            current_risk_metrics,
+            max_selective_risk=max_selective_risk,
+            max_abstention_rate=max_abstention_rate,
+        )
+    }
+    top_candidate = ranked_candidates[0] if ranked_candidates else {}
     challenger_model_name, challenger_score, challenger_scores = _best_current_group(
         current_rows,
         group_key=group_key,
         metric_name=metric_name,
         aggregate=resolved_aggregate,
         higher_is_better=higher_is_better,
+        eligible_groups=(eligible_groups if eligible_groups else None),
     )
     if not challenger_model_name:
         return _no_current_result_payload(
@@ -719,6 +882,19 @@ def evaluate_promotion_gate(
             max_selective_risk=max_selective_risk,
             max_abstention_rate=max_abstention_rate,
         )
+    selected_candidate_rank = next(
+        (
+            idx
+            for idx, row in enumerate(ranked_candidates, start=1)
+            if str(row.get("group_name", "")).strip() == challenger_model_name
+        ),
+        0,
+    )
+    challenger_selection_reason = (
+        "highest_scoring_candidate"
+        if selected_candidate_rank <= 1
+        else "highest_scoring_risk_eligible_candidate"
+    )
 
     champion_run_id, champion_model_name, champion_score, champion_scores = _best_history_group(
         history_csv,
@@ -734,8 +910,8 @@ def evaluate_promotion_gate(
     )
 
     challenger_risk = (current_risk_metrics or {}).get(challenger_model_name, {})
-    challenger_selective_risk = _safe_float(challenger_risk.get("val_selective_risk"))
-    challenger_abstention_rate = _safe_float(challenger_risk.get("val_abstention_rate"))
+    challenger_selective_risk = _risk_metric_max(challenger_risk, base_name="selective_risk")
+    challenger_abstention_rate = _risk_metric_max(challenger_risk, base_name="abstention_rate")
 
     if (higher_is_better and champion_score == float("-inf")) or (not higher_is_better and champion_score == float("inf")):
         status = "no_prior_champion"
@@ -774,6 +950,12 @@ def evaluate_promotion_gate(
             "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
             "challenger_selective_risk": challenger_selective_risk,
             "challenger_abstention_rate": challenger_abstention_rate,
+            "selected_candidate_rank": int(selected_candidate_rank),
+            "eligible_candidate_count": int(sum(1 for row in ranked_candidates if bool(row.get("risk_eligible", False)))),
+            "challenger_selection_reason": challenger_selection_reason,
+            "top_candidate_model_name": str(top_candidate.get("group_name", "")),
+            "top_candidate_score": _safe_float(top_candidate.get("score")),
+            "top_candidate_risk_blockers": list(top_candidate.get("risk_blockers", [])),
         }
 
     regression = (
@@ -836,4 +1018,10 @@ def evaluate_promotion_gate(
         "max_abstention_rate": (float(max_abstention_rate) if max_abstention_rate is not None else float("nan")),
         "challenger_selective_risk": challenger_selective_risk,
         "challenger_abstention_rate": challenger_abstention_rate,
+        "selected_candidate_rank": int(selected_candidate_rank),
+        "eligible_candidate_count": int(sum(1 for row in ranked_candidates if bool(row.get("risk_eligible", False)))),
+        "challenger_selection_reason": challenger_selection_reason,
+        "top_candidate_model_name": str(top_candidate.get("group_name", "")),
+        "top_candidate_score": _safe_float(top_candidate.get("score")),
+        "top_candidate_risk_blockers": list(top_candidate.get("risk_blockers", [])),
     }

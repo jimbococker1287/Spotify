@@ -98,6 +98,7 @@ def run_moonshot_lab(
         data=data,
         digital_twin=digital_twin,
         multimodal_space=multimodal_space,
+        causal_artifact=causal_artifact,
         output_dir=safe_policy_dir,
         logger=logger,
         random_seed=random_seed,

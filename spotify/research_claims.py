@@ -4,10 +4,11 @@ import argparse
 import csv
 import json
 import math
+from statistics import median
 from pathlib import Path
 
 from .control_room import build_control_room_report
-from .run_artifacts import safe_read_json
+from .run_artifacts import collect_run_manifests, safe_read_json
 
 
 _STATUS_RANK = {
@@ -111,6 +112,126 @@ def _load_benchmark_bundle(manifest_path: Path | None) -> dict[str, object]:
     }
 
 
+def _median_metric(values: list[float]) -> float:
+    finite = [value for value in values if math.isfinite(value)]
+    if not finite:
+        return float("nan")
+    return float(median(finite))
+
+
+def _shift_robustness_signature(run_dir: Path) -> dict[str, object]:
+    manifest = safe_read_json(run_dir / "run_manifest.json", default={})
+    manifest = manifest if isinstance(manifest, dict) else {}
+    if not manifest:
+        return {}
+    robustness_rows = safe_read_json(run_dir / "analysis" / "robustness_summary.json", default=[])
+    robustness_rows = robustness_rows if isinstance(robustness_rows, list) else []
+    if not robustness_rows or not isinstance(robustness_rows[0], dict):
+        return {}
+    drift_summary = safe_read_json(run_dir / "analysis" / "data_drift_summary.json", default={})
+    drift_summary = drift_summary if isinstance(drift_summary, dict) else {}
+    if not drift_summary:
+        return {}
+
+    worst_row = dict(robustness_rows[0])
+    target_drift = _safe_float(
+        (drift_summary.get("target_drift", {}) if isinstance(drift_summary.get("target_drift", {}), dict) else {}).get(
+            "train_vs_test_jsd"
+        )
+    )
+    largest_segment_shift = _safe_float(
+        (
+            drift_summary.get("largest_segment_shift", {})
+            if isinstance(drift_summary.get("largest_segment_shift", {}), dict)
+            else {}
+        ).get("abs_share_shift")
+    )
+    drift_interpretation = (
+        drift_summary.get("drift_interpretation", {})
+        if isinstance(drift_summary.get("drift_interpretation", {}), dict)
+        else {}
+    )
+    return {
+        "run_id": str(manifest.get("run_id", "")).strip() or run_dir.name,
+        "profile": str(manifest.get("profile", "")).strip(),
+        "timestamp": str(manifest.get("timestamp", "")).strip(),
+        "worst_segment": str(worst_row.get("worst_segment", "")).strip(),
+        "worst_bucket": str(worst_row.get("worst_bucket", "")).strip(),
+        "supported_gap": _safe_float(worst_row.get("max_top1_gap")),
+        "raw_gap": _safe_float(worst_row.get("raw_max_top1_gap")),
+        "bucket_count": int(worst_row.get("worst_bucket_count", 0) or 0),
+        "bucket_share": _safe_float(worst_row.get("worst_bucket_share")),
+        "target_drift_jsd": target_drift,
+        "largest_segment_shift": largest_segment_shift,
+        "dominant_context_driver": str(drift_interpretation.get("dominant_context_driver", "")).strip(),
+    }
+
+
+def _shift_robustness_history(output_root: Path, *, run_dir: Path, limit: int = 6) -> dict[str, object]:
+    current_signature = _shift_robustness_signature(run_dir)
+    if not current_signature:
+        return {
+            "current_signature": {},
+            "history": [],
+            "run_count": 0,
+            "consistent_slice_run_count": 0,
+            "consistency_rate": float("nan"),
+            "median_supported_gap": float("nan"),
+            "median_target_drift_jsd": float("nan"),
+            "dominant_context_driver": "",
+        }
+
+    current_profile = str(current_signature.get("profile", "")).strip()
+    signatures: list[dict[str, object]] = []
+    for manifest in collect_run_manifests(output_root):
+        manifest_profile = str(manifest.get("profile", "")).strip()
+        if current_profile and manifest_profile and manifest_profile != current_profile:
+            continue
+        run_dir_candidate = Path(str(manifest.get("run_dir", "")).strip()).expanduser()
+        if not run_dir_candidate.exists():
+            continue
+        signature = _shift_robustness_signature(run_dir_candidate)
+        if signature:
+            signatures.append(signature)
+
+    signatures.sort(
+        key=lambda row: (
+            str(row.get("timestamp", "")),
+            str(row.get("run_id", "")),
+        )
+    )
+    history = signatures[-limit:]
+    target_segment = str(current_signature.get("worst_segment", "")).strip()
+    target_bucket = str(current_signature.get("worst_bucket", "")).strip()
+    consistent = [
+        row
+        for row in history
+        if str(row.get("worst_segment", "")).strip() == target_segment
+        and str(row.get("worst_bucket", "")).strip() == target_bucket
+    ]
+    driver_counts: dict[str, int] = {}
+    for row in history:
+        driver = str(row.get("dominant_context_driver", "")).strip()
+        if driver:
+            driver_counts[driver] = driver_counts.get(driver, 0) + 1
+    dominant_driver = max(driver_counts.items(), key=lambda item: (item[1], item[0]))[0] if driver_counts else ""
+
+    return {
+        "current_signature": current_signature,
+        "history": history,
+        "run_count": int(len(history)),
+        "consistent_slice_run_count": int(len(consistent)),
+        "consistency_rate": (
+            float(len(consistent) / len(history))
+            if history
+            else float("nan")
+        ),
+        "median_supported_gap": _median_metric([_safe_float(row.get("supported_gap")) for row in history]),
+        "median_target_drift_jsd": _median_metric([_safe_float(row.get("target_drift_jsd")) for row in history]),
+        "dominant_context_driver": dominant_driver,
+    }
+
+
 def _best_row(rows: list[dict[str, object]], *, predicate) -> dict[str, object]:
     candidates = [row for row in rows if predicate(row)]
     if not candidates:
@@ -162,8 +283,18 @@ def _claim_candidate_ranking(
     )
     benchmark_rows = benchmark_bundle.get("summary_rows", [])
     benchmark_rows = benchmark_rows if isinstance(benchmark_rows, list) else []
+    significance_rows = benchmark_bundle.get("significance_rows", [])
+    significance_rows = significance_rows if isinstance(significance_rows, list) else []
     benchmark_manifest = benchmark_bundle.get("manifest", {})
     benchmark_manifest = benchmark_manifest if isinstance(benchmark_manifest, dict) else {}
+    lock_retrieval = next(
+        (
+            row
+            for row in benchmark_rows
+            if str(row.get("model_name", "")).strip() == "retrieval_reranker"
+        ),
+        {},
+    )
     lock_non_deep = _best_benchmark_row(
         benchmark_rows,
         predicate=lambda row: str(row.get("model_type", "")).strip().lower() != "deep",
@@ -177,13 +308,36 @@ def _claim_candidate_ranking(
     best_deep_test = _safe_float(best_deep.get("test_top1"))
     live_delta = retrieval_test - best_deep_test if math.isfinite(retrieval_test) and math.isfinite(best_deep_test) else float("nan")
     benchmark_delta = (
-        _safe_float(lock_non_deep.get("val_top1_mean")) - _safe_float(lock_deep.get("val_top1_mean"))
-        if lock_non_deep and lock_deep
+        _safe_float(lock_retrieval.get("val_top1_mean")) - _safe_float(lock_deep.get("val_top1_mean"))
+        if lock_retrieval and lock_deep
         else float("nan")
     )
     benchmark_ready = bool(benchmark_manifest.get("comparison_ready"))
-    if math.isfinite(live_delta) and live_delta >= 0.10 and benchmark_ready and math.isfinite(benchmark_delta) and benchmark_delta >= 0.02:
+    retrieval_benchmark_ready = benchmark_ready and int(float(lock_retrieval.get("run_count", 0) or 0)) >= 3
+    retrieval_vs_deep_significance = next(
+        (
+            row
+            for row in significance_rows
+            if {
+                str(row.get("left_model", "")).strip(),
+                str(row.get("right_model", "")).strip(),
+            }
+            == {"retrieval_reranker", str(lock_deep.get("model_name", "")).strip()}
+        ),
+        {},
+    )
+    significant_retrieval_lift = bool(int(float(retrieval_vs_deep_significance.get("significant_at_95", 0) or 0)))
+    if (
+        math.isfinite(live_delta)
+        and live_delta >= 0.10
+        and retrieval_benchmark_ready
+        and math.isfinite(benchmark_delta)
+        and benchmark_delta >= 0.02
+        and significant_retrieval_lift
+    ):
         status = "submission_candidate"
+    elif math.isfinite(live_delta) and live_delta >= 0.10 and retrieval_benchmark_ready:
+        status = "promising_but_unlocked"
     elif math.isfinite(live_delta) and live_delta >= 0.10:
         status = "promising_but_unlocked"
     elif math.isfinite(live_delta) and live_delta >= 0.03:
@@ -202,17 +356,33 @@ def _claim_candidate_ranking(
             f"Best overall non-deep surface in the same run is `{best_non_deep.get('model_name', '')}` with val_top1 "
             f"`{_format_metric(best_non_deep.get('val_top1'))}` and test_top1 `{_format_metric(best_non_deep.get('test_top1'))}`."
         )
-    if lock_non_deep and lock_deep:
+    if lock_retrieval and lock_deep:
         evidence.append(
-            f"Benchmark lock: best non-deep `{lock_non_deep.get('model_name', '')}` mean val_top1 `{_format_metric(lock_non_deep.get('val_top1_mean'))}` "
+            f"Benchmark lock: `retrieval_reranker` mean val_top1 `{_format_metric(lock_retrieval.get('val_top1_mean'))}` "
             f"vs best deep `{lock_deep.get('model_name', '')}` at `{_format_metric(lock_deep.get('val_top1_mean'))}`."
+        )
+    elif lock_retrieval:
+        evidence.append(
+            f"Benchmark lock: `retrieval_reranker` is repeated-seed stable with mean val_top1 `{_format_metric(lock_retrieval.get('val_top1_mean'))}` "
+            f"across `{int(float(lock_retrieval.get('run_count', 0) or 0))}` run(s)."
+        )
+    if retrieval_vs_deep_significance:
+        evidence.append(
+            f"Repeated-seed significance vs `{lock_deep.get('model_name', '')}` is `{int(float(retrieval_vs_deep_significance.get('significant_at_95', 0) or 0))}` "
+            f"with mean val_top1 diff `{_format_metric(retrieval_vs_deep_significance.get('mean_diff_val_top1'))}`."
         )
 
     missing_checks = []
     if not benchmark_ready:
         missing_checks.append("Finish the repeated-seed benchmark lock with at least 3 runs and a complete manifest artifact pack.")
-    if lock_non_deep and str(lock_non_deep.get("model_name", "")).strip() != "retrieval_reranker":
+    if not lock_retrieval:
         missing_checks.append("Add retrieval and reranker models to the benchmark-lock script so the main claim is repeated-seed, not single-run only.")
+    elif int(float(lock_retrieval.get("run_count", 0) or 0)) < 3:
+        missing_checks.append("Repeat the benchmark lock until retrieval_reranker appears in at least 3 manifest-backed runs.")
+    elif not lock_deep:
+        missing_checks.append("Add a repeated deep comparator to the benchmark lock before calling this a submission-grade ranking claim.")
+    elif not significant_retrieval_lift:
+        missing_checks.append("Increase repeated-seed confidence until retrieval_reranker clears a 95% significance check against the best deep baseline.")
     if math.isfinite(live_delta) and live_delta < 0.10:
         missing_checks.append("Increase the live-run gap over deep baselines or narrow the claim to the surfaces that actually hold.")
 
@@ -232,9 +402,12 @@ def _claim_candidate_ranking(
             "best_deep_test_top1": best_deep_test,
             "live_test_top1_lift_vs_deep": live_delta,
             "benchmark_best_non_deep": str(lock_non_deep.get("model_name", "")),
+            "benchmark_retrieval_model_name": str(lock_retrieval.get("model_name", "")),
             "benchmark_best_deep": str(lock_deep.get("model_name", "")),
             "benchmark_val_top1_lift_vs_deep": benchmark_delta,
             "benchmark_comparison_ready": benchmark_ready,
+            "benchmark_retrieval_ready": retrieval_benchmark_ready,
+            "benchmark_significant_lift": significant_retrieval_lift,
         },
         "missing_checks": missing_checks,
         "supporting_artifacts": [
@@ -270,6 +443,15 @@ def _claim_shift_robustness(
     stress_skip_risk = _safe_float(moonshot_summary.get("stress_worst_skip_risk"))
     selective_risk = _safe_float(confidence_summary.get("test_selective_risk"))
     abstention_rate = _safe_float(confidence_summary.get("test_abstention_rate"))
+    bucket_count = int(worst_robustness.get("worst_bucket_count", 0) or 0)
+    bucket_share = _safe_float(worst_robustness.get("worst_bucket_share"))
+    history_summary = _shift_robustness_history(run_dir.parent.parent, run_dir=run_dir)
+    repeated_run_count = int(history_summary.get("run_count", 0) or 0)
+    consistent_slice_run_count = int(history_summary.get("consistent_slice_run_count", 0) or 0)
+    consistency_rate = _safe_float(history_summary.get("consistency_rate"))
+    repeated_support = repeated_run_count >= 2 and consistent_slice_run_count >= 2 and (
+        not math.isfinite(consistency_rate) or consistency_rate >= 0.66
+    )
 
     support_count = sum(
         1
@@ -281,7 +463,10 @@ def _claim_shift_robustness(
         )
         if math.isfinite(value) and value >= threshold
     )
-    if support_count >= 3:
+    if repeated_support:
+        support_count += 1
+
+    if support_count >= 4:
         status = "analysis_ready"
     elif support_count >= 2:
         status = "promising_but_unlocked"
@@ -291,7 +476,7 @@ def _claim_shift_robustness(
         status = "not_supported"
 
     evidence = [
-        f"Worst robustness gap is `{_format_metric(worst_gap)}` on `{worst_robustness.get('worst_segment', 'segment')}={worst_robustness.get('worst_bucket', 'bucket')}`.",
+        f"Worst supported robustness gap is `{_format_metric(worst_gap)}` on `{worst_robustness.get('worst_segment', 'segment')}={worst_robustness.get('worst_bucket', 'bucket')}` across `{bucket_count}` rows (`{_format_metric(bucket_share)}` share).",
         f"Target drift JSD is `{_format_metric(target_drift)}` and the largest segment shift is `{_format_metric(largest_segment_shift.get('abs_share_shift'))}`.",
         f"Best served model `{best_serving_row.get('model_name', '')}` has selective risk `{_format_metric(selective_risk)}` with abstention `{_format_metric(abstention_rate)}`.",
     ]
@@ -299,14 +484,25 @@ def _claim_shift_robustness(
         evidence.append(
             f"Worst stress scenario `{moonshot_summary.get('stress_worst_skip_scenario', 'unknown')}` reaches skip risk `{_format_metric(stress_skip_risk)}`."
         )
+    if repeated_run_count >= 2:
+        evidence.append(
+            f"Across `{repeated_run_count}` recent `{history_summary.get('current_signature', {}).get('profile', '') or 'matching'}` runs, "
+            f"`{worst_robustness.get('worst_segment', 'segment')}={worst_robustness.get('worst_bucket', 'bucket')}` stays the worst supported slice in "
+            f"`{consistent_slice_run_count}` runs, with median supported gap `{_format_metric(history_summary.get('median_supported_gap'))}` and median target drift `{_format_metric(history_summary.get('median_target_drift_jsd'))}`."
+        )
+    dominant_driver = str(history_summary.get("dominant_context_driver", "")).strip()
+    if dominant_driver:
+        evidence.append(f"Repeated-run drift is primarily `{dominant_driver}` rather than technical or temporal movement.")
 
     missing_checks = []
     if math.isfinite(abstention_rate) and abstention_rate <= 0.01 and math.isfinite(selective_risk) and selective_risk >= 0.50:
         missing_checks.append("Retune abstention so the uncertainty story shows non-zero refusal rather than full-coverage risk.")
     if math.isfinite(worst_gap) and worst_gap >= 0.15:
-        missing_checks.append("Add a slice-targeted ablation for the worst bucket before turning this into a causal or mitigation claim.")
-    if math.isfinite(target_drift) and target_drift >= 0.15:
-        missing_checks.append("Repeat the drift and robustness slices across repeated seeds so the shift story is not single-run only.")
+        missing_checks.append(
+            f"Add a slice-targeted ablation or mitigation for `{worst_robustness.get('worst_segment', 'segment')}={worst_robustness.get('worst_bucket', 'bucket')}` before turning this into a causal or mitigation claim."
+        )
+    if math.isfinite(target_drift) and target_drift >= 0.15 and not repeated_support:
+        missing_checks.append("Repeat the drift and robustness slices across multiple completed runs so the shift story is not single-run only.")
 
     return {
         "key": "shift_robustness",
@@ -314,7 +510,7 @@ def _claim_shift_robustness(
         "status": status,
         "summary": (
             f"The current full run shows drift `{_format_metric(target_drift)}`, worst-slice gap `{_format_metric(worst_gap)}`, "
-            f"and selective risk `{_format_metric(selective_risk)}`, which is enough for a believable diagnostic paper path."
+            f"and selective risk `{_format_metric(selective_risk)}`; across `{repeated_run_count}` matching runs, the same failure slice recurs `{consistent_slice_run_count}` times."
         ),
         "evidence": evidence,
         "metrics": {
@@ -322,11 +518,19 @@ def _claim_shift_robustness(
             "worst_robustness_gap": worst_gap,
             "worst_robustness_segment": str(worst_robustness.get("worst_segment", "")),
             "worst_robustness_bucket": str(worst_robustness.get("worst_bucket", "")),
+            "worst_robustness_bucket_count": bucket_count,
+            "worst_robustness_bucket_share": bucket_share,
             "target_drift_jsd": target_drift,
             "largest_segment_shift": _safe_float(largest_segment_shift.get("abs_share_shift")),
             "selective_risk": selective_risk,
             "abstention_rate": abstention_rate,
             "stress_skip_risk": stress_skip_risk,
+            "repeated_run_count": repeated_run_count,
+            "consistent_slice_run_count": consistent_slice_run_count,
+            "consistent_slice_rate": consistency_rate,
+            "repeated_median_supported_gap": _safe_float(history_summary.get("median_supported_gap")),
+            "repeated_median_target_drift_jsd": _safe_float(history_summary.get("median_target_drift_jsd")),
+            "dominant_context_driver": dominant_driver,
             "conformal_coverage": _safe_float((conformal_summary.get("test", {}) if isinstance(conformal_summary.get("test", {}), dict) else {}).get("coverage")),
         },
         "missing_checks": missing_checks,

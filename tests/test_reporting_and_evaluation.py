@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from spotify.evaluation import _build_label_lookup
-from spotify.reporting import persist_to_sqlite
+from spotify.reporting import persist_to_sqlite, restore_deep_reporting_artifacts, save_deep_reporting_artifacts
 
 
 def test_build_label_lookup_returns_sorted_first_seen_names() -> None:
@@ -69,3 +69,67 @@ def test_persist_to_sqlite_writes_expected_summary_tables(tmp_path: Path) -> Non
         (1, 20.0, 15.0),
         (2, 30.0, None),
     ]
+
+
+def test_deep_reporting_cache_round_trip_restores_artifacts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_CACHE_DEEP_REPORTING", "1")
+
+    output_dir = tmp_path / "run"
+    cache_root = tmp_path / "cache"
+    db_path = output_dir / "spotify_training.db"
+    histories = {
+        "demo_model": SimpleNamespace(
+            history={
+                "loss": [1.0, 0.8],
+                "val_loss": [1.1, 0.9],
+                "val_artist_output_sparse_categorical_accuracy": [0.3, 0.4],
+                "val_artist_output_top_5": [0.7, 0.8],
+            }
+        )
+    }
+    cpu_usage = [10.0, 20.0]
+    gpu_usage = [5.0, 15.0]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    original_payloads = {
+        output_dir / "model_comparison.png": b"model-comparison",
+        output_dir / "demo_model_learning_curve.png": b"learning-curve",
+        output_dir / "histories.json": b"{\"histories\":true}",
+        output_dir / "utilization.png": b"utilization",
+        db_path: b"sqlite-artifact",
+    }
+    for path, payload in original_payloads.items():
+        path.write_bytes(payload)
+
+    save_deep_reporting_artifacts(
+        histories=histories,
+        cpu_usage=cpu_usage,
+        gpu_usage=gpu_usage,
+        output_dir=output_dir,
+        db_path=db_path,
+        cache_root=cache_root,
+        cache_fingerprint="prepared123",
+    )
+
+    for path in original_payloads:
+        path.unlink()
+
+    restored = restore_deep_reporting_artifacts(
+        histories=histories,
+        cpu_usage=cpu_usage,
+        gpu_usage=gpu_usage,
+        output_dir=output_dir,
+        db_path=db_path,
+        cache_root=cache_root,
+        cache_fingerprint="prepared123",
+    )
+
+    assert restored is not None
+    model_comparison_path, learning_paths, histories_path, utilization_path, restored_db_path = restored
+    assert model_comparison_path == output_dir / "model_comparison.png"
+    assert learning_paths == [output_dir / "demo_model_learning_curve.png"]
+    assert histories_path == output_dir / "histories.json"
+    assert utilization_path == output_dir / "utilization.png"
+    assert restored_db_path == db_path
+    for path, payload in original_payloads.items():
+        assert path.read_bytes() == payload

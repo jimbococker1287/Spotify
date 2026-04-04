@@ -20,7 +20,7 @@ DEFAULT_MAX_STRESS_TEST_SESSIONS = 2500
 DEFAULT_STRESS_TEST_PROGRESS_EVERY = 500
 DEFAULT_STRESS_TEST_BATCH_SIZE = 256
 DEFAULT_STRESS_BENCHMARK_SCENARIO = "evening_drift"
-DEFAULT_STRESS_BENCHMARK_POLICY = "safe_global"
+DEFAULT_STRESS_BENCHMARK_POLICY = "safe_routed"
 DEFAULT_STRESS_BENCHMARK_REFERENCE_POLICY = "baseline_exploit"
 
 
@@ -85,9 +85,10 @@ def _scenario_safe_policy(
         return "safe_routed_high_friction", _normalize_policy(base)
     if scenario_name == "evening_drift":
         base = dict(policy_map.get("normal_friction", global_policy))
-        base["continuity"] = base.get("continuity", 0.0) + 0.25
-        base["repeat"] = base.get("repeat", 0.0) + 0.10
-        base["novelty"] = max(0.0, base.get("novelty", 0.0) - 0.20)
+        base["continuity"] = base.get("continuity", 0.0) + 0.35
+        base["repeat"] = base.get("repeat", 0.0) + 0.15
+        base["transition"] = base.get("transition", 0.0) + 0.05
+        base["novelty"] = max(0.0, base.get("novelty", 0.0) - 0.30)
         return "safe_routed_evening", _normalize_policy(base)
     if scenario_name == "listener_fatigue":
         base = dict(policy_map.get("high_friction", global_policy))
@@ -116,15 +117,29 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
         "SPOTIFY_STRESS_BENCHMARK_REFERENCE_POLICY",
         DEFAULT_STRESS_BENCHMARK_REFERENCE_POLICY,
     )
-    benchmark_row = next(
-        (
+    policy_selection_mode = "exact_match"
+    benchmark_row: dict[str, object] = {}
+    if benchmark_policy in {"safe_routed", "scenario_safe", "auto"}:
+        routed_rows = [
             row
             for row in rows
             if str(row.get("scenario", "")).strip() == benchmark_scenario
-            and str(row.get("policy_name", "")).strip() == benchmark_policy
-        ),
-        {},
-    )
+            and str(row.get("policy_name", "")).strip().startswith("safe_routed")
+        ]
+        if routed_rows:
+            benchmark_row = min(routed_rows, key=lambda row: _safe_float(row.get("mean_skip_risk")))
+            benchmark_policy = str(benchmark_row.get("policy_name", "")).strip() or benchmark_policy
+            policy_selection_mode = "scenario_routed_alias"
+    if not benchmark_row:
+        benchmark_row = next(
+            (
+                row
+                for row in rows
+                if str(row.get("scenario", "")).strip() == benchmark_scenario
+                and str(row.get("policy_name", "")).strip() == benchmark_policy
+            ),
+            {},
+        )
     reference_row = next(
         (
             row
@@ -155,6 +170,7 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
     return {
         "benchmark_scenario": benchmark_scenario,
         "benchmark_policy_name": benchmark_policy,
+        "benchmark_policy_selection_mode": policy_selection_mode,
         "reference_policy_name": reference_policy,
         "available": bool(benchmark_row),
         "reference_available": bool(reference_row),
@@ -379,6 +395,7 @@ def run_stress_test_lab(
         [
             "benchmark_scenario",
             "benchmark_policy_name",
+            "benchmark_policy_selection_mode",
             "reference_policy_name",
             "available",
             "reference_available",

@@ -7,6 +7,7 @@ from typing import Any
 
 from .branch_portfolio import build_branch_portfolio_report, write_branch_portfolio_artifacts
 from .claim_to_demo import build_claim_to_demo_report, write_claim_to_demo_artifacts
+from .front_door import build_front_door_report, write_front_door_artifacts
 from .portfolio_artifacts import load_portfolio_artifact_bundle
 from .run_artifacts import copy_file_if_changed, write_json, write_markdown
 
@@ -144,6 +145,10 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
         build_claim_to_demo_report(output_root),
         output_dir=output_root,
     )
+    front_door_paths = write_front_door_artifacts(
+        build_front_door_report(output_root),
+        output_dir=output_root,
+    )
 
     selected_artifacts = _coerce_dict(report.get("selected_artifacts"))
     copied_artifacts = {
@@ -154,6 +159,14 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
         "claim_to_demo_talk_track_md": _copy_if_exists(
             claim_to_demo_paths["talk_track_md"],
             package_root / "flagship" / "claim_to_demo_talk_track.md",
+        ),
+        "front_door_html": _copy_if_exists(
+            front_door_paths["html"],
+            package_root / "flagship" / "index.html",
+        ),
+        "front_door_md": _copy_if_exists(
+            front_door_paths["md"],
+            package_root / "flagship" / "front_door.md",
         ),
         "taste_os_md": _copy_if_exists(
             Path(str(_coerce_dict(selected_artifacts.get("taste_os")).get("source_md", "")))
@@ -233,6 +246,9 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
             "claim_to_demo_json": str(claim_to_demo_paths["json"]),
             "claim_to_demo_md": str(claim_to_demo_paths["md"]),
             "claim_to_demo_talk_track_md": str(claim_to_demo_paths["talk_track_md"]),
+            "front_door_json": str(front_door_paths["json"]),
+            "front_door_md": str(front_door_paths["md"]),
+            "front_door_html": str(front_door_paths["html"]),
             "four_branch_summary_md": str(four_branch_summary_md.resolve()),
             "safety_research_showcase_md": str(safety_showcase_path.resolve()),
         },
@@ -253,6 +269,7 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
     lines.extend(["", "## Finalized Package Assets", ""])
     lines.append(f"- Claim-to-demo flagship pack: `{copied_artifacts['claim_to_demo_md']}`")
     lines.append(f"- Claim-to-demo talk track: `{copied_artifacts['claim_to_demo_talk_track_md']}`")
+    lines.append(f"- Front-door landing page: `{copied_artifacts['front_door_html']}`")
     lines.append(f"- Taste OS showcase: `{copied_artifacts['taste_os_md']}`")
     lines.append(f"- Control-room sample: `{copied_artifacts['control_room_md']}`")
     lines.append(f"- Creator brief: `{copied_artifacts['creator_primary_md']}`")

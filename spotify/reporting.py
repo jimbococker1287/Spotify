@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from itertools import zip_longest
 from datetime import datetime
+import hashlib
 from pathlib import Path
 import csv
 import json
@@ -9,6 +10,8 @@ import math
 import sqlite3
 
 import numpy as np
+
+from .run_artifacts import copy_file_if_changed
 
 VAL_KEY = "val_artist_output_sparse_categorical_accuracy"
 TRN_KEY = "artist_output_sparse_categorical_accuracy"
@@ -253,6 +256,125 @@ def persist_to_sqlite(df, histories: dict[str, object], cpu_usage: list[float], 
         conn.close()
 
     return db_path
+
+
+def _deep_reporting_cache_enabled_from_env() -> bool:
+    import os
+
+    raw = os.getenv("SPOTIFY_CACHE_DEEP_REPORTING", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _reporting_source_digest() -> str:
+    path = Path(__file__).resolve()
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:24]
+
+
+def _build_deep_reporting_cache_key(
+    *,
+    cache_fingerprint: str,
+    histories: dict[str, object],
+    cpu_usage: list[float],
+    gpu_usage: list[float],
+) -> str:
+    payload = {
+        "prepared_fingerprint": str(cache_fingerprint).strip(),
+        "histories": histories_to_dict(histories),
+        "cpu_usage": [float(value) for value in cpu_usage],
+        "gpu_usage": [float(value) for value in gpu_usage],
+        "source_digest": _reporting_source_digest(),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _deep_reporting_cache_artifact_map(
+    *,
+    root_dir: Path,
+    histories: dict[str, object],
+    db_name: str,
+) -> dict[str, Path]:
+    paths = {
+        "model_comparison": root_dir / "model_comparison.png",
+        "histories_json": root_dir / "histories.json",
+        "utilization": root_dir / "utilization.png",
+        "sqlite": root_dir / db_name,
+    }
+    for model_name in histories:
+        paths[f"learning_curve:{model_name}"] = root_dir / f"{model_name}_learning_curve.png"
+    return paths
+
+
+def restore_deep_reporting_artifacts(
+    *,
+    histories: dict[str, object],
+    cpu_usage: list[float],
+    gpu_usage: list[float],
+    output_dir: Path,
+    db_path: Path,
+    cache_root: Path | None,
+    cache_fingerprint: str,
+) -> tuple[Path, list[Path], Path, Path, Path] | None:
+    if not histories:
+        return None
+    if cache_root is None or not _deep_reporting_cache_enabled_from_env() or not str(cache_fingerprint).strip():
+        return None
+
+    cache_key = _build_deep_reporting_cache_key(
+        cache_fingerprint=cache_fingerprint,
+        histories=histories,
+        cpu_usage=cpu_usage,
+        gpu_usage=gpu_usage,
+    )
+    cache_dir = (cache_root / str(cache_fingerprint).strip() / cache_key).resolve()
+    cached_paths = _deep_reporting_cache_artifact_map(root_dir=cache_dir, histories=histories, db_name=db_path.name)
+    output_paths = _deep_reporting_cache_artifact_map(root_dir=output_dir, histories=histories, db_name=db_path.name)
+
+    if any(not path.exists() for path in cached_paths.values()):
+        return None
+
+    for key, source_path in cached_paths.items():
+        copy_file_if_changed(source_path, output_paths[key])
+
+    learning_paths = [output_paths[f"learning_curve:{model_name}"] for model_name in histories]
+    return (
+        output_paths["model_comparison"],
+        learning_paths,
+        output_paths["histories_json"],
+        output_paths["utilization"],
+        output_paths["sqlite"],
+    )
+
+
+def save_deep_reporting_artifacts(
+    *,
+    histories: dict[str, object],
+    cpu_usage: list[float],
+    gpu_usage: list[float],
+    output_dir: Path,
+    db_path: Path,
+    cache_root: Path | None,
+    cache_fingerprint: str,
+) -> None:
+    if not histories:
+        return
+    if cache_root is None or not _deep_reporting_cache_enabled_from_env() or not str(cache_fingerprint).strip():
+        return
+
+    cache_key = _build_deep_reporting_cache_key(
+        cache_fingerprint=cache_fingerprint,
+        histories=histories,
+        cpu_usage=cpu_usage,
+        gpu_usage=gpu_usage,
+    )
+    cache_dir = (cache_root / str(cache_fingerprint).strip() / cache_key).resolve()
+    cached_paths = _deep_reporting_cache_artifact_map(root_dir=cache_dir, histories=histories, db_name=db_path.name)
+    output_paths = _deep_reporting_cache_artifact_map(root_dir=output_dir, histories=histories, db_name=db_path.name)
+
+    for key, destination_path in cached_paths.items():
+        source_path = output_paths[key]
+        if source_path.exists():
+            copy_file_if_changed(source_path, destination_path)
 
 
 def plot_run_leaderboard(results: list[dict[str, object]], output_dir: Path) -> Path | None:

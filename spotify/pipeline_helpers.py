@@ -123,6 +123,10 @@ def _backfill_risk_summary(
         test_proba=test_proba,
         test_y=np.asarray(test_y, dtype="int64"),
         alpha=float(conformal_alpha),
+        target_selective_risk=(0.45 if model_type in ("classical", "classical_tuned") else 0.50),
+        min_accepted_rate=(0.70 if model_type in ("classical", "classical_tuned") else 0.10),
+        env_prefix=("CLASSICAL" if model_type in ("classical", "classical_tuned") else None),
+        enable_temperature_scaling=bool(model_type in ("classical", "classical_tuned")),
     )
     if not isinstance(conformal_payload, dict):
         return {}
@@ -140,6 +144,12 @@ def _backfill_risk_summary(
             "tag": f"{prefix}_{model_name}",
             "conformal_enabled": True,
             "conformal_alpha": _safe_json_float(calibration.get("alpha")),
+            "probability_calibration_method": str(
+                dict(conformal_payload.get("probability_calibration", {})).get("method", "raw")
+            ),
+            "probability_calibration_temperature": _safe_json_float(
+                dict(conformal_payload.get("probability_calibration", {})).get("temperature", 1.0)
+            ),
             "conformal_threshold": _safe_json_float(calibration.get("threshold")),
             "conformal_operating_threshold": _safe_json_float(calibration.get("operating_threshold")),
             "val_abstention_rate": _safe_json_float(val_conformal.get("abstention_rate")),

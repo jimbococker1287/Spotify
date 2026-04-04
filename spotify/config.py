@@ -67,6 +67,9 @@ FAST_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
     "extra_trees",
     "mlp",
 )
+RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
+    "retrieval_reranker",
+)
 EXPERIMENTAL_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "hist_gbm",
     "knn",
@@ -469,6 +472,10 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         if args.backtest_models
         else (classical_model_names if args.classical_models else tuple(preset["temporal_backtest_model_names"]))
     )
+    if enable_retrieval_stack and not args.backtest_models:
+        temporal_backtest_model_names = tuple(
+            dict.fromkeys((*temporal_backtest_model_names, *RETRIEVAL_BACKTEST_MODEL_NAMES))
+        )
 
     return PipelineConfig(
         project_root=project_root,
@@ -686,7 +693,7 @@ def add_cli_arguments(parser: argparse.ArgumentParser) -> None:
         "--backtest-models",
         type=str,
         default=None,
-        help="Comma-separated classical model names for temporal backtesting.",
+        help="Comma-separated model names for temporal backtesting.",
     )
     parser.add_argument("--no-video", action="store_true", help="Exclude Streaming_History_Video files.")
     parser.add_argument(

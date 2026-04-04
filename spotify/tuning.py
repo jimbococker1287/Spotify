@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import csv
+import hashlib
 import json
 import os
 import time
@@ -22,6 +23,10 @@ from .benchmarks import (
 )
 from .data import PreparedData
 from .probability_bundles import save_prediction_bundle
+from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+
+
+OPTUNA_CACHE_SCHEMA_VERSION = "optuna-tuning-cache-v1"
 
 
 @dataclass
@@ -48,12 +53,29 @@ class OptunaTuningResult:
     estimator_artifact_path: str = ""
 
 
+@dataclass(frozen=True)
+class OptunaModelCachePaths:
+    cache_key: str
+    cache_dir: Path
+    result_path: Path
+    metadata_path: Path
+    trial_log_path: Path
+    history_plot_path: Path
+    estimator_artifact_path: Path
+    prediction_bundle_path: Path
+
+
 def _load_optuna():
     try:
         import optuna
     except Exception:
         return None
     return optuna
+
+
+def _optuna_cache_enabled_from_env() -> bool:
+    raw = os.getenv("SPOTIFY_CACHE_OPTUNA", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _suggest_params(trial, model_name: str) -> dict[str, object]:
@@ -150,11 +172,20 @@ def _parse_fidelity_schedule(raw: str | None) -> tuple[float, ...]:
     return tuple(values)
 
 
-def _build_pruner(optuna):
-    pruner_name = os.getenv("SPOTIFY_OPTUNA_PRUNER", "median").strip().lower()
+def _resolve_optuna_pruner_name(raw: str | None) -> str:
+    pruner_name = str(raw or "median").strip().lower()
     if pruner_name in ("none", "off", "0"):
-        return optuna.pruners.NopPruner(), "none"
+        return "none"
     if pruner_name in ("sha", "successive_halving", "halving"):
+        return "successive_halving"
+    return "median"
+
+
+def _build_pruner(optuna):
+    pruner_name = _resolve_optuna_pruner_name(os.getenv("SPOTIFY_OPTUNA_PRUNER", "median"))
+    if pruner_name == "none":
+        return optuna.pruners.NopPruner(), "none"
+    if pruner_name == "successive_halving":
         return optuna.pruners.SuccessiveHalvingPruner(min_resource=1, reduction_factor=2), "successive_halving"
     startup_trials = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
     warmup_steps = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
@@ -177,6 +208,148 @@ def _resolve_optuna_worker_plan(
     if model_workers <= 1:
         return 1, trial_jobs
     return model_workers, max(1, trial_jobs // model_workers)
+
+
+def _build_optuna_cache_payload(
+    *,
+    cache_fingerprint: str,
+    model_name: str,
+    random_seed: int,
+    trials: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    model_timeout_seconds: int,
+    per_trial_timeout_seconds: int,
+    fidelity_schedule: tuple[float, ...],
+    pruner_name: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": OPTUNA_CACHE_SCHEMA_VERSION,
+        "prepared_fingerprint": str(cache_fingerprint).strip(),
+        "model_name": model_name,
+        "random_seed": int(random_seed),
+        "trials": int(trials),
+        "max_train_samples": int(max_train_samples),
+        "max_eval_samples": int(max_eval_samples),
+        "model_timeout_seconds": int(model_timeout_seconds),
+        "per_trial_timeout_seconds": int(per_trial_timeout_seconds),
+        "fidelity_schedule": [float(value) for value in fidelity_schedule],
+        "pruner_name": pruner_name,
+        "median_startup_trials": _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
+        if pruner_name == "median"
+        else 0,
+        "median_warmup_steps": _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
+        if pruner_name == "median"
+        else 0,
+    }
+
+
+def _build_optuna_cache_key(payload: dict[str, object]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _resolve_optuna_model_cache_paths(
+    cache_root: Path,
+    cache_fingerprint: str,
+    model_name: str,
+    cache_key: str,
+) -> OptunaModelCachePaths:
+    cache_dir = (cache_root / cache_fingerprint / model_name / cache_key).resolve()
+    return OptunaModelCachePaths(
+        cache_key=cache_key,
+        cache_dir=cache_dir,
+        result_path=cache_dir / "result.json",
+        metadata_path=cache_dir / "cache_meta.json",
+        trial_log_path=cache_dir / f"optuna_trials_{model_name}.csv",
+        history_plot_path=cache_dir / f"optuna_history_{model_name}.png",
+        estimator_artifact_path=cache_dir / "estimators" / f"classical_tuned_{model_name}.joblib",
+        prediction_bundle_path=cache_dir / "prediction_bundles" / f"classical_tuned_{model_name}.npz",
+    )
+
+
+def _copy_optional_artifact(source: Path, destination: Path) -> str:
+    if not source.exists():
+        return ""
+    return str(copy_file_if_changed(source, destination))
+
+
+def _load_cached_optuna_result(
+    *,
+    cache_paths: OptunaModelCachePaths,
+    output_dir: Path,
+    model_name: str,
+    logger,
+) -> OptunaTuningResult | None:
+    payload = safe_read_json(cache_paths.result_path, default=None)
+    if not isinstance(payload, dict):
+        return None
+    result_payload = payload.get("result", payload)
+    if not isinstance(result_payload, dict):
+        return None
+
+    try:
+        if cache_paths.trial_log_path.exists():
+            copy_file_if_changed(cache_paths.trial_log_path, output_dir / f"optuna_trials_{model_name}.csv")
+        if cache_paths.history_plot_path.exists():
+            copy_file_if_changed(cache_paths.history_plot_path, output_dir / f"optuna_history_{model_name}.png")
+        estimator_artifact_path = _copy_optional_artifact(
+            cache_paths.estimator_artifact_path,
+            output_dir / "estimators" / f"classical_tuned_{model_name}.joblib",
+        )
+        prediction_bundle_path = _copy_optional_artifact(
+            cache_paths.prediction_bundle_path,
+            output_dir / "prediction_bundles" / f"classical_tuned_{model_name}.npz",
+        )
+        hydrated_payload = dict(result_payload)
+        hydrated_payload["estimator_artifact_path"] = estimator_artifact_path
+        hydrated_payload["prediction_bundle_path"] = prediction_bundle_path
+        return OptunaTuningResult(**hydrated_payload)
+    except Exception as exc:
+        logger.warning("Optuna cache load failed for %s (%s). Rebuilding.", model_name, exc)
+        return None
+
+
+def _save_optuna_result_to_cache(
+    *,
+    cache_paths: OptunaModelCachePaths,
+    cache_payload: dict[str, object],
+    result: OptunaTuningResult,
+    output_dir: Path,
+    model_name: str,
+    logger,
+) -> None:
+    try:
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        trial_log_path = output_dir / f"optuna_trials_{model_name}.csv"
+        history_plot_path = output_dir / f"optuna_history_{model_name}.png"
+        if trial_log_path.exists():
+            copy_file_if_changed(trial_log_path, cache_paths.trial_log_path)
+        if history_plot_path.exists():
+            copy_file_if_changed(history_plot_path, cache_paths.history_plot_path)
+        if result.estimator_artifact_path:
+            source_estimator_path = Path(result.estimator_artifact_path)
+            if source_estimator_path.exists():
+                copy_file_if_changed(source_estimator_path, cache_paths.estimator_artifact_path)
+        if result.prediction_bundle_path:
+            source_bundle_path = Path(result.prediction_bundle_path)
+            if source_bundle_path.exists():
+                copy_file_if_changed(source_bundle_path, cache_paths.prediction_bundle_path)
+
+        stored_result = asdict(result)
+        stored_result["estimator_artifact_path"] = ""
+        stored_result["prediction_bundle_path"] = ""
+        write_json(
+            cache_paths.result_path,
+            {
+                "cache_schema_version": OPTUNA_CACHE_SCHEMA_VERSION,
+                "result": stored_result,
+            },
+            sort_keys=True,
+        )
+        write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+    except Exception as exc:
+        logger.warning("Optuna cache save failed for %s (%s).", model_name, exc)
 
 
 def _plot_study_history(values: list[float], output_path: Path, title: str) -> None:
@@ -230,18 +403,100 @@ def run_optuna_tuning(
     max_eval_samples: int,
     logger,
     feature_bundle: ClassicalFeatureBundle | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+    cache_stats_out: dict[str, object] | None = None,
 ) -> list[OptunaTuningResult]:
     if trials <= 0:
         logger.info("Skipping Optuna tuning because trials <= 0.")
         return []
 
-    optuna = _load_optuna()
-    if optuna is None:
-        logger.warning("Optuna is not installed; skipping hyperparameter tuning.")
-        return []
-
     validate_classical_models(selected_models, random_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
+    selected_models = tuple(selected_models)
+
+    per_trial_timeout_seconds = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS"), 0)
+    model_timeout_default = timeout_seconds if timeout_seconds > 0 else 0
+    model_timeout_default = _parse_positive_int(
+        os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS"),
+        model_timeout_default,
+    )
+    model_timeout_overrides = _parse_model_timeout_overrides(os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUTS"))
+    fidelity_schedule = _parse_fidelity_schedule(os.getenv("SPOTIFY_OPTUNA_PRUNING_FIDELITIES"))
+    pruner_name = _resolve_optuna_pruner_name(os.getenv("SPOTIFY_OPTUNA_PRUNER", "median"))
+
+    cache_enabled = _optuna_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
+    cache_contexts: dict[str, tuple[OptunaModelCachePaths, dict[str, object]]] = {}
+    cached_results_by_model: dict[str, OptunaTuningResult] = {}
+    uncached_models: list[str] = []
+
+    for model_name in selected_models:
+        model_timeout_seconds = model_timeout_overrides.get(model_name, model_timeout_default)
+        if cache_enabled and cache_root is not None:
+            cache_payload = _build_optuna_cache_payload(
+                cache_fingerprint=cache_fingerprint,
+                model_name=model_name,
+                random_seed=random_seed,
+                trials=trials,
+                max_train_samples=max_train_samples,
+                max_eval_samples=max_eval_samples,
+                model_timeout_seconds=model_timeout_seconds,
+                per_trial_timeout_seconds=per_trial_timeout_seconds,
+                fidelity_schedule=fidelity_schedule,
+                pruner_name=pruner_name,
+            )
+            cache_key = _build_optuna_cache_key(cache_payload)
+            cache_paths = _resolve_optuna_model_cache_paths(
+                cache_root=cache_root,
+                cache_fingerprint=cache_fingerprint,
+                model_name=model_name,
+                cache_key=cache_key,
+            )
+            cache_contexts[model_name] = (cache_paths, cache_payload)
+            cached_result = _load_cached_optuna_result(
+                cache_paths=cache_paths,
+                output_dir=output_dir,
+                model_name=model_name,
+                logger=logger,
+            )
+            if cached_result is not None:
+                cached_results_by_model[model_name] = cached_result
+                continue
+        uncached_models.append(model_name)
+
+    if cache_stats_out is not None:
+        cache_stats_out.clear()
+        cache_stats_out.update(
+            {
+                "enabled": bool(cache_enabled),
+                "fingerprint": (str(cache_fingerprint).strip() if cache_enabled else ""),
+                "hit_model_names": [name for name in selected_models if name in cached_results_by_model],
+                "miss_model_names": list(uncached_models),
+            }
+        )
+
+    logger.info(
+        "Optuna cache status: enabled=%s fingerprint=%s hits=%d misses=%d",
+        cache_enabled,
+        (cache_fingerprint if cache_enabled else "disabled"),
+        len(cached_results_by_model),
+        len(uncached_models),
+    )
+
+    if not uncached_models:
+        ordered_results = [cached_results_by_model[name] for name in selected_models if name in cached_results_by_model]
+        write_json(output_dir / "optuna_results.json", [asdict(result) for result in ordered_results])
+        return ordered_results
+
+    optuna = _load_optuna()
+    if optuna is None:
+        logger.warning(
+            "Optuna is not installed; skipping hyperparameter tuning for uncached models: %s",
+            ", ".join(uncached_models),
+        )
+        ordered_results = [cached_results_by_model[name] for name in selected_models if name in cached_results_by_model]
+        write_json(output_dir / "optuna_results.json", [asdict(result) for result in ordered_results])
+        return ordered_results
 
     bundle = feature_bundle if feature_bundle is not None else build_classical_feature_bundle(data)
     X_train, X_val, X_test = bundle.X_train, bundle.X_val, bundle.X_test
@@ -276,7 +531,6 @@ def run_optuna_tuning(
         len(X_test),
     )
 
-    results: list[OptunaTuningResult] = []
     prediction_output_dir = output_dir / "prediction_bundles"
     prediction_output_dir.mkdir(parents=True, exist_ok=True)
     estimator_output_dir = output_dir / "estimators"
@@ -285,20 +539,12 @@ def run_optuna_tuning(
     requested_optuna_jobs = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_JOBS"), 1)
     requested_model_workers = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_MODEL_WORKERS"), 1)
     model_workers, optuna_jobs = _resolve_optuna_worker_plan(
-        len(selected_models),
+        len(uncached_models),
         requested_optuna_jobs,
         requested_model_workers,
     )
     if optuna_jobs > 1 or model_workers > 1:
         estimator_n_jobs = 1
-    per_trial_timeout_seconds = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS"), 0)
-    model_timeout_default = timeout_seconds if timeout_seconds > 0 else 0
-    model_timeout_default = _parse_positive_int(
-        os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS"),
-        model_timeout_default,
-    )
-    model_timeout_overrides = _parse_model_timeout_overrides(os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUTS"))
-    fidelity_schedule = _parse_fidelity_schedule(os.getenv("SPOTIFY_OPTUNA_PRUNING_FIDELITIES"))
     pruner, pruner_name = _build_pruner(optuna)
 
     logger.info(
@@ -477,14 +723,25 @@ def run_optuna_tuning(
             val_top1,
             test_top1,
         )
+        if cache_enabled and model_name in cache_contexts:
+            cache_paths, cache_payload = cache_contexts[model_name]
+            _save_optuna_result_to_cache(
+                cache_paths=cache_paths,
+                cache_payload=cache_payload,
+                result=result,
+                output_dir=output_dir,
+                model_name=model_name,
+                logger=logger,
+            )
         return result
 
-    if model_workers > 1 and len(selected_models) > 1:
-        ordered_results: list[OptunaTuningResult | None] = [None] * len(selected_models)
+    fresh_results_by_model: dict[str, OptunaTuningResult] = {}
+    if model_workers > 1 and len(uncached_models) > 1:
+        ordered_results: list[OptunaTuningResult | None] = [None] * len(uncached_models)
         with ThreadPoolExecutor(max_workers=model_workers) as executor:
             futures = {
                 executor.submit(run_model_study, model_name): (idx, model_name)
-                for idx, model_name in enumerate(selected_models)
+                for idx, model_name in enumerate(uncached_models)
             }
             for future in as_completed(futures):
                 idx, model_name = futures[future]
@@ -492,16 +749,24 @@ def run_optuna_tuning(
                     ordered_results[idx] = future.result()
                 except Exception as exc:
                     logger.warning("Optuna tuning failed for %s: %s", model_name, exc)
-        results = [result for result in ordered_results if result is not None]
+        fresh_results_by_model = {
+            model_name: result
+            for model_name, result in zip(uncached_models, ordered_results)
+            if result is not None
+        }
     else:
-        for model_name in selected_models:
+        for model_name in uncached_models:
             result = run_model_study(model_name)
             if result is not None:
-                results.append(result)
+                fresh_results_by_model[model_name] = result
 
-    summary_payload = [asdict(result) for result in results]
+    results = [
+        cached_results_by_model.get(model_name) or fresh_results_by_model.get(model_name)
+        for model_name in selected_models
+    ]
+    ordered_results = [result for result in results if result is not None]
+    summary_payload = [asdict(result) for result in ordered_results]
 
-    with (output_dir / "optuna_results.json").open("w", encoding="utf-8") as out:
-        json.dump(summary_payload, out, indent=2)
+    write_json(output_dir / "optuna_results.json", summary_payload)
 
-    return results
+    return ordered_results

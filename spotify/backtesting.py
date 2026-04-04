@@ -20,6 +20,11 @@ from .benchmarks import (
 from .data import PreparedData
 from .recommender_safety import build_temporal_backtest_windows, write_temporal_backtest_artifacts
 
+RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
+    "retrieval_dual_encoder",
+    "retrieval_reranker",
+)
+
 
 @dataclass
 class BacktestFoldResult:
@@ -57,10 +62,14 @@ def _run_backtest_job(
     y_train: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
+    estimator_model_name: str | None = None,
+    estimator_params: dict[str, object] | None = None,
+    result_model_type: str = "classical",
 ) -> BacktestFoldResult:
     family, estimator = build_classical_estimator(
-        model_name,
+        (estimator_model_name or model_name),
         random_seed + fold_idx,
+        params=estimator_params,
         estimator_n_jobs=estimator_n_jobs,
     )
     started = time.perf_counter()
@@ -69,7 +78,7 @@ def _run_backtest_job(
     top1, top5 = _score_backtest_estimator(estimator, X_test, y_test)
     return BacktestFoldResult(
         model_name=model_name,
-        model_type="classical",
+        model_type=result_model_type,
         model_family=family,
         adaptation_mode="cold",
         fold=fold_idx,
@@ -155,28 +164,162 @@ def _deep_train_validation_split(n_rows: int, reference_rows: int) -> tuple[slic
     return slice(0, split_idx), slice(split_idx, n_rows)
 
 
-def _resolve_backtest_model_groups(selected_models: tuple[str, ...], random_seed: int) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _resolve_backtest_model_groups(
+    selected_models: tuple[str, ...],
+    random_seed: int,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     from .config import DEFAULT_MODEL_NAMES
 
     classical_registry = get_classical_model_registry(random_seed)
     deep_registry = set(DEFAULT_MODEL_NAMES)
+    retrieval_registry = set(RETRIEVAL_BACKTEST_MODEL_NAMES)
+    tuned_model_names = set((tuned_model_specs or {}).keys())
     classical: list[str] = []
     deep: list[str] = []
+    retrieval: list[str] = []
     unknown: list[str] = []
 
     for model_name in selected_models:
-        if model_name in classical_registry:
+        if model_name in tuned_model_names or model_name in classical_registry:
             classical.append(model_name)
         elif model_name in deep_registry:
             deep.append(model_name)
+        elif model_name in retrieval_registry:
+            retrieval.append(model_name)
         else:
             unknown.append(model_name)
 
     if unknown:
-        known = ", ".join(sorted(set(classical_registry) | deep_registry))
+        known = ", ".join(sorted(set(classical_registry) | deep_registry | retrieval_registry))
         raise ValueError(f"Unknown temporal backtest model names: {', '.join(unknown)}. Known models: {known}")
 
-    return tuple(classical), tuple(deep)
+    return tuple(classical), tuple(deep), tuple(retrieval)
+
+
+def _run_retrieval_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    y_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    logger,
+) -> BacktestFoldResult:
+    from .retrieval_common import (
+        DEFAULT_EMBEDDING_DIM,
+        DEFAULT_RETRIEVAL_CANDIDATE_K,
+        RetrievalServingArtifact,
+        _normalize_rows,
+        _prediction_metrics,
+        _softmax_rows,
+    )
+    from .retrieval_reranking import _fit_reranker, _predict_reranked_probabilities
+    from .retrieval_training import _fit_dual_encoder
+
+    started = time.perf_counter()
+    rng = np.random.default_rng(int(random_seed) + int(fold_idx))
+    embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
+    try:
+        embedding_dim = max(4, int(embedding_dim_raw)) if embedding_dim_raw else DEFAULT_EMBEDDING_DIM
+    except Exception:
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+    candidate_k = min(
+        int(num_artists),
+        max(2, int(os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_CANDIDATE_K", str(DEFAULT_RETRIEVAL_CANDIDATE_K)).strip() or DEFAULT_RETRIEVAL_CANDIDATE_K)),
+    )
+    backtest_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_EPOCHS", "").strip()
+    try:
+        backtest_epochs = max(1, int(backtest_epochs_raw)) if backtest_epochs_raw else None
+    except Exception:
+        backtest_epochs = None
+
+    counts = np.bincount(
+        np.concatenate([np.asarray(X_seq_train, dtype="int32").reshape(-1), np.asarray(y_train, dtype="int32").reshape(-1)]),
+        minlength=int(num_artists),
+    ).astype("float32")
+    counts += 1.0
+    popularity = counts / float(np.sum(counts))
+    artist_embeddings = _normalize_rows(
+        rng.normal(scale=0.05, size=(int(num_artists), int(embedding_dim))).astype("float32")
+    )
+    sequence_projection, context_projection, item_bias, _ = _fit_dual_encoder(
+        seq_train=np.asarray(X_seq_train, dtype="int32"),
+        ctx_train=np.asarray(X_ctx_train, dtype="float32"),
+        y_train=np.asarray(y_train, dtype="int32"),
+        artist_embeddings=artist_embeddings,
+        popularity=popularity,
+        random_seed=int(random_seed) + int(fold_idx),
+        logger=logger,
+        epochs=backtest_epochs,
+    )
+    retrieval_artifact = RetrievalServingArtifact(
+        model_name="retrieval_dual_encoder",
+        candidate_k=candidate_k,
+        artist_embeddings=np.asarray(artist_embeddings, dtype="float32"),
+        sequence_projection=np.asarray(sequence_projection, dtype="float32"),
+        context_projection=np.asarray(context_projection, dtype="float32"),
+        item_bias=np.asarray(item_bias, dtype="float32"),
+        popularity=np.asarray(popularity, dtype="float32"),
+        ann_index=None,
+        reranker=None,
+    )
+    test_session_vec, test_scores = retrieval_artifact.score_items(
+        np.asarray(X_seq_test, dtype="int32"),
+        np.asarray(X_ctx_test, dtype="float32"),
+    )
+
+    if model_name == "retrieval_reranker":
+        reranker = _fit_reranker(
+            seq_train=np.asarray(X_seq_train, dtype="int32"),
+            ctx_train=np.asarray(X_ctx_train, dtype="float32"),
+            y_train=np.asarray(y_train, dtype="int32"),
+            retrieval_artifact=retrieval_artifact,
+            random_seed=int(random_seed) + int(fold_idx),
+        )
+        serving_artifact = RetrievalServingArtifact(
+            model_name="retrieval_reranker",
+            candidate_k=retrieval_artifact.candidate_k,
+            artist_embeddings=retrieval_artifact.artist_embeddings,
+            sequence_projection=retrieval_artifact.sequence_projection,
+            context_projection=retrieval_artifact.context_projection,
+            item_bias=retrieval_artifact.item_bias,
+            popularity=retrieval_artifact.popularity,
+            ann_index=None,
+            reranker=reranker,
+        )
+        test_proba = _predict_reranked_probabilities(
+            seq_batch=np.asarray(X_seq_test, dtype="int32"),
+            ctx_batch=np.asarray(X_ctx_test, dtype="float32"),
+            session_vec=test_session_vec,
+            retrieval_scores=test_scores,
+            artifact=serving_artifact,
+        )
+        model_type = "retrieval_reranker"
+        model_family = "candidate_reranker"
+    else:
+        test_proba = _softmax_rows(test_scores)
+        model_type = "retrieval"
+        model_family = "dual_encoder"
+
+    metrics = _prediction_metrics(test_proba, np.asarray(y_test, dtype="int32"), num_items=int(num_artists))
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_type=model_type,
+        model_family=model_family,
+        adaptation_mode="cold",
+        fold=int(fold_idx),
+        train_rows=len(np.asarray(X_seq_train)),
+        test_rows=len(np.asarray(X_seq_test)),
+        fit_seconds=float(time.perf_counter() - started),
+        top1=float(metrics.get("top1", float("nan"))),
+        top5=float(metrics.get("top5", float("nan"))),
+    )
 
 
 def _resolve_deep_builders(
@@ -467,12 +610,18 @@ def run_temporal_backtest(
     deep_model_builders=None,
     strategy=None,
     adaptation_mode: str | None = None,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
 ) -> list[BacktestFoldResult]:
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
         return []
 
-    classical_models, deep_models = _resolve_backtest_model_groups(selected_models, random_seed)
+    resolved_tuned_specs = dict(tuned_model_specs or {})
+    classical_models, deep_models, retrieval_models = _resolve_backtest_model_groups(
+        selected_models,
+        random_seed,
+        tuned_model_specs=resolved_tuned_specs,
+    )
     resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -505,9 +654,10 @@ def run_temporal_backtest(
         return []
 
     needs_session_sequences = "session_knn" in classical_models
+    needs_retrieval_inputs = bool(retrieval_models)
     needs_deep_inputs = bool(deep_models)
     X_all_seq = None
-    if needs_session_sequences or needs_deep_inputs:
+    if needs_session_sequences or needs_retrieval_inputs or needs_deep_inputs:
         if feature_bundle is None:
             X_all_seq = np.concatenate(
                 [
@@ -528,7 +678,7 @@ def run_temporal_backtest(
             )
     X_all_ctx = None
     y_skip_all = None
-    if needs_deep_inputs:
+    if needs_retrieval_inputs or needs_deep_inputs:
         X_all_ctx = np.concatenate(
             [
                 data.X_ctx_train.astype("float32", copy=False),
@@ -547,7 +697,7 @@ def run_temporal_backtest(
         )
 
     results: list[BacktestFoldResult] = []
-    jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str | None, dict[str, object] | None, str]] = []
     for window in resolved_windows:
         X_train_tab = X_all[window.train_slice]
         y_train = y_all[window.train_slice]
@@ -556,6 +706,7 @@ def run_temporal_backtest(
         for model_name in classical_models:
             if model_name == "session_knn":
                 assert X_all_seq is not None
+                tuned_spec = resolved_tuned_specs.get(model_name, {})
                 jobs.append(
                     (
                         window.fold,
@@ -564,10 +715,26 @@ def run_temporal_backtest(
                         y_train,
                         X_all_seq[window.test_slice],
                         y_test,
+                        (str(tuned_spec.get("base_model_name", "")).strip() or None),
+                        (dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None),
+                        ("classical_tuned" if tuned_spec else "classical"),
                     )
                 )
             else:
-                jobs.append((window.fold, model_name, X_train_tab, y_train, X_test_tab, y_test))
+                tuned_spec = resolved_tuned_specs.get(model_name, {})
+                jobs.append(
+                    (
+                        window.fold,
+                        model_name,
+                        X_train_tab,
+                        y_train,
+                        X_test_tab,
+                        y_test,
+                        (str(tuned_spec.get("base_model_name", "")).strip() or None),
+                        (dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None),
+                        ("classical_tuned" if tuned_spec else "classical"),
+                    )
+                )
 
     workers_raw = os.getenv("SPOTIFY_BACKTEST_WORKERS", "")
     _, estimator_n_jobs = resolve_classical_parallelism()
@@ -584,7 +751,7 @@ def run_temporal_backtest(
     if backtest_workers > 1 and len(jobs) > 1:
         with ThreadPoolExecutor(max_workers=backtest_workers) as executor:
             futures = {}
-            for fold_idx, model_name, X_train, y_train, X_test, y_test in jobs:
+            for fold_idx, model_name, X_train, y_train, X_test, y_test, estimator_model_name, estimator_params, result_model_type in jobs:
                 future = executor.submit(
                     _run_backtest_job,
                     model_name,
@@ -595,6 +762,9 @@ def run_temporal_backtest(
                     y_train,
                     X_test,
                     y_test,
+                    estimator_model_name,
+                    estimator_params,
+                    result_model_type,
                 )
                 futures[future] = (fold_idx, model_name)
 
@@ -622,7 +792,17 @@ def run_temporal_backtest(
                 f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
             )
     else:
-        for fold_idx, model_name, X_train, y_train, X_test, y_test in jobs:
+        for (
+            fold_idx,
+            model_name,
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            estimator_model_name,
+            estimator_params,
+            result_model_type,
+        ) in jobs:
             try:
                 row = _run_backtest_job(
                     model_name=model_name,
@@ -633,6 +813,9 @@ def run_temporal_backtest(
                     y_train=y_train,
                     X_test=X_test,
                     y_test=y_test,
+                    estimator_model_name=estimator_model_name,
+                    estimator_params=estimator_params,
+                    result_model_type=result_model_type,
                 )
             except Exception as exc:
                 logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
@@ -645,6 +828,50 @@ def run_temporal_backtest(
                 row.top1,
                 f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
             )
+
+    if retrieval_models:
+        assert X_all_seq is not None
+        assert X_all_ctx is not None
+        logger.info(
+            "Retrieval temporal backtesting: models=%s",
+            ",".join(retrieval_models),
+        )
+        for window in resolved_windows:
+            X_train_seq = X_all_seq[window.train_slice]
+            X_train_ctx = X_all_ctx[window.train_slice]
+            y_train = y_all[window.train_slice]
+            X_test_seq = X_all_seq[window.test_slice]
+            X_test_ctx = X_all_ctx[window.test_slice]
+            y_test = y_all[window.test_slice]
+            if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
+                continue
+            for model_name in retrieval_models:
+                try:
+                    row = _run_retrieval_backtest_job(
+                        model_name=model_name,
+                        fold_idx=window.fold,
+                        random_seed=random_seed,
+                        X_seq_train=X_train_seq,
+                        X_ctx_train=X_train_ctx,
+                        y_train=y_train,
+                        X_seq_test=X_test_seq,
+                        X_ctx_test=X_test_ctx,
+                        y_test=y_test,
+                        num_artists=data.num_artists,
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    logger.warning("Retrieval backtest fit failed for %s fold=%d: %s", model_name, window.fold, exc)
+                    continue
+                results.append(row)
+                logger.info(
+                    "[BACKTEST] fold=%d model=%s type=%s top1=%.4f top5=%s",
+                    row.fold,
+                    row.model_name,
+                    row.model_type,
+                    row.top1,
+                    f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+                )
 
     if deep_models:
         deep_epochs_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_EPOCHS", "3").strip()
