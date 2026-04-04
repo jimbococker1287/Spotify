@@ -341,3 +341,41 @@ def test_evaluate_promotion_gate_prefers_eligible_challenger_when_risk_caps_exis
     assert result["challenger_model_name"] == "eligible_candidate"
     assert result["promoted"] is True
     assert result["status"] == "pass"
+
+
+def test_evaluate_promotion_gate_uses_worst_case_risk_metrics(tmp_path: Path) -> None:
+    history_csv = tmp_path / "top1_history.csv"
+    _write_history(
+        history_csv,
+        [
+            {"run_id": "run_a", "profile": "prod", "model_name": "champion", "top1": 0.42},
+        ],
+        fieldnames=["run_id", "profile", "model_name", "top1"],
+    )
+
+    result = evaluate_promotion_gate(
+        history_csv=history_csv,
+        current_run_id="run_b",
+        current_rows=[
+            {"model_name": "candidate", "top1": 0.44},
+        ],
+        metric_name="top1",
+        regression_threshold=0.0,
+        current_profile="prod",
+        current_risk_metrics={
+            "candidate": {
+                "val_selective_risk": 0.10,
+                "test_selective_risk": 0.62,
+                "val_abstention_rate": 0.08,
+                "test_abstention_rate": 0.14,
+            }
+        },
+        max_selective_risk=0.50,
+        max_abstention_rate=0.30,
+    )
+
+    assert result["challenger_model_name"] == "candidate"
+    assert result["challenger_selective_risk"] == 0.62
+    assert result["challenger_abstention_rate"] == 0.14
+    assert result["promoted"] is False
+    assert result["status"] == "fail_selective_risk"

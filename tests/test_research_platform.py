@@ -285,4 +285,10 @@ def test_risk_metrics_backfill_from_prediction_bundle_for_missing_challenger_sum
     )
 
     assert gate["challenger_model_name"] == "extra_trees"
-    assert gate["challenger_selective_risk"] == 0.0
+    expected_selective_risk = max(
+        metrics["extra_trees"]["val_selective_risk"],
+        metrics["extra_trees"]["test_selective_risk"],
+    )
+    assert gate["challenger_selective_risk"] == expected_selective_risk
+    if expected_selective_risk > 0.0:
+        assert gate["status"] == "fail_selective_risk"

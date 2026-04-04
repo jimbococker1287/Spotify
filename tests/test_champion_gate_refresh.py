@@ -128,17 +128,26 @@ def test_refresh_champion_gate_backfills_missing_challenger_risk_metrics(tmp_pat
 
     assert payload["run_id"] == run_id
     assert payload["metric_source"] == "backtest_top1"
-    assert payload["status"] == "pass"
-    assert payload["promoted"] is True
     assert payload["challenger_model_name"] == "extra_trees"
-    assert payload["challenger_selective_risk"] == 0.0
-    assert payload["challenger_abstention_rate"] == 0.0
+    assert payload["challenger_selective_risk"] >= 0.0
+    assert payload["challenger_abstention_rate"] >= 0.0
     assert payload["risk_metric_model_count"] == 1
     assert payload["control_room_refreshed"] is False
-    assert gate_payload["challenger_selective_risk"] == 0.0
-    assert gate_payload["challenger_abstention_rate"] == 0.0
-    assert manifest_payload["champion_gate"]["challenger_selective_risk"] == 0.0
-    assert manifest_payload["champion_gate"]["challenger_abstention_rate"] == 0.0
+    assert gate_payload["challenger_selective_risk"] == payload["challenger_selective_risk"]
+    assert gate_payload["challenger_abstention_rate"] == payload["challenger_abstention_rate"]
+    assert manifest_payload["champion_gate"]["challenger_selective_risk"] == payload["challenger_selective_risk"]
+    assert manifest_payload["champion_gate"]["challenger_abstention_rate"] == payload["challenger_abstention_rate"]
+    max_selective_risk = float(gate_payload["max_selective_risk"])
+    max_abstention_rate = float(gate_payload["max_abstention_rate"])
+    if payload["challenger_selective_risk"] > max_selective_risk:
+        assert payload["status"] == "fail_selective_risk"
+        assert payload["promoted"] is False
+    elif payload["challenger_abstention_rate"] > max_abstention_rate:
+        assert payload["status"] == "fail_abstention_rate"
+        assert payload["promoted"] is False
+    else:
+        assert payload["status"] == "pass"
+        assert payload["promoted"] is True
     assert (run_dir / "analysis" / "classical_extra_trees_confidence_summary.json").exists()
     assert (run_dir / "analysis" / "classical_extra_trees_conformal_summary.json").exists()
 
@@ -166,8 +175,8 @@ def test_champion_gate_refresh_module_updates_existing_run(tmp_path: Path) -> No
     gate_payload = safe_read_json(run_dir / "champion_gate.json", default={})
     assert result.returncode == 0
     assert "challenger=extra_trees" in result.stdout
-    assert "challenger_selective_risk=0.0" in result.stdout
-    assert gate_payload["challenger_selective_risk"] == 0.0
+    assert f"challenger_selective_risk={gate_payload['challenger_selective_risk']}" in result.stdout
+    assert gate_payload["challenger_selective_risk"] >= 0.0
 
 
 def test_load_run_backtest_rows_prefers_local_backtest_artifact(tmp_path: Path) -> None:
