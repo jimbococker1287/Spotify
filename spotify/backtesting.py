@@ -4,8 +4,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import gc
-import os
 import csv
+import hashlib
+import os
+import json
 import time
 
 import numpy as np
@@ -19,11 +21,14 @@ from .benchmarks import (
 )
 from .data import PreparedData
 from .recommender_safety import build_temporal_backtest_windows, write_temporal_backtest_artifacts
+from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
 
 RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
     "retrieval_dual_encoder",
     "retrieval_reranker",
 )
+
+BACKTEST_CACHE_SCHEMA_VERSION = "temporal-backtest-cache-v1"
 
 
 @dataclass
@@ -49,8 +54,248 @@ class _BacktestWindowSlices:
     raw_test_end: int
 
 
+@dataclass(frozen=True)
+class TemporalBacktestCachePaths:
+    cache_key: str
+    cache_dir: Path
+    result_path: Path
+    metadata_path: Path
+    artifact_dir: Path
+
+
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
     return [(window.test_start, window.test_end) for window in build_temporal_backtest_windows(n_rows, folds)]
+
+
+def _backtest_cache_enabled_from_env() -> bool:
+    raw = os.getenv("SPOTIFY_CACHE_BACKTEST", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _backtesting_source_digest() -> str:
+    source_names = (
+        "backtesting.py",
+        "benchmarks.py",
+        "recommender_safety.py",
+        "modeling.py",
+        "runtime.py",
+        "retrieval_common.py",
+        "retrieval_training.py",
+        "retrieval_reranking.py",
+    )
+    root_dir = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in source_names:
+        path = root_dir / name
+        if path.exists():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def _deep_backtest_runtime_config() -> dict[str, int]:
+    deep_epochs_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_EPOCHS", "3").strip()
+    deep_batch_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_BATCH_SIZE", "256").strip()
+    try:
+        deep_epochs = max(1, int(deep_epochs_raw))
+    except Exception:
+        deep_epochs = 3
+    try:
+        deep_batch_size = max(1, int(deep_batch_raw))
+    except Exception:
+        deep_batch_size = 256
+    return {
+        "epochs": int(deep_epochs),
+        "batch_size": int(deep_batch_size),
+    }
+
+
+def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, int | None]:
+    from .retrieval_common import DEFAULT_EMBEDDING_DIM, DEFAULT_RETRIEVAL_CANDIDATE_K
+
+    embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
+    try:
+        embedding_dim = max(4, int(embedding_dim_raw)) if embedding_dim_raw else DEFAULT_EMBEDDING_DIM
+    except Exception:
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+
+    candidate_k_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_CANDIDATE_K", str(DEFAULT_RETRIEVAL_CANDIDATE_K)).strip()
+    try:
+        candidate_k = max(2, int(candidate_k_raw or DEFAULT_RETRIEVAL_CANDIDATE_K))
+    except Exception:
+        candidate_k = DEFAULT_RETRIEVAL_CANDIDATE_K
+    candidate_k = min(int(num_artists), int(candidate_k))
+
+    backtest_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_EPOCHS", "").strip()
+    try:
+        backtest_epochs = max(1, int(backtest_epochs_raw)) if backtest_epochs_raw else None
+    except Exception:
+        backtest_epochs = None
+
+    return {
+        "embedding_dim": int(embedding_dim),
+        "candidate_k": int(candidate_k),
+        "epochs": (int(backtest_epochs) if backtest_epochs is not None else None),
+    }
+
+
+def _serialize_tuned_model_specs(tuned_model_specs: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    serialized: dict[str, dict[str, object]] = {}
+    for model_name in sorted(tuned_model_specs):
+        spec = tuned_model_specs.get(model_name, {})
+        if not isinstance(spec, dict):
+            continue
+        best_params_raw = spec.get("best_params", {})
+        if not isinstance(best_params_raw, dict):
+            best_params_raw = {}
+        serialized[str(model_name)] = {
+            "base_model_name": str(spec.get("base_model_name", "")).strip(),
+            "best_params": {str(key): best_params_raw[key] for key in sorted(best_params_raw)},
+        }
+    return serialized
+
+
+def _build_temporal_backtest_cache_payload(
+    *,
+    cache_fingerprint: str,
+    selected_models: tuple[str, ...],
+    classical_models: tuple[str, ...],
+    deep_models: tuple[str, ...],
+    retrieval_models: tuple[str, ...],
+    random_seed: int,
+    folds: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    adaptation_mode: str,
+    tuned_model_specs: dict[str, dict[str, object]],
+    sequence_length: int,
+    num_artists: int,
+    num_ctx: int,
+    total_rows: int,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "cache_schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+        "prepared_fingerprint": str(cache_fingerprint).strip(),
+        "selected_models": [str(name) for name in selected_models],
+        "classical_models": [str(name) for name in classical_models],
+        "deep_models": [str(name) for name in deep_models],
+        "retrieval_models": [str(name) for name in retrieval_models],
+        "random_seed": int(random_seed),
+        "folds": int(folds),
+        "max_train_samples": int(max_train_samples),
+        "max_eval_samples": int(max_eval_samples),
+        "adaptation_mode": str(adaptation_mode),
+        "tuned_model_specs": _serialize_tuned_model_specs(tuned_model_specs),
+        "sequence_length": int(sequence_length),
+        "num_artists": int(num_artists),
+        "num_ctx": int(num_ctx),
+        "total_rows": int(total_rows),
+        "source_digest": _backtesting_source_digest(),
+    }
+    if deep_models:
+        payload["deep_runtime"] = _deep_backtest_runtime_config()
+    if retrieval_models:
+        payload["retrieval_runtime"] = _retrieval_backtest_runtime_config(num_artists=num_artists)
+    return payload
+
+
+def _build_temporal_backtest_cache_key(payload: dict[str, object]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _resolve_temporal_backtest_cache_paths(
+    *,
+    cache_root: Path,
+    cache_fingerprint: str,
+    cache_key: str,
+) -> TemporalBacktestCachePaths:
+    cache_dir = (cache_root / cache_fingerprint / cache_key).resolve()
+    return TemporalBacktestCachePaths(
+        cache_key=cache_key,
+        cache_dir=cache_dir,
+        result_path=cache_dir / "result.json",
+        metadata_path=cache_dir / "cache_meta.json",
+        artifact_dir=cache_dir / "artifacts",
+    )
+
+
+def _coerce_backtest_row(row: dict[str, object]) -> BacktestFoldResult:
+    return BacktestFoldResult(
+        model_name=str(row.get("model_name", "")).strip(),
+        model_type=str(row.get("model_type", "")).strip(),
+        model_family=str(row.get("model_family", "")).strip(),
+        fold=int(row.get("fold", 0)),
+        train_rows=int(row.get("train_rows", 0)),
+        test_rows=int(row.get("test_rows", 0)),
+        fit_seconds=float(row.get("fit_seconds", float("nan"))),
+        top1=float(row.get("top1", float("nan"))),
+        top5=float(row.get("top5", float("nan"))),
+        adaptation_mode=str(row.get("adaptation_mode", "cold")).strip() or "cold",
+    )
+
+
+def _load_cached_temporal_backtest_result(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+    output_dir: Path,
+    logger,
+) -> list[BacktestFoldResult] | None:
+    try:
+        payload = safe_read_json(cache_paths.result_path, default=None)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("cache_schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
+            return None
+        rows_payload = payload.get("rows")
+        artifact_names = payload.get("artifact_names")
+        if not isinstance(rows_payload, list) or not isinstance(artifact_names, list):
+            return None
+        artifact_files = []
+        for name in artifact_names:
+            name_text = str(name).strip()
+            if not name_text:
+                continue
+            source_path = cache_paths.artifact_dir / name_text
+            if not source_path.exists():
+                return None
+            artifact_files.append((source_path, output_dir / name_text))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for source_path, destination_path in artifact_files:
+            copy_file_if_changed(source_path, destination_path)
+        return [_coerce_backtest_row(dict(row)) for row in rows_payload if isinstance(row, dict)]
+    except Exception as exc:
+        logger.warning("Temporal backtest cache load failed (%s). Rebuilding.", exc)
+        return None
+
+
+def _save_temporal_backtest_result_to_cache(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+    cache_payload: dict[str, object],
+    results: list[BacktestFoldResult],
+    artifact_paths: list[Path],
+) -> None:
+    try:
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_paths.artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_names: list[str] = []
+        for source_path in artifact_paths:
+            if not source_path.exists():
+                continue
+            artifact_names.append(source_path.name)
+            copy_file_if_changed(source_path, cache_paths.artifact_dir / source_path.name)
+        write_json(
+            cache_paths.result_path,
+            {
+                "cache_schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+                "rows": [asdict(row) for row in results],
+                "artifact_names": artifact_names,
+            },
+            sort_keys=True,
+        )
+        write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+    except Exception:
+        return None
 
 
 def _run_backtest_job(
@@ -611,6 +856,9 @@ def run_temporal_backtest(
     strategy=None,
     adaptation_mode: str | None = None,
     tuned_model_specs: dict[str, dict[str, object]] | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+    cache_stats_out: dict[str, object] | None = None,
 ) -> list[BacktestFoldResult]:
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
@@ -624,6 +872,64 @@ def run_temporal_backtest(
     )
     resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
+    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
+
+    cache_enabled = _backtest_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
+    cache_paths = None
+    if cache_enabled and cache_root is not None:
+        cache_payload = _build_temporal_backtest_cache_payload(
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            selected_models=selected_models,
+            classical_models=classical_models,
+            deep_models=deep_models,
+            retrieval_models=retrieval_models,
+            random_seed=random_seed,
+            folds=folds,
+            max_train_samples=resolved_max_train_samples,
+            max_eval_samples=resolved_max_eval_samples,
+            adaptation_mode=resolved_adaptation_mode,
+            tuned_model_specs=resolved_tuned_specs,
+            sequence_length=int(data.X_seq_train.shape[1]) if data.X_seq_train.ndim >= 2 else 0,
+            num_artists=int(data.num_artists),
+            num_ctx=int(data.num_ctx),
+            total_rows=int(len(data.y_train) + len(data.y_val) + len(data.y_test)),
+        )
+        cache_key = _build_temporal_backtest_cache_key(cache_payload)
+        cache_paths = _resolve_temporal_backtest_cache_paths(
+            cache_root=cache_root,
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            cache_key=cache_key,
+        )
+        cached_results = _load_cached_temporal_backtest_result(
+            cache_paths=cache_paths,
+            output_dir=output_dir,
+            logger=logger,
+        )
+    else:
+        cache_payload = {}
+        cached_results = None
+
+    if cache_stats_out is not None:
+        cache_stats_out.clear()
+        cache_stats_out.update(
+            {
+                "enabled": bool(cache_enabled),
+                "fingerprint": (str(cache_fingerprint).strip() if cache_enabled else ""),
+                "cache_key": (cache_paths.cache_key if cache_paths is not None else ""),
+                "hit": bool(cached_results is not None),
+                "selected_models": [str(name) for name in selected_models],
+            }
+        )
+
+    logger.info(
+        "Temporal backtest cache status: enabled=%s fingerprint=%s hit=%s",
+        cache_enabled,
+        (cache_fingerprint if cache_enabled else "disabled"),
+        bool(cached_results is not None),
+    )
+    if cached_results is not None:
+        return cached_results
 
     X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
     windows = _build_expanding_windows(len(X_all), folds)
@@ -637,8 +943,6 @@ def run_temporal_backtest(
         len(X_all),
     )
 
-    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
-    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
     logger.info(
         "Temporal backtesting caps: train_rows=%d eval_rows=%d",
         resolved_max_train_samples,
@@ -874,16 +1178,9 @@ def run_temporal_backtest(
                 )
 
     if deep_models:
-        deep_epochs_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_EPOCHS", "3").strip()
-        deep_batch_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_BATCH_SIZE", "256").strip()
-        try:
-            deep_epochs = max(1, int(deep_epochs_raw))
-        except Exception:
-            deep_epochs = 3
-        try:
-            deep_batch_size = max(1, int(deep_batch_raw))
-        except Exception:
-            deep_batch_size = 256
+        deep_runtime = _deep_backtest_runtime_config()
+        deep_epochs = int(deep_runtime["epochs"])
+        deep_batch_size = int(deep_runtime["batch_size"])
 
         resolved_strategy = _resolve_deep_strategy(strategy, logger)
         deep_builders = _resolve_deep_builders(
@@ -996,6 +1293,13 @@ def run_temporal_backtest(
             summary_parts.append(f"{model_name}={float(np.mean(timings)):.2f}s")
         logger.info("Backtest runtime summary: %s", ", ".join(summary_parts))
 
-    write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
+    artifact_paths = write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
+    if cache_enabled and cache_paths is not None:
+        _save_temporal_backtest_result_to_cache(
+            cache_paths=cache_paths,
+            cache_payload=cache_payload,
+            results=results,
+            artifact_paths=artifact_paths,
+        )
 
     return results

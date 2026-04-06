@@ -311,3 +311,101 @@ def test_run_temporal_backtest_supports_retrieval_models(tmp_path: Path, monkeyp
     assert rows[0].model_name == "retrieval_reranker"
     assert rows[0].model_type == "retrieval_reranker"
     assert captured == [{"model_name": "retrieval_reranker", "train_rows": 4, "test_rows": 2}]
+
+
+def test_run_temporal_backtest_reuses_cached_phase_artifacts_without_recomputing(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    cache_root = tmp_path / "cache"
+    output_dir = tmp_path / "run"
+    cache_fingerprint = "prepared123"
+    model_name = "gru_artist"
+
+    monkeypatch.setenv("SPOTIFY_CACHE_BACKTEST", "1")
+
+    cache_payload = backtesting._build_temporal_backtest_cache_payload(
+        cache_fingerprint=cache_fingerprint,
+        selected_models=(model_name,),
+        classical_models=(),
+        deep_models=(model_name,),
+        retrieval_models=(),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        adaptation_mode="cold",
+        tuned_model_specs={},
+        sequence_length=int(data.X_seq_train.shape[1]),
+        num_artists=int(data.num_artists),
+        num_ctx=int(data.num_ctx),
+        total_rows=int(len(data.y_train) + len(data.y_val) + len(data.y_test)),
+    )
+    cache_key = backtesting._build_temporal_backtest_cache_key(cache_payload)
+    cache_paths = backtesting._resolve_temporal_backtest_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_key=cache_key,
+    )
+    cache_paths.artifact_dir.mkdir(parents=True, exist_ok=True)
+    cached_artifacts = {
+        "temporal_backtest.csv": b"csv",
+        "temporal_backtest.json": b"json",
+        "temporal_backtest_summary.csv": b"summary-csv",
+        "temporal_backtest_summary.json": b"summary-json",
+        "temporal_backtest_top1.png": b"plot",
+    }
+    for name, payload in cached_artifacts.items():
+        (cache_paths.artifact_dir / name).write_bytes(payload)
+    backtesting.write_json(
+        cache_paths.result_path,
+        {
+            "cache_schema_version": backtesting.BACKTEST_CACHE_SCHEMA_VERSION,
+            "rows": [
+                {
+                    "model_name": model_name,
+                    "model_type": "deep",
+                    "model_family": "neural",
+                    "fold": 1,
+                    "train_rows": 4,
+                    "test_rows": 2,
+                    "fit_seconds": 3.5,
+                    "top1": 0.5,
+                    "top5": 1.0,
+                    "adaptation_mode": "cold",
+                }
+            ],
+            "artifact_names": sorted(cached_artifacts),
+        },
+        sort_keys=True,
+    )
+    backtesting.write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+
+    monkeypatch.setattr(backtesting, "build_full_tabular_dataset", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dataset build should be skipped on a cache hit")))
+    monkeypatch.setattr(backtesting, "_resolve_deep_builders", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deep builders should be skipped on a cache hit")))
+    cache_stats: dict[str, object] = {}
+
+    rows = run_temporal_backtest(
+        data=data,
+        output_dir=output_dir,
+        selected_models=(model_name,),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_cache"),
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_stats_out=cache_stats,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].model_name == model_name
+    assert rows[0].fit_seconds == 3.5
+    for name, payload in cached_artifacts.items():
+        assert (output_dir / name).read_bytes() == payload
+    assert cache_stats == {
+        "enabled": True,
+        "fingerprint": cache_fingerprint,
+        "cache_key": cache_key,
+        "hit": True,
+        "selected_models": [model_name],
+    }

@@ -636,3 +636,50 @@ Validation gate:
 - `ruff` passed on the touched Python files.
 - `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
 - `tests/test_benchmarks_features.py`, `tests/test_reporting_and_evaluation.py`, `tests/test_training_cache.py`, `tests/test_explainability.py`, `tests/test_pipeline_runtime_shortlists.py`, and `tests/test_tuning_cache.py` passed.
+
+### Persistent Temporal Backtest Cache Reuse
+
+Scope:
+- Added a persistent phase-level temporal backtest cache in `spotify/backtesting.py` keyed by:
+  - prepared-data fingerprint
+  - selected backtest models
+  - folds, train/eval sample caps, adaptation mode
+  - tuned challenger specs
+  - sequence length, artist count, context width, total row count
+  - deep/retrieval backtest runtime knobs that affect results
+  - a source digest across the backtesting stack
+- Wired the experiment runtime to pass the prepared-data fingerprint into `run_temporal_backtest(...)` from `spotify/pipeline_runtime_experiments.py` and record cache metadata in the `temporal_backtest` phase.
+- Enabled the cache by default in `scripts/run_everything.sh` and `scripts/run_fast.sh` with `SPOTIFY_CACHE_BACKTEST=1`.
+
+What gets reused:
+- the full backtest row payload
+- `temporal_backtest.csv`
+- `temporal_backtest.json`
+- `temporal_backtest_summary.csv`
+- `temporal_backtest_summary.json`
+- the generated metric plot such as `temporal_backtest_top1.png`
+
+Validation and cache behavior:
+- Added `tests/test_drift_and_backtesting.py` coverage proving a cache hit restores the phase artifacts and returns cached rows without rebuilding the full dataset or resolving deep builders.
+
+Measured impact:
+- Real prepared-data benchmark using `outputs/cache/prepared_data/07eb728b1f7b45a58b263785/prepared_bundle.joblib`
+- Bounded workload A: `selected_models=(logreg, mlp)`, `folds=1`, `max_train_samples=12000`, `max_eval_samples=6000`
+  - cold backtest run: `32.8805s`
+  - warm cache replay: `0.0046s`
+  - speedup: about `7168.0x`
+- Larger representative workload B: `selected_models=(logreg, extra_trees, mlp)`, `folds=2`, `max_train_samples=30000`, `max_eval_samples=12000`
+  - cold backtest run: `191.9846s`
+  - warm cache replay: `0.0128s`
+  - speedup: about `14972.5x`
+
+Interpretation:
+- This does not mean the whole pipeline is `7000x` faster.
+- It means unchanged-data reruns can now collapse the temporal backtest phase to artifact replay instead of refitting every fold again.
+- Pipeline-level savings will be slightly smaller if TensorFlow was already initialized earlier for another phase, but the backtest compute itself is now effectively removed on stable reruns.
+
+Validation gate:
+- `compileall` passed on `spotify/backtesting.py`, `spotify/pipeline_runtime_experiments.py`, and `tests/test_drift_and_backtesting.py`.
+- `ruff` passed on the touched Python files.
+- `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
+- `tests/test_drift_and_backtesting.py`, `tests/test_research_platform.py`, and `tests/test_recommender_safety_platform.py` passed.

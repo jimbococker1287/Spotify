@@ -3,28 +3,25 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import random
-import sys
 
 import numpy as np
 
 from .config import DEFAULT_MODEL_NAMES, PipelineConfig, configure_logging
 from .pipeline_helpers import (
-    _append_existing_artifact_path,
     _build_run_id,
-    _release_deep_runtime_resources,
     _track_file,
     _write_json_artifact,
 )
 from .pipeline_postrun import PipelinePostRunContext, PipelinePostRunDeps, run_pipeline_postrun
-from .pipeline_runtime_shortlists import (
-    _resolve_shortlist_top_n,
-    _shortlist_classical_model_names,
-    _tuned_backtest_specs,
+from .pipeline_runtime_experiments import (
+    PipelineExperimentContext,
+    PipelineExperimentDeps,
+    run_experiment_stages,
 )
 from .run_artifacts import write_json
 from .run_timing import RunPhaseRecorder
-from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
 from .tracking import MlflowTracker
+
 
 def run_pipeline(config: PipelineConfig) -> None:
     run_id = _build_run_id(config)
@@ -64,19 +61,11 @@ def run_pipeline(config: PipelineConfig) -> None:
     optuna_rows: list[dict[str, object]] = []
     backtest_rows: list[dict[str, object]] = []
     cache_info_payload: dict[str, object] = {}
-    deep_cache_stats: dict[str, object] = {}
-    classical_cache_stats: dict[str, object] = {}
-    optuna_cache_stats: dict[str, object] = {}
     artifact_paths: list[Path] = [run_dir / "train.log"]
     tracker: MlflowTracker | None = None
     manifest_payload: dict[str, object] | None = None
     final_tracker_status = "FAILED"
     strict_gate_error: str | None = None
-    selected_optuna_model_names = config.optuna_model_names
-    selected_backtest_model_names = config.temporal_backtest_model_names
-    tuned_results = []
-    tuned_backtest_specs: dict[str, dict[str, object]] = {}
-    deep_cache_plan = None
 
     try:
         run_deep_models = (not config.classical_only) and bool(config.model_names)
@@ -86,9 +75,6 @@ def run_pipeline(config: PipelineConfig) -> None:
         run_deep_backtest = bool(config.enable_temporal_backtest) and any(
             model_name in DEFAULT_MODEL_NAMES for model_name in config.temporal_backtest_model_names
         )
-
-        tf = None
-        strategy = None
 
         with phase_recorder.phase("mlflow_tracking_init", enabled=config.enable_mlflow) as phase:
             tracker = MlflowTracker(
@@ -264,444 +250,44 @@ def run_pipeline(config: PipelineConfig) -> None:
                 **baseline_metrics,
             }
         )
-
-        if run_deep_models:
-            deep_cache_plan = resolve_cached_deep_training_artifacts(
-                data=prepared,
-                selected_model_names=config.model_names,
-                batch_size=config.batch_size,
-                epochs=config.epochs,
-                output_dir=run_dir,
-                logger=logger,
-                random_seed=config.random_seed,
-                cache_root=config.output_dir / "cache" / "deep_training",
+        experiment_outputs = run_experiment_stages(
+            context=PipelineExperimentContext(
+                artifact_paths=artifact_paths,
+                backtest_rows=backtest_rows,
                 cache_fingerprint=cache_info.fingerprint,
-            )
-            deep_cache_stats = {
-                "enabled": bool(deep_cache_plan.enabled),
-                "fingerprint": str(deep_cache_plan.fingerprint),
-                "hit_model_names": list(deep_cache_plan.hit_model_names),
-                "miss_model_names": list(deep_cache_plan.miss_model_names),
-            }
-
-        needs_tf_for_deep_training = bool(run_deep_models and deep_cache_plan is not None and deep_cache_plan.miss_model_names)
-        needs_tf_for_deep_backtest = bool(run_deep_backtest)
-        if needs_tf_for_deep_training or needs_tf_for_deep_backtest:
-            with phase_recorder.phase(
-                "tensorflow_runtime_init",
-                run_deep_models=run_deep_models,
+                config=config,
+                logger=logger,
+                optuna_rows=optuna_rows,
+                phase_recorder=phase_recorder,
+                prepared=prepared,
+                result_rows=result_rows,
+                run_classical_models=run_classical_models,
                 run_deep_backtest=run_deep_backtest,
-                deep_cache_hit_models=list(deep_cache_stats.get("hit_model_names", [])),
-                deep_cache_miss_models=list(deep_cache_stats.get("miss_model_names", [])),
-            ) as phase:
-                configure_process_env()
-                tf = load_tensorflow_runtime(logger)
-                tf.random.set_seed(config.random_seed)
-                strategy = select_distribution_strategy(tf, logger=logger)
-                device_count = int(getattr(strategy, "num_replicas_in_sync", 1))
-                phase["device_count"] = device_count
-                phase["initialized_for_deep_training"] = bool(needs_tf_for_deep_training)
-                phase["initialized_for_deep_backtest"] = bool(needs_tf_for_deep_backtest)
-                phase["cache_hit_count"] = int(len(deep_cache_stats.get("hit_model_names", [])))
-                phase["cache_miss_count"] = int(len(deep_cache_stats.get("miss_model_names", [])))
-                logger.info("Number of devices: %s", device_count)
-        else:
-            phase_recorder.skip(
-                "tensorflow_runtime_init",
-                reason=(
-                    "deep_training_fully_cached_and_deep_backtest_disabled"
-                    if run_deep_models
-                    else "deep_models_and_deep_backtest_disabled"
-                ),
-            )
-
-        model_builders = None
-        if run_deep_models:
-            with phase_recorder.phase(
-                "deep_model_training",
-                model_names=list(config.model_names),
-                batch_size=config.batch_size,
-                epochs=config.epochs,
-            ) as phase:
-                deep_model_names_to_build = tuple(deep_cache_plan.miss_model_names) if deep_cache_plan is not None else config.model_names
-                if deep_model_names_to_build:
-                    model_builders = build_model_builders(
-                        sequence_length=config.sequence_length,
-                        num_artists=prepared.num_artists,
-                        num_ctx=prepared.num_ctx,
-                        selected_names=deep_model_names_to_build,
-                    )
-                else:
-                    model_builders = []
-
-                disable_monitor = os.getenv("SPOTIFY_DISABLE_MONITOR", "auto").strip().lower()
-                monitor_enabled = bool(deep_model_names_to_build)
-                if disable_monitor in ("1", "true", "yes", "on"):
-                    monitor_enabled = False
-                elif disable_monitor == "auto" and sys.platform == "darwin":
-                    monitor_enabled = False
-
-                monitor = ResourceMonitor(logger) if monitor_enabled else None
-                if monitor is not None:
-                    monitor.start()
-                try:
-                    artifacts = train_and_evaluate_models(
-                        data=prepared,
-                        model_builders=model_builders,
-                        batch_size=config.batch_size,
-                        epochs=config.epochs,
-                        output_dir=run_dir,
-                        strategy=strategy,
-                        logger=logger,
-                        random_seed=config.random_seed,
-                        cache_root=config.output_dir / "cache" / "deep_training",
-                        cache_fingerprint=cache_info.fingerprint,
-                        cache_stats_out=deep_cache_stats,
-                        cache_plan=deep_cache_plan,
-                    )
-                finally:
-                    if monitor is not None:
-                        monitor.stop()
-
-                cpu_usage = monitor.cpu_usage if monitor is not None else []
-                gpu_usage = monitor.gpu_usage if monitor is not None else []
-                sqlite_path = run_dir / "spotify_training.db"
-                restored_reporting = restore_deep_reporting_artifacts(
-                    histories=artifacts.histories,
-                    cpu_usage=cpu_usage,
-                    gpu_usage=gpu_usage,
-                    output_dir=run_dir,
-                    db_path=sqlite_path,
-                    cache_root=config.output_dir / "cache" / "deep_reporting",
-                    cache_fingerprint=cache_info.fingerprint,
-                )
-                if restored_reporting is not None:
-                    (
-                        model_comparison_path,
-                        learning_paths,
-                        histories_path,
-                        utilization_path,
-                        sqlite_path,
-                    ) = restored_reporting
-                else:
-                    model_comparison_path = plot_model_comparison(artifacts.histories, run_dir)
-                    learning_paths = plot_learning_curves(artifacts.histories, run_dir)
-                    histories_path = save_histories_json(artifacts.histories, run_dir)
-                    utilization_path = save_utilization_plot(cpu_usage, gpu_usage, run_dir)
-                    sqlite_path = persist_to_sqlite(
-                        df=prepared.df,
-                        histories=artifacts.histories,
-                        cpu_usage=cpu_usage,
-                        gpu_usage=gpu_usage,
-                        db_path=sqlite_path,
-                    )
-                    save_deep_reporting_artifacts(
-                        histories=artifacts.histories,
-                        cpu_usage=cpu_usage,
-                        gpu_usage=gpu_usage,
-                        output_dir=run_dir,
-                        db_path=sqlite_path,
-                        cache_root=config.output_dir / "cache" / "deep_reporting",
-                        cache_fingerprint=cache_info.fingerprint,
-                    )
-                artifact_paths.extend([model_comparison_path, histories_path, utilization_path, *learning_paths])
-
-                if config.enable_shap:
-                    run_shap_analysis(
-                        artifacts.histories,
-                        run_dir,
-                        prepared,
-                        logger,
-                        cache_root=config.output_dir / "cache" / "shap",
-                        cache_fingerprint=cache_info.fingerprint,
-                    )
-                else:
-                    logger.info("Skipping SHAP analysis because --no-shap was set.")
-
-                artifact_paths.append(sqlite_path)
-
-                logger.info("Final Validation Artist Accuracy (Top-1 / Top-5):")
-                for name, history in artifacts.histories.items():
-                    val_key = VAL_KEY if VAL_KEY in history.history else "val_sparse_categorical_accuracy"
-                    top1 = history.history[val_key][-1]
-                    top5_key = "val_artist_output_top_5" if "val_artist_output_top_5" in history.history else "val_top_5"
-                    top5 = history.history.get(top5_key, [np.nan])[-1]
-                    logger.info("%s: Top-1=%.4f | Top-5=%.4f", name, top1, top5)
-
-                    result_rows.append(
-                        {
-                            "model_name": name,
-                            "model_type": "deep",
-                            "model_family": "neural",
-                            "val_top1": float(artifacts.val_metrics.get(name, {}).get("top1", np.nan)),
-                            "val_top5": float(artifacts.val_metrics.get(name, {}).get("top5", np.nan)),
-                            "val_ndcg_at5": float(artifacts.val_metrics.get(name, {}).get("ndcg_at5", np.nan)),
-                            "val_mrr_at5": float(artifacts.val_metrics.get(name, {}).get("mrr_at5", np.nan)),
-                            "val_coverage_at5": float(artifacts.val_metrics.get(name, {}).get("coverage_at5", np.nan)),
-                            "val_diversity_at5": float(artifacts.val_metrics.get(name, {}).get("diversity_at5", np.nan)),
-                            "test_top1": float(artifacts.test_metrics.get(name, {}).get("top1", np.nan)),
-                            "test_top5": float(artifacts.test_metrics.get(name, {}).get("top5", np.nan)),
-                            "test_ndcg_at5": float(artifacts.test_metrics.get(name, {}).get("ndcg_at5", np.nan)),
-                            "test_mrr_at5": float(artifacts.test_metrics.get(name, {}).get("mrr_at5", np.nan)),
-                            "test_coverage_at5": float(artifacts.test_metrics.get(name, {}).get("coverage_at5", np.nan)),
-                            "test_diversity_at5": float(artifacts.test_metrics.get(name, {}).get("diversity_at5", np.nan)),
-                            "fit_seconds": float(artifacts.fit_seconds.get(name, np.nan)),
-                            "epochs": len(history.history.get("loss", [])),
-                            "prediction_bundle_path": str(artifacts.prediction_bundle_paths.get(name, "")),
-                        }
-                    )
-                    _append_existing_artifact_path(artifact_paths, artifacts.prediction_bundle_paths.get(name, ""))
-                phase["trained_model_count"] = int(len(artifacts.histories))
-                phase["monitor_enabled"] = bool(monitor_enabled)
-                phase["cpu_samples"] = int(len(cpu_usage))
-                phase["gpu_samples"] = int(len(gpu_usage))
-                phase["cache_enabled"] = bool(deep_cache_stats.get("enabled", False))
-                phase["cache_fingerprint"] = str(deep_cache_stats.get("fingerprint", ""))
-                phase["cache_hit_models"] = list(deep_cache_stats.get("hit_model_names", []))
-                phase["cache_hit_count"] = int(len(deep_cache_stats.get("hit_model_names", [])))
-                phase["cache_miss_models"] = list(deep_cache_stats.get("miss_model_names", []))
-                phase["cache_miss_count"] = int(len(deep_cache_stats.get("miss_model_names", [])))
-                phase["reporting_cache_reused"] = bool(restored_reporting is not None)
-        else:
-            phase_recorder.skip("deep_model_training", reason="deep_models_disabled")
-            logger.info("Skipping deep models for this run.")
-
-        classical_feature_bundle = build_classical_feature_bundle(prepared) if run_classical_models else None
-        classical_results = []
-
-        if run_classical_models:
-            with phase_recorder.phase(
-                "classical_benchmarks",
-                model_names=list(config.classical_model_names),
-                max_train_samples=config.classical_max_train_samples,
-                max_eval_samples=config.classical_max_eval_samples,
-            ) as phase:
-                classical_results = run_classical_benchmarks(
-                    data=prepared,
-                    output_dir=run_dir,
-                    selected_models=config.classical_model_names,
-                    random_seed=config.random_seed,
-                    max_train_samples=config.classical_max_train_samples,
-                    max_eval_samples=config.classical_max_eval_samples,
-                    logger=logger,
-                    feature_bundle=classical_feature_bundle,
-                    cache_root=config.output_dir / "cache" / "classical_benchmarks",
-                    cache_fingerprint=cache_info.fingerprint,
-                    cache_stats_out=classical_cache_stats,
-                )
-                artifact_paths.append(run_dir / "classical_results.json")
-                for row in classical_results:
-                    result_rows.append(
-                        {
-                            "model_name": row.model_name,
-                            "model_type": "classical",
-                            "model_family": row.model_family,
-                            "val_top1": row.val_top1,
-                            "val_top5": row.val_top5,
-                            "val_ndcg_at5": row.val_ndcg_at5,
-                            "val_mrr_at5": row.val_mrr_at5,
-                            "val_coverage_at5": row.val_coverage_at5,
-                            "val_diversity_at5": row.val_diversity_at5,
-                            "test_top1": row.test_top1,
-                            "test_top5": row.test_top5,
-                            "test_ndcg_at5": row.test_ndcg_at5,
-                            "test_mrr_at5": row.test_mrr_at5,
-                            "test_coverage_at5": row.test_coverage_at5,
-                            "test_diversity_at5": row.test_diversity_at5,
-                            "fit_seconds": row.fit_seconds,
-                            "epochs": "",
-                            "prediction_bundle_path": row.prediction_bundle_path,
-                            "estimator_artifact_path": row.estimator_artifact_path,
-                        }
-                    )
-                    _append_existing_artifact_path(artifact_paths, row.prediction_bundle_path)
-                    _append_existing_artifact_path(artifact_paths, row.estimator_artifact_path)
-                phase["model_count"] = int(len(classical_results))
-                phase["cache_enabled"] = bool(classical_cache_stats.get("enabled", False))
-                phase["cache_fingerprint"] = str(classical_cache_stats.get("fingerprint", ""))
-                phase["cache_hit_models"] = list(classical_cache_stats.get("hit_model_names", []))
-                phase["cache_hit_count"] = int(len(classical_cache_stats.get("hit_model_names", [])))
-                phase["cache_miss_models"] = list(classical_cache_stats.get("miss_model_names", []))
-                phase["cache_miss_count"] = int(len(classical_cache_stats.get("miss_model_names", [])))
-        else:
-            phase_recorder.skip("classical_benchmarks", reason="classical_models_disabled")
-            logger.info("Skipping classical model benchmarks for this run.")
-
-        if classical_results:
-            selected_optuna_model_names = _shortlist_classical_model_names(
-                config.optuna_model_names,
-                classical_results,
-                top_n=_resolve_shortlist_top_n("SPOTIFY_OPTUNA_SHORTLIST_TOP_N"),
-                logger=logger,
-                stage_label="Optuna",
-            )
-            selected_backtest_model_names = _shortlist_classical_model_names(
-                config.temporal_backtest_model_names,
-                classical_results,
-                top_n=_resolve_shortlist_top_n("SPOTIFY_BACKTEST_SHORTLIST_TOP_N"),
-                logger=logger,
-                stage_label="Temporal backtest",
-            )
-
-        if run_classical_models and config.enable_optuna:
-            optuna_dir = run_dir / "optuna"
-            with phase_recorder.phase(
-                "optuna_tuning",
-                model_names=list(selected_optuna_model_names),
-                candidate_model_names=list(config.optuna_model_names),
-                trials=config.optuna_trials,
-                timeout_seconds=config.optuna_timeout_seconds,
-            ) as phase:
-                tuned_results = run_optuna_tuning(
-                    data=prepared,
-                    output_dir=optuna_dir,
-                    selected_models=selected_optuna_model_names,
-                    random_seed=config.random_seed,
-                    trials=config.optuna_trials,
-                    timeout_seconds=config.optuna_timeout_seconds,
-                    max_train_samples=config.classical_max_train_samples,
-                    max_eval_samples=config.classical_max_eval_samples,
-                    logger=logger,
-                    feature_bundle=classical_feature_bundle,
-                    cache_root=config.output_dir / "cache" / "optuna",
-                    cache_fingerprint=cache_info.fingerprint,
-                    cache_stats_out=optuna_cache_stats,
-                )
-                for row in tuned_results:
-                    payload = {
-                        "model_name": row.model_name,
-                        "base_model_name": row.base_model_name,
-                        "model_type": "classical_tuned",
-                        "model_family": row.model_family,
-                        "val_top1": row.val_top1,
-                        "val_top5": row.val_top5,
-                        "val_ndcg_at5": row.val_ndcg_at5,
-                        "val_mrr_at5": row.val_mrr_at5,
-                        "val_coverage_at5": row.val_coverage_at5,
-                        "val_diversity_at5": row.val_diversity_at5,
-                        "test_top1": row.test_top1,
-                        "test_top5": row.test_top5,
-                        "test_ndcg_at5": row.test_ndcg_at5,
-                        "test_mrr_at5": row.test_mrr_at5,
-                        "test_coverage_at5": row.test_coverage_at5,
-                        "test_diversity_at5": row.test_diversity_at5,
-                        "fit_seconds": row.fit_seconds,
-                        "epochs": "",
-                        "n_trials": row.n_trials,
-                        "best_params": row.best_params,
-                        "prediction_bundle_path": row.prediction_bundle_path,
-                        "estimator_artifact_path": row.estimator_artifact_path,
-                    }
-                    result_rows.append(payload)
-                    optuna_rows.append(payload)
-                    _append_existing_artifact_path(artifact_paths, row.prediction_bundle_path)
-                    _append_existing_artifact_path(artifact_paths, row.estimator_artifact_path)
-                if optuna_dir.exists():
-                    artifact_paths.extend(sorted(p for p in optuna_dir.glob("*") if p.is_file()))
-                phase["result_count"] = int(len(tuned_results))
-                phase["cache_enabled"] = bool(optuna_cache_stats.get("enabled", False))
-                phase["cache_fingerprint"] = str(optuna_cache_stats.get("fingerprint", ""))
-                phase["cache_hit_models"] = list(optuna_cache_stats.get("hit_model_names", []))
-                phase["cache_hit_count"] = int(len(optuna_cache_stats.get("hit_model_names", [])))
-                phase["cache_miss_models"] = list(optuna_cache_stats.get("miss_model_names", []))
-                phase["cache_miss_count"] = int(len(optuna_cache_stats.get("miss_model_names", [])))
-                selected_backtest_model_names, tuned_backtest_specs = _tuned_backtest_specs(
-                    selected_backtest_model_names,
-                    tuned_results,
-                    logger=logger,
-                )
-        elif config.enable_optuna:
-            phase_recorder.skip("optuna_tuning", reason="classical_models_disabled")
-            logger.info("Skipping Optuna tuning because classical models are disabled.")
-        else:
-            phase_recorder.skip("optuna_tuning", reason="optuna_disabled")
-
-        if config.enable_retrieval_stack:
-            with phase_recorder.phase(
-                "retrieval_stack",
-                candidate_k=config.retrieval_candidate_k,
-                enable_self_supervised_pretraining=config.enable_self_supervised_pretraining,
-            ) as phase:
-                retrieval_result = train_retrieval_stack(
-                    data=prepared,
-                    output_dir=run_dir,
-                    random_seed=config.random_seed,
-                    candidate_k=config.retrieval_candidate_k,
-                    enable_self_supervised_pretraining=config.enable_self_supervised_pretraining,
-                    logger=logger,
-                )
-                for row in retrieval_result.rows:
-                    result_rows.append(dict(row))
-                artifact_paths.extend(retrieval_result.artifact_paths)
-                phase["result_count"] = int(len(retrieval_result.rows))
-        else:
-            phase_recorder.skip("retrieval_stack", reason="retrieval_disabled")
-            logger.info("Skipping retrieval stack for this run.")
-
-        if config.enable_temporal_backtest:
-            backtest_dir = run_dir / "backtest"
-            with phase_recorder.phase(
-                "temporal_backtest",
-                folds=config.temporal_backtest_folds,
-                model_names=list(selected_backtest_model_names),
-                candidate_model_names=list(config.temporal_backtest_model_names),
-                adaptation_mode=os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold"),
-            ) as phase:
-                deep_backtest_builders = model_builders
-                if run_deep_backtest and deep_backtest_builders is None:
-                    deep_backtest_names = tuple(
-                        model_name for model_name in selected_backtest_model_names if model_name in DEFAULT_MODEL_NAMES
-                    )
-                    if deep_backtest_names:
-                        deep_backtest_builders = build_model_builders(
-                            sequence_length=config.sequence_length,
-                            num_artists=prepared.num_artists,
-                            num_ctx=prepared.num_ctx,
-                            selected_names=deep_backtest_names,
-                        )
-                backtest_results = run_temporal_backtest(
-                    data=prepared,
-                    output_dir=backtest_dir,
-                    selected_models=selected_backtest_model_names,
-                    random_seed=config.random_seed,
-                    folds=config.temporal_backtest_folds,
-                    max_train_samples=config.classical_max_train_samples,
-                    max_eval_samples=config.classical_max_eval_samples,
-                    logger=logger,
-                    feature_bundle=classical_feature_bundle,
-                    deep_model_builders=deep_backtest_builders,
-                    strategy=strategy,
-                    adaptation_mode=os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold"),
-                    tuned_model_specs=tuned_backtest_specs,
-                )
-                for row in backtest_results:
-                    backtest_rows.append(
-                        {
-                            "model_name": row.model_name,
-                            "model_type": row.model_type,
-                            "model_family": row.model_family,
-                            "adaptation_mode": row.adaptation_mode,
-                            "fold": row.fold,
-                            "train_rows": row.train_rows,
-                            "test_rows": row.test_rows,
-                            "fit_seconds": row.fit_seconds,
-                            "top1": row.top1,
-                            "top5": row.top5,
-                        }
-                    )
-                if backtest_dir.exists():
-                    artifact_paths.extend(sorted(p for p in backtest_dir.glob("*") if p.is_file()))
-                phase["row_count"] = int(len(backtest_rows))
-                phase["deep_backtest_builders"] = bool(deep_backtest_builders)
-        else:
-            phase_recorder.skip("temporal_backtest", reason="temporal_backtest_disabled")
-
-        if tf is not None:
-            with phase_recorder.phase("release_deep_runtime_resources") as phase:
-                _release_deep_runtime_resources(tf, logger)
-                phase["tensorflow_loaded"] = True
-        else:
-            phase_recorder.skip("release_deep_runtime_resources", reason="tensorflow_not_initialized")
+                run_deep_models=run_deep_models,
+                run_dir=run_dir,
+            ),
+            deps=PipelineExperimentDeps(
+                ResourceMonitor=ResourceMonitor,
+                VAL_KEY=VAL_KEY,
+                build_classical_feature_bundle=build_classical_feature_bundle,
+                build_model_builders=build_model_builders,
+                persist_to_sqlite=persist_to_sqlite,
+                plot_learning_curves=plot_learning_curves,
+                plot_model_comparison=plot_model_comparison,
+                resolve_cached_deep_training_artifacts=resolve_cached_deep_training_artifacts,
+                restore_deep_reporting_artifacts=restore_deep_reporting_artifacts,
+                run_classical_benchmarks=run_classical_benchmarks,
+                run_optuna_tuning=run_optuna_tuning,
+                run_shap_analysis=run_shap_analysis,
+                run_temporal_backtest=run_temporal_backtest,
+                save_deep_reporting_artifacts=save_deep_reporting_artifacts,
+                save_histories_json=save_histories_json,
+                save_utilization_plot=save_utilization_plot,
+                train_and_evaluate_models=train_and_evaluate_models,
+                train_retrieval_stack=train_retrieval_stack,
+            ),
+        )
+        classical_feature_bundle = experiment_outputs.classical_feature_bundle
 
         if not result_rows:
             raise RuntimeError("No models were run. Enable deep and/or classical models.")
