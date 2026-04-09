@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import gc
 import csv
 import hashlib
@@ -82,6 +85,11 @@ def _backtesting_source_digest() -> str:
         "retrieval_common.py",
         "retrieval_training.py",
         "retrieval_reranking.py",
+        "retrieval_seed_selection.py",
+        "retrieval_seed_selection_runtime.py",
+        "retrieval_seed_candidates.py",
+        "retrieval_pretraining.py",
+        "retrieval_runtime_eval.py",
     )
     root_dir = Path(__file__).resolve().parent
     digest = hashlib.sha256()
@@ -109,7 +117,29 @@ def _deep_backtest_runtime_config() -> dict[str, int]:
     }
 
 
-def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, int | None]:
+def _optional_positive_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return max(1, value)
+
+
+def _optional_nonnegative_float_env(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return max(0.0, value)
+
+
+def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, object]:
     from .retrieval_common import DEFAULT_EMBEDDING_DIM, DEFAULT_RETRIEVAL_CANDIDATE_K
 
     embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
@@ -131,10 +161,36 @@ def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, int | N
     except Exception:
         backtest_epochs = None
 
+    enable_pretraining_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ENABLE_PRETRAINING", "1").strip().lower()
+    enable_pretraining = enable_pretraining_raw not in ("0", "false", "no", "off")
+    pretrain_objectives = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_OBJECTIVES", "cooccurrence").strip() or "cooccurrence"
+    pretrain_max_pairs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_MAX_PAIRS", "250000").strip()
+    try:
+        pretrain_max_pairs = max(1, int(pretrain_max_pairs_raw))
+    except Exception:
+        pretrain_max_pairs = 250000
+    pretrain_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_EPOCHS", "3").strip()
+    try:
+        pretrain_epochs = max(1, int(pretrain_epochs_raw))
+    except Exception:
+        pretrain_epochs = 3
+    ann_bits = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS")
+    batch_size = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE")
+    learning_rate = _optional_nonnegative_float_env("SPOTIFY_RETRIEVAL_BACKTEST_LR")
+    l2 = _optional_nonnegative_float_env("SPOTIFY_RETRIEVAL_BACKTEST_L2")
+
     return {
         "embedding_dim": int(embedding_dim),
         "candidate_k": int(candidate_k),
         "epochs": (int(backtest_epochs) if backtest_epochs is not None else None),
+        "enable_pretraining": bool(enable_pretraining),
+        "pretrain_objectives": str(pretrain_objectives),
+        "pretrain_max_pairs": int(pretrain_max_pairs),
+        "pretrain_epochs": int(pretrain_epochs),
+        "ann_bits": (int(ann_bits) if ann_bits is not None else None),
+        "batch_size": (int(batch_size) if batch_size is not None else None),
+        "learning_rate": (float(learning_rate) if learning_rate is not None else None),
+        "l2": (float(l2) if l2 is not None else None),
     }
 
 
@@ -459,16 +515,11 @@ def _run_retrieval_backtest_job(
     from .retrieval_common import (
         DEFAULT_EMBEDDING_DIM,
         DEFAULT_RETRIEVAL_CANDIDATE_K,
-        RetrievalServingArtifact,
-        _normalize_rows,
-        _prediction_metrics,
-        _softmax_rows,
     )
-    from .retrieval_reranking import _fit_reranker, _predict_reranked_probabilities
-    from .retrieval_training import _fit_dual_encoder
+    from .retrieval_runtime_eval import evaluate_retrieval_baseline, train_and_evaluate_reranker
+    from .retrieval_seed_selection import train_pretraining_seed
 
     started = time.perf_counter()
-    rng = np.random.default_rng(int(random_seed) + int(fold_idx))
     embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
     try:
         embedding_dim = max(4, int(embedding_dim_raw)) if embedding_dim_raw else DEFAULT_EMBEDDING_DIM
@@ -483,84 +534,99 @@ def _run_retrieval_backtest_job(
         backtest_epochs = max(1, int(backtest_epochs_raw)) if backtest_epochs_raw else None
     except Exception:
         backtest_epochs = None
+    split_slices = _deep_train_validation_split(len(np.asarray(X_seq_train)), len(np.asarray(X_seq_test)))
+    if split_slices is None:
+        raise ValueError("Retrieval backtest requires enough training rows for a fold-local validation split.")
+    fit_slice, val_slice = split_slices
 
-    counts = np.bincount(
-        np.concatenate([np.asarray(X_seq_train, dtype="int32").reshape(-1), np.asarray(y_train, dtype="int32").reshape(-1)]),
-        minlength=int(num_artists),
-    ).astype("float32")
-    counts += 1.0
-    popularity = counts / float(np.sum(counts))
-    artist_embeddings = _normalize_rows(
-        rng.normal(scale=0.05, size=(int(num_artists), int(embedding_dim))).astype("float32")
+    enable_pretraining_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ENABLE_PRETRAINING", "1").strip().lower()
+    enable_pretraining = enable_pretraining_raw not in ("0", "false", "no", "off")
+    pretrain_objectives = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_OBJECTIVES", "cooccurrence").strip() or "cooccurrence"
+    pretrain_max_pairs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_MAX_PAIRS", "250000").strip() or "250000"
+    pretrain_epochs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_EPOCHS", "3").strip() or "3"
+    retrieval_ann_bits = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "").strip() or None
+    retrieval_batch_size = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "").strip() or None
+    retrieval_lr = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_LR", "").strip() or None
+    retrieval_l2 = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_L2", "").strip() or None
+    backtest_seed = int(random_seed) + int(fold_idx)
+
+    seq_train_arr = np.asarray(X_seq_train, dtype="int32")
+    ctx_train_arr = np.asarray(X_ctx_train, dtype="float32")
+    y_train_arr = np.asarray(y_train, dtype="int32")
+    seq_test_arr = np.asarray(X_seq_test, dtype="int32")
+    ctx_test_arr = np.asarray(X_ctx_test, dtype="float32")
+    y_test_arr = np.asarray(y_test, dtype="int32")
+
+    fold_data = SimpleNamespace(
+        X_seq_train=seq_train_arr[fit_slice],
+        X_ctx_train=ctx_train_arr[fit_slice],
+        y_train=y_train_arr[fit_slice],
+        X_seq_val=seq_train_arr[val_slice],
+        X_ctx_val=ctx_train_arr[val_slice],
+        y_val=y_train_arr[val_slice],
+        X_seq_test=seq_test_arr,
+        X_ctx_test=ctx_test_arr,
+        y_test=y_test_arr,
+        num_artists=int(num_artists),
+        num_ctx=(int(ctx_train_arr.shape[1]) if ctx_train_arr.ndim == 2 else 0),
     )
-    sequence_projection, context_projection, item_bias, _ = _fit_dual_encoder(
-        seq_train=np.asarray(X_seq_train, dtype="int32"),
-        ctx_train=np.asarray(X_ctx_train, dtype="float32"),
-        y_train=np.asarray(y_train, dtype="int32"),
-        artist_embeddings=artist_embeddings,
-        popularity=popularity,
-        random_seed=int(random_seed) + int(fold_idx),
-        logger=logger,
-        epochs=backtest_epochs,
-    )
-    retrieval_artifact = RetrievalServingArtifact(
-        model_name="retrieval_dual_encoder",
-        candidate_k=candidate_k,
-        artist_embeddings=np.asarray(artist_embeddings, dtype="float32"),
-        sequence_projection=np.asarray(sequence_projection, dtype="float32"),
-        context_projection=np.asarray(context_projection, dtype="float32"),
-        item_bias=np.asarray(item_bias, dtype="float32"),
-        popularity=np.asarray(popularity, dtype="float32"),
-        ann_index=None,
-        reranker=None,
-    )
-    test_session_vec, test_scores = retrieval_artifact.score_items(
-        np.asarray(X_seq_test, dtype="int32"),
-        np.asarray(X_ctx_test, dtype="float32"),
-    )
+
+    with TemporaryDirectory(prefix="spotify_retrieval_backtest_") as tmp_dir:
+        with _temporary_env(
+            {
+                "SPOTIFY_PRETRAIN_OBJECTIVES": pretrain_objectives,
+                "SPOTIFY_PRETRAIN_MAX_PAIRS": pretrain_max_pairs,
+                "SPOTIFY_PRETRAIN_EPOCHS": pretrain_epochs,
+                "SPOTIFY_RETRIEVAL_EPOCHS": (str(backtest_epochs) if backtest_epochs is not None else None),
+                "SPOTIFY_RETRIEVAL_ANN_BITS": retrieval_ann_bits,
+                "SPOTIFY_RETRIEVAL_BATCH_SIZE": retrieval_batch_size,
+                "SPOTIFY_RETRIEVAL_LR": retrieval_lr,
+                "SPOTIFY_RETRIEVAL_L2": retrieval_l2,
+            }
+        ):
+            pretrain_result, _pretrain_path, sequence_projection, context_projection, item_bias, _retrieval_epochs, _objective_rows = train_pretraining_seed(
+                data=fold_data,
+                pretrain_dir=Path(tmp_dir),
+                random_seed=backtest_seed,
+                logger=logger,
+                embedding_dim=embedding_dim,
+                top_k=candidate_k,
+                enable_self_supervised_pretraining=enable_pretraining,
+                artifact_paths=[],
+            )
+            popularity = np.asarray(pretrain_result.artist_frequency, dtype="float32")
+            baseline = evaluate_retrieval_baseline(
+                artist_embeddings=np.asarray(pretrain_result.artist_embeddings, dtype="float32"),
+                context_projection=np.asarray(context_projection, dtype="float32"),
+                data=fold_data,
+                item_bias=np.asarray(item_bias, dtype="float32"),
+                popularity=popularity.astype("float32"),
+                random_seed=backtest_seed,
+                sequence_projection=np.asarray(sequence_projection, dtype="float32"),
+                top_k=candidate_k,
+            )
+            reranker = train_and_evaluate_reranker(
+                baseline=baseline,
+                data=fold_data,
+                random_seed=backtest_seed,
+            )
 
     if model_name == "retrieval_reranker":
-        reranker = _fit_reranker(
-            seq_train=np.asarray(X_seq_train, dtype="int32"),
-            ctx_train=np.asarray(X_ctx_train, dtype="float32"),
-            y_train=np.asarray(y_train, dtype="int32"),
-            retrieval_artifact=retrieval_artifact,
-            random_seed=int(random_seed) + int(fold_idx),
-        )
-        serving_artifact = RetrievalServingArtifact(
-            model_name="retrieval_reranker",
-            candidate_k=retrieval_artifact.candidate_k,
-            artist_embeddings=retrieval_artifact.artist_embeddings,
-            sequence_projection=retrieval_artifact.sequence_projection,
-            context_projection=retrieval_artifact.context_projection,
-            item_bias=retrieval_artifact.item_bias,
-            popularity=retrieval_artifact.popularity,
-            ann_index=None,
-            reranker=reranker,
-        )
-        test_proba = _predict_reranked_probabilities(
-            seq_batch=np.asarray(X_seq_test, dtype="int32"),
-            ctx_batch=np.asarray(X_ctx_test, dtype="float32"),
-            session_vec=test_session_vec,
-            retrieval_scores=test_scores,
-            artifact=serving_artifact,
-        )
+        metrics = reranker.rerank_metrics_test
         model_type = "retrieval_reranker"
         model_family = "candidate_reranker"
     else:
-        test_proba = _softmax_rows(test_scores)
+        metrics = baseline.retrieval_metrics_test
         model_type = "retrieval"
         model_family = "dual_encoder"
-
-    metrics = _prediction_metrics(test_proba, np.asarray(y_test, dtype="int32"), num_items=int(num_artists))
     return BacktestFoldResult(
         model_name=model_name,
         model_type=model_type,
         model_family=model_family,
         adaptation_mode="cold",
         fold=int(fold_idx),
-        train_rows=len(np.asarray(X_seq_train)),
-        test_rows=len(np.asarray(X_seq_test)),
+        train_rows=len(seq_train_arr),
+        test_rows=len(seq_test_arr),
         fit_seconds=float(time.perf_counter() - started),
         top1=float(metrics.get("top1", float("nan"))),
         top5=float(metrics.get("top5", float("nan"))),
@@ -668,6 +734,25 @@ def _resolve_backtest_workers(raw_value: str | None, *, job_count: int) -> int:
     if capped_jobs <= 1:
         return 1
     return min(cpu_count, capped_jobs, 2)
+
+
+@contextmanager
+def _temporary_env(overrides: dict[str, str | None]):
+    previous: dict[str, str | None] = {}
+    try:
+        for key, value in overrides.items():
+            previous[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run_deep_backtest_job(

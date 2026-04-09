@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -311,6 +313,76 @@ def test_run_temporal_backtest_supports_retrieval_models(tmp_path: Path, monkeyp
     assert rows[0].model_name == "retrieval_reranker"
     assert rows[0].model_type == "retrieval_reranker"
     assert captured == [{"model_name": "retrieval_reranker", "train_rows": 4, "test_rows": 2}]
+
+
+def test_retrieval_backtest_runtime_config_tracks_extended_knobs(monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "12")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "512")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_LR", "0.045")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_L2", "0.0001")
+
+    config = backtesting._retrieval_backtest_runtime_config(num_artists=200)
+
+    assert config["ann_bits"] == 12
+    assert config["batch_size"] == 512
+    assert config["learning_rate"] == 0.045
+    assert config["l2"] == 0.0001
+
+
+def test_run_retrieval_backtest_job_forwards_backtest_specific_retrieval_knobs(monkeypatch) -> None:
+    import spotify.retrieval_runtime_eval as retrieval_runtime_eval
+    import spotify.retrieval_seed_selection as retrieval_seed_selection
+
+    captured_env: dict[str, str | None] = {}
+
+    def _fake_train_pretraining_seed(**kwargs):
+        captured_env["ann_bits"] = os.getenv("SPOTIFY_RETRIEVAL_ANN_BITS")
+        captured_env["batch_size"] = os.getenv("SPOTIFY_RETRIEVAL_BATCH_SIZE")
+        captured_env["learning_rate"] = os.getenv("SPOTIFY_RETRIEVAL_LR")
+        captured_env["l2"] = os.getenv("SPOTIFY_RETRIEVAL_L2")
+        result = SimpleNamespace(
+            artist_embeddings=np.eye(3, dtype="float32"),
+            artist_frequency=np.array([0.4, 0.35, 0.25], dtype="float32"),
+        )
+        return result, Path("/tmp/pretrain.joblib"), np.eye(3, dtype="float32"), np.zeros((2, 3), dtype="float32"), np.zeros(3, dtype="float32"), 8, []
+
+    def _fake_evaluate_retrieval_baseline(**kwargs):
+        return SimpleNamespace(retrieval_metrics_test={"top1": 0.2, "top5": 0.4})
+
+    def _fake_train_and_evaluate_reranker(**kwargs):
+        return SimpleNamespace(rerank_metrics_test={"top1": 0.33, "top5": 0.66})
+
+    monkeypatch.setattr(retrieval_seed_selection, "train_pretraining_seed", _fake_train_pretraining_seed)
+    monkeypatch.setattr(retrieval_runtime_eval, "evaluate_retrieval_baseline", _fake_evaluate_retrieval_baseline)
+    monkeypatch.setattr(retrieval_runtime_eval, "train_and_evaluate_reranker", _fake_train_and_evaluate_reranker)
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "12")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "512")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_LR", "0.045")
+    monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_L2", "0.0001")
+
+    row = backtesting._run_retrieval_backtest_job(
+        model_name="retrieval_reranker",
+        fold_idx=1,
+        random_seed=42,
+        X_seq_train=np.array([[0, 1], [1, 2], [2, 0], [0, 1]], dtype="int32"),
+        X_ctx_train=np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]], dtype="float32"),
+        y_train=np.array([1, 2, 0, 1], dtype="int32"),
+        X_seq_test=np.array([[0, 2], [2, 1]], dtype="int32"),
+        X_ctx_test=np.array([[8.0, 8.0], [9.0, 9.0]], dtype="float32"),
+        y_test=np.array([2, 1], dtype="int32"),
+        num_artists=3,
+        logger=_logger("spotify.test.retrieval_backtest_knobs"),
+    )
+
+    assert captured_env == {
+        "ann_bits": "12",
+        "batch_size": "512",
+        "learning_rate": "0.045",
+        "l2": "0.0001",
+    }
+    assert row.model_name == "retrieval_reranker"
+    assert row.top1 == 0.33
+    assert row.top5 == 0.66
 
 
 def test_run_temporal_backtest_reuses_cached_phase_artifacts_without_recomputing(tmp_path: Path, monkeypatch) -> None:
