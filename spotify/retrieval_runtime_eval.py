@@ -28,6 +28,7 @@ class RetrievalBaselineEvaluation:
 class RetrievalRerankerEvaluation:
     reranker_artifact: RetrievalServingArtifact
     reranker_estimator: object
+    reranker_model_name: str
     rerank_metrics_val: dict[str, float]
     rerank_metrics_test: dict[str, float]
     val_rerank_proba: np.ndarray
@@ -107,6 +108,9 @@ def train_and_evaluate_reranker(
         seq_train=data.X_seq_train,
         ctx_train=data.X_ctx_train,
         y_train=data.y_train,
+        seq_val=data.X_seq_val,
+        ctx_val=data.X_ctx_val,
+        y_val=data.y_val,
         retrieval_artifact=baseline.retrieval_artifact,
         random_seed=random_seed,
     )
@@ -140,6 +144,7 @@ def train_and_evaluate_reranker(
     return RetrievalRerankerEvaluation(
         reranker_artifact=reranker_artifact,
         reranker_estimator=reranker_estimator,
+        reranker_model_name=str(getattr(reranker_estimator, "_spotify_reranker_model_name", "")),
         rerank_metrics_val=rerank_metrics_val,
         rerank_metrics_test=rerank_metrics_test,
         val_rerank_proba=val_rerank_proba,

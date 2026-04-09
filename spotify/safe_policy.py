@@ -22,6 +22,8 @@ class SafeBanditPolicyArtifact:
     global_policy: dict[str, float]
     reward_metric: str
     global_policy_name: str = "safe_global"
+    scenario_policy_map: dict[str, dict[str, float]] = field(default_factory=dict)
+    scenario_policy_names: dict[str, str] = field(default_factory=dict)
     benchmark_scenario: str = ""
     benchmark_reference_policy_name: str = "exploit_preference"
     benchmark_metrics: dict[str, float] = field(default_factory=dict)
@@ -37,6 +39,42 @@ POLICY_TEMPLATES: dict[str, dict[str, float]] = {
 DEFAULT_SAFE_POLICY_REFERENCE_POLICY_NAME = "exploit_preference"
 DEFAULT_SAFE_POLICY_BENCHMARK_SCENARIO = "evening_drift"
 _BENCHMARK_EPSILON = 1e-6
+_SCENARIO_BUCKET_HINTS = {
+    "baseline": "normal_friction",
+    "high_friction_spike": "high_friction",
+    "session_restart": "normal_friction",
+    "evening_drift": "normal_friction",
+    "listener_fatigue": "high_friction",
+}
+_SCENARIO_ROUTE_SLUGS = {
+    "baseline": "default",
+    "high_friction_spike": "high_friction",
+    "session_restart": "restart",
+    "evening_drift": "evening",
+    "listener_fatigue": "fatigue",
+}
+_SCENARIO_VARIANT_DELTAS: dict[str, tuple[tuple[str, dict[str, float]], ...]] = {
+    "baseline": (
+        ("steady_guard", {"transition": -0.10, "continuity": 0.10, "repeat": 0.10, "novelty": -0.10}),
+    ),
+    "high_friction_spike": (
+        ("friction_anchor", {"transition": -0.15, "continuity": 0.25, "repeat": 0.25, "novelty": -0.20}),
+        ("friction_recovery", {"transition": -0.20, "continuity": 0.30, "repeat": 0.30, "novelty": -0.25}),
+    ),
+    "session_restart": (
+        ("restart_anchor", {"transition": -0.05, "continuity": 0.20, "repeat": 0.20, "novelty": -0.10}),
+        ("restart_repeat", {"transition": 0.00, "continuity": 0.15, "repeat": 0.30, "novelty": -0.15}),
+    ),
+    "evening_drift": (
+        ("evening_anchor", {"transition": -0.10, "continuity": 0.35, "repeat": 0.35, "novelty": -0.30}),
+        ("evening_low_transition", {"transition": -0.20, "continuity": 0.30, "repeat": 0.40, "novelty": -0.35}),
+        ("evening_comfort_max", {"transition": -0.05, "continuity": 0.45, "repeat": 0.45, "novelty": -0.40}),
+    ),
+    "listener_fatigue": (
+        ("fatigue_anchor", {"transition": -0.10, "continuity": 0.25, "repeat": 0.35, "novelty": -0.25}),
+        ("fatigue_repeat_max", {"transition": -0.15, "continuity": 0.20, "repeat": 0.45, "novelty": -0.30}),
+    ),
+}
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
@@ -56,6 +94,27 @@ def _safe_float(value) -> float:
     if not math.isfinite(out):
         return float("nan")
     return out
+
+
+def _normalize_weight_dict(weights: dict[str, float]) -> dict[str, float]:
+    return {
+        key: float(max(0.0, value))
+        for key, value in weights.items()
+    }
+
+
+def _scenario_route_slug(scenario_name: str) -> str:
+    return _SCENARIO_ROUTE_SLUGS.get(scenario_name, scenario_name).strip() or scenario_name
+
+
+def _apply_policy_delta(
+    base_policy: dict[str, float],
+    delta: dict[str, float],
+) -> dict[str, float]:
+    adjusted = dict(base_policy)
+    for key, value in delta.items():
+        adjusted[key] = adjusted.get(key, 0.0) + float(value)
+    return _normalize_weight_dict(adjusted)
 
 
 def _friction_feature_indices(data: PreparedData) -> np.ndarray:
@@ -234,6 +293,183 @@ def _select_global_safe_policy(
     return selected_name, benchmark_rows, summary
 
 
+def _scenario_adjusted_policy(
+    *,
+    scenario_name: str,
+    policy_map: dict[str, dict[str, float]],
+    global_policy: dict[str, float],
+) -> tuple[str, dict[str, float]]:
+    route_slug = _scenario_route_slug(scenario_name)
+    base_policy = dict(global_policy)
+    if scenario_name == "high_friction_spike":
+        base_policy = dict(policy_map.get("high_friction", base_policy))
+        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.15
+        base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.10)
+    elif scenario_name == "evening_drift":
+        base_policy = dict(policy_map.get("normal_friction", base_policy))
+        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.35
+        base_policy["repeat"] = base_policy.get("repeat", 0.0) + 0.15
+        base_policy["transition"] = base_policy.get("transition", 0.0) + 0.05
+        base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.30)
+    elif scenario_name == "listener_fatigue":
+        base_policy = dict(policy_map.get("high_friction", base_policy))
+        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.20
+        base_policy["repeat"] = base_policy.get("repeat", 0.0) + 0.20
+        base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.25)
+    elif scenario_name == "session_restart":
+        base_policy = dict(policy_map.get("normal_friction", base_policy))
+        base_policy["repeat"] = base_policy.get("repeat", 0.0) + 0.15
+        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.10
+    return f"safe_routed_{route_slug}", _normalize_weight_dict(base_policy)
+
+
+def _scenario_policy_candidates(
+    *,
+    scenario_name: str,
+    policy_map: dict[str, dict[str, float]],
+    global_policy_name: str,
+    global_policy: dict[str, float],
+) -> list[tuple[str, dict[str, float], str]]:
+    candidates: list[tuple[str, dict[str, float], str]] = []
+    seen: set[tuple[tuple[str, float], ...]] = set()
+    route_slug = _scenario_route_slug(scenario_name)
+
+    def _append(display_name: str, route_name: str, weights: dict[str, float]) -> None:
+        normalized = _normalize_weight_dict(weights)
+        key = tuple(sorted((str(name), float(value)) for name, value in normalized.items()))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((display_name, normalized, route_name))
+
+    adjusted_name, adjusted_policy = _scenario_adjusted_policy(
+        scenario_name=scenario_name,
+        policy_map=policy_map,
+        global_policy=global_policy,
+    )
+    _append(f"heuristic:{scenario_name}", adjusted_name, adjusted_policy)
+    _append(f"template:{global_policy_name}", f"safe_routed_{route_slug}__safe_global", global_policy)
+
+    hinted_bucket = _SCENARIO_BUCKET_HINTS.get(scenario_name, "").strip()
+    if hinted_bucket and hinted_bucket in policy_map:
+        _append(
+            f"bucket:{hinted_bucket}",
+            f"safe_routed_{route_slug}__bucket_{hinted_bucket}",
+            policy_map[hinted_bucket],
+        )
+    for bucket_name, weights in sorted(policy_map.items()):
+        route_name = f"safe_routed_{route_slug}__bucket_{bucket_name}"
+        _append(f"bucket:{bucket_name}", route_name, weights)
+    for policy_name, weights in sorted(POLICY_TEMPLATES.items()):
+        route_name = f"safe_routed_{route_slug}__template_{policy_name}"
+        _append(f"template:{policy_name}", route_name, weights)
+
+    variant_base = dict(policy_map.get(hinted_bucket, global_policy))
+    for variant_name, delta in _SCENARIO_VARIANT_DELTAS.get(scenario_name, ()):
+        route_name = f"safe_routed_{route_slug}__variant_{variant_name}"
+        _append(
+            f"variant:{variant_name}",
+            route_name,
+            _apply_policy_delta(variant_base, delta),
+        )
+    return candidates
+
+
+def _select_scenario_safe_policies(
+    *,
+    data: PreparedData,
+    digital_twin: ListenerDigitalTwinArtifact,
+    multimodal_space: MultimodalArtistSpace,
+    causal_artifact: CausalSkipDecompositionArtifact | None,
+    policy_map: dict[str, dict[str, float]],
+    global_policy_name: str,
+    global_policy: dict[str, float],
+    policy_means: dict[str, list[float]],
+    rng: np.random.Generator,
+) -> tuple[dict[str, dict[str, float]], dict[str, str], list[dict[str, object]]]:
+    from .stress_test import SCENARIOS
+
+    seq_val = np.asarray(getattr(data, "X_seq_val", []), dtype="int32")
+    ctx_val = np.asarray(getattr(data, "X_ctx_val", []), dtype="float32")
+    if len(seq_val) == 0 or len(ctx_val) == 0:
+        return {}, {}, []
+
+    scenario_policy_map: dict[str, dict[str, float]] = {}
+    scenario_policy_names: dict[str, str] = {}
+    rows: list[dict[str, object]] = []
+    fallback_reward = float(np.mean(policy_means.get(global_policy_name, [float("nan")])))
+
+    def _scenario_sort_key(row: dict[str, object]) -> tuple[float, float, float, float, str]:
+        return (
+            _safe_float(row.get("mean_skip_risk")),
+            _safe_float(row.get("mean_end_risk")),
+            -_safe_float(row.get("mean_session_length")),
+            -_safe_float(row.get("mean_reward")),
+            str(row.get("candidate_name", "")),
+        )
+
+    for scenario_name, scenario in SCENARIOS.items():
+        candidate_rows: list[dict[str, object]] = []
+        candidate_specs = _scenario_policy_candidates(
+            scenario_name=scenario_name,
+            policy_map=policy_map,
+            global_policy_name=global_policy_name,
+            global_policy=global_policy,
+        )
+        for display_name, weights, route_name in candidate_specs:
+            batch_summary = simulate_rollout_batch_summary(
+                twin=digital_twin,
+                multimodal_space=multimodal_space,
+                causal_artifact=causal_artifact,
+                start_sequences=seq_val,
+                start_contexts=ctx_val,
+                horizon=6,
+                policy_weights=weights,
+                scenario=scenario,
+                rng=rng,
+            )
+            skip_risk = _safe_float(np.nanmean(np.asarray(batch_summary["mean_skip_risk"], dtype="float64")))
+            end_risk = _safe_float(np.nanmean(np.asarray(batch_summary["mean_end_risk"], dtype="float64")))
+            mean_session_length = _safe_float(np.mean(np.asarray(batch_summary["session_length"], dtype="float64")))
+            mean_reward = fallback_reward
+            for policy_name, template in POLICY_TEMPLATES.items():
+                if dict(template) == dict(weights):
+                    mean_reward = float(np.mean(policy_means.get(policy_name, [float("nan")])))
+                    break
+            candidate_rows.append(
+                {
+                    "scenario": scenario_name,
+                    "candidate_name": display_name,
+                    "policy_name": route_name,
+                    "mean_skip_risk": skip_risk,
+                    "mean_end_risk": end_risk,
+                    "mean_session_length": mean_session_length,
+                    "mean_reward": mean_reward,
+                }
+            )
+        if not candidate_rows:
+            continue
+        ranked_rows = sorted(candidate_rows, key=_scenario_sort_key)
+        for rank, row in enumerate(ranked_rows, start=1):
+            row["selection_rank"] = rank
+            row["selected"] = (rank == 1)
+        selected_row = ranked_rows[0]
+        selected_name = str(selected_row.get("policy_name", "")).strip()
+        selected_weights = next(
+            (
+                weights
+                for _display_name, weights, route_name in candidate_specs
+                if route_name == selected_name
+            ),
+            dict(global_policy),
+        )
+        scenario_policy_map[scenario_name] = dict(selected_weights)
+        scenario_policy_names[scenario_name] = selected_name
+        rows.extend(ranked_rows)
+
+    return scenario_policy_map, scenario_policy_names, rows
+
+
 def learn_safe_bandit_policy(
     *,
     data: PreparedData,
@@ -313,11 +549,25 @@ def learn_safe_bandit_policy(
         policy_means=policy_means,
         rng=benchmark_rng,
     )
+    scenario_rng = np.random.default_rng(random_seed + 29)
+    scenario_policy_map, scenario_policy_names, scenario_rows = _select_scenario_safe_policies(
+        data=data,
+        digital_twin=digital_twin,
+        multimodal_space=multimodal_space,
+        causal_artifact=causal_artifact,
+        policy_map=policy_map,
+        global_policy_name=global_name,
+        global_policy=dict(POLICY_TEMPLATES[global_name]),
+        policy_means=policy_means,
+        rng=scenario_rng,
+    )
     artifact = SafeBanditPolicyArtifact(
         policy_map=policy_map,
         global_policy=dict(POLICY_TEMPLATES[global_name]),
         reward_metric="hit_plus_novelty_minus_risk",
         global_policy_name=global_name,
+        scenario_policy_map=scenario_policy_map,
+        scenario_policy_names=scenario_policy_names,
         benchmark_scenario=str(benchmark_summary.get("benchmark_scenario", "")),
         benchmark_reference_policy_name=str(
             benchmark_summary.get(
@@ -364,12 +614,29 @@ def learn_safe_bandit_policy(
             "selection_rank",
         ],
     )
+    scenario_path = _write_csv(
+        output_dir / "safe_bandit_policy_scenarios.csv",
+        scenario_rows,
+        [
+            "scenario",
+            "candidate_name",
+            "policy_name",
+            "mean_skip_risk",
+            "mean_end_risk",
+            "mean_session_length",
+            "mean_reward",
+            "selection_rank",
+            "selected",
+        ],
+    )
     summary_path = output_dir / "safe_bandit_policy_summary.json"
     summary_path.write_text(
         json.dumps(
             {
                 "global_policy_name": global_name,
                 "global_policy": artifact.global_policy,
+                "scenario_policy_names": scenario_policy_names,
+                "scenario_policy_map": scenario_policy_map,
                 "bucket_count": len(policy_map),
                 "reward_metric": artifact.reward_metric,
                 **benchmark_summary,
@@ -385,4 +652,4 @@ def learn_safe_bandit_policy(
         benchmark_summary.get("global_selection_strategy", ""),
         benchmark_summary.get("benchmark_beats_reference", False),
     )
-    return artifact, [artifact_path, csv_path, map_path, benchmark_path, summary_path]
+    return artifact, [artifact_path, csv_path, map_path, benchmark_path, scenario_path, summary_path]

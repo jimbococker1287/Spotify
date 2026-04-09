@@ -9,6 +9,7 @@ import pandas as pd
 
 from spotify.data import PreparedData
 from spotify.friction import run_friction_proxy_analysis
+import spotify.retrieval_runtime as retrieval_runtime
 from spotify.retrieval import train_retrieval_stack, train_self_supervised_artist_embeddings
 from spotify.serving import load_predictor, resolve_model_row
 
@@ -129,10 +130,14 @@ def test_train_retrieval_stack_writes_artifacts_and_rows(tmp_path: Path) -> None
     assert any((tmp_path / "pretraining").glob("self_supervised_artist_embeddings_*.joblib"))
     summary = json.loads((tmp_path / "retrieval" / "retrieval_summary.json").read_text(encoding="utf-8"))
     assert summary["candidate_k"] == 3
-    assert summary["selected_pretraining_objective"] in {"cooccurrence", "masked_tail", "contrastive_session"}
+    assert summary["selected_pretraining_objective"] in {"cooccurrence", "masked_tail", "contrastive_session"} or str(
+        summary["selected_pretraining_objective"]
+    ).startswith("blend_")
     assert "ann_validation" in summary
     assert "retrieval" in summary
     assert "reranker" in summary
+    assert summary["reranker"]["model_name"] in {"logreg", "hist_gbm"}
+    assert result.rows[1]["reranker_model_name"] in {"logreg", "hist_gbm"}
 
 
 def test_self_supervised_pretraining_caps_pair_count(tmp_path: Path, monkeypatch) -> None:
@@ -188,6 +193,156 @@ def test_retrieval_reranker_artifact_is_serveable(tmp_path: Path) -> None:
     assert predictor.model_type == "retrieval_reranker"
     assert proba.shape == (1, 4)
     assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+def test_train_retrieval_stack_reuses_cached_phase_artifacts_without_recomputing(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    cache_root = tmp_path / "cache"
+    output_dir = tmp_path / "run"
+    cache_fingerprint = "prepared123"
+
+    monkeypatch.setenv("SPOTIFY_CACHE_RETRIEVAL", "1")
+
+    cache_payload = retrieval_runtime._build_retrieval_cache_payload(
+        cache_fingerprint=cache_fingerprint,
+        data=data,
+        random_seed=42,
+        candidate_k=3,
+        enable_self_supervised_pretraining=True,
+    )
+    cache_key = retrieval_runtime._build_retrieval_cache_key(cache_payload)
+    cache_paths = retrieval_runtime._resolve_retrieval_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_key=cache_key,
+    )
+    cache_paths.artifact_dir.mkdir(parents=True, exist_ok=True)
+    cached_artifacts = {
+        "prediction_bundles/retrieval_dual_encoder.npz": b"dual-bundle",
+        "prediction_bundles/retrieval_reranker.npz": b"rerank-bundle",
+        "retrieval/retrieval_dual_encoder.joblib": b"dual-model",
+        "retrieval/retrieval_reranker.joblib": b"rerank-model",
+        "retrieval/retrieval_reranker_estimator.joblib": b"rerank-estimator",
+        "retrieval/retrieval_summary.json": b"{}",
+        "pretraining/self_supervised_artist_embeddings_cached.joblib": b"pretrain",
+    }
+    for rel_path, payload in cached_artifacts.items():
+        artifact_path = cache_paths.artifact_dir / rel_path
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(payload)
+
+    dual_row = {
+        "model_name": "retrieval_dual_encoder",
+        "model_type": "retrieval",
+        "model_family": "dual_encoder",
+        "val_top1": 0.25,
+        "val_top5": 0.75,
+        "val_ndcg_at5": 0.3,
+        "val_mrr_at5": 0.2,
+        "val_coverage_at5": 0.5,
+        "val_diversity_at5": 0.4,
+        "test_top1": 0.2,
+        "test_top5": 0.7,
+        "test_ndcg_at5": 0.28,
+        "test_mrr_at5": 0.18,
+        "test_coverage_at5": 0.45,
+        "test_diversity_at5": 0.35,
+        "fit_seconds": 1.5,
+        "epochs": 6,
+        "prediction_bundle_path": str(output_dir / "prediction_bundles" / "retrieval_dual_encoder.npz"),
+        "retrieval_artifact_path": str(output_dir / "retrieval" / "retrieval_dual_encoder.joblib"),
+        "pretraining_artifact_path": str(output_dir / "pretraining" / "self_supervised_artist_embeddings_cached.joblib"),
+        "pretraining_objective": "cooccurrence",
+        "val_recall_at3": 0.75,
+        "test_recall_at3": 0.7,
+        "val_ann_recall_at3": 0.72,
+        "test_ann_recall_at3": 0.68,
+    }
+    reranker_row = {
+        "model_name": "retrieval_reranker",
+        "model_type": "retrieval_reranker",
+        "model_family": "candidate_reranker",
+        "val_top1": 0.3,
+        "val_top5": 0.8,
+        "val_ndcg_at5": 0.34,
+        "val_mrr_at5": 0.24,
+        "val_coverage_at5": 0.55,
+        "val_diversity_at5": 0.42,
+        "test_top1": 0.27,
+        "test_top5": 0.78,
+        "test_ndcg_at5": 0.31,
+        "test_mrr_at5": 0.22,
+        "test_coverage_at5": 0.5,
+        "test_diversity_at5": 0.39,
+        "fit_seconds": 1.5,
+        "epochs": 6,
+        "prediction_bundle_path": str(output_dir / "prediction_bundles" / "retrieval_reranker.npz"),
+        "retrieval_artifact_path": str(output_dir / "retrieval" / "retrieval_reranker.joblib"),
+        "estimator_artifact_path": str(output_dir / "retrieval" / "retrieval_reranker_estimator.joblib"),
+        "pretraining_artifact_path": str(output_dir / "pretraining" / "self_supervised_artist_embeddings_cached.joblib"),
+        "pretraining_objective": "cooccurrence",
+        "val_recall_at3": 0.75,
+        "test_recall_at3": 0.7,
+        "val_ann_recall_at3": 0.72,
+        "test_ann_recall_at3": 0.68,
+    }
+    retrieval_runtime.write_json(
+        cache_paths.result_path,
+        {
+            "cache_schema_version": retrieval_runtime.RETRIEVAL_CACHE_SCHEMA_VERSION,
+            "rows": [
+                retrieval_runtime._serialize_cached_retrieval_row(dual_row, output_dir=output_dir),
+                retrieval_runtime._serialize_cached_retrieval_row(reranker_row, output_dir=output_dir),
+            ],
+            "artifact_names": sorted(cached_artifacts),
+        },
+        sort_keys=True,
+    )
+    retrieval_runtime.write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+
+    monkeypatch.setattr(
+        retrieval_runtime,
+        "train_pretraining_seed",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("pretraining should be skipped on a cache hit")),
+    )
+    monkeypatch.setattr(
+        retrieval_runtime,
+        "evaluate_retrieval_baseline",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("baseline evaluation should be skipped on a cache hit")),
+    )
+    monkeypatch.setattr(
+        retrieval_runtime,
+        "train_and_evaluate_reranker",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("reranker training should be skipped on a cache hit")),
+    )
+    cache_stats: dict[str, object] = {}
+
+    result = train_retrieval_stack(
+        data=data,
+        output_dir=output_dir,
+        random_seed=42,
+        candidate_k=3,
+        enable_self_supervised_pretraining=True,
+        logger=_logger("spotify.test.retrieval.cache"),
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_stats_out=cache_stats,
+    )
+
+    assert [row["model_name"] for row in result.rows] == ["retrieval_dual_encoder", "retrieval_reranker"]
+    assert cache_stats == {
+        "enabled": True,
+        "fingerprint": cache_fingerprint,
+        "cache_key": cache_key,
+        "hit": True,
+        "candidate_k": 3,
+    }
+    for rel_path, payload in cached_artifacts.items():
+        assert (output_dir / rel_path).read_bytes() == payload
+    assert Path(str(result.rows[0]["prediction_bundle_path"])).exists()
+    assert Path(str(result.rows[0]["retrieval_artifact_path"])).exists()
+    assert Path(str(result.rows[1]["estimator_artifact_path"])).exists()
+    assert Path(str(result.rows[1]["pretraining_artifact_path"])).exists()
 
 
 def test_friction_proxy_analysis_writes_expected_artifacts(tmp_path: Path) -> None:

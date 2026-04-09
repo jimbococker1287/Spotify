@@ -66,6 +66,23 @@ class TemporalBacktestCachePaths:
     artifact_dir: Path
 
 
+@dataclass
+class TemporalBacktestCacheInspection:
+    enabled: bool
+    fingerprint: str
+    cache_key: str
+    hit: bool
+    selected_models: tuple[str, ...]
+    classical_models: tuple[str, ...]
+    deep_models: tuple[str, ...]
+    retrieval_models: tuple[str, ...]
+    adaptation_mode: str
+    max_train_samples: int
+    max_eval_samples: int
+    cache_paths: TemporalBacktestCachePaths | None
+    cache_payload: dict[str, object]
+
+
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
     return [(window.test_start, window.test_end) for window in build_temporal_backtest_windows(n_rows, folds)]
 
@@ -174,6 +191,7 @@ def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, object]
         pretrain_epochs = max(1, int(pretrain_epochs_raw))
     except Exception:
         pretrain_epochs = 3
+    pretrain_blend_topk = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_BLEND_TOPK")
     ann_bits = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS")
     batch_size = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE")
     learning_rate = _optional_nonnegative_float_env("SPOTIFY_RETRIEVAL_BACKTEST_LR")
@@ -187,6 +205,7 @@ def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, object]
         "pretrain_objectives": str(pretrain_objectives),
         "pretrain_max_pairs": int(pretrain_max_pairs),
         "pretrain_epochs": int(pretrain_epochs),
+        "pretrain_blend_topk": (int(pretrain_blend_topk) if pretrain_blend_topk is not None else None),
         "ann_bits": (int(ann_bits) if ann_bits is not None else None),
         "batch_size": (int(batch_size) if batch_size is not None else None),
         "learning_rate": (float(learning_rate) if learning_rate is not None else None),
@@ -290,6 +309,31 @@ def _coerce_backtest_row(row: dict[str, object]) -> BacktestFoldResult:
     )
 
 
+def _read_cached_temporal_backtest_manifest(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+) -> tuple[list[dict[str, object]], list[str]] | None:
+    payload = safe_read_json(cache_paths.result_path, default=None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
+        return None
+    rows_payload = payload.get("rows")
+    artifact_names = payload.get("artifact_names")
+    if not isinstance(rows_payload, list) or not isinstance(artifact_names, list):
+        return None
+    normalized_rows = [dict(row) for row in rows_payload if isinstance(row, dict)]
+    normalized_names: list[str] = []
+    for name in artifact_names:
+        name_text = str(name).strip()
+        if not name_text:
+            continue
+        if not (cache_paths.artifact_dir / name_text).exists():
+            return None
+        normalized_names.append(name_text)
+    return normalized_rows, normalized_names
+
+
 def _load_cached_temporal_backtest_result(
     *,
     cache_paths: TemporalBacktestCachePaths,
@@ -297,15 +341,10 @@ def _load_cached_temporal_backtest_result(
     logger,
 ) -> list[BacktestFoldResult] | None:
     try:
-        payload = safe_read_json(cache_paths.result_path, default=None)
-        if not isinstance(payload, dict):
+        cached_manifest = _read_cached_temporal_backtest_manifest(cache_paths=cache_paths)
+        if cached_manifest is None:
             return None
-        if payload.get("cache_schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
-            return None
-        rows_payload = payload.get("rows")
-        artifact_names = payload.get("artifact_names")
-        if not isinstance(rows_payload, list) or not isinstance(artifact_names, list):
-            return None
+        rows_payload, artifact_names = cached_manifest
         artifact_files = []
         for name in artifact_names:
             name_text = str(name).strip()
@@ -322,6 +361,77 @@ def _load_cached_temporal_backtest_result(
     except Exception as exc:
         logger.warning("Temporal backtest cache load failed (%s). Rebuilding.", exc)
         return None
+
+
+def inspect_temporal_backtest_cache(
+    *,
+    data: PreparedData,
+    selected_models: tuple[str, ...],
+    random_seed: int,
+    folds: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    adaptation_mode: str | None = None,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+) -> TemporalBacktestCacheInspection:
+    resolved_tuned_specs = dict(tuned_model_specs or {})
+    classical_models, deep_models, retrieval_models = _resolve_backtest_model_groups(
+        selected_models,
+        random_seed,
+        tuned_model_specs=resolved_tuned_specs,
+    )
+    resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
+    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
+    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
+    cache_enabled = _backtest_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
+    cache_paths = None
+    cache_payload: dict[str, object] = {}
+    cache_hit = False
+    if cache_enabled and cache_root is not None:
+        cache_payload = _build_temporal_backtest_cache_payload(
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            selected_models=selected_models,
+            classical_models=classical_models,
+            deep_models=deep_models,
+            retrieval_models=retrieval_models,
+            random_seed=random_seed,
+            folds=folds,
+            max_train_samples=resolved_max_train_samples,
+            max_eval_samples=resolved_max_eval_samples,
+            adaptation_mode=resolved_adaptation_mode,
+            tuned_model_specs=resolved_tuned_specs,
+            sequence_length=int(data.X_seq_train.shape[1]) if data.X_seq_train.ndim >= 2 else 0,
+            num_artists=int(data.num_artists),
+            num_ctx=int(data.num_ctx),
+            total_rows=int(len(data.y_train) + len(data.y_val) + len(data.y_test)),
+        )
+        cache_key = _build_temporal_backtest_cache_key(cache_payload)
+        cache_paths = _resolve_temporal_backtest_cache_paths(
+            cache_root=cache_root,
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            cache_key=cache_key,
+        )
+        cache_hit = _read_cached_temporal_backtest_manifest(cache_paths=cache_paths) is not None
+    else:
+        cache_key = ""
+
+    return TemporalBacktestCacheInspection(
+        enabled=bool(cache_enabled),
+        fingerprint=(str(cache_fingerprint).strip() if cache_enabled else ""),
+        cache_key=str(cache_key),
+        hit=bool(cache_hit),
+        selected_models=tuple(selected_models),
+        classical_models=tuple(classical_models),
+        deep_models=tuple(deep_models),
+        retrieval_models=tuple(retrieval_models),
+        adaptation_mode=str(resolved_adaptation_mode),
+        max_train_samples=int(resolved_max_train_samples),
+        max_eval_samples=int(resolved_max_eval_samples),
+        cache_paths=cache_paths,
+        cache_payload=cache_payload,
+    )
 
 
 def _save_temporal_backtest_result_to_cache(
@@ -544,6 +654,7 @@ def _run_retrieval_backtest_job(
     pretrain_objectives = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_OBJECTIVES", "cooccurrence").strip() or "cooccurrence"
     pretrain_max_pairs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_MAX_PAIRS", "250000").strip() or "250000"
     pretrain_epochs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_EPOCHS", "3").strip() or "3"
+    pretrain_blend_topk = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_BLEND_TOPK", "").strip() or None
     retrieval_ann_bits = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "").strip() or None
     retrieval_batch_size = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "").strip() or None
     retrieval_lr = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_LR", "").strip() or None
@@ -577,6 +688,7 @@ def _run_retrieval_backtest_job(
                 "SPOTIFY_PRETRAIN_OBJECTIVES": pretrain_objectives,
                 "SPOTIFY_PRETRAIN_MAX_PAIRS": pretrain_max_pairs,
                 "SPOTIFY_PRETRAIN_EPOCHS": pretrain_epochs,
+                "SPOTIFY_PRETRAIN_BLEND_TOPK": pretrain_blend_topk,
                 "SPOTIFY_RETRIEVAL_EPOCHS": (str(backtest_epochs) if backtest_epochs is not None else None),
                 "SPOTIFY_RETRIEVAL_ANN_BITS": retrieval_ann_bits,
                 "SPOTIFY_RETRIEVAL_BATCH_SIZE": retrieval_batch_size,
@@ -949,59 +1061,44 @@ def run_temporal_backtest(
         logger.info("Skipping temporal backtesting because folds <= 0.")
         return []
 
-    resolved_tuned_specs = dict(tuned_model_specs or {})
-    classical_models, deep_models, retrieval_models = _resolve_backtest_model_groups(
-        selected_models,
-        random_seed,
-        tuned_model_specs=resolved_tuned_specs,
-    )
-    resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
-    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
-
-    cache_enabled = _backtest_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
-    cache_paths = None
-    if cache_enabled and cache_root is not None:
-        cache_payload = _build_temporal_backtest_cache_payload(
-            cache_fingerprint=str(cache_fingerprint).strip(),
-            selected_models=selected_models,
-            classical_models=classical_models,
-            deep_models=deep_models,
-            retrieval_models=retrieval_models,
-            random_seed=random_seed,
-            folds=folds,
-            max_train_samples=resolved_max_train_samples,
-            max_eval_samples=resolved_max_eval_samples,
-            adaptation_mode=resolved_adaptation_mode,
-            tuned_model_specs=resolved_tuned_specs,
-            sequence_length=int(data.X_seq_train.shape[1]) if data.X_seq_train.ndim >= 2 else 0,
-            num_artists=int(data.num_artists),
-            num_ctx=int(data.num_ctx),
-            total_rows=int(len(data.y_train) + len(data.y_val) + len(data.y_test)),
-        )
-        cache_key = _build_temporal_backtest_cache_key(cache_payload)
-        cache_paths = _resolve_temporal_backtest_cache_paths(
-            cache_root=cache_root,
-            cache_fingerprint=str(cache_fingerprint).strip(),
-            cache_key=cache_key,
-        )
+    cache_inspection = inspect_temporal_backtest_cache(
+        data=data,
+        selected_models=selected_models,
+        random_seed=random_seed,
+        folds=folds,
+        max_train_samples=max_train_samples,
+        max_eval_samples=max_eval_samples,
+        adaptation_mode=adaptation_mode,
+        tuned_model_specs=tuned_model_specs,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+    )
+    resolved_tuned_specs = dict(tuned_model_specs or {})
+    classical_models = cache_inspection.classical_models
+    deep_models = cache_inspection.deep_models
+    retrieval_models = cache_inspection.retrieval_models
+    resolved_adaptation_mode = cache_inspection.adaptation_mode
+    resolved_max_train_samples = cache_inspection.max_train_samples
+    resolved_max_eval_samples = cache_inspection.max_eval_samples
+    cache_enabled = cache_inspection.enabled
+    cache_paths = cache_inspection.cache_paths
+    cache_payload = cache_inspection.cache_payload
+    cached_results = None
+    if cache_inspection.hit and cache_paths is not None:
         cached_results = _load_cached_temporal_backtest_result(
             cache_paths=cache_paths,
             output_dir=output_dir,
             logger=logger,
         )
-    else:
-        cache_payload = {}
-        cached_results = None
 
     if cache_stats_out is not None:
         cache_stats_out.clear()
         cache_stats_out.update(
             {
                 "enabled": bool(cache_enabled),
-                "fingerprint": (str(cache_fingerprint).strip() if cache_enabled else ""),
-                "cache_key": (cache_paths.cache_key if cache_paths is not None else ""),
+                "fingerprint": str(cache_inspection.fingerprint),
+                "cache_key": str(cache_inspection.cache_key),
                 "hit": bool(cached_results is not None),
                 "selected_models": [str(name) for name in selected_models],
             }

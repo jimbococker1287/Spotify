@@ -76,6 +76,12 @@ def _scenario_safe_policy(
     safe_policy: SafeBanditPolicyArtifact,
     scenario_name: str,
 ) -> tuple[str, dict[str, float]]:
+    scenario_policy_map = getattr(safe_policy, "scenario_policy_map", {}) or {}
+    scenario_policy_names = getattr(safe_policy, "scenario_policy_names", {}) or {}
+    selected_scenario_policy = scenario_policy_map.get(scenario_name)
+    if isinstance(selected_scenario_policy, dict) and selected_scenario_policy:
+        selected_name = str(scenario_policy_names.get(scenario_name, "")).strip() or f"safe_routed_{scenario_name}"
+        return selected_name, _normalize_policy(selected_scenario_policy)
     policy_map = getattr(safe_policy, "policy_map", {}) or {}
     global_policy = dict(getattr(safe_policy, "global_policy", {}) or {})
     if scenario_name == "high_friction_spike":

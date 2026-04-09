@@ -21,6 +21,10 @@ def _policy_name_for(weights: dict[str, float]) -> str:
     for policy_name, template in safe_policy.POLICY_TEMPLATES.items():
         if template == weights:
             return policy_name
+    if weights.get("continuity", 0.0) >= 0.6 and weights.get("novelty", 1.0) <= 0.05:
+        return "evening_safe"
+    if weights.get("novelty", 1.0) <= 0.05 and weights.get("repeat", 0.0) >= 0.8:
+        return "comfort_policy"
     raise AssertionError(f"Unknown policy weights: {weights}")
 
 
@@ -58,6 +62,7 @@ def test_learn_safe_bandit_policy_selects_global_policy_that_beats_benchmark_ref
                 "novelty_boosted": (0.12, 0.11),
                 "comfort_policy": (0.14, 0.12),
                 "safe_balance": (0.13, 0.11),
+                "evening_safe": (0.15, 0.11),
             }
             skip_risk, end_risk = metrics[policy_name]
             first_choice = np.zeros(batch_size, dtype="int32")
@@ -68,6 +73,7 @@ def test_learn_safe_bandit_policy_selects_global_policy_that_beats_benchmark_ref
                 "novelty_boosted": (0.61, 0.13),
                 "comfort_policy": (0.57, 0.11),
                 "safe_balance": (0.59, 0.12),
+                "evening_safe": (0.54, 0.10),
             }
             skip_risk, end_risk = metrics[policy_name]
             first_choice = np.zeros(batch_size, dtype="int32")
@@ -94,12 +100,17 @@ def test_learn_safe_bandit_policy_selects_global_policy_that_beats_benchmark_ref
 
     summary = json.loads((tmp_path / "safe_bandit_policy_summary.json").read_text(encoding="utf-8"))
     benchmark_rows = (tmp_path / "safe_bandit_policy_benchmark.csv").read_text(encoding="utf-8")
+    scenario_rows = (tmp_path / "safe_bandit_policy_scenarios.csv").read_text(encoding="utf-8")
 
     assert artifact.global_policy_name == "comfort_policy"
     assert artifact.global_policy == safe_policy.POLICY_TEMPLATES["comfort_policy"]
+    assert artifact.scenario_policy_names["evening_drift"].startswith("safe_routed_evening")
+    assert artifact.scenario_policy_map["evening_drift"]["novelty"] <= 0.0
+    assert artifact.scenario_policy_map["evening_drift"]["repeat"] >= 0.8
     assert artifact.benchmark_scenario == "evening_drift"
     assert artifact.benchmark_reference_policy_name == "exploit_preference"
     assert summary["global_policy_name"] == "comfort_policy"
+    assert str(summary["scenario_policy_names"]["evening_drift"]).startswith("safe_routed_evening")
     assert summary["benchmark_scenario"] == "evening_drift"
     assert summary["benchmark_reference_policy_name"] == "exploit_preference"
     assert summary["global_selection_strategy"] == "beats_reference_on_stress_benchmark"
@@ -107,4 +118,6 @@ def test_learn_safe_bandit_policy_selects_global_policy_that_beats_benchmark_ref
     assert abs(float(summary["selected_skip_risk"]) - 0.57) < 1e-6
     assert abs(float(summary["reference_skip_risk"]) - 0.62) < 1e-6
     assert "comfort_policy" in benchmark_rows
+    assert "safe_routed_evening" in scenario_rows
     assert (tmp_path / "safe_bandit_policy_benchmark.csv") in paths
+    assert (tmp_path / "safe_bandit_policy_scenarios.csv") in paths

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import spotify.stress_test as stress_test
 
@@ -117,3 +118,58 @@ def test_run_stress_test_lab_samples_sessions_and_logs_progress(
     assert "Stress-test benchmark scenario=evening_drift policy=safe_routed_evening" in caplog.text
     assert "Stress-test progress scenario=baseline policy=baseline_exploit processed=2/3" in caplog.text
     assert "Ran stress-test lab across 5 scenarios using 3/6 sessions." in caplog.text
+
+
+def test_run_stress_test_lab_prefers_learned_scenario_policy_names(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data = SimpleNamespace(
+        X_seq_test=np.array([[0, 1], [1, 2], [2, 0]], dtype="int32"),
+        X_ctx_test=np.array([[8.0, 0.0], [9.0, 1.0], [10.0, 0.0]], dtype="float32"),
+    )
+    safe_policy = SimpleNamespace(
+        global_policy={"transition": 0.8, "continuity": 0.3, "novelty": 0.2, "repeat": 0.7},
+        scenario_policy_map={
+            "evening_drift": {"transition": 0.95, "continuity": 0.7, "novelty": 0.0, "repeat": 0.95},
+        },
+        scenario_policy_names={"evening_drift": "safe_routed_evening__learned"},
+    )
+
+    def _fake_rollout(
+        *,
+        twin,
+        multimodal_space,
+        causal_artifact,
+        start_sequence,
+        start_context,
+        horizon,
+        policy_weights,
+        scenario,
+        rng,
+    ) -> dict[str, float]:
+        _ = (twin, multimodal_space, causal_artifact, start_sequence, start_context, horizon, rng)
+        if scenario == stress_test.SCENARIOS["evening_drift"] and policy_weights["continuity"] >= 0.7:
+            return {"session_length": 5.0, "mean_skip_risk": 0.18, "mean_end_risk": 0.10}
+        return {"session_length": 4.0, "mean_skip_risk": 0.25, "mean_end_risk": 0.15}
+
+    monkeypatch.setattr(stress_test, "simulate_rollout", _fake_rollout)
+    monkeypatch.setenv("SPOTIFY_STRESS_TEST_MAX_SESSIONS", "3")
+    monkeypatch.setenv("SPOTIFY_STRESS_TEST_PROGRESS_EVERY", "0")
+
+    stress_test.run_stress_test_lab(
+        data=data,
+        digital_twin=object(),
+        multimodal_space=object(),
+        safe_policy=safe_policy,
+        causal_artifact=None,
+        output_dir=tmp_path,
+        logger=_logger("spotify.test.stress_test.learned"),
+        random_seed=9,
+    )
+
+    benchmark = json.loads((tmp_path / "stress_test_benchmark.json").read_text(encoding="utf-8"))
+    assert benchmark["benchmark_scenario"] == "evening_drift"
+    assert benchmark["benchmark_policy_name"] == "safe_routed_evening__learned"
+    assert benchmark["benchmark_policy_selection_mode"] == "scenario_routed_alias"
+    assert benchmark["skip_risk"] == pytest.approx(0.18)

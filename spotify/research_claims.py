@@ -504,6 +504,16 @@ def _claim_shift_robustness(
     if math.isfinite(target_drift) and target_drift >= 0.15 and not repeated_support:
         missing_checks.append("Repeat the drift and robustness slices across multiple completed runs so the shift story is not single-run only.")
 
+    strong_repeated_support = (
+        repeated_support
+        and repeated_run_count >= 3
+        and consistent_slice_run_count >= 3
+        and (not math.isfinite(consistency_rate) or consistency_rate >= 0.80)
+    )
+
+    if status != "analysis_ready" and support_count >= 3 and strong_repeated_support and not missing_checks:
+        status = "analysis_ready"
+
     return {
         "key": "shift_robustness",
         "title": "Failure concentration is measurable under drift, slice shift, and repeated-session regimes",

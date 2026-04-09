@@ -21,6 +21,7 @@ def build_retrieval_summary_payload(
     retrieval_metrics_test: dict[str, float],
     rerank_metrics_val: dict[str, float],
     rerank_metrics_test: dict[str, float],
+    reranker_model_name: str,
 ) -> dict[str, object]:
     return {
         "candidate_k": top_k,
@@ -39,6 +40,7 @@ def build_retrieval_summary_payload(
             "test": retrieval_metrics_test,
         },
         "reranker": {
+            "model_name": str(reranker_model_name),
             "val": rerank_metrics_val,
             "test": rerank_metrics_test,
         },
@@ -61,6 +63,7 @@ def build_retrieval_result_rows(
     retrieval_metrics_test: dict[str, float],
     rerank_metrics_val: dict[str, float],
     rerank_metrics_test: dict[str, float],
+    reranker_model_name: str,
     val_candidate_hit: float,
     test_candidate_hit: float,
     ann_metrics_val: dict[str, float],
@@ -115,6 +118,7 @@ def build_retrieval_result_rows(
             "prediction_bundle_path": str(reranker_bundle_path),
             "retrieval_artifact_path": str(reranker_model_path),
             "estimator_artifact_path": str(reranker_path),
+            "reranker_model_name": str(reranker_model_name),
             "pretraining_artifact_path": str(pretrain_path),
             "pretraining_objective": str(pretrain_result.objective_name),
             f"val_recall_at{top_k}": float(val_candidate_hit),
