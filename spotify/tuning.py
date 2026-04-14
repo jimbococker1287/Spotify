@@ -65,6 +65,15 @@ class OptunaModelCachePaths:
     prediction_bundle_path: Path
 
 
+@dataclass(frozen=True)
+class OptunaWarmStartCandidate:
+    cache_fingerprint: str
+    cache_key: str
+    best_params: dict[str, object]
+    val_top1: float
+    modified_time: float
+
+
 def _load_optuna():
     try:
         import optuna
@@ -75,6 +84,11 @@ def _load_optuna():
 
 def _optuna_cache_enabled_from_env() -> bool:
     raw = os.getenv("SPOTIFY_CACHE_OPTUNA", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _optuna_warm_start_enabled_from_env() -> bool:
+    raw = os.getenv("SPOTIFY_WARM_START_OPTUNA", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
@@ -274,6 +288,102 @@ def _copy_optional_artifact(source: Path, destination: Path) -> str:
     return str(copy_file_if_changed(source, destination))
 
 
+def _find_optuna_warm_start_candidate(
+    *,
+    cache_root: Path | None,
+    current_cache_key: str,
+    cache_fingerprint: str,
+    model_name: str,
+    max_train_samples: int,
+    max_eval_samples: int,
+    per_trial_timeout_seconds: int,
+    fidelity_schedule: tuple[float, ...],
+    pruner_name: str,
+) -> OptunaWarmStartCandidate | None:
+    if cache_root is None or not cache_root.exists() or not _optuna_warm_start_enabled_from_env():
+        return None
+
+    best_candidate: OptunaWarmStartCandidate | None = None
+    for meta_path in cache_root.glob(f"*/{model_name}/*/cache_meta.json"):
+        payload = safe_read_json(meta_path, default=None)
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("schema_version", "")) != OPTUNA_CACHE_SCHEMA_VERSION:
+            continue
+        if str(payload.get("model_name", "")) != model_name:
+            continue
+        if int(payload.get("max_train_samples", -1)) != int(max_train_samples):
+            continue
+        if int(payload.get("max_eval_samples", -1)) != int(max_eval_samples):
+            continue
+        if int(payload.get("per_trial_timeout_seconds", -1)) != int(per_trial_timeout_seconds):
+            continue
+        payload_schedule = tuple(float(value) for value in payload.get("fidelity_schedule", []) or [])
+        if payload_schedule != tuple(float(value) for value in fidelity_schedule):
+            continue
+        if str(payload.get("pruner_name", "")) != str(pruner_name):
+            continue
+
+        candidate_cache_key = str(payload.get("cache_key", "")).strip() or meta_path.parent.name
+        if candidate_cache_key == current_cache_key:
+            continue
+
+        result_payload = safe_read_json(meta_path.parent / "result.json", default=None)
+        if not isinstance(result_payload, dict):
+            continue
+        result = result_payload.get("result", result_payload)
+        if not isinstance(result, dict):
+            continue
+        best_params = result.get("best_params")
+        if not isinstance(best_params, dict) or not best_params:
+            continue
+        try:
+            val_top1 = float(result.get("val_top1", float("nan")))
+        except Exception:
+            val_top1 = float("nan")
+        try:
+            modified_time = float((meta_path.parent / "result.json").stat().st_mtime)
+        except Exception:
+            modified_time = 0.0
+        candidate = OptunaWarmStartCandidate(
+            cache_fingerprint=str(payload.get("prepared_fingerprint", "")).strip(),
+            cache_key=candidate_cache_key,
+            best_params={str(key): value for key, value in best_params.items()},
+            val_top1=val_top1,
+            modified_time=modified_time,
+        )
+        if best_candidate is None:
+            best_candidate = candidate
+            continue
+        candidate_rank = (
+            int(candidate.cache_fingerprint == str(cache_fingerprint).strip()),
+            int(np.isfinite(candidate.val_top1)),
+            float(candidate.val_top1 if np.isfinite(candidate.val_top1) else float("-inf")),
+            float(candidate.modified_time),
+        )
+        best_rank = (
+            int(best_candidate.cache_fingerprint == str(cache_fingerprint).strip()),
+            int(np.isfinite(best_candidate.val_top1)),
+            float(best_candidate.val_top1 if np.isfinite(best_candidate.val_top1) else float("-inf")),
+            float(best_candidate.modified_time),
+        )
+        if candidate_rank > best_rank:
+            best_candidate = candidate
+    return best_candidate
+
+
+def _resolve_optuna_warm_start_trials(requested_trials: int) -> int:
+    fraction_raw = os.getenv("SPOTIFY_OPTUNA_WARM_START_TRIAL_FRACTION", "0.60").strip()
+    min_trials = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_WARM_START_MIN_TRIALS"), 4)
+    try:
+        fraction = float(fraction_raw)
+    except Exception:
+        fraction = 0.60
+    fraction = min(1.0, max(0.10, fraction))
+    reduced_trials = int(np.ceil(float(requested_trials) * fraction))
+    return max(1, max(min_trials, reduced_trials))
+
+
 def _load_cached_optuna_result(
     *,
     cache_paths: OptunaModelCachePaths,
@@ -347,7 +457,14 @@ def _save_optuna_result_to_cache(
             },
             sort_keys=True,
         )
-        write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+        write_json(
+            cache_paths.metadata_path,
+            {
+                **cache_payload,
+                "cache_key": cache_paths.cache_key,
+            },
+            sort_keys=True,
+        )
     except Exception as exc:
         logger.warning("Optuna cache save failed for %s (%s).", model_name, exc)
 
@@ -464,6 +581,22 @@ def run_optuna_tuning(
                 continue
         uncached_models.append(model_name)
 
+    warm_start_candidates = {
+        model_name: _find_optuna_warm_start_candidate(
+            cache_root=cache_root,
+            current_cache_key=cache_contexts[model_name][0].cache_key if model_name in cache_contexts else "",
+            cache_fingerprint=cache_fingerprint,
+            model_name=model_name,
+            max_train_samples=max_train_samples,
+            max_eval_samples=max_eval_samples,
+            per_trial_timeout_seconds=per_trial_timeout_seconds,
+            fidelity_schedule=fidelity_schedule,
+            pruner_name=pruner_name,
+        )
+        for model_name in uncached_models
+    }
+    warm_start_model_names = [name for name, candidate in warm_start_candidates.items() if candidate is not None]
+
     if cache_stats_out is not None:
         cache_stats_out.clear()
         cache_stats_out.update(
@@ -474,6 +607,8 @@ def run_optuna_tuning(
                 "miss_model_names": list(uncached_models),
             }
         )
+        if warm_start_model_names:
+            cache_stats_out["warm_start_model_names"] = list(warm_start_model_names)
 
     logger.info(
         "Optuna cache status: enabled=%s fingerprint=%s hits=%d misses=%d",
@@ -482,6 +617,8 @@ def run_optuna_tuning(
         len(cached_results_by_model),
         len(uncached_models),
     )
+    if warm_start_model_names:
+        logger.info("Optuna warm-start candidates: %s", ", ".join(warm_start_model_names))
 
     if not uncached_models:
         ordered_results = [cached_results_by_model[name] for name in selected_models if name in cached_results_by_model]
@@ -561,11 +698,16 @@ def run_optuna_tuning(
 
     def run_model_study(model_name: str) -> OptunaTuningResult | None:
         model_timeout = model_timeout_overrides.get(model_name, model_timeout_default)
+        warm_start_candidate = warm_start_candidates.get(model_name)
+        effective_trials = int(trials)
+        if warm_start_candidate is not None:
+            effective_trials = min(int(trials), _resolve_optuna_warm_start_trials(trials))
         logger.info(
-            "Running Optuna tuning for %s (%d trials, timeout_s=%s)",
+            "Running Optuna tuning for %s (%d trials, timeout_s=%s warm_start=%s)",
             model_name,
-            trials,
+            effective_trials,
             (str(model_timeout) if model_timeout > 0 else "none"),
+            ("yes" if warm_start_candidate is not None else "no"),
         )
         study = optuna.create_study(
             direction="maximize",
@@ -573,6 +715,18 @@ def run_optuna_tuning(
             study_name=f"{model_name}_tuning",
             pruner=pruner,
         )
+        if warm_start_candidate is not None:
+            study.enqueue_trial(dict(warm_start_candidate.best_params))
+            logger.info(
+                "Warm-starting Optuna for %s from prior fingerprint=%s val_top1=%s",
+                model_name,
+                warm_start_candidate.cache_fingerprint or "unknown",
+                (
+                    f"{warm_start_candidate.val_top1:.4f}"
+                    if np.isfinite(warm_start_candidate.val_top1)
+                    else "unknown"
+                ),
+            )
 
         def objective(trial):
             params = _suggest_params(trial, model_name)
@@ -621,7 +775,7 @@ def run_optuna_tuning(
 
         study.optimize(
             objective,
-            n_trials=trials,
+            n_trials=effective_trials,
             timeout=(None if model_timeout <= 0 else model_timeout),
             show_progress_bar=False,
             n_jobs=optuna_jobs,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import math
 
+from .champion_alias import ChampionAlias, read_champion_alias
 from .recommender_safety import evaluate_promotion_gate
 
 
@@ -67,6 +68,51 @@ def _map_platform_gate(
     }
 
 
+def _resolve_outputs_dir(*paths: Path | None) -> Path | None:
+    for path in paths:
+        if path is None:
+            continue
+        resolved = Path(path).expanduser().resolve()
+        parent = resolved.parent
+        if parent.name == "history":
+            return parent.parent
+    return None
+
+
+def _resolve_alias_profile(alias: ChampionAlias) -> str:
+    manifest_path = alias.run_dir / "run_manifest.json"
+    try:
+        import json
+
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("profile", "")).strip().lower()
+
+
+def _resolve_preferred_champion_alias(
+    *,
+    current_run_id: str,
+    current_profile: str | None,
+    require_profile_match: bool,
+    history_csv: Path,
+    backtest_history_csv: Path | None,
+) -> ChampionAlias | None:
+    outputs_dir = _resolve_outputs_dir(backtest_history_csv, history_csv)
+    if outputs_dir is None:
+        return None
+    alias = read_champion_alias(outputs_dir / "models" / "champion" / "alias.json")
+    if alias is None or alias.run_id == str(current_run_id).strip():
+        return None
+    if require_profile_match and current_profile:
+        alias_profile = _resolve_alias_profile(alias)
+        if alias_profile and alias_profile != str(current_profile).strip().lower():
+            return None
+    return alias
+
+
 def evaluate_champion_gate(
     *,
     history_csv: Path,
@@ -91,6 +137,15 @@ def evaluate_champion_gate(
 
     effective_source = source
     status_suffix = ""
+    preferred_alias = _resolve_preferred_champion_alias(
+        current_run_id=current_run_id,
+        current_profile=current_profile,
+        require_profile_match=require_profile_match,
+        history_csv=history_csv,
+        backtest_history_csv=backtest_history_csv,
+    )
+    preferred_run_id = preferred_alias.run_id if preferred_alias is not None else None
+    preferred_model_name = preferred_alias.model_name if preferred_alias is not None else None
 
     if source == "backtest_top1":
         gate = evaluate_promotion_gate(
@@ -106,6 +161,8 @@ def evaluate_champion_gate(
             current_risk_metrics=current_risk_metrics,
             max_selective_risk=max_selective_risk,
             max_abstention_rate=max_abstention_rate,
+            preferred_champion_run_id=preferred_run_id,
+            preferred_champion_model_name=preferred_model_name,
         )
         if str(gate.get("status", "")).strip() == "no_current_results":
             effective_source = "val_top1"
@@ -127,6 +184,8 @@ def evaluate_champion_gate(
         current_risk_metrics=current_risk_metrics,
         max_selective_risk=max_selective_risk,
         max_abstention_rate=max_abstention_rate,
+        preferred_champion_run_id=preferred_run_id,
+        preferred_champion_model_name=preferred_model_name,
     )
     mapped = _map_platform_gate(gate, metric_source=effective_source)
     if status_suffix:

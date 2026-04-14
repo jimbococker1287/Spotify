@@ -315,6 +315,85 @@ def test_run_temporal_backtest_supports_retrieval_models(tmp_path: Path, monkeyp
     assert captured == [{"model_name": "retrieval_reranker", "train_rows": 4, "test_rows": 2}]
 
 
+def test_run_temporal_backtest_supports_blended_ensemble_models(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    captured: list[dict[str, object]] = []
+
+    monkeypatch.setattr(backtesting, "_build_expanding_windows", lambda _n_rows, _folds: [(4, 6)])
+    monkeypatch.setenv("SPOTIFY_BACKTEST_WORKERS", "1")
+
+    def _fake_backtest_job(**kwargs) -> BacktestFoldResult:
+        return BacktestFoldResult(
+            model_name=str(kwargs["model_name"]),
+            model_type="classical",
+            model_family="tree_ensemble",
+            fold=int(kwargs["fold_idx"]),
+            train_rows=len(kwargs["X_train"]),
+            test_rows=len(kwargs["X_test"]),
+            fit_seconds=0.02,
+            top1=0.35,
+            top5=0.70,
+        )
+
+    def _fake_retrieval_backtest_job(**kwargs) -> BacktestFoldResult:
+        return BacktestFoldResult(
+            model_name=str(kwargs["model_name"]),
+            model_type="retrieval_reranker",
+            model_family="candidate_reranker",
+            fold=int(kwargs["fold_idx"]),
+            train_rows=len(kwargs["X_seq_train"]),
+            test_rows=len(kwargs["X_seq_test"]),
+            fit_seconds=0.03,
+            top1=0.44,
+            top5=0.88,
+        )
+
+    def _fake_ensemble_backtest_job(**kwargs) -> BacktestFoldResult:
+        captured.append(
+            {
+                "model_name": kwargs["model_name"],
+                "candidate_model_names": kwargs["candidate_model_names"],
+                "tuned_model_specs": kwargs["tuned_model_specs"],
+            }
+        )
+        return BacktestFoldResult(
+            model_name="blended_ensemble",
+            model_type="ensemble",
+            model_family="blend",
+            fold=int(kwargs["fold_idx"]),
+            train_rows=len(kwargs["X_seq_train"]),
+            test_rows=len(kwargs["X_seq_test"]),
+            fit_seconds=0.05,
+            top1=0.52,
+            top5=0.93,
+        )
+
+    monkeypatch.setattr(backtesting, "_run_backtest_job", _fake_backtest_job)
+    monkeypatch.setattr(backtesting, "_run_retrieval_backtest_job", _fake_retrieval_backtest_job)
+    monkeypatch.setattr(backtesting, "_run_ensemble_backtest_job", _fake_ensemble_backtest_job)
+
+    rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path,
+        selected_models=("extra_trees", "retrieval_reranker", "blended_ensemble"),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_ensemble"),
+    )
+
+    assert {row.model_name for row in rows} == {"extra_trees", "retrieval_reranker", "blended_ensemble"}
+    assert next(row for row in rows if row.model_name == "blended_ensemble").model_type == "ensemble"
+    assert captured == [
+        {
+            "model_name": "blended_ensemble",
+            "candidate_model_names": ("extra_trees", "retrieval_reranker", "blended_ensemble"),
+            "tuned_model_specs": {},
+        }
+    ]
+
+
 def test_retrieval_backtest_runtime_config_tracks_extended_knobs(monkeypatch) -> None:
     monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "12")
     monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "512")

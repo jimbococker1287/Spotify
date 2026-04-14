@@ -375,79 +375,19 @@ def _write_triage_artifacts(
     thresholds: dict[str, float | None],
     violations: list[dict[str, object]],
 ) -> tuple[Path, Path]:
-    analytics_dir = outputs_dir / "analytics"
-    analytics_dir.mkdir(parents=True, exist_ok=True)
-    latest_run = control_room.get("latest_run", {})
-    latest_run = latest_run if isinstance(latest_run, dict) else {}
-    baseline = control_room.get("baseline_comparison", {})
-    baseline = baseline if isinstance(baseline, dict) else {}
-    triage_items = _build_triage_items(control_room=control_room, violations=violations)
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from spotify.control_room_triage import write_control_room_triage_artifacts
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "output_dir": str(outputs_dir),
-        "control_room_status": status,
-        "run_id": str(latest_run.get("run_id", "")),
-        "run_profile": str(latest_run.get("profile", "")),
-        "promotion_status": str(latest_run.get("promotion_status", "")),
-        "thresholds": thresholds,
-        "baseline_summary": baseline.get("summary", []) if isinstance(baseline.get("summary", []), list) else [],
-        "violations": violations,
-        "triage_items": triage_items,
-    }
-
-    json_path = analytics_dir / "control_room_triage.json"
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    lines = [
-        "# Control Room Triage",
-        "",
-        f"- Generated: `{payload['generated_at']}`",
-        f"- Run: `{payload['run_id']}` (`{payload['run_profile']}`)",
-        f"- Promotion: `{payload['promotion_status']}`",
-        f"- Control-room status: `{status}`",
-        f"- Threshold violations: `{len(violations)}`",
-        "",
-        "## Baseline Context",
-        "",
-    ]
-    baseline_summary = payload["baseline_summary"] if isinstance(payload["baseline_summary"], list) else []
-    if baseline_summary:
-        for item in baseline_summary:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- No baseline comparison summary was available.")
-
-    lines.extend(["", "## Threshold Violations", ""])
-    if violations:
-        for violation in violations:
-            lines.append(f"- {violation['message']}")
-    else:
-        lines.append("- No configured thresholds were exceeded.")
-
-    lines.extend(["", "## Playbook", ""])
-    if triage_items:
-        for item in triage_items:
-            lines.append("")
-            lines.append(f"### {item['title']}")
-            lines.append("")
-            lines.append(f"- Area: `{item['area']}`")
-            lines.append(f"- Priority: `{item['priority']}`")
-            lines.append(f"- Trigger: {item['trigger']}")
-            for inspect_file in item["inspect_files"]:
-                lines.append(f"- Inspect file: `{inspect_file}`")
-            for step in item["inspect_steps"]:
-                lines.append(f"- Inspect: {step}")
-            for step in item["fix_steps"]:
-                lines.append(f"- Fix: {step}")
-            for step in item["rerun_steps"]:
-                lines.append(f"- Rerun: {step}")
-    else:
-        lines.append("- No triage items were generated.")
-
-    md_path = analytics_dir / "control_room_triage.md"
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return json_path, md_path
+    return write_control_room_triage_artifacts(
+        outputs_dir=outputs_dir,
+        control_room=control_room,
+        status=status,
+        thresholds=thresholds,
+        violations=violations,
+        generated_at=datetime.now(timezone.utc),
+    )
 
 
 def main() -> int:

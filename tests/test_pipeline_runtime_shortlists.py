@@ -47,6 +47,25 @@ def test_shortlist_classical_model_names_skips_when_baseline_metrics_missing() -
     assert selected == ("logreg", "mlp")
 
 
+def test_shortlist_classical_model_names_preserves_passthrough_backtest_candidates() -> None:
+    rows = [
+        SimpleNamespace(model_name="logreg", val_top1=0.31, fit_seconds=12.0),
+        SimpleNamespace(model_name="mlp", val_top1=0.41, fit_seconds=15.0),
+        SimpleNamespace(model_name="extra_trees", val_top1=0.37, fit_seconds=20.0),
+    ]
+
+    selected = pipeline_runtime._shortlist_classical_model_names(
+        ("logreg", "extra_trees", "mlp", "retrieval_reranker", "blended_ensemble"),
+        rows,
+        top_n=2,
+        logger=_logger("spotify.test.shortlist.passthrough"),
+        stage_label="Temporal backtest",
+        passthrough_names=("retrieval_reranker", "blended_ensemble"),
+    )
+
+    assert selected == ("mlp", "extra_trees", "retrieval_reranker", "blended_ensemble")
+
+
 def test_resolve_shortlist_top_n_parses_positive_ints(monkeypatch) -> None:
     monkeypatch.setenv("SPOTIFY_OPTUNA_SHORTLIST_TOP_N", "2")
     assert pipeline_runtime._resolve_shortlist_top_n("SPOTIFY_OPTUNA_SHORTLIST_TOP_N") == 2

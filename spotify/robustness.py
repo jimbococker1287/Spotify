@@ -164,9 +164,12 @@ def _build_guardrail_payload(
         gap = _safe_metric(row.get("guardrail_gap"))
         top1 = _safe_metric(row.get("guardrail_top1"))
         global_top1 = _safe_metric(row.get("global_top1"))
+        model_type = str(row.get("model_type", "")).strip().lower()
         per_model.append(
             {
                 "model_name": str(row.get("model_name", "")),
+                "model_type": model_type,
+                "operational_model": bool(row.get("operational_model", False)),
                 "segment": segment,
                 "bucket": bucket,
                 "slice_top1": top1,
@@ -184,6 +187,12 @@ def _build_guardrail_payload(
     )
     available_rows = [row for row in per_model if math.isfinite(_safe_metric(row.get("slice_gap")))]
     worst_row = available_rows[0] if available_rows else {}
+    operational_rows = [
+        row
+        for row in available_rows
+        if bool(row.get("operational_model", False))
+    ]
+    operational_worst_row = operational_rows[0] if operational_rows else {}
     return {
         "segment": segment,
         "bucket": bucket,
@@ -193,6 +202,12 @@ def _build_guardrail_payload(
         "worst_gap": _safe_metric(worst_row.get("slice_gap")),
         "worst_top1": _safe_metric(worst_row.get("slice_top1")),
         "worst_bucket_count": int(worst_row.get("slice_count", 0) or 0),
+        "operational_model_count": int(len(operational_rows)),
+        "operational_worst_model_name": str(operational_worst_row.get("model_name", "")),
+        "operational_worst_model_type": str(operational_worst_row.get("model_type", "")),
+        "operational_worst_gap": _safe_metric(operational_worst_row.get("slice_gap")),
+        "operational_worst_top1": _safe_metric(operational_worst_row.get("slice_top1")),
+        "operational_worst_bucket_count": int(operational_worst_row.get("slice_count", 0) or 0),
         "models": per_model,
     }
 
@@ -232,6 +247,11 @@ def run_robustness_slice_evaluation(
     slice_rows: list[dict[str, object]] = []
     test_global_top1: dict[str, float] = {}
     test_row_counts: dict[str, int] = {}
+    model_type_by_name = {
+        str(row.get("model_name", "")).strip(): str(row.get("model_type", "")).strip().lower()
+        for row in results
+        if str(row.get("model_name", "")).strip()
+    }
     guardrail_segment, guardrail_bucket = _resolve_guardrail_target()
 
     for row in results:
@@ -302,6 +322,14 @@ def run_robustness_slice_evaluation(
         summary_rows.append(
             {
                 "model_name": model_name,
+                "model_type": model_type_by_name.get(model_name, ""),
+                "operational_model": model_type_by_name.get(model_name, "") in {
+                    "classical",
+                    "classical_tuned",
+                    "retrieval",
+                    "retrieval_reranker",
+                    "ensemble",
+                },
                 "max_top1_gap": float(max(actionable_gap, 0.0)),
                 "raw_max_top1_gap": float(max_top1 - min_top1),
                 "global_top1": global_top1,

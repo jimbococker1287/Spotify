@@ -7,6 +7,7 @@ import pandas as pd
 
 from spotify.data import PreparedData
 from spotify.training import (
+    _resolve_tensorflow_input_mode,
     _weighted_top1_accuracy_from_proba,
     _weighted_topk_accuracy_from_proba,
     compute_baselines,
@@ -104,3 +105,43 @@ def test_weighted_accuracy_helpers_match_expected_scores() -> None:
 
     assert np.isclose(top1, 1.0 / 6.0)
     assert np.isclose(top2, 0.5)
+
+
+class _DummyTFConfig:
+    def __init__(self, gpu_count: int):
+        self._gpu_count = int(gpu_count)
+
+    def list_logical_devices(self, device_type: str):
+        if device_type != "GPU":
+            return []
+        return [object() for _ in range(self._gpu_count)]
+
+
+class _DummyTF:
+    def __init__(self, gpu_count: int):
+        self.config = _DummyTFConfig(gpu_count)
+
+
+class _DummyStrategy:
+    def __init__(self, replicas: int):
+        self.num_replicas_in_sync = int(replicas)
+
+
+def test_resolve_tensorflow_input_mode_prefers_arrays_on_cpu_only_darwin(monkeypatch) -> None:
+    monkeypatch.delenv("SPOTIFY_TF_INPUT_MODE", raising=False)
+    monkeypatch.setattr("spotify.training.sys.platform", "darwin")
+
+    mode, reason = _resolve_tensorflow_input_mode(tf=_DummyTF(gpu_count=0), strategy=_DummyStrategy(replicas=1))
+
+    assert mode == "arrays"
+    assert reason == "auto(darwin_cpu_single_device)"
+
+
+def test_resolve_tensorflow_input_mode_honors_forced_dataset(monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_TF_INPUT_MODE", "dataset")
+    monkeypatch.setattr("spotify.training.sys.platform", "darwin")
+
+    mode, reason = _resolve_tensorflow_input_mode(tf=_DummyTF(gpu_count=0), strategy=_DummyStrategy(replicas=1))
+
+    assert mode == "dataset"
+    assert reason == "forced_dataset"

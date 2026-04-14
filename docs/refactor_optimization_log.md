@@ -683,3 +683,103 @@ Validation gate:
 - `ruff` passed on the touched Python files.
 - `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
 - `tests/test_drift_and_backtesting.py`, `tests/test_research_platform.py`, and `tests/test_recommender_safety_platform.py` passed.
+
+### Retrieval Phase Replay And Lazy TensorFlow Init
+
+Scope:
+- Added a persistent phase-level retrieval cache in `spotify/retrieval_runtime.py` keyed by:
+  - prepared-data fingerprint
+  - random seed and resolved candidate-k
+  - sequence length, artist count, context width, and split sizes
+  - self-supervised pretraining toggle
+  - retrieval, pretraining, ANN, and reranker runtime knobs
+  - a source digest across the retrieval stack
+- The retrieval cache replays the full retrieval phase into a fresh run directory, including:
+  - retrieval prediction bundles
+  - retrieval and reranker serving artifacts
+  - the reranker estimator artifact
+  - the retrieval summary JSON
+  - the selected pretraining artifact
+- Wired retrieval cache metadata into the `retrieval_stack` phase in `spotify/pipeline_runtime_search_stage.py`.
+- Enabled retrieval cache by default in `scripts/run_everything.sh` and `scripts/run_fast.sh` with `SPOTIFY_CACHE_RETRIEVAL=1`.
+
+Lazy TensorFlow init:
+- Reordered `spotify/pipeline_runtime_experiments.py` so classical benchmarks, Optuna, and retrieval run before TensorFlow startup.
+- Added `inspect_temporal_backtest_cache(...)` in `spotify/backtesting.py` so the runtime can decide whether the selected deep temporal backtest models will be served from cache before it tries to initialize TensorFlow.
+- Updated `spotify/pipeline_runtime_tensorflow_stage.py` so TensorFlow initializes only when:
+  - there are uncached deep training models, or
+  - the selected deep temporal backtest models are uncached
+- Stopped passing partial deep-builder lists from deep training into temporal backtesting; the backtest phase now resolves deep builders lazily only on real cache misses.
+
+Validation and cache behavior:
+- Added `tests/test_retrieval_and_friction.py` coverage proving a retrieval cache hit restores all phase artifacts and rows without running pretraining, baseline scoring, or reranker training.
+- Added `tests/test_pipeline_runtime_experiments.py` coverage proving `run_experiment_stages(...)` skips the `tensorflow_runtime_init` phase entirely when deep training is fully cached and the selected deep temporal backtest is already cached.
+
+Measured impact:
+- Real prepared-data benchmark using `/tmp/spotify-cache-bench.6BCLOP/cache/prepared_data/e66160c1b6edbadf099d85ed/prepared_bundle.joblib`
+- Retrieval workload: `candidate_k=30`, `enable_self_supervised_pretraining=False`, same prepared fingerprint and random seed
+  - cold retrieval run: `10.0572s`
+  - warm retrieval cache replay: `0.0039s`
+  - speedup: about `2571.9x`
+
+Interpretation:
+- This does not mean the whole pipeline is `2571x` faster.
+- It means the retrieval phase is now effectively removed on unchanged reruns, just like Optuna, classical benchmarks, deep training, deep reporting, SHAP, and temporal backtest.
+- The TensorFlow startup change is a structural warm-path optimization: on cache-hit reruns, the pipeline can now skip the entire `tensorflow_runtime_init` phase instead of paying that startup just to discover there is no uncached deep work left.
+- I attempted a tiny live deep-training smoke on April 8, 2026 to attach a wall-clock number to the TensorFlow skip, but the local Python 3.13 CPU-only TensorFlow environment stalled after `Epoch 1/1 started`, so I am not claiming a measured end-to-end warm-run speedup from that smoke.
+
+Validation gate:
+- `compileall` passed on `spotify/retrieval_runtime.py`, `spotify/backtesting.py`, `spotify/pipeline_runtime_dependency_types.py`, `spotify/pipeline_runtime_experiment_types.py`, `spotify/pipeline_runtime_dependency_bundle.py`, `spotify/pipeline_runtime_tensorflow_stage.py`, `spotify/pipeline_runtime_deep_training.py`, `spotify/pipeline_runtime_search_stage.py`, `spotify/pipeline_runtime_experiments.py`, `tests/test_retrieval_and_friction.py`, and `tests/test_pipeline_runtime_experiments.py`.
+- `ruff` passed on the touched Python files.
+- `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
+- `tests/test_retrieval_and_friction.py`, `tests/test_drift_and_backtesting.py`, `tests/test_pipeline_runtime_experiments.py`, `tests/test_research_platform.py`, and `tests/test_recommender_safety_platform.py` passed.
+
+### Cold-Path Deep Training And Warm-Start Pass
+
+Scope:
+- Added deep-model warm-start discovery in `spotify/training.py` so changed-data runs can reuse the best compatible prior checkpoint for the same:
+  - model name
+  - sequence length
+  - artist vocabulary size
+  - context width
+  - deep-training source digest
+- Deep cache writes now persist a dedicated weights artifact (`warm_start_<model>.weights.h5`) alongside the existing `.keras` checkpoint so future changed-data runs can load weights directly instead of requiring a full-model restore.
+- Added deep screening in `spotify/training.py`:
+  - when a large uncached deep sweep is requested, the pipeline runs a short probe fit on each uncached model
+  - ranks models by probe `val_top1`, `val_top5`, then probe time
+  - fully trains only the shortlisted top-N models
+- Added Optuna warm-start in `spotify/tuning.py`:
+  - changed-data runs now enqueue the best compatible prior hyperparameters first
+  - the live study budget is reduced using `SPOTIFY_OPTUNA_WARM_START_TRIAL_FRACTION`
+- Added Apple Silicon Python 3.13 runtime protection in `spotify/runtime.py` plus launcher auto-routing in `scripts/run_everything.sh` and `scripts/run_fast.sh`:
+  - if `.venv-metal/bin/python` is available and the default deep runtime would otherwise run on Python 3.13, the launcher now routes there automatically
+  - if a risky Python 3.13 deep runtime still slips through, TensorFlow now fails fast with a clear remediation message instead of stalling deep phases
+
+Default efficiency policy now enabled by the launchers:
+- `SPOTIFY_WARM_START_DEEP=1`
+- `SPOTIFY_WARM_START_OPTUNA=1`
+- `SPOTIFY_DEEP_SCREENING=auto`
+- `SPOTIFY_DEEP_SCREENING_TOP_N=3` for `run_everything.sh`
+- `SPOTIFY_DEEP_SCREENING_TOP_N=2` for `run_fast.sh`
+- `SPOTIFY_OPTUNA_WARM_START_TRIAL_FRACTION=0.60`
+- `SPOTIFY_FAIL_FAST_PY313_DEEP=1`
+
+Measured / deterministic impact:
+- Optuna changed-data budget reduction is deterministic:
+  - requested `10` trials now becomes `6` on warm-started changed-data runs
+  - requested `18` trials now becomes `11`
+- Deep-screening budget reduction is workload dependent, but on the old 14-model research sweep with `12` target epochs and `1` probe epoch:
+  - before: `14 x 12 = 168` full-epoch equivalents
+  - after shortlist-to-3: `14 x 1 + 3 x 12 = 50`
+  - projected training-budget reduction: about `70.2%`
+
+Interpretation:
+- The Optuna reduction is a real budget cut for changed-data runs; it should lower wall-clock time whenever prior studies exist.
+- The deep-screening number is a projected epoch-budget reduction, not a claimed end-to-end wall-clock benchmark.
+- The launcher/runtime work is primarily a reliability and startup-protection fix: it avoids wasting time in unstable Python 3.13 deep-runtime paths on Apple Silicon.
+
+Validation gate:
+- `python3 -m py_compile` passed on the touched Python modules and the new tests.
+- `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
+- `.venv/bin/ruff check` passed on the touched Python files and tests.
+- `PYTHONPATH=/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify .venv/bin/pytest -q tests/test_training_cache.py tests/test_tuning_cache.py tests/test_runtime_acceleration.py` passed.

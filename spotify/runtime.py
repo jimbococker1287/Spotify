@@ -65,6 +65,54 @@ def build_acceleration_hint(summary: dict[str, object], *, logical_gpu_count: in
     return None
 
 
+def should_disable_deep_models_for_cpu_only_full_pass(summary: dict[str, object]) -> tuple[bool, str | None]:
+    policy = os.getenv("SPOTIFY_FULL_DEEP_MODE_POLICY", "auto").strip().lower()
+    if policy in ("0", "false", "no", "off", "disable", "disabled"):
+        return True, "policy=off"
+    if policy in ("1", "true", "yes", "on", "enable", "enabled"):
+        return False, None
+    if policy != "auto":
+        return False, None
+
+    if bool(summary.get("force_cpu")):
+        return True, "force_cpu"
+
+    if summary.get("platform") != "darwin" or summary.get("machine") != "arm64":
+        return False, None
+
+    python_version = str(summary.get("python_version", "0.0"))
+    if _parse_python_version(python_version) < (3, 13):
+        return False, None
+
+    if summary.get("tensorflow_metal_version"):
+        return False, None
+
+    return True, "apple_silicon_python_313_no_tensorflow_metal"
+
+
+def should_prefer_compatibility_python_for_deep_runtime(summary: dict[str, object]) -> tuple[bool, str | None]:
+    if summary.get("platform") != "darwin" or summary.get("machine") != "arm64":
+        return False, None
+    python_version = str(summary.get("python_version", "0.0"))
+    if _parse_python_version(python_version) < (3, 13):
+        return False, None
+    if summary.get("tensorflow_metal_version"):
+        return False, None
+    return True, "apple_silicon_python_313_no_tensorflow_metal"
+
+
+def should_fail_fast_for_deep_tensorflow_runtime(summary: dict[str, object]) -> tuple[bool, str | None]:
+    policy = os.getenv("SPOTIFY_FAIL_FAST_PY313_DEEP", "auto").strip().lower()
+    if policy in ("0", "false", "no", "off"):
+        return False, None
+    prefer_alt, reason = should_prefer_compatibility_python_for_deep_runtime(summary)
+    if not prefer_alt:
+        return False, None
+    if policy in ("1", "true", "yes", "on"):
+        return True, reason
+    return True, reason
+
+
 def configure_process_env() -> None:
     force_cpu = os.getenv("SPOTIFY_FORCE_CPU", "0").strip().lower() in ("1", "true", "yes")
     if force_cpu:
@@ -84,6 +132,16 @@ def configure_process_env() -> None:
 
 
 def load_tensorflow_runtime(logger):
+    summary = detect_acceleration_environment()
+    fail_fast, fail_fast_reason = should_fail_fast_for_deep_tensorflow_runtime(summary)
+    if fail_fast:
+        raise RuntimeError(
+            "Refusing to initialize TensorFlow for deep training on Apple Silicon with "
+            f"Python {summary.get('python_version')} and no tensorflow-metal "
+            f"({fail_fast_reason}). Re-run via `scripts/run_everything.sh`, "
+            "set `PYTHON_BIN=.venv-metal/bin/python`, or override with "
+            "`SPOTIFY_FAIL_FAST_PY313_DEEP=off`."
+        )
     try:
         import tensorflow as tf
     except ImportError as exc:
@@ -166,7 +224,6 @@ def load_tensorflow_runtime(logger):
         len(physical_gpus),
         logical_gpu_count,
     )
-    summary = detect_acceleration_environment()
     hint = build_acceleration_hint(summary, logical_gpu_count=logical_gpu_count)
     if hint:
         logger.warning(hint)

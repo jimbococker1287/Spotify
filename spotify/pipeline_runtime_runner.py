@@ -21,6 +21,11 @@ from .pipeline_runtime_experiments import (
     PipelineExperimentContext,
     run_experiment_stages,
 )
+from .runtime import (
+    detect_acceleration_environment,
+    should_disable_deep_models_for_cpu_only_full_pass,
+    should_prefer_compatibility_python_for_deep_runtime,
+)
 from .run_artifacts import write_json
 from .run_timing import RunPhaseRecorder
 
@@ -57,10 +62,34 @@ def run_pipeline(config: PipelineConfig) -> None:
 
     try:
         run_deep_models = (not config.classical_only) and bool(config.model_names)
+        deep_disable_reason = None
+        acceleration_summary = detect_acceleration_environment()
+        if run_deep_models:
+            prefer_alt_python, prefer_alt_reason = should_prefer_compatibility_python_for_deep_runtime(
+                acceleration_summary
+            )
+            if prefer_alt_python:
+                logger.warning(
+                    "Current deep-runtime interpreter looks compatibility-limited (%s). "
+                    "Prefer the launcher auto-route or set PYTHON_BIN=.venv-metal/bin/python.",
+                    prefer_alt_reason,
+                )
+        if run_deep_models and config.profile == "full":
+            disable_deep_models, deep_disable_reason = should_disable_deep_models_for_cpu_only_full_pass(
+                acceleration_summary
+            )
+            if disable_deep_models:
+                run_deep_models = False
+                logger.info(
+                    "Auto-disabling deep models for this full pass (%s). Requested models: %s. "
+                    "Override with SPOTIFY_FULL_DEEP_MODE_POLICY=on.",
+                    deep_disable_reason,
+                    ",".join(config.model_names),
+                )
         run_classical_models = bool(config.enable_classical_models)
         if config.classical_only:
             run_classical_models = True
-        run_deep_backtest = bool(config.enable_temporal_backtest) and any(
+        run_deep_backtest = run_deep_models and bool(config.enable_temporal_backtest) and any(
             model_name in DEFAULT_MODEL_NAMES for model_name in config.temporal_backtest_model_names
         )
 

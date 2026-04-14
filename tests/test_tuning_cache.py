@@ -141,3 +141,98 @@ def test_run_optuna_tuning_reuses_cached_result_without_loading_optuna(
         "hit_model_names": ["logreg"],
         "miss_model_names": [],
     }
+
+
+def test_find_optuna_warm_start_candidate_prefers_matching_fingerprint(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache"
+    matching_payload = tuning._build_optuna_cache_payload(
+        cache_fingerprint="prepared-next",
+        model_name="logreg",
+        random_seed=42,
+        trials=8,
+        max_train_samples=10_000,
+        max_eval_samples=4_000,
+        model_timeout_seconds=300,
+        per_trial_timeout_seconds=120,
+        fidelity_schedule=(0.25, 0.6, 1.0),
+        pruner_name="median",
+    )
+    matching_key = tuning._build_optuna_cache_key(matching_payload)
+    matching_paths = tuning._resolve_optuna_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint="prepared-next",
+        model_name="logreg",
+        cache_key=matching_key,
+    )
+    matching_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    tuning.write_json(
+        matching_paths.metadata_path,
+        {
+            **matching_payload,
+            "cache_key": matching_key,
+        },
+    )
+    tuning.write_json(
+        matching_paths.result_path,
+        {
+            "result": {
+                "val_top1": 0.78,
+                "best_params": {"C": 0.5, "max_iter": 250},
+            }
+        },
+    )
+
+    older_payload = tuning._build_optuna_cache_payload(
+        cache_fingerprint="prepared-old",
+        model_name="logreg",
+        random_seed=42,
+        trials=8,
+        max_train_samples=10_000,
+        max_eval_samples=4_000,
+        model_timeout_seconds=300,
+        per_trial_timeout_seconds=120,
+        fidelity_schedule=(0.25, 0.6, 1.0),
+        pruner_name="median",
+    )
+    older_key = tuning._build_optuna_cache_key(older_payload)
+    older_paths = tuning._resolve_optuna_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint="prepared-old",
+        model_name="logreg",
+        cache_key=older_key,
+    )
+    older_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    tuning.write_json(
+        older_paths.metadata_path,
+        {
+            **older_payload,
+            "cache_key": older_key,
+        },
+    )
+    tuning.write_json(
+        older_paths.result_path,
+        {
+            "result": {
+                "val_top1": 0.95,
+                "best_params": {"C": 1.5, "max_iter": 400},
+            }
+        },
+    )
+
+    candidate = tuning._find_optuna_warm_start_candidate(
+        cache_root=cache_root,
+        current_cache_key="brand-new-key",
+        cache_fingerprint="prepared-next",
+        model_name="logreg",
+        max_train_samples=10_000,
+        max_eval_samples=4_000,
+        per_trial_timeout_seconds=120,
+        fidelity_schedule=(0.25, 0.6, 1.0),
+        pruner_name="median",
+    )
+
+    assert candidate is not None
+    assert candidate.cache_fingerprint == "prepared-next"
+    assert candidate.best_params == {"C": 0.5, "max_iter": 250}

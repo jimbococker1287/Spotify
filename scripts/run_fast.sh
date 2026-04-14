@@ -11,13 +11,55 @@ else
   RUN_NAME="fast-$(date +%Y%m%d-%H%M%S)"
 fi
 
-if [[ -n "${PYTHON_BIN:-}" ]]; then
-  PYTHON_CMD="$PYTHON_BIN"
-elif [[ -x ".venv/bin/python" ]]; then
-  PYTHON_CMD=".venv/bin/python"
-else
-  PYTHON_CMD="python3"
-fi
+_python_is_ge_313() {
+  "$1" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 13) else 1)
+PY
+}
+
+_python_has_tensorflow() {
+  "$1" - <<'PY' >/dev/null 2>&1
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("tensorflow") else 1)
+PY
+}
+
+_resolve_python_cmd() {
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    PYTHON_CMD="$PYTHON_BIN"
+    return
+  fi
+  if [[ -x ".venv/bin/python" ]]; then
+    PYTHON_CMD=".venv/bin/python"
+  else
+    PYTHON_CMD="python3"
+  fi
+
+  case "$(printf '%s' "${SPOTIFY_AUTO_ROUTE_TF_PYTHON:-auto}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off)
+      return
+      ;;
+  esac
+  if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    return
+  fi
+  if [[ ! -x ".venv-metal/bin/python" ]]; then
+    return
+  fi
+  if ! _python_is_ge_313 "$PYTHON_CMD"; then
+    return
+  fi
+  if ! _python_has_tensorflow ".venv-metal/bin/python"; then
+    return
+  fi
+
+  PYTHON_CMD=".venv-metal/bin/python"
+  export SPOTIFY_TF_COMPAT_VENV_ROUTED="${SPOTIFY_TF_COMPAT_VENV_ROUTED:-1}"
+  echo "Auto-routing fast deep runtime to ${PYTHON_CMD} to avoid Apple Silicon Python 3.13 TensorFlow instability." >&2
+}
+
+_resolve_python_cmd
 
 DEEP_MODELS="${DEEP_MODELS:-dense,gru_artist,lstm}"
 CLASSICAL_MODELS="${CLASSICAL_MODELS:-logreg,extra_trees,mlp}"
@@ -30,7 +72,16 @@ export SPOTIFY_CACHE_BACKTEST="${SPOTIFY_CACHE_BACKTEST:-1}"
 export SPOTIFY_CACHE_CLASSICAL="${SPOTIFY_CACHE_CLASSICAL:-1}"
 export SPOTIFY_CACHE_DEEP="${SPOTIFY_CACHE_DEEP:-1}"
 export SPOTIFY_CACHE_DEEP_REPORTING="${SPOTIFY_CACHE_DEEP_REPORTING:-1}"
+export SPOTIFY_CACHE_RETRIEVAL="${SPOTIFY_CACHE_RETRIEVAL:-1}"
 export SPOTIFY_CACHE_SHAP="${SPOTIFY_CACHE_SHAP:-1}"
+export SPOTIFY_WARM_START_DEEP="${SPOTIFY_WARM_START_DEEP:-1}"
+export SPOTIFY_WARM_START_OPTUNA="${SPOTIFY_WARM_START_OPTUNA:-1}"
+export SPOTIFY_DEEP_SCREENING="${SPOTIFY_DEEP_SCREENING:-auto}"
+export SPOTIFY_DEEP_SCREENING_TOP_N="${SPOTIFY_DEEP_SCREENING_TOP_N:-2}"
+export SPOTIFY_DEEP_SCREENING_EPOCHS="${SPOTIFY_DEEP_SCREENING_EPOCHS:-1}"
+export SPOTIFY_DEEP_SCREENING_MIN_MODELS="${SPOTIFY_DEEP_SCREENING_MIN_MODELS:-4}"
+export SPOTIFY_OPTUNA_WARM_START_TRIAL_FRACTION="${SPOTIFY_OPTUNA_WARM_START_TRIAL_FRACTION:-0.60}"
+export SPOTIFY_OPTUNA_WARM_START_MIN_TRIALS="${SPOTIFY_OPTUNA_WARM_START_MIN_TRIALS:-4}"
 export SPOTIFY_CLASSICAL_MODEL_WORKERS="${SPOTIFY_CLASSICAL_MODEL_WORKERS:-1}"
 export SPOTIFY_BACKTEST_WORKERS="${SPOTIFY_BACKTEST_WORKERS:-1}"
 export SPOTIFY_OPTUNA_JOBS="${SPOTIFY_OPTUNA_JOBS:-1}"
@@ -51,6 +102,7 @@ export SPOTIFY_CHAMPION_GATE_MAX_REGRESSION="${SPOTIFY_CHAMPION_GATE_MAX_REGRESS
 export SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK="${SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK:-0.55}"
 export SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE="${SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE:-0.35}"
 export SPOTIFY_DISABLE_MONITOR="${SPOTIFY_DISABLE_MONITOR:-1}"
+export SPOTIFY_FAIL_FAST_PY313_DEEP="${SPOTIFY_FAIL_FAST_PY313_DEEP:-1}"
 
 FAST_SAFE_MODE="${SPOTIFY_FAST_SAFE_MODE:-auto}"
 FAST_PROGRESS_TIMEOUT_SECONDS="${SPOTIFY_FAST_PROGRESS_TIMEOUT_SECONDS:-75}"

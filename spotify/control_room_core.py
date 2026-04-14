@@ -24,6 +24,7 @@ from .control_room_history import (
     _write_weekly_ops_summary,
 )
 from .control_room_rendering import build_control_room_markdown_lines
+from .control_room_triage import write_control_room_triage_artifacts
 from .control_room_selection import (
     _build_cadence_lane as _build_cadence_lane_impl,
     _is_promoted_manifest,
@@ -702,6 +703,18 @@ def write_control_room_report(
         "operational_issue_snapshots": _safe_int(weekly_payload.get("operational_issue_snapshots"), default=0),
         "fast_cadence_issue_snapshots": _safe_int(weekly_payload.get("fast_cadence_issue_snapshots"), default=0),
         "full_cadence_issue_snapshots": _safe_int(weekly_payload.get("full_cadence_issue_snapshots"), default=0),
+    }
+    triage_json_path, triage_md_path = write_control_room_triage_artifacts(
+        outputs_dir=output_root,
+        control_room=report,
+        status="ok",
+        thresholds={},
+        violations=[],
+        generated_at=now,
+    )
+    report["triage_artifacts"] = {
+        "json_path": str(triage_json_path),
+        "markdown_path": str(triage_md_path),
     }
 
     json_path = write_json(analytics_dir / "control_room.json", report)

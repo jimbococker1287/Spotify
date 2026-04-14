@@ -70,6 +70,9 @@ FAST_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
 RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
     "retrieval_reranker",
 )
+ENSEMBLE_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
+    "blended_ensemble",
+)
 EXPERIMENTAL_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "hist_gbm",
     "knn",
@@ -472,9 +475,15 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         if args.backtest_models
         else (classical_model_names if args.classical_models else tuple(preset["temporal_backtest_model_names"]))
     )
-    if enable_retrieval_stack and not args.backtest_models:
+    if enable_retrieval_stack:
         temporal_backtest_model_names = tuple(
-            dict.fromkeys((*temporal_backtest_model_names, *RETRIEVAL_BACKTEST_MODEL_NAMES))
+            dict.fromkeys(
+                (
+                    *temporal_backtest_model_names,
+                    *RETRIEVAL_BACKTEST_MODEL_NAMES,
+                    *ENSEMBLE_BACKTEST_MODEL_NAMES,
+                )
+            )
         )
 
     return PipelineConfig(

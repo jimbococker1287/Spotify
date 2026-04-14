@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from itertools import combinations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from .benchmarks import (
     ClassicalFeatureBundle,
     build_classical_estimator,
     build_full_tabular_dataset,
+    collect_aligned_probabilities,
     get_classical_model_registry,
     resolve_classical_parallelism,
 )
@@ -30,6 +32,7 @@ RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
     "retrieval_dual_encoder",
     "retrieval_reranker",
 )
+ENSEMBLE_BACKTEST_MODEL_NAMES: tuple[str, ...] = ("blended_ensemble",)
 
 BACKTEST_CACHE_SCHEMA_VERSION = "temporal-backtest-cache-v1"
 
@@ -81,6 +84,16 @@ class TemporalBacktestCacheInspection:
     max_eval_samples: int
     cache_paths: TemporalBacktestCachePaths | None
     cache_payload: dict[str, object]
+
+
+def _safe_float(value) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(out):
+        return float("nan")
+    return out
 
 
 def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
@@ -584,7 +597,7 @@ def _resolve_backtest_model_groups(
 
     classical_registry = get_classical_model_registry(random_seed)
     deep_registry = set(DEFAULT_MODEL_NAMES)
-    retrieval_registry = set(RETRIEVAL_BACKTEST_MODEL_NAMES)
+    retrieval_registry = set(RETRIEVAL_BACKTEST_MODEL_NAMES) | set(ENSEMBLE_BACKTEST_MODEL_NAMES)
     tuned_model_names = set((tuned_model_specs or {}).keys())
     classical: list[str] = []
     deep: list[str] = []
@@ -608,9 +621,8 @@ def _resolve_backtest_model_groups(
     return tuple(classical), tuple(deep), tuple(retrieval)
 
 
-def _run_retrieval_backtest_job(
+def _fit_retrieval_backtest_models(
     *,
-    model_name: str,
     fold_idx: int,
     random_seed: int,
     X_seq_train: np.ndarray,
@@ -621,11 +633,8 @@ def _run_retrieval_backtest_job(
     y_test: np.ndarray,
     num_artists: int,
     logger,
-) -> BacktestFoldResult:
-    from .retrieval_common import (
-        DEFAULT_EMBEDDING_DIM,
-        DEFAULT_RETRIEVAL_CANDIDATE_K,
-    )
+) -> tuple[object, object, float]:
+    from .retrieval_common import DEFAULT_EMBEDDING_DIM, DEFAULT_RETRIEVAL_CANDIDATE_K
     from .retrieval_runtime_eval import evaluate_retrieval_baseline, train_and_evaluate_reranker
     from .retrieval_seed_selection import train_pretraining_seed
 
@@ -723,6 +732,36 @@ def _run_retrieval_backtest_job(
                 random_seed=backtest_seed,
             )
 
+    return baseline, reranker, float(time.perf_counter() - started)
+
+
+def _run_retrieval_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    y_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    logger,
+) -> BacktestFoldResult:
+    baseline, reranker, fit_seconds = _fit_retrieval_backtest_models(
+        fold_idx=fold_idx,
+        random_seed=random_seed,
+        X_seq_train=X_seq_train,
+        X_ctx_train=X_ctx_train,
+        y_train=y_train,
+        X_seq_test=X_seq_test,
+        X_ctx_test=X_ctx_test,
+        y_test=y_test,
+        num_artists=num_artists,
+        logger=logger,
+    )
+
     if model_name == "retrieval_reranker":
         metrics = reranker.rerank_metrics_test
         model_type = "retrieval_reranker"
@@ -737,11 +776,295 @@ def _run_retrieval_backtest_job(
         model_family=model_family,
         adaptation_mode="cold",
         fold=int(fold_idx),
-        train_rows=len(seq_train_arr),
-        test_rows=len(seq_test_arr),
-        fit_seconds=float(time.perf_counter() - started),
+        train_rows=len(np.asarray(X_seq_train)),
+        test_rows=len(np.asarray(X_seq_test)),
+        fit_seconds=fit_seconds,
         top1=float(metrics.get("top1", float("nan"))),
         top5=float(metrics.get("top5", float("nan"))),
+    )
+
+
+def _fit_classical_backtest_probabilities(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    estimator_model_name: str | None = None,
+    estimator_params: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    family, estimator = build_classical_estimator(
+        (estimator_model_name or model_name),
+        random_seed + fold_idx,
+        params=estimator_params,
+        estimator_n_jobs=estimator_n_jobs,
+    )
+    started = time.perf_counter()
+    estimator.fit(X_train, y_train)
+    fit_seconds = float(time.perf_counter() - started)
+    aligned = collect_aligned_probabilities(estimator, X_val, X_test, num_classes=num_artists)
+    if aligned is None:
+        return None
+    val_proba, test_proba = aligned
+    if (
+        val_proba.ndim != 2
+        or test_proba.ndim != 2
+        or len(val_proba) != len(np.asarray(y_val).reshape(-1))
+        or len(test_proba) != len(np.asarray(y_test).reshape(-1))
+    ):
+        return None
+    y_val_arr = np.asarray(y_val).reshape(-1)
+    y_test_arr = np.asarray(y_test).reshape(-1)
+    return {
+        "model_name": model_name,
+        "model_type": "classical_tuned" if estimator_params else "classical",
+        "model_family": family,
+        "base_model_name": str(estimator_model_name or model_name),
+        "fit_seconds": fit_seconds,
+        "val_proba": np.asarray(val_proba, dtype="float32"),
+        "test_proba": np.asarray(test_proba, dtype="float32"),
+        "val_top1": float(np.mean(np.argmax(val_proba, axis=1) == y_val_arr)),
+        "val_top5": _topk_accuracy_from_proba(val_proba, y_val_arr, k=5),
+        "test_top1": float(np.mean(np.argmax(test_proba, axis=1) == y_test_arr)),
+        "test_top5": _topk_accuracy_from_proba(test_proba, y_test_arr, k=5),
+    }
+
+
+def _backtest_candidate_key(row: dict[str, object]) -> str:
+    base_name = str(row.get("base_model_name", "")).strip()
+    return base_name or str(row.get("model_name", "")).strip()
+
+
+def _select_backtest_ensemble_candidates(
+    candidate_rows: list[dict[str, object]],
+    *,
+    max_candidates: int = 4,
+) -> list[dict[str, object]]:
+    ordered = sorted(
+        candidate_rows,
+        key=lambda row: (_safe_float(row.get("val_top1")) if np.isfinite(_safe_float(row.get("val_top1"))) else float("-inf")),
+        reverse=True,
+    )
+    selected: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for target_type in ("retrieval_reranker", "retrieval", "classical_tuned", "classical", "deep"):
+        for row in ordered:
+            row_type = str(row.get("model_type", "")).strip()
+            key = _backtest_candidate_key(row)
+            if row_type != target_type or not key or key in seen_keys:
+                continue
+            selected.append(row)
+            seen_keys.add(key)
+            break
+
+    for row in ordered:
+        if len(selected) >= max_candidates:
+            break
+        key = _backtest_candidate_key(row)
+        if not key or key in seen_keys:
+            continue
+        selected.append(row)
+        seen_keys.add(key)
+    return selected[:max_candidates]
+
+
+def _run_ensemble_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train_tab: np.ndarray,
+    y_train: np.ndarray,
+    X_test_tab: np.ndarray,
+    y_test: np.ndarray,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    num_artists: int,
+    logger,
+    candidate_model_names: tuple[str, ...],
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+) -> BacktestFoldResult:
+    from .ensemble import _apply_temperature, _blend_probabilities, _fit_temperature, _negative_log_likelihood
+    from .retrieval_common import _softmax_rows
+
+    started = time.perf_counter()
+    split_slices = _deep_train_validation_split(len(np.asarray(X_seq_train)), len(np.asarray(X_seq_test)))
+    if split_slices is None:
+        raise ValueError("Ensemble backtest requires enough training rows for a fold-local validation split.")
+    fit_slice, val_slice = split_slices
+
+    train_tab_arr = np.asarray(X_train_tab)
+    test_tab_arr = np.asarray(X_test_tab)
+    train_seq_arr = np.asarray(X_seq_train, dtype="int32")
+    train_ctx_arr = np.asarray(X_ctx_train, dtype="float32")
+    test_seq_arr = np.asarray(X_seq_test, dtype="int32")
+    test_ctx_arr = np.asarray(X_ctx_test, dtype="float32")
+    y_train_arr = np.asarray(y_train, dtype="int32")
+    y_test_arr = np.asarray(y_test, dtype="int32")
+    y_val_arr = y_train_arr[val_slice]
+
+    candidate_rows: list[dict[str, object]] = []
+    requested_names = tuple(
+        name for name in candidate_model_names if name not in ENSEMBLE_BACKTEST_MODEL_NAMES
+    )
+    retrieval_names = tuple(name for name in requested_names if name in RETRIEVAL_BACKTEST_MODEL_NAMES)
+    if retrieval_names:
+        baseline, reranker, _ = _fit_retrieval_backtest_models(
+            fold_idx=fold_idx,
+            random_seed=random_seed,
+            X_seq_train=train_seq_arr,
+            X_ctx_train=train_ctx_arr,
+            y_train=y_train_arr,
+            X_seq_test=test_seq_arr,
+            X_ctx_test=test_ctx_arr,
+            y_test=y_test_arr,
+            num_artists=num_artists,
+            logger=logger,
+        )
+        if "retrieval_dual_encoder" in retrieval_names:
+            candidate_rows.append(
+                {
+                    "model_name": "retrieval_dual_encoder",
+                    "model_type": "retrieval",
+                    "model_family": "dual_encoder",
+                    "fit_seconds": 0.0,
+                    "val_proba": _softmax_rows(baseline.val_retrieval_scores),
+                    "test_proba": _softmax_rows(baseline.test_retrieval_scores),
+                    "val_top1": float(baseline.retrieval_metrics_val.get("top1", float("nan"))),
+                    "val_top5": float(baseline.retrieval_metrics_val.get("top5", float("nan"))),
+                    "test_top1": float(baseline.retrieval_metrics_test.get("top1", float("nan"))),
+                    "test_top5": float(baseline.retrieval_metrics_test.get("top5", float("nan"))),
+                }
+            )
+        if "retrieval_reranker" in retrieval_names:
+            candidate_rows.append(
+                {
+                    "model_name": "retrieval_reranker",
+                    "model_type": "retrieval_reranker",
+                    "model_family": "candidate_reranker",
+                    "fit_seconds": 0.0,
+                    "val_proba": np.asarray(reranker.val_rerank_proba, dtype="float32"),
+                    "test_proba": np.asarray(reranker.test_rerank_proba, dtype="float32"),
+                    "val_top1": float(reranker.rerank_metrics_val.get("top1", float("nan"))),
+                    "val_top5": float(reranker.rerank_metrics_val.get("top5", float("nan"))),
+                    "test_top1": float(reranker.rerank_metrics_test.get("top1", float("nan"))),
+                    "test_top5": float(reranker.rerank_metrics_test.get("top5", float("nan"))),
+                }
+            )
+
+    for candidate_name in requested_names:
+        if candidate_name in RETRIEVAL_BACKTEST_MODEL_NAMES:
+            continue
+        tuned_spec = dict((tuned_model_specs or {}).get(candidate_name, {}))
+        estimator_model_name = str(tuned_spec.get("base_model_name", "")).strip() or None
+        estimator_params = dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None
+        candidate_train = train_tab_arr[fit_slice]
+        candidate_val = train_tab_arr[val_slice]
+        candidate_test = test_tab_arr
+        if (estimator_model_name or candidate_name) == "session_knn":
+            candidate_train = train_seq_arr[fit_slice]
+            candidate_val = train_seq_arr[val_slice]
+            candidate_test = test_seq_arr
+        payload = _fit_classical_backtest_probabilities(
+            model_name=candidate_name,
+            fold_idx=fold_idx,
+            random_seed=random_seed,
+            estimator_n_jobs=estimator_n_jobs,
+            X_train=candidate_train,
+            y_train=y_train_arr[fit_slice],
+            X_val=candidate_val,
+            y_val=y_val_arr,
+            X_test=candidate_test,
+            y_test=y_test_arr,
+            num_artists=num_artists,
+            estimator_model_name=estimator_model_name,
+            estimator_params=estimator_params,
+        )
+        if payload is not None:
+            candidate_rows.append(payload)
+
+    selected_payloads = _select_backtest_ensemble_candidates(candidate_rows)
+    if len(selected_payloads) < 2:
+        raise ValueError("Ensemble backtest needs at least two viable fold-local candidates.")
+
+    best_choice: dict[str, object] | None = None
+    score_options = (0.0, 1.0, 2.5, 4.0)
+    for size in range(2, len(selected_payloads) + 1):
+        for combo in combinations(selected_payloads, size):
+            raw_scores = np.array(
+                [
+                    max(1e-6, (_safe_float(item.get("val_top1")) if np.isfinite(_safe_float(item.get("val_top1"))) else 1e-6))
+                    for item in combo
+                ],
+                dtype="float64",
+            )
+            centered = raw_scores - float(np.mean(raw_scores))
+            for alpha in score_options:
+                if alpha <= 0.0:
+                    weights = np.full(len(combo), 1.0 / len(combo), dtype="float64")
+                else:
+                    logits = alpha * centered
+                    logits -= logits.max()
+                    weights = np.exp(logits)
+                    weights /= np.sum(weights)
+                val_blend = _blend_probabilities([item["val_proba"] for item in combo], weights)
+                temperature = _fit_temperature(val_blend, y_val_arr.astype("int64"))
+                val_calibrated = _apply_temperature(val_blend, temperature)
+                val_top1 = float(np.mean(np.argmax(val_calibrated, axis=1) == y_val_arr))
+                val_top5 = _topk_accuracy_from_proba(val_calibrated, y_val_arr, k=5)
+                choice = {
+                    "combo": combo,
+                    "weights": weights.astype("float32"),
+                    "temperature": float(temperature),
+                    "val_top1": val_top1,
+                    "val_top5": val_top5,
+                    "val_nll": _negative_log_likelihood(val_calibrated, y_val_arr.astype("int64")),
+                }
+                if best_choice is None:
+                    best_choice = choice
+                    continue
+                incumbent = (
+                    _safe_float(best_choice.get("val_top1")),
+                    _safe_float(best_choice.get("val_top5")),
+                    -_safe_float(best_choice.get("val_nll")),
+                )
+                challenger = (
+                    val_top1,
+                    val_top5,
+                    -_safe_float(choice.get("val_nll")),
+                )
+                if challenger > incumbent:
+                    best_choice = choice
+
+    if best_choice is None:
+        raise ValueError("Ensemble backtest could not produce a viable fold-local blend.")
+
+    weights = np.asarray(best_choice["weights"], dtype="float32")
+    temperature = float(best_choice["temperature"])
+    test_blend = _blend_probabilities([item["test_proba"] for item in best_choice["combo"]], weights)
+    test_calibrated = _apply_temperature(test_blend, temperature)
+
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_type="ensemble",
+        model_family="blend",
+        adaptation_mode="cold",
+        fold=int(fold_idx),
+        train_rows=len(train_seq_arr),
+        test_rows=len(test_seq_arr),
+        fit_seconds=float(time.perf_counter() - started),
+        top1=float(np.mean(np.argmax(test_calibrated, axis=1) == y_test_arr)),
+        top5=_topk_accuracy_from_proba(test_calibrated, y_test_arr, k=5),
     )
 
 
@@ -1319,7 +1642,7 @@ def run_temporal_backtest(
         assert X_all_seq is not None
         assert X_all_ctx is not None
         logger.info(
-            "Retrieval temporal backtesting: models=%s",
+            "Retrieval/ensemble temporal backtesting: models=%s",
             ",".join(retrieval_models),
         )
         for window in resolved_windows:
@@ -1333,19 +1656,39 @@ def run_temporal_backtest(
                 continue
             for model_name in retrieval_models:
                 try:
-                    row = _run_retrieval_backtest_job(
-                        model_name=model_name,
-                        fold_idx=window.fold,
-                        random_seed=random_seed,
-                        X_seq_train=X_train_seq,
-                        X_ctx_train=X_train_ctx,
-                        y_train=y_train,
-                        X_seq_test=X_test_seq,
-                        X_ctx_test=X_test_ctx,
-                        y_test=y_test,
-                        num_artists=data.num_artists,
-                        logger=logger,
-                    )
+                    if model_name in ENSEMBLE_BACKTEST_MODEL_NAMES:
+                        row = _run_ensemble_backtest_job(
+                            model_name=model_name,
+                            fold_idx=window.fold,
+                            random_seed=random_seed,
+                            estimator_n_jobs=estimator_n_jobs,
+                            X_train_tab=X_all[window.train_slice],
+                            y_train=y_train,
+                            X_test_tab=X_all[window.test_slice],
+                            y_test=y_test,
+                            X_seq_train=X_train_seq,
+                            X_ctx_train=X_train_ctx,
+                            X_seq_test=X_test_seq,
+                            X_ctx_test=X_test_ctx,
+                            num_artists=data.num_artists,
+                            logger=logger,
+                            candidate_model_names=tuple((*classical_models, *retrieval_models)),
+                            tuned_model_specs=resolved_tuned_specs,
+                        )
+                    else:
+                        row = _run_retrieval_backtest_job(
+                            model_name=model_name,
+                            fold_idx=window.fold,
+                            random_seed=random_seed,
+                            X_seq_train=X_train_seq,
+                            X_ctx_train=X_train_ctx,
+                            y_train=y_train,
+                            X_seq_test=X_test_seq,
+                            X_ctx_test=X_test_ctx,
+                            y_test=y_test,
+                            num_artists=data.num_artists,
+                            logger=logger,
+                        )
                 except Exception as exc:
                     logger.warning("Retrieval backtest fit failed for %s fold=%d: %s", model_name, window.fold, exc)
                     continue

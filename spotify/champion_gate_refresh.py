@@ -7,6 +7,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 
+from .champion_alias import best_serveable_model, write_champion_alias
 from .control_room import write_control_room_report
 from .governance import evaluate_champion_gate
 from .pipeline_helpers import _load_current_risk_metrics
@@ -169,8 +170,44 @@ def refresh_champion_gate(
         max_abstention_rate=max_abstention_rate,
     )
 
+    champion_alias_payload: dict[str, object] = {
+        "updated": False,
+        "alias_file": "",
+        "run_id": "",
+        "run_dir": "",
+        "model_name": "",
+        "model_type": "",
+        "reason": "gate_not_promoted",
+    }
+    if bool(refreshed_gate.get("promoted", False)):
+        champion_model = best_serveable_model(
+            [dict(row) for row in current_results if isinstance(row, dict)],
+            run_dir=run_dir,
+        )
+        if champion_model is None:
+            champion_alias_payload["reason"] = "no_serveable_models_in_promoted_run"
+        else:
+            champion_model_name, champion_model_type = champion_model
+            alias_file = write_champion_alias(
+                output_dir=outputs_dir,
+                run_id=run_id,
+                run_dir=run_dir,
+                model_name=champion_model_name,
+                model_type=champion_model_type,
+            )
+            champion_alias_payload = {
+                "updated": True,
+                "alias_file": str(alias_file),
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "model_name": champion_model_name,
+                "model_type": champion_model_type,
+                "reason": "promoted",
+            }
+
     write_json(gate_path, refreshed_gate)
     manifest["champion_gate"] = refreshed_gate
+    manifest["champion_alias"] = champion_alias_payload
     write_json(manifest_path, manifest)
 
     control_room_json = None
@@ -189,6 +226,8 @@ def refresh_champion_gate(
         "challenger_selective_risk": _safe_float(refreshed_gate.get("challenger_selective_risk")),
         "challenger_abstention_rate": _safe_float(refreshed_gate.get("challenger_abstention_rate")),
         "risk_metric_model_count": int(len(current_risk_metrics)),
+        "champion_alias_updated": bool(champion_alias_payload.get("updated", False)),
+        "champion_alias_model_name": str(champion_alias_payload.get("model_name", "")),
         "control_room_refreshed": bool(control_room_json is not None),
         "control_room_json": str(control_room_json) if control_room_json is not None else "",
     }
@@ -211,6 +250,8 @@ def main() -> int:
         f"challenger_selective_risk={payload['challenger_selective_risk']} "
         f"challenger_abstention_rate={payload['challenger_abstention_rate']} "
         f"risk_metric_model_count={payload['risk_metric_model_count']} "
+        f"champion_alias_updated={payload['champion_alias_updated']} "
+        f"champion_alias_model_name={payload['champion_alias_model_name']} "
         f"control_room_refreshed={payload['control_room_refreshed']}"
     )
     if payload["control_room_json"]:

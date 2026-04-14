@@ -1029,3 +1029,56 @@ def test_control_room_prefers_latest_completed_full_run_as_review_anchor(tmp_pat
     assert report["run_selection"]["selected_run"]["run_id"] == "run_newer"
     assert report["run_selection"]["observed_matches_selected"] is True
     assert "fully completed production run" in report["run_selection"]["selection_reason"]
+
+
+def test_write_control_room_report_refreshes_triage_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_full", "model_name": "blended_ensemble", "model_type": "ensemble", "val_top1": 0.63},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_full", "model_name": "blended_ensemble", "model_type": "ensemble", "top1": 0.60},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_full",
+        timestamp="2026-04-11T13:27:15+00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="blended_ensemble",
+        best_model_type="ensemble",
+        val_top1=0.63,
+        test_top1=0.60,
+        gate_regression=0.02,
+        drift_jsd=0.18,
+        ece=0.04,
+        selective_risk=0.22,
+        abstention_rate=0.11,
+        robustness_gap=0.08,
+        stress_skip_risk=0.28,
+        stress_scenario="evening_drift",
+        backtest_rows=16,
+        optuna_rows=3,
+    )
+
+    write_control_room_report(output_dir)
+
+    triage_json = output_dir / "analytics" / "control_room_triage.json"
+    triage_md = output_dir / "analytics" / "control_room_triage.md"
+    assert triage_json.exists()
+    assert triage_md.exists()
+    triage_payload = json.loads(triage_json.read_text(encoding="utf-8"))
+    assert triage_payload["run_id"] == "run_full"
+    assert triage_payload["control_room_status"] == "ok"
+    markdown = triage_md.read_text(encoding="utf-8")
+    assert "Run: `run_full` (`full`)" in markdown
+    assert "Recover the champion path" in markdown

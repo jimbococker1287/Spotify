@@ -20,11 +20,14 @@ def _shortlist_classical_model_names(
     top_n: int,
     logger,
     stage_label: str,
+    passthrough_names: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     if top_n <= 0 or len(candidate_names) <= top_n:
         return candidate_names
     if not classical_results:
         return candidate_names
+
+    passthrough = {str(name).strip() for name in (passthrough_names or ()) if str(name).strip()}
 
     metrics_by_name: dict[str, tuple[float, float]] = {}
     for row in classical_results:
@@ -38,7 +41,7 @@ def _shortlist_classical_model_names(
             continue
         metrics_by_name[model_name] = (val_top1, fit_seconds)
 
-    missing = [name for name in candidate_names if name not in metrics_by_name]
+    missing = [name for name in candidate_names if name not in metrics_by_name and name not in passthrough]
     if missing:
         logger.info(
             "Skipping %s shortlist because baseline metrics are missing for: %s",
@@ -47,9 +50,13 @@ def _shortlist_classical_model_names(
         )
         return candidate_names
 
+    eligible_names = tuple(name for name in candidate_names if name in metrics_by_name)
+    if len(eligible_names) <= top_n:
+        return candidate_names
+
     ranked_names = tuple(
         sorted(
-            candidate_names,
+            eligible_names,
             key=lambda name: (
                 -metrics_by_name[name][0],
                 metrics_by_name[name][1],
@@ -57,18 +64,20 @@ def _shortlist_classical_model_names(
             ),
         )[:top_n]
     )
-    dropped_names = tuple(name for name in candidate_names if name not in ranked_names)
+    dropped_names = tuple(name for name in eligible_names if name not in ranked_names)
     if not dropped_names:
         return candidate_names
+    passthrough_selected = tuple(name for name in candidate_names if name in passthrough)
+    selected_names = tuple((*ranked_names, *passthrough_selected))
     logger.info(
         "%s shortlist selected %s from %s using baseline val_top1 (top_n=%d); dropped=%s",
         stage_label,
-        ",".join(ranked_names),
+        ",".join(selected_names),
         ",".join(candidate_names),
         top_n,
         ",".join(dropped_names),
     )
-    return ranked_names
+    return selected_names
 
 
 def _tuned_backtest_specs(

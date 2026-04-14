@@ -150,3 +150,106 @@ def test_train_and_evaluate_models_reuses_cached_deep_artifacts_without_tensorfl
         "hit_model_names": ["dense"],
         "miss_model_names": [],
     }
+
+
+def test_select_deep_screened_model_names_keeps_best_probe_scores() -> None:
+    decision = training._select_deep_screened_model_names(
+        {
+            "dense": {"val_top1": 0.62, "val_top5": 0.91, "probe_seconds": 2.0},
+            "gru": {"val_top1": 0.66, "val_top5": 0.92, "probe_seconds": 2.5},
+            "lstm": {"val_top1": 0.61, "val_top5": 0.95, "probe_seconds": 1.8},
+        },
+        top_n=2,
+    )
+
+    assert decision.selected_model_names == ("gru", "dense")
+    assert decision.screened_out_model_names == ("lstm",)
+
+
+def test_find_deep_warm_start_candidate_prefers_matching_fingerprint_and_best_score(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache"
+    matching_payload = training._build_deep_cache_payload(
+        cache_fingerprint="prepared-next",
+        model_name="dense",
+        random_seed=42,
+        batch_size=32,
+        epochs=4,
+        sequence_length=2,
+        num_artists=3,
+        num_ctx=1,
+    )
+    matching_key = training._build_deep_cache_key(matching_payload)
+    matching_paths = training._resolve_deep_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint="prepared-next",
+        model_name="dense",
+        cache_key=matching_key,
+    )
+    matching_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    matching_paths.weights_path.write_bytes(b"weights")
+    training.write_json(
+        matching_paths.metadata_path,
+        {
+            **matching_payload,
+            "cache_key": matching_key,
+        },
+    )
+    training.write_json(
+        matching_paths.result_path,
+        {
+            "result": {
+                "val_metrics": {"top1": 0.71},
+            }
+        },
+    )
+
+    older_payload = training._build_deep_cache_payload(
+        cache_fingerprint="prepared-old",
+        model_name="dense",
+        random_seed=42,
+        batch_size=32,
+        epochs=4,
+        sequence_length=2,
+        num_artists=3,
+        num_ctx=1,
+    )
+    older_key = training._build_deep_cache_key(older_payload)
+    older_paths = training._resolve_deep_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint="prepared-old",
+        model_name="dense",
+        cache_key=older_key,
+    )
+    older_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    older_paths.weights_path.write_bytes(b"weights")
+    training.write_json(
+        older_paths.metadata_path,
+        {
+            **older_payload,
+            "cache_key": older_key,
+        },
+    )
+    training.write_json(
+        older_paths.result_path,
+        {
+            "result": {
+                "val_metrics": {"top1": 0.93},
+            }
+        },
+    )
+
+    candidate = training._find_deep_warm_start_candidate(
+        cache_root=cache_root,
+        cache_fingerprint="prepared-next",
+        current_cache_key="brand-new-key",
+        model_name="dense",
+        sequence_length=2,
+        num_artists=3,
+        num_ctx=1,
+    )
+
+    assert candidate is not None
+    assert candidate.cache_fingerprint == "prepared-next"
+    assert candidate.source_path == matching_paths.weights_path

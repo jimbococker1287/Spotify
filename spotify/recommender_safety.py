@@ -763,6 +763,59 @@ def _best_history_group(
     return best_run_id, best_group, best_score, best_scores
 
 
+def _preferred_history_group(
+    history_csv: Path | None,
+    *,
+    current_run_id: str,
+    target_run_id: str | None,
+    target_group_name: str | None,
+    metric_name: str,
+    aggregate: str,
+    current_profile: str | None,
+    require_profile_match: bool,
+    run_id_key: str,
+    profile_key: str,
+    group_key: str,
+) -> tuple[str, str, float, list[float]]:
+    resolved_run_id = str(target_run_id or "").strip()
+    resolved_group_name = str(target_group_name or "").strip()
+    if (
+        history_csv is None
+        or not history_csv.exists()
+        or not resolved_run_id
+        or not resolved_group_name
+        or resolved_run_id == current_run_id
+    ):
+        return "", "", float("nan"), []
+
+    scores: list[float] = []
+    with history_csv.open("r", encoding="utf-8") as infile:
+        for row in csv.DictReader(infile):
+            run_id = str(row.get(run_id_key, "")).strip()
+            if run_id != resolved_run_id:
+                continue
+            if require_profile_match and current_profile:
+                profile = str(row.get(profile_key, "")).strip().lower()
+                if profile and profile != str(current_profile).strip().lower():
+                    continue
+            group_name = str(row.get(group_key, "")).strip()
+            if group_name != resolved_group_name:
+                continue
+            score = _safe_float(row.get(metric_name))
+            if math.isnan(score):
+                continue
+            scores.append(score)
+
+    if not scores:
+        return "", "", float("nan"), []
+    return (
+        resolved_run_id,
+        resolved_group_name,
+        _aggregate_scores(scores, aggregate),
+        scores,
+    )
+
+
 def _no_current_result_payload(
     *,
     metric_name: str,
@@ -827,6 +880,8 @@ def evaluate_promotion_gate(
     current_risk_metrics: dict[str, dict[str, float]] | None = None,
     max_selective_risk: float | None = None,
     max_abstention_rate: float | None = None,
+    preferred_champion_run_id: str | None = None,
+    preferred_champion_model_name: str | None = None,
     run_id_key: str = "run_id",
     profile_key: str = "profile",
 ) -> dict[str, object]:
@@ -896,18 +951,32 @@ def evaluate_promotion_gate(
         else "highest_scoring_risk_eligible_candidate"
     )
 
-    champion_run_id, champion_model_name, champion_score, champion_scores = _best_history_group(
+    champion_run_id, champion_model_name, champion_score, champion_scores = _preferred_history_group(
         history_csv,
         current_run_id=current_run_id,
-        group_key=group_key,
+        target_run_id=preferred_champion_run_id,
+        target_group_name=preferred_champion_model_name,
         metric_name=metric_name,
         aggregate=resolved_aggregate,
-        higher_is_better=higher_is_better,
         current_profile=current_profile,
         require_profile_match=require_profile_match,
         run_id_key=run_id_key,
         profile_key=profile_key,
+        group_key=group_key,
     )
+    if not champion_run_id or not champion_model_name or math.isnan(champion_score):
+        champion_run_id, champion_model_name, champion_score, champion_scores = _best_history_group(
+            history_csv,
+            current_run_id=current_run_id,
+            group_key=group_key,
+            metric_name=metric_name,
+            aggregate=resolved_aggregate,
+            higher_is_better=higher_is_better,
+            current_profile=current_profile,
+            require_profile_match=require_profile_match,
+            run_id_key=run_id_key,
+            profile_key=profile_key,
+        )
 
     challenger_risk = (current_risk_metrics or {}).get(challenger_model_name, {})
     challenger_selective_risk = _risk_metric_max(challenger_risk, base_name="selective_risk")

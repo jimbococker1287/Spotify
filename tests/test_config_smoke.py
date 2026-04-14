@@ -1,7 +1,20 @@
 from __future__ import annotations
 
 from spotify.cli import build_parser
-from spotify.config import FAST_BACKTEST_MODEL_NAMES, build_config
+from spotify.config import (
+    ENSEMBLE_BACKTEST_MODEL_NAMES,
+    FAST_BACKTEST_MODEL_NAMES,
+    RETRIEVAL_BACKTEST_MODEL_NAMES,
+    build_config,
+)
+
+
+def _full_governance_backtest_names() -> tuple[str, ...]:
+    return (
+        *FAST_BACKTEST_MODEL_NAMES,
+        *RETRIEVAL_BACKTEST_MODEL_NAMES,
+        *ENSEMBLE_BACKTEST_MODEL_NAMES,
+    )
 
 
 def test_default_config_paths() -> None:
@@ -33,7 +46,7 @@ def test_default_config_paths() -> None:
     assert config.classical_max_train_samples == 50_000
     assert config.classical_max_eval_samples == 25_000
     assert set(config.optuna_model_names) == set(config.classical_model_names)
-    assert config.temporal_backtest_model_names == FAST_BACKTEST_MODEL_NAMES
+    assert config.temporal_backtest_model_names == _full_governance_backtest_names()
 
 
 def test_model_subset_parsing() -> None:
@@ -161,6 +174,11 @@ def test_retrieval_and_friction_flags_override_profile_defaults() -> None:
     assert config.enable_self_supervised_pretraining is True
     assert config.enable_friction_analysis is False
     assert config.retrieval_candidate_k == 18
+    assert config.temporal_backtest_model_names == (
+        *FAST_BACKTEST_MODEL_NAMES,
+        *RETRIEVAL_BACKTEST_MODEL_NAMES,
+        *ENSEMBLE_BACKTEST_MODEL_NAMES,
+    )
 
 
 def test_moonshot_flag_overrides_profile_default() -> None:
@@ -193,4 +211,9 @@ def test_backtest_models_can_mix_deep_and_classical_names() -> None:
     args = parser.parse_args(["--backtest-models", "gru_artist,logreg"])
     config = build_config(args)
 
-    assert config.temporal_backtest_model_names == ("gru_artist", "logreg")
+    assert config.temporal_backtest_model_names == (
+        "gru_artist",
+        "logreg",
+        *RETRIEVAL_BACKTEST_MODEL_NAMES,
+        *ENSEMBLE_BACKTEST_MODEL_NAMES,
+    )
