@@ -1,0 +1,1830 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from itertools import combinations
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import gc
+import csv
+import hashlib
+import os
+import json
+import time
+
+import numpy as np
+
+from .benchmarks import (
+    ClassicalFeatureBundle,
+    build_classical_estimator,
+    build_full_tabular_dataset,
+    collect_aligned_probabilities,
+    get_classical_model_registry,
+    resolve_classical_parallelism,
+)
+from .data import PreparedData
+from .recommender_safety import build_temporal_backtest_windows, write_temporal_backtest_artifacts
+from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+
+RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
+    "retrieval_dual_encoder",
+    "retrieval_reranker",
+)
+ENSEMBLE_BACKTEST_MODEL_NAMES: tuple[str, ...] = ("blended_ensemble",)
+
+BACKTEST_CACHE_SCHEMA_VERSION = "temporal-backtest-cache-v1"
+
+
+@dataclass
+class BacktestFoldResult:
+    model_name: str
+    model_type: str
+    model_family: str
+    fold: int
+    train_rows: int
+    test_rows: int
+    fit_seconds: float
+    top1: float
+    top5: float
+    adaptation_mode: str = "cold"
+
+
+@dataclass(frozen=True)
+class _BacktestWindowSlices:
+    fold: int
+    train_slice: slice
+    test_slice: slice
+    raw_test_start: int
+    raw_test_end: int
+
+
+@dataclass(frozen=True)
+class TemporalBacktestCachePaths:
+    cache_key: str
+    cache_dir: Path
+    result_path: Path
+    metadata_path: Path
+    artifact_dir: Path
+
+
+@dataclass
+class TemporalBacktestCacheInspection:
+    enabled: bool
+    fingerprint: str
+    cache_key: str
+    hit: bool
+    selected_models: tuple[str, ...]
+    classical_models: tuple[str, ...]
+    deep_models: tuple[str, ...]
+    retrieval_models: tuple[str, ...]
+    adaptation_mode: str
+    max_train_samples: int
+    max_eval_samples: int
+    cache_paths: TemporalBacktestCachePaths | None
+    cache_payload: dict[str, object]
+
+
+def _safe_float(value) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(out):
+        return float("nan")
+    return out
+
+
+def _build_expanding_windows(n_rows: int, folds: int) -> list[tuple[int, int]]:
+    return [(window.test_start, window.test_end) for window in build_temporal_backtest_windows(n_rows, folds)]
+
+
+def _backtest_cache_enabled_from_env() -> bool:
+    raw = os.getenv("SPOTIFY_CACHE_BACKTEST", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _backtesting_source_digest() -> str:
+    source_names = (
+        "backtesting.py",
+        "benchmarks.py",
+        "recommender_safety.py",
+        "modeling.py",
+        "runtime.py",
+        "retrieval_common.py",
+        "retrieval_training.py",
+        "retrieval_reranking.py",
+        "retrieval_seed_selection.py",
+        "retrieval_seed_selection_runtime.py",
+        "retrieval_seed_candidates.py",
+        "retrieval_pretraining.py",
+        "retrieval_runtime_eval.py",
+    )
+    root_dir = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in source_names:
+        path = root_dir / name
+        if path.exists():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def _deep_backtest_runtime_config() -> dict[str, int]:
+    deep_epochs_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_EPOCHS", "3").strip()
+    deep_batch_raw = os.getenv("SPOTIFY_DEEP_BACKTEST_BATCH_SIZE", "256").strip()
+    try:
+        deep_epochs = max(1, int(deep_epochs_raw))
+    except Exception:
+        deep_epochs = 3
+    try:
+        deep_batch_size = max(1, int(deep_batch_raw))
+    except Exception:
+        deep_batch_size = 256
+    return {
+        "epochs": int(deep_epochs),
+        "batch_size": int(deep_batch_size),
+    }
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return max(1, value)
+
+
+def _optional_nonnegative_float_env(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return max(0.0, value)
+
+
+def _retrieval_backtest_runtime_config(*, num_artists: int) -> dict[str, object]:
+    from .retrieval_common import DEFAULT_EMBEDDING_DIM, DEFAULT_RETRIEVAL_CANDIDATE_K
+
+    embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
+    try:
+        embedding_dim = max(4, int(embedding_dim_raw)) if embedding_dim_raw else DEFAULT_EMBEDDING_DIM
+    except Exception:
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+
+    candidate_k_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_CANDIDATE_K", str(DEFAULT_RETRIEVAL_CANDIDATE_K)).strip()
+    try:
+        candidate_k = max(2, int(candidate_k_raw or DEFAULT_RETRIEVAL_CANDIDATE_K))
+    except Exception:
+        candidate_k = DEFAULT_RETRIEVAL_CANDIDATE_K
+    candidate_k = min(int(num_artists), int(candidate_k))
+
+    backtest_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_EPOCHS", "").strip()
+    try:
+        backtest_epochs = max(1, int(backtest_epochs_raw)) if backtest_epochs_raw else None
+    except Exception:
+        backtest_epochs = None
+
+    enable_pretraining_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ENABLE_PRETRAINING", "1").strip().lower()
+    enable_pretraining = enable_pretraining_raw not in ("0", "false", "no", "off")
+    pretrain_objectives = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_OBJECTIVES", "cooccurrence").strip() or "cooccurrence"
+    pretrain_max_pairs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_MAX_PAIRS", "250000").strip()
+    try:
+        pretrain_max_pairs = max(1, int(pretrain_max_pairs_raw))
+    except Exception:
+        pretrain_max_pairs = 250000
+    pretrain_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_EPOCHS", "3").strip()
+    try:
+        pretrain_epochs = max(1, int(pretrain_epochs_raw))
+    except Exception:
+        pretrain_epochs = 3
+    pretrain_blend_topk = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_BLEND_TOPK")
+    ann_bits = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS")
+    batch_size = _optional_positive_int_env("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE")
+    learning_rate = _optional_nonnegative_float_env("SPOTIFY_RETRIEVAL_BACKTEST_LR")
+    l2 = _optional_nonnegative_float_env("SPOTIFY_RETRIEVAL_BACKTEST_L2")
+
+    return {
+        "embedding_dim": int(embedding_dim),
+        "candidate_k": int(candidate_k),
+        "epochs": (int(backtest_epochs) if backtest_epochs is not None else None),
+        "enable_pretraining": bool(enable_pretraining),
+        "pretrain_objectives": str(pretrain_objectives),
+        "pretrain_max_pairs": int(pretrain_max_pairs),
+        "pretrain_epochs": int(pretrain_epochs),
+        "pretrain_blend_topk": (int(pretrain_blend_topk) if pretrain_blend_topk is not None else None),
+        "ann_bits": (int(ann_bits) if ann_bits is not None else None),
+        "batch_size": (int(batch_size) if batch_size is not None else None),
+        "learning_rate": (float(learning_rate) if learning_rate is not None else None),
+        "l2": (float(l2) if l2 is not None else None),
+    }
+
+
+def _serialize_tuned_model_specs(tuned_model_specs: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    serialized: dict[str, dict[str, object]] = {}
+    for model_name in sorted(tuned_model_specs):
+        spec = tuned_model_specs.get(model_name, {})
+        if not isinstance(spec, dict):
+            continue
+        best_params_raw = spec.get("best_params", {})
+        if not isinstance(best_params_raw, dict):
+            best_params_raw = {}
+        serialized[str(model_name)] = {
+            "base_model_name": str(spec.get("base_model_name", "")).strip(),
+            "best_params": {str(key): best_params_raw[key] for key in sorted(best_params_raw)},
+        }
+    return serialized
+
+
+def _build_temporal_backtest_cache_payload(
+    *,
+    cache_fingerprint: str,
+    selected_models: tuple[str, ...],
+    classical_models: tuple[str, ...],
+    deep_models: tuple[str, ...],
+    retrieval_models: tuple[str, ...],
+    random_seed: int,
+    folds: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    adaptation_mode: str,
+    tuned_model_specs: dict[str, dict[str, object]],
+    sequence_length: int,
+    num_artists: int,
+    num_ctx: int,
+    total_rows: int,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "cache_schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+        "prepared_fingerprint": str(cache_fingerprint).strip(),
+        "selected_models": [str(name) for name in selected_models],
+        "classical_models": [str(name) for name in classical_models],
+        "deep_models": [str(name) for name in deep_models],
+        "retrieval_models": [str(name) for name in retrieval_models],
+        "random_seed": int(random_seed),
+        "folds": int(folds),
+        "max_train_samples": int(max_train_samples),
+        "max_eval_samples": int(max_eval_samples),
+        "adaptation_mode": str(adaptation_mode),
+        "tuned_model_specs": _serialize_tuned_model_specs(tuned_model_specs),
+        "sequence_length": int(sequence_length),
+        "num_artists": int(num_artists),
+        "num_ctx": int(num_ctx),
+        "total_rows": int(total_rows),
+        "source_digest": _backtesting_source_digest(),
+    }
+    if deep_models:
+        payload["deep_runtime"] = _deep_backtest_runtime_config()
+    if retrieval_models:
+        payload["retrieval_runtime"] = _retrieval_backtest_runtime_config(num_artists=num_artists)
+    return payload
+
+
+def _build_temporal_backtest_cache_key(payload: dict[str, object]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _resolve_temporal_backtest_cache_paths(
+    *,
+    cache_root: Path,
+    cache_fingerprint: str,
+    cache_key: str,
+) -> TemporalBacktestCachePaths:
+    cache_dir = (cache_root / cache_fingerprint / cache_key).resolve()
+    return TemporalBacktestCachePaths(
+        cache_key=cache_key,
+        cache_dir=cache_dir,
+        result_path=cache_dir / "result.json",
+        metadata_path=cache_dir / "cache_meta.json",
+        artifact_dir=cache_dir / "artifacts",
+    )
+
+
+def _coerce_backtest_row(row: dict[str, object]) -> BacktestFoldResult:
+    return BacktestFoldResult(
+        model_name=str(row.get("model_name", "")).strip(),
+        model_type=str(row.get("model_type", "")).strip(),
+        model_family=str(row.get("model_family", "")).strip(),
+        fold=int(row.get("fold", 0)),
+        train_rows=int(row.get("train_rows", 0)),
+        test_rows=int(row.get("test_rows", 0)),
+        fit_seconds=float(row.get("fit_seconds", float("nan"))),
+        top1=float(row.get("top1", float("nan"))),
+        top5=float(row.get("top5", float("nan"))),
+        adaptation_mode=str(row.get("adaptation_mode", "cold")).strip() or "cold",
+    )
+
+
+def _read_cached_temporal_backtest_manifest(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+) -> tuple[list[dict[str, object]], list[str]] | None:
+    payload = safe_read_json(cache_paths.result_path, default=None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
+        return None
+    rows_payload = payload.get("rows")
+    artifact_names = payload.get("artifact_names")
+    if not isinstance(rows_payload, list) or not isinstance(artifact_names, list):
+        return None
+    normalized_rows = [dict(row) for row in rows_payload if isinstance(row, dict)]
+    normalized_names: list[str] = []
+    for name in artifact_names:
+        name_text = str(name).strip()
+        if not name_text:
+            continue
+        if not (cache_paths.artifact_dir / name_text).exists():
+            return None
+        normalized_names.append(name_text)
+    return normalized_rows, normalized_names
+
+
+def _load_cached_temporal_backtest_result(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+    output_dir: Path,
+    logger,
+) -> list[BacktestFoldResult] | None:
+    try:
+        cached_manifest = _read_cached_temporal_backtest_manifest(cache_paths=cache_paths)
+        if cached_manifest is None:
+            return None
+        rows_payload, artifact_names = cached_manifest
+        artifact_files = []
+        for name in artifact_names:
+            name_text = str(name).strip()
+            if not name_text:
+                continue
+            source_path = cache_paths.artifact_dir / name_text
+            if not source_path.exists():
+                return None
+            artifact_files.append((source_path, output_dir / name_text))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for source_path, destination_path in artifact_files:
+            copy_file_if_changed(source_path, destination_path)
+        return [_coerce_backtest_row(dict(row)) for row in rows_payload if isinstance(row, dict)]
+    except Exception as exc:
+        logger.warning("Temporal backtest cache load failed (%s). Rebuilding.", exc)
+        return None
+
+
+def inspect_temporal_backtest_cache(
+    *,
+    data: PreparedData,
+    selected_models: tuple[str, ...],
+    random_seed: int,
+    folds: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    adaptation_mode: str | None = None,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+) -> TemporalBacktestCacheInspection:
+    resolved_tuned_specs = dict(tuned_model_specs or {})
+    classical_models, deep_models, retrieval_models = _resolve_backtest_model_groups(
+        selected_models,
+        random_seed,
+        tuned_model_specs=resolved_tuned_specs,
+    )
+    resolved_adaptation_mode = _resolve_backtest_adaptation_mode(adaptation_mode)
+    resolved_max_train_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES", max_train_samples)
+    resolved_max_eval_samples = _resolve_backtest_sample_cap("SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES", max_eval_samples)
+    cache_enabled = _backtest_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
+    cache_paths = None
+    cache_payload: dict[str, object] = {}
+    cache_hit = False
+    if cache_enabled and cache_root is not None:
+        cache_payload = _build_temporal_backtest_cache_payload(
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            selected_models=selected_models,
+            classical_models=classical_models,
+            deep_models=deep_models,
+            retrieval_models=retrieval_models,
+            random_seed=random_seed,
+            folds=folds,
+            max_train_samples=resolved_max_train_samples,
+            max_eval_samples=resolved_max_eval_samples,
+            adaptation_mode=resolved_adaptation_mode,
+            tuned_model_specs=resolved_tuned_specs,
+            sequence_length=int(data.X_seq_train.shape[1]) if data.X_seq_train.ndim >= 2 else 0,
+            num_artists=int(data.num_artists),
+            num_ctx=int(data.num_ctx),
+            total_rows=int(len(data.y_train) + len(data.y_val) + len(data.y_test)),
+        )
+        cache_key = _build_temporal_backtest_cache_key(cache_payload)
+        cache_paths = _resolve_temporal_backtest_cache_paths(
+            cache_root=cache_root,
+            cache_fingerprint=str(cache_fingerprint).strip(),
+            cache_key=cache_key,
+        )
+        cache_hit = _read_cached_temporal_backtest_manifest(cache_paths=cache_paths) is not None
+    else:
+        cache_key = ""
+
+    return TemporalBacktestCacheInspection(
+        enabled=bool(cache_enabled),
+        fingerprint=(str(cache_fingerprint).strip() if cache_enabled else ""),
+        cache_key=str(cache_key),
+        hit=bool(cache_hit),
+        selected_models=tuple(selected_models),
+        classical_models=tuple(classical_models),
+        deep_models=tuple(deep_models),
+        retrieval_models=tuple(retrieval_models),
+        adaptation_mode=str(resolved_adaptation_mode),
+        max_train_samples=int(resolved_max_train_samples),
+        max_eval_samples=int(resolved_max_eval_samples),
+        cache_paths=cache_paths,
+        cache_payload=cache_payload,
+    )
+
+
+def _save_temporal_backtest_result_to_cache(
+    *,
+    cache_paths: TemporalBacktestCachePaths,
+    cache_payload: dict[str, object],
+    results: list[BacktestFoldResult],
+    artifact_paths: list[Path],
+) -> None:
+    try:
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_paths.artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_names: list[str] = []
+        for source_path in artifact_paths:
+            if not source_path.exists():
+                continue
+            artifact_names.append(source_path.name)
+            copy_file_if_changed(source_path, cache_paths.artifact_dir / source_path.name)
+        write_json(
+            cache_paths.result_path,
+            {
+                "cache_schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+                "rows": [asdict(row) for row in results],
+                "artifact_names": artifact_names,
+            },
+            sort_keys=True,
+        )
+        write_json(cache_paths.metadata_path, cache_payload, sort_keys=True)
+    except Exception:
+        return None
+
+
+def _run_backtest_job(
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    estimator_model_name: str | None = None,
+    estimator_params: dict[str, object] | None = None,
+    result_model_type: str = "classical",
+) -> BacktestFoldResult:
+    family, estimator = build_classical_estimator(
+        (estimator_model_name or model_name),
+        random_seed + fold_idx,
+        params=estimator_params,
+        estimator_n_jobs=estimator_n_jobs,
+    )
+    started = time.perf_counter()
+    estimator.fit(X_train, y_train)
+    fit_seconds = float(time.perf_counter() - started)
+    top1, top5 = _score_backtest_estimator(estimator, X_test, y_test)
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_type=result_model_type,
+        model_family=family,
+        adaptation_mode="cold",
+        fold=fold_idx,
+        train_rows=len(X_train),
+        test_rows=len(X_test),
+        fit_seconds=fit_seconds,
+        top1=top1,
+        top5=top5,
+    )
+
+
+def _extract_artist_predictions(prediction) -> np.ndarray:
+    if isinstance(prediction, dict):
+        if "artist_output" in prediction:
+            return np.asarray(prediction["artist_output"])
+        first_value = next(iter(prediction.values()))
+        return np.asarray(first_value)
+    if isinstance(prediction, (list, tuple)):
+        return np.asarray(prediction[0])
+    return np.asarray(prediction)
+
+
+def _topk_accuracy_from_proba(proba: np.ndarray, y_true: np.ndarray, *, k: int) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    kk = max(1, min(int(k), int(proba_arr.shape[1])))
+    topk_idx = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+    hits = np.any(topk_idx == y_arr.reshape(-1, 1), axis=1)
+    return float(np.mean(hits))
+
+
+def _topk_accuracy_from_labeled_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    k: int,
+    class_labels: np.ndarray | None = None,
+) -> float:
+    proba_arr = np.asarray(proba)
+    y_arr = np.asarray(y_true).reshape(-1)
+    if proba_arr.ndim != 2 or len(proba_arr) != len(y_arr):
+        return float("nan")
+    labels = None if class_labels is None else np.asarray(class_labels).reshape(-1)
+    if labels is not None and labels.size == proba_arr.shape[1]:
+        kk = max(1, min(int(k), int(proba_arr.shape[1])))
+        topk_idx = np.argpartition(proba_arr, -kk, axis=1)[:, -kk:]
+        topk_labels = labels[topk_idx]
+        return float(np.mean(np.any(topk_labels == y_arr.reshape(-1, 1), axis=1)))
+    return _topk_accuracy_from_proba(proba_arr, y_arr, k=k)
+
+
+def _score_backtest_estimator(estimator, X_test: np.ndarray, y_test: np.ndarray) -> tuple[float, float]:
+    y_arr = np.asarray(y_test).reshape(-1)
+    if len(y_arr) == 0:
+        return float("nan"), float("nan")
+    if hasattr(estimator, "predict_proba"):
+        try:
+            proba = np.asarray(estimator.predict_proba(X_test))
+        except Exception:
+            proba = np.empty((0, 0), dtype="float32")
+        if proba.ndim == 2 and len(proba) == len(y_arr):
+            classes = np.asarray(getattr(estimator, "classes_", []))
+            if classes.size == proba.shape[1]:
+                pred = classes[np.argmax(proba, axis=1)]
+                top5 = _topk_accuracy_from_labeled_proba(proba, y_arr, k=5, class_labels=classes)
+            else:
+                pred = np.argmax(proba, axis=1)
+                top5 = _topk_accuracy_from_proba(proba, y_arr, k=5)
+            return float(np.mean(pred == y_arr)), top5
+    pred = estimator.predict(X_test)
+    return float(np.mean(np.asarray(pred).reshape(-1) == y_arr)), float("nan")
+
+
+def _deep_train_validation_split(n_rows: int, reference_rows: int) -> tuple[slice, slice] | None:
+    if n_rows <= 1:
+        return None
+    val_rows = min(n_rows - 1, max(1, min(reference_rows, max(1, n_rows // 5))))
+    split_idx = n_rows - val_rows
+    if split_idx <= 0:
+        return None
+    return slice(0, split_idx), slice(split_idx, n_rows)
+
+
+def _resolve_backtest_model_groups(
+    selected_models: tuple[str, ...],
+    random_seed: int,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    from .config import DEFAULT_MODEL_NAMES
+
+    classical_registry = get_classical_model_registry(random_seed)
+    deep_registry = set(DEFAULT_MODEL_NAMES)
+    retrieval_registry = set(RETRIEVAL_BACKTEST_MODEL_NAMES) | set(ENSEMBLE_BACKTEST_MODEL_NAMES)
+    tuned_model_names = set((tuned_model_specs or {}).keys())
+    classical: list[str] = []
+    deep: list[str] = []
+    retrieval: list[str] = []
+    unknown: list[str] = []
+
+    for model_name in selected_models:
+        if model_name in tuned_model_names or model_name in classical_registry:
+            classical.append(model_name)
+        elif model_name in deep_registry:
+            deep.append(model_name)
+        elif model_name in retrieval_registry:
+            retrieval.append(model_name)
+        else:
+            unknown.append(model_name)
+
+    if unknown:
+        known = ", ".join(sorted(set(classical_registry) | deep_registry | retrieval_registry))
+        raise ValueError(f"Unknown temporal backtest model names: {', '.join(unknown)}. Known models: {known}")
+
+    return tuple(classical), tuple(deep), tuple(retrieval)
+
+
+def _fit_retrieval_backtest_models(
+    *,
+    fold_idx: int,
+    random_seed: int,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    y_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    logger,
+) -> tuple[object, object, float]:
+    from .retrieval_common import DEFAULT_EMBEDDING_DIM, DEFAULT_RETRIEVAL_CANDIDATE_K
+    from .retrieval_runtime_eval import evaluate_retrieval_baseline, train_and_evaluate_reranker
+    from .retrieval_seed_selection import train_pretraining_seed
+
+    started = time.perf_counter()
+    embedding_dim_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_DIM", "").strip()
+    try:
+        embedding_dim = max(4, int(embedding_dim_raw)) if embedding_dim_raw else DEFAULT_EMBEDDING_DIM
+    except Exception:
+        embedding_dim = DEFAULT_EMBEDDING_DIM
+    candidate_k = min(
+        int(num_artists),
+        max(2, int(os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_CANDIDATE_K", str(DEFAULT_RETRIEVAL_CANDIDATE_K)).strip() or DEFAULT_RETRIEVAL_CANDIDATE_K)),
+    )
+    backtest_epochs_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_EPOCHS", "").strip()
+    try:
+        backtest_epochs = max(1, int(backtest_epochs_raw)) if backtest_epochs_raw else None
+    except Exception:
+        backtest_epochs = None
+    split_slices = _deep_train_validation_split(len(np.asarray(X_seq_train)), len(np.asarray(X_seq_test)))
+    if split_slices is None:
+        raise ValueError("Retrieval backtest requires enough training rows for a fold-local validation split.")
+    fit_slice, val_slice = split_slices
+
+    enable_pretraining_raw = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ENABLE_PRETRAINING", "1").strip().lower()
+    enable_pretraining = enable_pretraining_raw not in ("0", "false", "no", "off")
+    pretrain_objectives = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_OBJECTIVES", "cooccurrence").strip() or "cooccurrence"
+    pretrain_max_pairs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_MAX_PAIRS", "250000").strip() or "250000"
+    pretrain_epochs = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_EPOCHS", "3").strip() or "3"
+    pretrain_blend_topk = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_PRETRAIN_BLEND_TOPK", "").strip() or None
+    retrieval_ann_bits = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "").strip() or None
+    retrieval_batch_size = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "").strip() or None
+    retrieval_lr = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_LR", "").strip() or None
+    retrieval_l2 = os.getenv("SPOTIFY_RETRIEVAL_BACKTEST_L2", "").strip() or None
+    backtest_seed = int(random_seed) + int(fold_idx)
+
+    seq_train_arr = np.asarray(X_seq_train, dtype="int32")
+    ctx_train_arr = np.asarray(X_ctx_train, dtype="float32")
+    y_train_arr = np.asarray(y_train, dtype="int32")
+    seq_test_arr = np.asarray(X_seq_test, dtype="int32")
+    ctx_test_arr = np.asarray(X_ctx_test, dtype="float32")
+    y_test_arr = np.asarray(y_test, dtype="int32")
+
+    fold_data = SimpleNamespace(
+        X_seq_train=seq_train_arr[fit_slice],
+        X_ctx_train=ctx_train_arr[fit_slice],
+        y_train=y_train_arr[fit_slice],
+        X_seq_val=seq_train_arr[val_slice],
+        X_ctx_val=ctx_train_arr[val_slice],
+        y_val=y_train_arr[val_slice],
+        X_seq_test=seq_test_arr,
+        X_ctx_test=ctx_test_arr,
+        y_test=y_test_arr,
+        num_artists=int(num_artists),
+        num_ctx=(int(ctx_train_arr.shape[1]) if ctx_train_arr.ndim == 2 else 0),
+    )
+
+    with TemporaryDirectory(prefix="spotify_retrieval_backtest_") as tmp_dir:
+        with _temporary_env(
+            {
+                "SPOTIFY_PRETRAIN_OBJECTIVES": pretrain_objectives,
+                "SPOTIFY_PRETRAIN_MAX_PAIRS": pretrain_max_pairs,
+                "SPOTIFY_PRETRAIN_EPOCHS": pretrain_epochs,
+                "SPOTIFY_PRETRAIN_BLEND_TOPK": pretrain_blend_topk,
+                "SPOTIFY_RETRIEVAL_EPOCHS": (str(backtest_epochs) if backtest_epochs is not None else None),
+                "SPOTIFY_RETRIEVAL_ANN_BITS": retrieval_ann_bits,
+                "SPOTIFY_RETRIEVAL_BATCH_SIZE": retrieval_batch_size,
+                "SPOTIFY_RETRIEVAL_LR": retrieval_lr,
+                "SPOTIFY_RETRIEVAL_L2": retrieval_l2,
+            }
+        ):
+            pretrain_result, _pretrain_path, sequence_projection, context_projection, item_bias, _retrieval_epochs, _objective_rows = train_pretraining_seed(
+                data=fold_data,
+                pretrain_dir=Path(tmp_dir),
+                random_seed=backtest_seed,
+                logger=logger,
+                embedding_dim=embedding_dim,
+                top_k=candidate_k,
+                enable_self_supervised_pretraining=enable_pretraining,
+                artifact_paths=[],
+            )
+            popularity = np.asarray(pretrain_result.artist_frequency, dtype="float32")
+            baseline = evaluate_retrieval_baseline(
+                artist_embeddings=np.asarray(pretrain_result.artist_embeddings, dtype="float32"),
+                context_projection=np.asarray(context_projection, dtype="float32"),
+                data=fold_data,
+                item_bias=np.asarray(item_bias, dtype="float32"),
+                popularity=popularity.astype("float32"),
+                random_seed=backtest_seed,
+                sequence_projection=np.asarray(sequence_projection, dtype="float32"),
+                top_k=candidate_k,
+            )
+            reranker = train_and_evaluate_reranker(
+                baseline=baseline,
+                data=fold_data,
+                random_seed=backtest_seed,
+            )
+
+    return baseline, reranker, float(time.perf_counter() - started)
+
+
+def _run_retrieval_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    y_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    logger,
+) -> BacktestFoldResult:
+    baseline, reranker, fit_seconds = _fit_retrieval_backtest_models(
+        fold_idx=fold_idx,
+        random_seed=random_seed,
+        X_seq_train=X_seq_train,
+        X_ctx_train=X_ctx_train,
+        y_train=y_train,
+        X_seq_test=X_seq_test,
+        X_ctx_test=X_ctx_test,
+        y_test=y_test,
+        num_artists=num_artists,
+        logger=logger,
+    )
+
+    if model_name == "retrieval_reranker":
+        metrics = reranker.rerank_metrics_test
+        model_type = "retrieval_reranker"
+        model_family = "candidate_reranker"
+    else:
+        metrics = baseline.retrieval_metrics_test
+        model_type = "retrieval"
+        model_family = "dual_encoder"
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_type=model_type,
+        model_family=model_family,
+        adaptation_mode="cold",
+        fold=int(fold_idx),
+        train_rows=len(np.asarray(X_seq_train)),
+        test_rows=len(np.asarray(X_seq_test)),
+        fit_seconds=fit_seconds,
+        top1=float(metrics.get("top1", float("nan"))),
+        top5=float(metrics.get("top5", float("nan"))),
+    )
+
+
+def _fit_classical_backtest_probabilities(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    estimator_model_name: str | None = None,
+    estimator_params: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    family, estimator = build_classical_estimator(
+        (estimator_model_name or model_name),
+        random_seed + fold_idx,
+        params=estimator_params,
+        estimator_n_jobs=estimator_n_jobs,
+    )
+    started = time.perf_counter()
+    estimator.fit(X_train, y_train)
+    fit_seconds = float(time.perf_counter() - started)
+    aligned = collect_aligned_probabilities(estimator, X_val, X_test, num_classes=num_artists)
+    if aligned is None:
+        return None
+    val_proba, test_proba = aligned
+    if (
+        val_proba.ndim != 2
+        or test_proba.ndim != 2
+        or len(val_proba) != len(np.asarray(y_val).reshape(-1))
+        or len(test_proba) != len(np.asarray(y_test).reshape(-1))
+    ):
+        return None
+    y_val_arr = np.asarray(y_val).reshape(-1)
+    y_test_arr = np.asarray(y_test).reshape(-1)
+    return {
+        "model_name": model_name,
+        "model_type": "classical_tuned" if estimator_params else "classical",
+        "model_family": family,
+        "base_model_name": str(estimator_model_name or model_name),
+        "fit_seconds": fit_seconds,
+        "val_proba": np.asarray(val_proba, dtype="float32"),
+        "test_proba": np.asarray(test_proba, dtype="float32"),
+        "val_top1": float(np.mean(np.argmax(val_proba, axis=1) == y_val_arr)),
+        "val_top5": _topk_accuracy_from_proba(val_proba, y_val_arr, k=5),
+        "test_top1": float(np.mean(np.argmax(test_proba, axis=1) == y_test_arr)),
+        "test_top5": _topk_accuracy_from_proba(test_proba, y_test_arr, k=5),
+    }
+
+
+def _backtest_candidate_key(row: dict[str, object]) -> str:
+    base_name = str(row.get("base_model_name", "")).strip()
+    return base_name or str(row.get("model_name", "")).strip()
+
+
+def _select_backtest_ensemble_candidates(
+    candidate_rows: list[dict[str, object]],
+    *,
+    max_candidates: int = 4,
+) -> list[dict[str, object]]:
+    ordered = sorted(
+        candidate_rows,
+        key=lambda row: (_safe_float(row.get("val_top1")) if np.isfinite(_safe_float(row.get("val_top1"))) else float("-inf")),
+        reverse=True,
+    )
+    selected: list[dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for target_type in ("retrieval_reranker", "retrieval", "classical_tuned", "classical", "deep"):
+        for row in ordered:
+            row_type = str(row.get("model_type", "")).strip()
+            key = _backtest_candidate_key(row)
+            if row_type != target_type or not key or key in seen_keys:
+                continue
+            selected.append(row)
+            seen_keys.add(key)
+            break
+
+    for row in ordered:
+        if len(selected) >= max_candidates:
+            break
+        key = _backtest_candidate_key(row)
+        if not key or key in seen_keys:
+            continue
+        selected.append(row)
+        seen_keys.add(key)
+    return selected[:max_candidates]
+
+
+def _run_ensemble_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    estimator_n_jobs: int,
+    X_train_tab: np.ndarray,
+    y_train: np.ndarray,
+    X_test_tab: np.ndarray,
+    y_test: np.ndarray,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    num_artists: int,
+    logger,
+    candidate_model_names: tuple[str, ...],
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+) -> BacktestFoldResult:
+    from .ensemble import _apply_temperature, _blend_probabilities, _fit_temperature, _negative_log_likelihood
+    from .retrieval_common import _softmax_rows
+
+    started = time.perf_counter()
+    split_slices = _deep_train_validation_split(len(np.asarray(X_seq_train)), len(np.asarray(X_seq_test)))
+    if split_slices is None:
+        raise ValueError("Ensemble backtest requires enough training rows for a fold-local validation split.")
+    fit_slice, val_slice = split_slices
+
+    train_tab_arr = np.asarray(X_train_tab)
+    test_tab_arr = np.asarray(X_test_tab)
+    train_seq_arr = np.asarray(X_seq_train, dtype="int32")
+    train_ctx_arr = np.asarray(X_ctx_train, dtype="float32")
+    test_seq_arr = np.asarray(X_seq_test, dtype="int32")
+    test_ctx_arr = np.asarray(X_ctx_test, dtype="float32")
+    y_train_arr = np.asarray(y_train, dtype="int32")
+    y_test_arr = np.asarray(y_test, dtype="int32")
+    y_val_arr = y_train_arr[val_slice]
+
+    candidate_rows: list[dict[str, object]] = []
+    requested_names = tuple(
+        name for name in candidate_model_names if name not in ENSEMBLE_BACKTEST_MODEL_NAMES
+    )
+    retrieval_names = tuple(name for name in requested_names if name in RETRIEVAL_BACKTEST_MODEL_NAMES)
+    if retrieval_names:
+        baseline, reranker, _ = _fit_retrieval_backtest_models(
+            fold_idx=fold_idx,
+            random_seed=random_seed,
+            X_seq_train=train_seq_arr,
+            X_ctx_train=train_ctx_arr,
+            y_train=y_train_arr,
+            X_seq_test=test_seq_arr,
+            X_ctx_test=test_ctx_arr,
+            y_test=y_test_arr,
+            num_artists=num_artists,
+            logger=logger,
+        )
+        if "retrieval_dual_encoder" in retrieval_names:
+            candidate_rows.append(
+                {
+                    "model_name": "retrieval_dual_encoder",
+                    "model_type": "retrieval",
+                    "model_family": "dual_encoder",
+                    "fit_seconds": 0.0,
+                    "val_proba": _softmax_rows(baseline.val_retrieval_scores),
+                    "test_proba": _softmax_rows(baseline.test_retrieval_scores),
+                    "val_top1": float(baseline.retrieval_metrics_val.get("top1", float("nan"))),
+                    "val_top5": float(baseline.retrieval_metrics_val.get("top5", float("nan"))),
+                    "test_top1": float(baseline.retrieval_metrics_test.get("top1", float("nan"))),
+                    "test_top5": float(baseline.retrieval_metrics_test.get("top5", float("nan"))),
+                }
+            )
+        if "retrieval_reranker" in retrieval_names:
+            candidate_rows.append(
+                {
+                    "model_name": "retrieval_reranker",
+                    "model_type": "retrieval_reranker",
+                    "model_family": "candidate_reranker",
+                    "fit_seconds": 0.0,
+                    "val_proba": np.asarray(reranker.val_rerank_proba, dtype="float32"),
+                    "test_proba": np.asarray(reranker.test_rerank_proba, dtype="float32"),
+                    "val_top1": float(reranker.rerank_metrics_val.get("top1", float("nan"))),
+                    "val_top5": float(reranker.rerank_metrics_val.get("top5", float("nan"))),
+                    "test_top1": float(reranker.rerank_metrics_test.get("top1", float("nan"))),
+                    "test_top5": float(reranker.rerank_metrics_test.get("top5", float("nan"))),
+                }
+            )
+
+    for candidate_name in requested_names:
+        if candidate_name in RETRIEVAL_BACKTEST_MODEL_NAMES:
+            continue
+        tuned_spec = dict((tuned_model_specs or {}).get(candidate_name, {}))
+        estimator_model_name = str(tuned_spec.get("base_model_name", "")).strip() or None
+        estimator_params = dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None
+        candidate_train = train_tab_arr[fit_slice]
+        candidate_val = train_tab_arr[val_slice]
+        candidate_test = test_tab_arr
+        if (estimator_model_name or candidate_name) == "session_knn":
+            candidate_train = train_seq_arr[fit_slice]
+            candidate_val = train_seq_arr[val_slice]
+            candidate_test = test_seq_arr
+        payload = _fit_classical_backtest_probabilities(
+            model_name=candidate_name,
+            fold_idx=fold_idx,
+            random_seed=random_seed,
+            estimator_n_jobs=estimator_n_jobs,
+            X_train=candidate_train,
+            y_train=y_train_arr[fit_slice],
+            X_val=candidate_val,
+            y_val=y_val_arr,
+            X_test=candidate_test,
+            y_test=y_test_arr,
+            num_artists=num_artists,
+            estimator_model_name=estimator_model_name,
+            estimator_params=estimator_params,
+        )
+        if payload is not None:
+            candidate_rows.append(payload)
+
+    selected_payloads = _select_backtest_ensemble_candidates(candidate_rows)
+    if len(selected_payloads) < 2:
+        raise ValueError("Ensemble backtest needs at least two viable fold-local candidates.")
+
+    best_choice: dict[str, object] | None = None
+    score_options = (0.0, 1.0, 2.5, 4.0)
+    for size in range(2, len(selected_payloads) + 1):
+        for combo in combinations(selected_payloads, size):
+            raw_scores = np.array(
+                [
+                    max(1e-6, (_safe_float(item.get("val_top1")) if np.isfinite(_safe_float(item.get("val_top1"))) else 1e-6))
+                    for item in combo
+                ],
+                dtype="float64",
+            )
+            centered = raw_scores - float(np.mean(raw_scores))
+            for alpha in score_options:
+                if alpha <= 0.0:
+                    weights = np.full(len(combo), 1.0 / len(combo), dtype="float64")
+                else:
+                    logits = alpha * centered
+                    logits -= logits.max()
+                    weights = np.exp(logits)
+                    weights /= np.sum(weights)
+                val_blend = _blend_probabilities([item["val_proba"] for item in combo], weights)
+                temperature = _fit_temperature(val_blend, y_val_arr.astype("int64"))
+                val_calibrated = _apply_temperature(val_blend, temperature)
+                val_top1 = float(np.mean(np.argmax(val_calibrated, axis=1) == y_val_arr))
+                val_top5 = _topk_accuracy_from_proba(val_calibrated, y_val_arr, k=5)
+                choice = {
+                    "combo": combo,
+                    "weights": weights.astype("float32"),
+                    "temperature": float(temperature),
+                    "val_top1": val_top1,
+                    "val_top5": val_top5,
+                    "val_nll": _negative_log_likelihood(val_calibrated, y_val_arr.astype("int64")),
+                }
+                if best_choice is None:
+                    best_choice = choice
+                    continue
+                incumbent = (
+                    _safe_float(best_choice.get("val_top1")),
+                    _safe_float(best_choice.get("val_top5")),
+                    -_safe_float(best_choice.get("val_nll")),
+                )
+                challenger = (
+                    val_top1,
+                    val_top5,
+                    -_safe_float(choice.get("val_nll")),
+                )
+                if challenger > incumbent:
+                    best_choice = choice
+
+    if best_choice is None:
+        raise ValueError("Ensemble backtest could not produce a viable fold-local blend.")
+
+    weights = np.asarray(best_choice["weights"], dtype="float32")
+    temperature = float(best_choice["temperature"])
+    test_blend = _blend_probabilities([item["test_proba"] for item in best_choice["combo"]], weights)
+    test_calibrated = _apply_temperature(test_blend, temperature)
+
+    return BacktestFoldResult(
+        model_name=model_name,
+        model_type="ensemble",
+        model_family="blend",
+        adaptation_mode="cold",
+        fold=int(fold_idx),
+        train_rows=len(train_seq_arr),
+        test_rows=len(test_seq_arr),
+        fit_seconds=float(time.perf_counter() - started),
+        top1=float(np.mean(np.argmax(test_calibrated, axis=1) == y_test_arr)),
+        top5=_topk_accuracy_from_proba(test_calibrated, y_test_arr, k=5),
+    )
+
+
+def _resolve_deep_builders(
+    *,
+    data: PreparedData,
+    selected_models: tuple[str, ...],
+    deep_model_builders,
+) -> dict[str, object]:
+    if not selected_models:
+        return {}
+
+    if deep_model_builders is None:
+        from .modeling import build_model_builders
+
+        built = build_model_builders(
+            sequence_length=int(data.X_seq_train.shape[1]),
+            num_artists=int(data.num_artists),
+            num_ctx=int(data.num_ctx),
+            selected_names=selected_models,
+        )
+        return {name: builder for name, builder in built}
+
+    if isinstance(deep_model_builders, dict):
+        resolved = dict(deep_model_builders)
+    else:
+        resolved = {name: builder for name, builder in deep_model_builders}
+
+    missing = [name for name in selected_models if name not in resolved]
+    if missing:
+        raise ValueError(f"Missing deep temporal backtest builders for: {', '.join(missing)}")
+    return resolved
+
+
+def _resolve_deep_strategy(strategy, logger):
+    if strategy is not None:
+        return strategy
+
+    from .runtime import configure_process_env, load_tensorflow_runtime, select_distribution_strategy
+
+    configure_process_env()
+    tf = load_tensorflow_runtime(logger)
+    return select_distribution_strategy(tf, logger=logger)
+
+
+def _resolve_backtest_adaptation_mode(raw: str | None) -> str:
+    value = str(raw or os.getenv("SPOTIFY_BACKTEST_ADAPTATION_MODE", "cold")).strip().lower()
+    if value not in ("cold", "warm", "continual"):
+        return "cold"
+    return value
+
+
+def _resolve_backtest_sample_cap(env_name: str, fallback: int) -> int:
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return max(0, int(fallback))
+    try:
+        return max(0, int(raw_value))
+    except Exception:
+        return max(0, int(fallback))
+
+
+def _tail_slice_between(start: int, end: int, max_rows: int) -> slice:
+    if max_rows <= 0 or end - start <= max_rows:
+        return slice(start, end)
+    return slice(end - max_rows, end)
+
+
+def _resolve_backtest_windows(
+    windows: list[tuple[int, int]],
+    *,
+    max_train_samples: int,
+    max_eval_samples: int,
+) -> list[_BacktestWindowSlices]:
+    resolved: list[_BacktestWindowSlices] = []
+    for fold_idx, (test_start, test_end) in enumerate(windows, start=1):
+        train_slice = _tail_slice_between(0, test_start, max_train_samples)
+        test_slice = _tail_slice_between(test_start, test_end, max_eval_samples)
+        if train_slice.stop <= train_slice.start or test_slice.stop <= test_slice.start:
+            continue
+        resolved.append(
+            _BacktestWindowSlices(
+                fold=fold_idx,
+                train_slice=train_slice,
+                test_slice=test_slice,
+                raw_test_start=test_start,
+                raw_test_end=test_end,
+            )
+        )
+    return resolved
+
+
+def _resolve_backtest_workers(raw_value: str | None, *, job_count: int) -> int:
+    cpu_count = os.cpu_count() or 1
+    capped_jobs = max(1, int(job_count))
+    raw = str(raw_value or "").strip().lower()
+    if raw and raw != "auto":
+        try:
+            return min(cpu_count, capped_jobs, max(1, int(raw)))
+        except Exception:
+            return 1
+    if capped_jobs <= 1:
+        return 1
+    return min(cpu_count, capped_jobs, 2)
+
+
+@contextmanager
+def _temporary_env(overrides: dict[str, str | None]):
+    previous: dict[str, str | None] = {}
+    try:
+        for key, value in overrides.items():
+            previous[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _run_deep_backtest_job(
+    *,
+    model_name: str,
+    fold_idx: int,
+    random_seed: int,
+    model_builder,
+    strategy,
+    batch_size: int,
+    epochs: int,
+    X_seq_fit: np.ndarray,
+    X_ctx_fit: np.ndarray,
+    y_fit: np.ndarray,
+    y_skip_fit: np.ndarray,
+    X_seq_val: np.ndarray,
+    X_ctx_val: np.ndarray,
+    y_val: np.ndarray,
+    y_skip_val: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    initial_weights=None,
+    weight_sink: dict[str, object] | None = None,
+    adaptation_mode: str = "cold",
+) -> BacktestFoldResult:
+    import tensorflow as tf
+
+    tf.keras.backend.clear_session()
+    try:
+        try:
+            tf.keras.utils.set_random_seed(int(random_seed))
+        except Exception:
+            tf.random.set_seed(int(random_seed))
+        started = time.perf_counter()
+        with strategy.scope():
+            model = model_builder()
+            single_head = len(model.outputs) == 1
+            if single_head:
+                model.compile(
+                    optimizer="adam",
+                    loss="sparse_categorical_crossentropy",
+                    metrics=[
+                        "sparse_categorical_accuracy",
+                        tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name="top_5"),
+                    ],
+                )
+                fit_targets = y_fit
+                val_targets = y_val
+                monitor_metric = "val_sparse_categorical_accuracy"
+            else:
+                model.compile(
+                    optimizer="adam",
+                    loss={
+                        "artist_output": "sparse_categorical_crossentropy",
+                        "skip_output": "binary_crossentropy",
+                    },
+                    metrics={
+                        "artist_output": [
+                            "sparse_categorical_accuracy",
+                            tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name="top_5"),
+                        ],
+                        "skip_output": ["accuracy"],
+                    },
+                    loss_weights={"artist_output": 1.0, "skip_output": 0.2},
+                )
+                fit_targets = {
+                    "artist_output": y_fit,
+                    "skip_output": y_skip_fit,
+                }
+                val_targets = {
+                    "artist_output": y_val,
+                    "skip_output": y_skip_val,
+                }
+                monitor_metric = "val_artist_output_sparse_categorical_accuracy"
+            if initial_weights:
+                try:
+                    model.set_weights(initial_weights)
+                except Exception:
+                    pass
+
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor=monitor_metric,
+                patience=1,
+                mode="max",
+                restore_best_weights=True,
+            )
+        ]
+        effective_batch = max(1, min(int(batch_size), len(X_seq_fit)))
+        model.fit(
+            (X_seq_fit, X_ctx_fit),
+            fit_targets,
+            validation_data=((X_seq_val, X_ctx_val), val_targets),
+            epochs=max(1, int(epochs)),
+            batch_size=effective_batch,
+            verbose=0,
+            callbacks=callbacks,
+        )
+        fit_seconds = float(time.perf_counter() - started)
+        prediction = model.predict((X_seq_test, X_ctx_test), verbose=0)
+        artist_proba = _extract_artist_predictions(prediction)
+        if weight_sink is not None:
+            try:
+                weight_sink["weights"] = model.get_weights()
+            except Exception:
+                pass
+        top1 = float(np.mean(np.argmax(artist_proba, axis=1) == np.asarray(y_test).reshape(-1)))
+        top5 = _topk_accuracy_from_proba(artist_proba, y_test, k=5)
+        return BacktestFoldResult(
+            model_name=model_name,
+            model_type="deep",
+            model_family="neural",
+            adaptation_mode=adaptation_mode,
+            fold=fold_idx,
+            train_rows=len(X_seq_fit),
+            test_rows=len(X_seq_test),
+            fit_seconds=fit_seconds,
+            top1=top1,
+            top5=top5,
+        )
+    finally:
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+
+def _write_backtest_csv(results: list[BacktestFoldResult], output_path: Path) -> None:
+    with output_path.open("w", newline="", encoding="utf-8") as outfile:
+        writer = csv.DictWriter(
+            outfile,
+            fieldnames=[
+                "model_name",
+                "model_type",
+                "model_family",
+                "adaptation_mode",
+                "fold",
+                "train_rows",
+                "test_rows",
+                "fit_seconds",
+                "top1",
+                "top5",
+            ],
+        )
+        writer.writeheader()
+        for row in results:
+            writer.writerow(asdict(row))
+
+
+def _plot_backtest(results: list[BacktestFoldResult], output_path: Path) -> None:
+    if not results:
+        return
+    import matplotlib.pyplot as plt
+
+    by_model: dict[str, list[BacktestFoldResult]] = {}
+    for row in results:
+        by_model.setdefault(row.model_name, []).append(row)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for model_name, model_rows in sorted(by_model.items()):
+        ordered = sorted(model_rows, key=lambda item: item.fold)
+        x = [row.fold for row in ordered]
+        y = [row.top1 for row in ordered]
+        ax.plot(x, y, marker="o", label=model_name)
+
+    ax.set_title("Temporal Backtest Top-1 Accuracy")
+    ax.set_xlabel("Fold")
+    ax.set_ylabel("Top-1 Accuracy")
+    ax.set_xticks(sorted({row.fold for row in results}))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def run_temporal_backtest(
+    data: PreparedData,
+    output_dir: Path,
+    selected_models: tuple[str, ...],
+    random_seed: int,
+    folds: int,
+    max_train_samples: int,
+    max_eval_samples: int,
+    logger,
+    feature_bundle: ClassicalFeatureBundle | None = None,
+    deep_model_builders=None,
+    strategy=None,
+    adaptation_mode: str | None = None,
+    tuned_model_specs: dict[str, dict[str, object]] | None = None,
+    cache_root: Path | None = None,
+    cache_fingerprint: str = "",
+    cache_stats_out: dict[str, object] | None = None,
+) -> list[BacktestFoldResult]:
+    if folds <= 0:
+        logger.info("Skipping temporal backtesting because folds <= 0.")
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_inspection = inspect_temporal_backtest_cache(
+        data=data,
+        selected_models=selected_models,
+        random_seed=random_seed,
+        folds=folds,
+        max_train_samples=max_train_samples,
+        max_eval_samples=max_eval_samples,
+        adaptation_mode=adaptation_mode,
+        tuned_model_specs=tuned_model_specs,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+    )
+    resolved_tuned_specs = dict(tuned_model_specs or {})
+    classical_models = cache_inspection.classical_models
+    deep_models = cache_inspection.deep_models
+    retrieval_models = cache_inspection.retrieval_models
+    resolved_adaptation_mode = cache_inspection.adaptation_mode
+    resolved_max_train_samples = cache_inspection.max_train_samples
+    resolved_max_eval_samples = cache_inspection.max_eval_samples
+    cache_enabled = cache_inspection.enabled
+    cache_paths = cache_inspection.cache_paths
+    cache_payload = cache_inspection.cache_payload
+    cached_results = None
+    if cache_inspection.hit and cache_paths is not None:
+        cached_results = _load_cached_temporal_backtest_result(
+            cache_paths=cache_paths,
+            output_dir=output_dir,
+            logger=logger,
+        )
+
+    if cache_stats_out is not None:
+        cache_stats_out.clear()
+        cache_stats_out.update(
+            {
+                "enabled": bool(cache_enabled),
+                "fingerprint": str(cache_inspection.fingerprint),
+                "cache_key": str(cache_inspection.cache_key),
+                "hit": bool(cached_results is not None),
+                "selected_models": [str(name) for name in selected_models],
+            }
+        )
+
+    logger.info(
+        "Temporal backtest cache status: enabled=%s fingerprint=%s hit=%s",
+        cache_enabled,
+        (cache_fingerprint if cache_enabled else "disabled"),
+        bool(cached_results is not None),
+    )
+    if cached_results is not None:
+        return cached_results
+
+    X_all, y_all = build_full_tabular_dataset(data, feature_bundle=feature_bundle)
+    windows = _build_expanding_windows(len(X_all), folds)
+    if not windows:
+        logger.warning("Unable to build temporal backtest windows from %d rows.", len(X_all))
+        return []
+
+    logger.info(
+        "Temporal backtesting windows=%d across %d rows",
+        len(windows),
+        len(X_all),
+    )
+
+    logger.info(
+        "Temporal backtesting caps: train_rows=%d eval_rows=%d",
+        resolved_max_train_samples,
+        resolved_max_eval_samples,
+    )
+    resolved_windows = _resolve_backtest_windows(
+        windows,
+        max_train_samples=resolved_max_train_samples,
+        max_eval_samples=resolved_max_eval_samples,
+    )
+    if not resolved_windows:
+        logger.warning("Temporal backtesting resolved to zero runnable folds after sampling caps.")
+        return []
+
+    needs_session_sequences = "session_knn" in classical_models
+    needs_retrieval_inputs = bool(retrieval_models)
+    needs_deep_inputs = bool(deep_models)
+    X_all_seq = None
+    if needs_session_sequences or needs_retrieval_inputs or needs_deep_inputs:
+        if feature_bundle is None:
+            X_all_seq = np.concatenate(
+                [
+                    data.X_seq_train.astype("int32", copy=False),
+                    data.X_seq_val.astype("int32", copy=False),
+                    data.X_seq_test.astype("int32", copy=False),
+                ],
+                axis=0,
+            )
+        else:
+            X_all_seq = np.concatenate(
+                [
+                    np.asarray(feature_bundle.X_train_seq, dtype="int32"),
+                    np.asarray(feature_bundle.X_val_seq, dtype="int32"),
+                    np.asarray(feature_bundle.X_test_seq, dtype="int32"),
+                ],
+                axis=0,
+            )
+    X_all_ctx = None
+    y_skip_all = None
+    if needs_retrieval_inputs or needs_deep_inputs:
+        X_all_ctx = np.concatenate(
+            [
+                data.X_ctx_train.astype("float32", copy=False),
+                data.X_ctx_val.astype("float32", copy=False),
+                data.X_ctx_test.astype("float32", copy=False),
+            ],
+            axis=0,
+        )
+        y_skip_all = np.concatenate(
+            [
+                np.asarray(data.y_skip_train),
+                np.asarray(data.y_skip_val),
+                np.asarray(data.y_skip_test),
+            ],
+            axis=0,
+        )
+
+    results: list[BacktestFoldResult] = []
+    jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str | None, dict[str, object] | None, str]] = []
+    for window in resolved_windows:
+        X_train_tab = X_all[window.train_slice]
+        y_train = y_all[window.train_slice]
+        X_test_tab = X_all[window.test_slice]
+        y_test = y_all[window.test_slice]
+        for model_name in classical_models:
+            if model_name == "session_knn":
+                assert X_all_seq is not None
+                tuned_spec = resolved_tuned_specs.get(model_name, {})
+                jobs.append(
+                    (
+                        window.fold,
+                        model_name,
+                        X_all_seq[window.train_slice],
+                        y_train,
+                        X_all_seq[window.test_slice],
+                        y_test,
+                        (str(tuned_spec.get("base_model_name", "")).strip() or None),
+                        (dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None),
+                        ("classical_tuned" if tuned_spec else "classical"),
+                    )
+                )
+            else:
+                tuned_spec = resolved_tuned_specs.get(model_name, {})
+                jobs.append(
+                    (
+                        window.fold,
+                        model_name,
+                        X_train_tab,
+                        y_train,
+                        X_test_tab,
+                        y_test,
+                        (str(tuned_spec.get("base_model_name", "")).strip() or None),
+                        (dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None),
+                        ("classical_tuned" if tuned_spec else "classical"),
+                    )
+                )
+
+    workers_raw = os.getenv("SPOTIFY_BACKTEST_WORKERS", "")
+    _, estimator_n_jobs = resolve_classical_parallelism()
+    backtest_workers = _resolve_backtest_workers(workers_raw, job_count=len(jobs))
+    if backtest_workers > 1:
+        estimator_n_jobs = 1
+    logger.info(
+        "Backtest parallelism: workers=%d estimator_n_jobs=%d jobs=%d",
+        backtest_workers,
+        estimator_n_jobs,
+        len(jobs),
+    )
+
+    if backtest_workers > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=backtest_workers) as executor:
+            futures = {}
+            for fold_idx, model_name, X_train, y_train, X_test, y_test, estimator_model_name, estimator_params, result_model_type in jobs:
+                future = executor.submit(
+                    _run_backtest_job,
+                    model_name,
+                    fold_idx,
+                    random_seed,
+                    estimator_n_jobs,
+                    X_train,
+                    y_train,
+                    X_test,
+                    y_test,
+                    estimator_model_name,
+                    estimator_params,
+                    result_model_type,
+                )
+                futures[future] = (fold_idx, model_name)
+
+            collected: dict[tuple[int, str], BacktestFoldResult] = {}
+            for future in as_completed(futures):
+                fold_idx, model_name = futures[future]
+                try:
+                    row = future.result()
+                except Exception as exc:
+                    logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                    continue
+                collected[(fold_idx, model_name)] = row
+
+        for fold_idx, model_name, *_ in jobs:
+            key = (fold_idx, model_name)
+            if key not in collected:
+                continue
+            row = collected[key]
+            results.append(row)
+            logger.info(
+                "[BACKTEST] fold=%d model=%s top1=%.4f top5=%s",
+                row.fold,
+                row.model_name,
+                row.top1,
+                f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+            )
+    else:
+        for (
+            fold_idx,
+            model_name,
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            estimator_model_name,
+            estimator_params,
+            result_model_type,
+        ) in jobs:
+            try:
+                row = _run_backtest_job(
+                    model_name=model_name,
+                    fold_idx=fold_idx,
+                    random_seed=random_seed,
+                    estimator_n_jobs=estimator_n_jobs,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_test=X_test,
+                    y_test=y_test,
+                    estimator_model_name=estimator_model_name,
+                    estimator_params=estimator_params,
+                    result_model_type=result_model_type,
+                )
+            except Exception as exc:
+                logger.warning("Backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                continue
+            results.append(row)
+            logger.info(
+                "[BACKTEST] fold=%d model=%s top1=%.4f top5=%s",
+                row.fold,
+                row.model_name,
+                row.top1,
+                f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+            )
+
+    if retrieval_models:
+        assert X_all_seq is not None
+        assert X_all_ctx is not None
+        logger.info(
+            "Retrieval/ensemble temporal backtesting: models=%s",
+            ",".join(retrieval_models),
+        )
+        for window in resolved_windows:
+            X_train_seq = X_all_seq[window.train_slice]
+            X_train_ctx = X_all_ctx[window.train_slice]
+            y_train = y_all[window.train_slice]
+            X_test_seq = X_all_seq[window.test_slice]
+            X_test_ctx = X_all_ctx[window.test_slice]
+            y_test = y_all[window.test_slice]
+            if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
+                continue
+            for model_name in retrieval_models:
+                try:
+                    if model_name in ENSEMBLE_BACKTEST_MODEL_NAMES:
+                        row = _run_ensemble_backtest_job(
+                            model_name=model_name,
+                            fold_idx=window.fold,
+                            random_seed=random_seed,
+                            estimator_n_jobs=estimator_n_jobs,
+                            X_train_tab=X_all[window.train_slice],
+                            y_train=y_train,
+                            X_test_tab=X_all[window.test_slice],
+                            y_test=y_test,
+                            X_seq_train=X_train_seq,
+                            X_ctx_train=X_train_ctx,
+                            X_seq_test=X_test_seq,
+                            X_ctx_test=X_test_ctx,
+                            num_artists=data.num_artists,
+                            logger=logger,
+                            candidate_model_names=tuple((*classical_models, *retrieval_models)),
+                            tuned_model_specs=resolved_tuned_specs,
+                        )
+                    else:
+                        row = _run_retrieval_backtest_job(
+                            model_name=model_name,
+                            fold_idx=window.fold,
+                            random_seed=random_seed,
+                            X_seq_train=X_train_seq,
+                            X_ctx_train=X_train_ctx,
+                            y_train=y_train,
+                            X_seq_test=X_test_seq,
+                            X_ctx_test=X_test_ctx,
+                            y_test=y_test,
+                            num_artists=data.num_artists,
+                            logger=logger,
+                        )
+                except Exception as exc:
+                    logger.warning("Retrieval backtest fit failed for %s fold=%d: %s", model_name, window.fold, exc)
+                    continue
+                results.append(row)
+                logger.info(
+                    "[BACKTEST] fold=%d model=%s type=%s top1=%.4f top5=%s",
+                    row.fold,
+                    row.model_name,
+                    row.model_type,
+                    row.top1,
+                    f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+                )
+
+    if deep_models:
+        deep_runtime = _deep_backtest_runtime_config()
+        deep_epochs = int(deep_runtime["epochs"])
+        deep_batch_size = int(deep_runtime["batch_size"])
+
+        resolved_strategy = _resolve_deep_strategy(strategy, logger)
+        deep_builders = _resolve_deep_builders(
+            data=data,
+            selected_models=deep_models,
+            deep_model_builders=deep_model_builders,
+        )
+        logger.info(
+            "Deep temporal backtesting: models=%s epochs=%d batch_size=%d adaptation=%s",
+            ",".join(deep_models),
+            deep_epochs,
+            deep_batch_size,
+            resolved_adaptation_mode,
+        )
+        prior_weights: dict[str, object] = {}
+        previous_test_end = 0
+
+        assert X_all_seq is not None
+        assert X_all_ctx is not None
+        assert y_skip_all is not None
+        for window in resolved_windows:
+            X_train_seq = X_all_seq[window.train_slice]
+            X_train_ctx = X_all_ctx[window.train_slice]
+            y_train = y_all[window.train_slice]
+            y_skip_train = y_skip_all[window.train_slice]
+
+            X_test_seq = X_all_seq[window.test_slice]
+            X_test_ctx = X_all_ctx[window.test_slice]
+            y_test = y_all[window.test_slice]
+
+            if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
+                continue
+
+            split_slices = _deep_train_validation_split(len(X_train_seq), len(X_test_seq))
+            if split_slices is None:
+                continue
+            fit_slice, val_slice = split_slices
+
+            for model_name in deep_models:
+                incremental_fit_seq = X_train_seq[fit_slice]
+                incremental_fit_ctx = X_train_ctx[fit_slice]
+                incremental_y = y_train[fit_slice]
+                incremental_skip = y_skip_train[fit_slice]
+                if (
+                    resolved_adaptation_mode == "continual"
+                    and model_name in prior_weights
+                    and previous_test_end < window.raw_test_start
+                ):
+                    inc_seq_all = X_all_seq[previous_test_end : window.raw_test_start]
+                    inc_ctx_all = X_all_ctx[previous_test_end : window.raw_test_start]
+                    inc_y_all = y_all[previous_test_end : window.raw_test_start]
+                    inc_skip_all = y_skip_all[previous_test_end : window.raw_test_start]
+                    if len(inc_seq_all) > 1:
+                        incremental_fit_seq = inc_seq_all
+                        incremental_fit_ctx = inc_ctx_all
+                        incremental_y = inc_y_all
+                        incremental_skip = inc_skip_all
+                weight_sink: dict[str, object] = {}
+                try:
+                    row = _run_deep_backtest_job(
+                        model_name=model_name,
+                        fold_idx=window.fold,
+                        random_seed=random_seed + window.fold,
+                        model_builder=deep_builders[model_name],
+                        strategy=resolved_strategy,
+                        batch_size=deep_batch_size,
+                        epochs=deep_epochs,
+                        X_seq_fit=incremental_fit_seq,
+                        X_ctx_fit=incremental_fit_ctx,
+                        y_fit=incremental_y,
+                        y_skip_fit=incremental_skip,
+                        X_seq_val=X_train_seq[val_slice],
+                        X_ctx_val=X_train_ctx[val_slice],
+                        y_val=y_train[val_slice],
+                        y_skip_val=y_skip_train[val_slice],
+                        X_seq_test=X_test_seq,
+                        X_ctx_test=X_test_ctx,
+                        y_test=y_test,
+                        initial_weights=(prior_weights.get(model_name) if resolved_adaptation_mode in ("warm", "continual") else None),
+                        weight_sink=weight_sink,
+                        adaptation_mode=resolved_adaptation_mode,
+                    )
+                except Exception as exc:
+                    logger.warning("Deep backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                    continue
+                if resolved_adaptation_mode in ("warm", "continual") and "weights" in weight_sink:
+                    prior_weights[model_name] = weight_sink["weights"]
+                results.append(row)
+                logger.info(
+                    "[BACKTEST] fold=%d model=%s type=%s adaptation=%s top1=%.4f top5=%s",
+                    row.fold,
+                    row.model_name,
+                    row.model_type,
+                    row.adaptation_mode,
+                    row.top1,
+                    f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
+                )
+            previous_test_end = window.raw_test_end
+
+    if results:
+        runtime_by_model: dict[str, list[float]] = {}
+        for row in results:
+            runtime_by_model.setdefault(row.model_name, []).append(float(row.fit_seconds))
+        summary_parts = []
+        for model_name, timings in sorted(
+            runtime_by_model.items(),
+            key=lambda item: (float(np.mean(item[1])), item[0]),
+            reverse=True,
+        ):
+            summary_parts.append(f"{model_name}={float(np.mean(timings)):.2f}s")
+        logger.info("Backtest runtime summary: %s", ", ".join(summary_parts))
+
+    artifact_paths = write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
+    if cache_enabled and cache_paths is not None:
+        _save_temporal_backtest_result_to_cache(
+            cache_paths=cache_paths,
+            cache_payload=cache_payload,
+            results=results,
+            artifact_paths=artifact_paths,
+        )
+
+    return results

@@ -232,6 +232,8 @@ def test_run_classical_benchmarks_reuses_cached_results_without_refitting(tmp_pa
     assert results[0].val_top1 == 0.5
     assert (output_dir / "estimators" / "classical_logreg.joblib").read_bytes() == b"classical-estimator"
     assert (output_dir / "prediction_bundles" / "classical_logreg.npz").exists()
+    assert (output_dir / "estimators" / "classical_logreg.joblib").samefile(cache_paths.estimator_artifact_path)
+    assert (output_dir / "prediction_bundles" / "classical_logreg.npz").samefile(cache_paths.prediction_bundle_path)
     assert (output_dir / "classical_results.json").exists()
     assert cache_stats == {
         "enabled": True,

@@ -783,3 +783,41 @@ Validation gate:
 - `bash -n scripts/run_everything.sh scripts/run_fast.sh` passed.
 - `.venv/bin/ruff check` passed on the touched Python files and tests.
 - `PYTHONPATH=/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify .venv/bin/pytest -q tests/test_training_cache.py tests/test_tuning_cache.py tests/test_runtime_acceleration.py` passed.
+
+### Analysis Artifact Replay And Safe Postrun Gating
+
+Scope:
+- Added a shared run-relative artifact replay layer in `spotify/pipeline_artifact_cache.py`.
+- Wired `spotify/pipeline_runtime_analysis_artifacts.py` to cache and replay these run-specific analysis phases when the prepared-data fingerprint and semantic result rows match:
+  - `extended_evaluation`
+  - `drift_diagnostics`
+  - `robustness_slice_evaluation`
+  - `policy_simulation`
+  - `friction_proxy_analysis`
+  - `moonshot_lab`
+- The cache keys deliberately normalize result rows to ignore run-specific absolute artifact paths and transient timing fields so stable reruns can actually hit.
+- Added safe postrun reuse in `spotify/pipeline_postrun_reporting.py` for the run-independent research summaries under `analysis/`:
+  - `ablation_summary`
+  - `backtest_significance`
+- Kept run-id-bearing postrun artifacts live:
+  - `benchmark_protocol`
+  - `experiment_registry`
+  - `run_report`
+  - `control_room_report`
+  This avoids restoring stale `run_id` / timestamp content into a fresh run directory.
+
+Measured / deterministic impact:
+- The phase-elimination behavior is deterministic on unchanged reruns:
+  - second-run analysis replay now executes `0/5` of the expensive enabled analysis builders in the cache test harness
+  - second-run postrun replay now executes `0/2` of the cached research-summary writers in the cache test harness
+- This pass is intentionally about removing repeated work rather than claiming a synthetic wall-clock speedup number that would understate or overstate the real value. The real savings scale directly with how expensive those diagnostics and summaries are in your actual pipeline runs.
+
+Interpretation:
+- Stable reruns no longer need to recompute the heavy diagnostics tail just because they are writing into a new run directory.
+- Postrun is now partially fingerprint-gated in a safe way: only the summaries that do not embed fresh run identity are replayed.
+- The remaining live postrun steps are the ones that either append to shared history or intentionally reflect the current run identity.
+
+Validation gate:
+- `python3 -m py_compile` passed on `spotify/pipeline_artifact_cache.py`, `spotify/pipeline_runtime_analysis_artifacts.py`, `spotify/pipeline_postrun_reporting.py`, `spotify/pipeline_postrun_stages.py`, and the new tests.
+- `.venv/bin/ruff check` passed on the touched Python files and tests.
+- `PYTHONPATH=/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify .venv/bin/pytest -q tests/test_pipeline_runtime_analysis_artifacts.py tests/test_reporting_and_evaluation.py tests/test_pipeline_runtime_experiments.py tests/test_pipeline_runtime_shortlists.py` passed.

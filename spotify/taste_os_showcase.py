@@ -60,7 +60,7 @@ NARRATIVE_GUARDRAILS: tuple[str, ...] = (
     "Prefer one clear comparison artifact over many raw run dumps; readability matters more than exhaustiveness here.",
 )
 
-_SHOWCASE_REUSE_VERSION = 1
+_SHOWCASE_REUSE_VERSION = 2
 
 
 def _parse_args() -> argparse.Namespace:

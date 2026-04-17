@@ -154,6 +154,10 @@ def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
     guardrail_payload = json.loads((run_dir / "analysis" / "robustness_guardrails.json").read_text(encoding="utf-8"))
     assert guardrail_payload["segment"] == "repeat_from_prev"
     assert guardrail_payload["bucket"] == "new"
+    summary_csv_lines = (run_dir / "analysis" / "robustness_summary.csv").read_text(encoding="utf-8").splitlines()
+    guardrail_csv_lines = (run_dir / "analysis" / "robustness_guardrails.csv").read_text(encoding="utf-8").splitlines()
+    assert summary_csv_lines[0].startswith("model_name,model_type,operational_model,")
+    assert guardrail_csv_lines[0].startswith("model_name,model_type,operational_model,")
 
 def test_backtest_warm_adaptation_reuses_previous_weights(tmp_path: Path, monkeypatch) -> None:
     data = _prepared_data()

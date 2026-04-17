@@ -5,6 +5,7 @@ import csv
 import filecmp
 import importlib
 import json
+import os
 from pathlib import Path
 import shutil
 from datetime import datetime
@@ -97,6 +98,44 @@ def copy_file_if_changed(source: Path, destination: Path) -> Path:
                 return destination
         except Exception:
             pass
+    shutil.copy2(source, destination)
+    return destination
+
+
+def materialize_cached_file(source: Path, destination: Path) -> Path:
+    if not source.exists():
+        raise FileNotFoundError(f"Source file not found: {source}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        try:
+            if source.samefile(destination):
+                return destination
+        except Exception:
+            pass
+        try:
+            if destination.exists() and filecmp.cmp(source, destination, shallow=False):
+                return destination
+        except Exception:
+            pass
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+
+    try:
+        os.link(source, destination)
+        return destination
+    except Exception:
+        pass
+
+    try:
+        relative_source = os.path.relpath(source, start=destination.parent)
+        destination.symlink_to(relative_source)
+        return destination
+    except Exception:
+        pass
+
     shutil.copy2(source, destination)
     return destination
 

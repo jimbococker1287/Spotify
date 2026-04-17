@@ -43,18 +43,18 @@ fi
 ALERT_EXIT=0
 GUARD_EXIT=0
 LATEST_RUN_DIR="$("$PYTHON_CMD" -c 'from pathlib import Path; from spotify.run_artifacts import latest_manifest_run_dir; path = latest_manifest_run_dir(Path("outputs")); print("" if path is None else path)' || true)"
-ALERT_ARGS=()
 
 if [[ -z "$LATEST_RUN_DIR" || ! -d "$LATEST_RUN_DIR" ]]; then
   echo "Unable to resolve the latest manifest-backed run directory under outputs/runs" >&2
   exit 1
 fi
 
+ALERT_CMD=("$PYTHON_CMD" scripts/regression_alert.py --run-dir "$LATEST_RUN_DIR" --review-threshold off)
 if [[ "$MODE" == "fast" ]]; then
-  ALERT_ARGS+=(--allow-fail)
+  ALERT_CMD+=(--allow-fail)
 fi
 
-"$PYTHON_CMD" scripts/regression_alert.py --run-dir "$LATEST_RUN_DIR" --review-threshold off "${ALERT_ARGS[@]}" || ALERT_EXIT=$?
+"${ALERT_CMD[@]}" || ALERT_EXIT=$?
 "$PYTHON_CMD" scripts/control_room_guard.py \
   --run-dir "$LATEST_RUN_DIR" \
   --max-robustness-gap "$CONTROL_ROOM_MAX_ROBUSTNESS_GAP" \

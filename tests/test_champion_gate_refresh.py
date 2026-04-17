@@ -28,6 +28,7 @@ def _build_completed_run(outputs_dir: Path) -> tuple[Path, str]:
     run_dir = outputs_dir / "runs" / run_id
     (run_dir / "analysis").mkdir(parents=True, exist_ok=True)
     (run_dir / "prediction_bundles").mkdir(parents=True, exist_ok=True)
+    (run_dir / "estimators").mkdir(parents=True, exist_ok=True)
     cache_path = outputs_dir / "cache" / "prepared_data" / "fixture" / "prepared_bundle.joblib"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(
@@ -56,6 +57,8 @@ def _build_completed_run(outputs_dir: Path) -> tuple[Path, str]:
             dtype="float32",
         ),
     )
+    estimator_path = run_dir / "estimators" / "classical_extra_trees.joblib"
+    estimator_path.write_bytes(b"estimator")
     run_results = [
         {
             "model_name": "extra_trees",
@@ -63,6 +66,7 @@ def _build_completed_run(outputs_dir: Path) -> tuple[Path, str]:
             "val_top1": 0.42,
             "test_top1": 0.31,
             "prediction_bundle_path": str(bundle_path),
+            "estimator_artifact_path": str(estimator_path),
         }
     ]
     gate_payload = {
@@ -177,6 +181,33 @@ def test_champion_gate_refresh_module_updates_existing_run(tmp_path: Path) -> No
     assert "challenger=extra_trees" in result.stdout
     assert f"challenger_selective_risk={gate_payload['challenger_selective_risk']}" in result.stdout
     assert gate_payload["challenger_selective_risk"] >= 0.0
+
+
+def test_refresh_champion_gate_updates_alias_when_refresh_promotes(tmp_path: Path) -> None:
+    outputs_dir = tmp_path / "outputs"
+    run_dir, run_id = _build_completed_run(outputs_dir)
+    gate_payload = safe_read_json(run_dir / "champion_gate.json", default={})
+    gate_payload["max_selective_risk"] = 1.0
+    gate_payload["max_abstention_rate"] = 1.0
+    write_json(run_dir / "champion_gate.json", gate_payload)
+
+    manifest_payload = safe_read_json(run_dir / "run_manifest.json", default={})
+    manifest_payload["champion_gate"] = gate_payload
+    write_json(run_dir / "run_manifest.json", manifest_payload)
+
+    payload = refresh_champion_gate(
+        outputs_dir=outputs_dir,
+        run_dir=run_dir,
+        refresh_control_room=False,
+    )
+
+    alias_payload = safe_read_json(outputs_dir / "models" / "champion" / "alias.json", default={})
+    refreshed_manifest = safe_read_json(run_dir / "run_manifest.json", default={})
+    assert payload["promoted"] is True
+    assert payload["champion_alias_updated"] is True
+    assert alias_payload["run_id"] == run_id
+    assert alias_payload["model_name"] == "extra_trees"
+    assert refreshed_manifest["champion_alias"]["updated"] is True
 
 
 def test_load_run_backtest_rows_prefers_local_backtest_artifact(tmp_path: Path) -> None:

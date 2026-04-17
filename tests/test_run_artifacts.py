@@ -7,6 +7,7 @@ from pathlib import Path
 from spotify.run_artifacts import (
     collect_run_manifests,
     latest_manifest_run_dir,
+    materialize_cached_file,
     safe_read_json,
     write_csv_rows,
     write_json,
@@ -83,3 +84,15 @@ def test_write_csv_rows_infers_fieldnames_in_first_seen_order(tmp_path: Path) ->
         "1,2,",
         ",3,4",
     ]
+
+
+def test_materialize_cached_file_reuses_same_underlying_artifact(tmp_path: Path) -> None:
+    source = tmp_path / "cache" / "artifact.bin"
+    destination = tmp_path / "run" / "artifact.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"cached-artifact")
+
+    materialize_cached_file(source, destination)
+
+    assert destination.exists()
+    assert destination.samefile(source)

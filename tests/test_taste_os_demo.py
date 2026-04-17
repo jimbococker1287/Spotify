@@ -268,6 +268,7 @@ def test_surface_reranked_indices_matches_full_sort_union_logic() -> None:
         "continuity": rng.random(512, dtype="float32"),
         "arc_affinity": rng.random(512, dtype="float32"),
         "freshness": rng.random(512, dtype="float32"),
+        "novelty": rng.random(512, dtype="float32"),
     }
     mode = MODE_CONFIGS["focus"]
     top_k = 6
@@ -296,6 +297,13 @@ def test_surface_reranked_indices_matches_full_sort_union_logic() -> None:
         _percentile_ranks(metric_arrays["transition_support"][shortlist]),
         dtype="float64",
     )
+    novelty_alignment = np.asarray(
+        _target_alignment(
+            _percentile_ranks(metric_arrays["novelty"][shortlist]),
+            target=mode.surface_novelty_target,
+        ),
+        dtype="float64",
+    )
     continuity_alignment = np.asarray(
         _target_alignment(
             _percentile_ranks(metric_arrays["continuity"][shortlist]),
@@ -320,6 +328,7 @@ def test_surface_reranked_indices_matches_full_sort_union_logic() -> None:
     surface = (
         float(mode.surface_probability_weight) * prob_ranks
         + float(mode.surface_transition_weight) * transition_ranks
+        + float(mode.surface_novelty_weight) * novelty_alignment
         + float(mode.surface_continuity_weight) * continuity_alignment
         + float(mode.surface_arc_weight) * arc_alignment
         + float(mode.surface_freshness_weight) * freshness_alignment

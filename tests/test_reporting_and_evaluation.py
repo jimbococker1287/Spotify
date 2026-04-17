@@ -3,11 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
+import logging
 
 import pandas as pd
 
 from spotify.evaluation import _build_label_lookup
+from spotify.pipeline_postrun_reporting import write_research_artifacts
 from spotify.reporting import persist_to_sqlite, restore_deep_reporting_artifacts, save_deep_reporting_artifacts
+from spotify.run_timing import RunPhaseRecorder
+
+
+def _logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    return logger
 
 
 def test_build_label_lookup_returns_sorted_first_seen_names() -> None:
@@ -133,3 +143,78 @@ def test_deep_reporting_cache_round_trip_restores_artifacts(tmp_path: Path, monk
     assert restored_db_path == db_path
     for path, payload in original_payloads.items():
         assert path.read_bytes() == payload
+
+
+def test_write_research_artifacts_reuses_cached_analysis_summaries(tmp_path: Path) -> None:
+    counters = {
+        "benchmark_protocol": 0,
+        "experiment_registry": 0,
+        "ablation": 0,
+        "significance": 0,
+    }
+
+    def _write_file(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _write_benchmark_protocol(*, output_dir: Path, run_id: str, **_kwargs):
+        counters["benchmark_protocol"] += 1
+        return [
+            _write_file(output_dir / "benchmark_protocol.json", f"json-{run_id}"),
+            _write_file(output_dir / "benchmark_protocol.md", f"md-{run_id}"),
+        ]
+
+    def _write_experiment_registry(*, output_dir: Path, run_id: str, **_kwargs):
+        counters["experiment_registry"] += 1
+        return _write_file(output_dir / "experiment_registry.json", f"registry-{run_id}")
+
+    def _write_ablation_summary(*, output_dir: Path, **_kwargs):
+        counters["ablation"] += 1
+        return [
+            _write_file(output_dir / "ablation_summary.csv", "csv"),
+            _write_file(output_dir / "ablation_summary.json", "json"),
+        ]
+
+    def _write_significance_summary(*, output_dir: Path, **_kwargs):
+        counters["significance"] += 1
+        return [
+            _write_file(output_dir / "backtest_significance.csv", "csv"),
+            _write_file(output_dir / "backtest_significance.json", "json"),
+        ]
+
+    def _run_once(run_dir: Path, run_id: str) -> list[Path]:
+        artifact_paths: list[Path] = []
+        write_research_artifacts(
+            artifact_paths=artifact_paths,
+            backtest_rows=[{"model_name": "dense", "fold": 1, "top1": 0.55}],
+            cache_info_payload={"fingerprint": "prepared123"},
+            config=SimpleNamespace(output_dir=tmp_path / "outputs", profile="full"),
+            data=SimpleNamespace(),
+            logger=_logger(f"research-{run_id}"),
+            phase_recorder=RunPhaseRecorder(run_id=run_id),
+            result_rows=[{"model_name": "dense", "model_type": "deep", "val_top1": 0.61, "test_top1": 0.58}],
+            run_dir=run_dir,
+            run_id=run_id,
+            write_ablation_summary=_write_ablation_summary,
+            write_benchmark_protocol=_write_benchmark_protocol,
+            write_experiment_registry=_write_experiment_registry,
+            write_significance_summary=_write_significance_summary,
+        )
+        return artifact_paths
+
+    first_run_dir = tmp_path / "outputs" / "runs" / "run_a"
+    second_run_dir = tmp_path / "outputs" / "runs" / "run_b"
+    _run_once(first_run_dir, "run_a")
+    _run_once(second_run_dir, "run_b")
+
+    assert counters == {
+        "benchmark_protocol": 2,
+        "experiment_registry": 2,
+        "ablation": 1,
+        "significance": 1,
+    }
+    assert (second_run_dir / "analysis" / "ablation_summary.csv").exists()
+    assert (second_run_dir / "analysis" / "ablation_summary.json").exists()
+    assert (second_run_dir / "analysis" / "backtest_significance.csv").exists()
+    assert (second_run_dir / "analysis" / "backtest_significance.json").exists()

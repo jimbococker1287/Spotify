@@ -14,7 +14,7 @@ import numpy as np
 from .data import PreparedData
 from .probability_bundles import align_proba_to_num_classes, save_prediction_bundle
 from .ranking import ranking_metrics_from_proba
-from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+from .run_artifacts import copy_file_if_changed, materialize_cached_file, safe_read_json, write_json
 
 
 CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v1"
@@ -237,7 +237,7 @@ def _load_cached_classical_result(
         if result_payload.get("estimator_artifact_path"):
             if not cache_paths.estimator_artifact_path.exists():
                 return None
-            copy_file_if_changed(cache_paths.estimator_artifact_path, estimator_output_path)
+            materialize_cached_file(cache_paths.estimator_artifact_path, estimator_output_path)
             result_payload["estimator_artifact_path"] = str(estimator_output_path.resolve())
         else:
             result_payload["estimator_artifact_path"] = ""
@@ -245,7 +245,7 @@ def _load_cached_classical_result(
         if result_payload.get("prediction_bundle_path"):
             if not cache_paths.prediction_bundle_path.exists():
                 return None
-            copy_file_if_changed(cache_paths.prediction_bundle_path, prediction_output_path)
+            materialize_cached_file(cache_paths.prediction_bundle_path, prediction_output_path)
             result_payload["prediction_bundle_path"] = str(prediction_output_path.resolve())
         else:
             result_payload["prediction_bundle_path"] = ""

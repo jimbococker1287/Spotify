@@ -15,7 +15,7 @@ from sklearn.utils import class_weight
 from .data import PreparedData
 from .probability_bundles import save_prediction_bundle
 from .ranking import ranking_metrics_from_proba
-from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+from .run_artifacts import copy_file_if_changed, materialize_cached_file, safe_read_json, write_json
 
 
 DEEP_TRAINING_CACHE_SCHEMA_VERSION = "deep-training-cache-v1"
@@ -498,8 +498,8 @@ def _load_cached_deep_artifact(
     try:
         checkpoint_dest = output_dir / f"best_{model_name}.keras"
         prediction_dest = output_dir / "prediction_bundles" / f"deep_{model_name}.npz"
-        copy_file_if_changed(cache_paths.checkpoint_path, checkpoint_dest)
-        copy_file_if_changed(cache_paths.prediction_bundle_path, prediction_dest)
+        materialize_cached_file(cache_paths.checkpoint_path, checkpoint_dest)
+        materialize_cached_file(cache_paths.prediction_bundle_path, prediction_dest)
         fit_seconds = float(result_payload.get("fit_seconds", float("nan")))
     except Exception as exc:
         logger.warning("Deep-training cache load failed for %s (%s). Rebuilding.", model_name, exc)
@@ -702,8 +702,13 @@ def train_and_evaluate_models(
     else:
         steps_per_execution = _parse_pos_int(steps_per_execution_raw, 1 if run_eagerly else 64)
 
-    model_builders = list(model_builders)
-    selected_model_names = [name for name, _builder in model_builders]
+    model_builders = list(model_builders or [])
+    if model_builders:
+        selected_model_names = [name for name, _builder in model_builders]
+    elif cache_plan is not None:
+        selected_model_names = list(cache_plan.hit_model_names) + list(cache_plan.miss_model_names)
+    else:
+        selected_model_names = []
     resolved_cache_plan = cache_plan or resolve_cached_deep_training_artifacts(
         data=data,
         selected_model_names=tuple(selected_model_names),
@@ -722,6 +727,11 @@ def train_and_evaluate_models(
     prediction_bundle_paths.update(resolved_cache_plan.artifacts.prediction_bundle_paths)
     cache_contexts = dict(resolved_cache_plan.cache_contexts)
     uncached_model_names = set(resolved_cache_plan.miss_model_names)
+    if uncached_model_names and not model_builders:
+        raise ValueError(
+            "Deep cache misses require model_builders, but none were provided for: "
+            + ", ".join(sorted(uncached_model_names))
+        )
     uncached_model_builders = [(name, builder) for name, builder in model_builders if name in uncached_model_names]
     sequence_length = int(data.X_seq_train.shape[1]) if getattr(data.X_seq_train, "ndim", 0) >= 2 else 0
     warm_start_candidates = {

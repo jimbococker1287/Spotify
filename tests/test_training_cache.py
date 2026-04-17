@@ -144,12 +144,107 @@ def test_train_and_evaluate_models_reuses_cached_deep_artifacts_without_tensorfl
     assert artifacts.prediction_bundle_paths[model_name] == str(output_dir / "prediction_bundles" / "deep_dense.npz")
     assert (output_dir / "best_dense.keras").exists()
     assert (output_dir / "prediction_bundles" / "deep_dense.npz").exists()
+    assert (output_dir / "best_dense.keras").samefile(cache_paths.checkpoint_path)
+    assert (output_dir / "prediction_bundles" / "deep_dense.npz").samefile(cache_paths.prediction_bundle_path)
     assert cache_stats == {
         "enabled": True,
         "fingerprint": cache_fingerprint,
         "hit_model_names": ["dense"],
         "miss_model_names": [],
     }
+
+
+def test_train_and_evaluate_models_accepts_none_builders_on_full_cache_hit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPOTIFY_CACHE_DEEP", "1")
+
+    data = _prepared_data()
+    cache_root = tmp_path / "cache"
+    output_dir = tmp_path / "run"
+    cache_fingerprint = "prepared123"
+    model_name = "dense"
+    cache_payload = training._build_deep_cache_payload(
+        cache_fingerprint=cache_fingerprint,
+        model_name=model_name,
+        random_seed=42,
+        batch_size=32,
+        epochs=2,
+        sequence_length=int(data.X_seq_train.shape[1]),
+        num_artists=int(data.num_artists),
+        num_ctx=int(data.num_ctx),
+    )
+    cache_key = training._build_deep_cache_key(cache_payload)
+    cache_paths = training._resolve_deep_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        model_name=model_name,
+        cache_key=cache_key,
+    )
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_paths.checkpoint_path.write_bytes(b"keras")
+    save_prediction_bundle(
+        cache_paths.prediction_bundle_path,
+        val_proba=np.asarray([[0.2, 0.7, 0.1]], dtype="float32"),
+        test_proba=np.asarray([[0.6, 0.3, 0.1]], dtype="float32"),
+    )
+    training.write_json(
+        cache_paths.result_path,
+        {
+            "cache_schema_version": training.DEEP_TRAINING_CACHE_SCHEMA_VERSION,
+            "result": {
+                "history": {
+                    "loss": [1.0],
+                    "val_loss": [0.8],
+                    "val_sparse_categorical_accuracy": [0.6],
+                    "val_top_5": [0.9],
+                },
+                "val_metrics": {"top1": 0.6, "top5": 0.9},
+                "test_metrics": {"top1": 0.5, "top5": 0.8},
+                "fit_seconds": 12.5,
+            },
+        },
+    )
+    training.write_json(cache_paths.metadata_path, cache_payload)
+    cache_plan = training.resolve_cached_deep_training_artifacts(
+        data=data,
+        selected_model_names=(model_name,),
+        batch_size=32,
+        epochs=2,
+        output_dir=output_dir,
+        logger=_logger("spotify.test.training.cache.plan"),
+        random_seed=42,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+    )
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tensorflow" or name.startswith("tensorflow."):
+            raise AssertionError("TensorFlow should not be imported on a deep cache hit")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    artifacts = training.train_and_evaluate_models(
+        data=data,
+        model_builders=None,
+        batch_size=32,
+        epochs=2,
+        output_dir=output_dir,
+        strategy=None,
+        logger=_logger("spotify.test.training.cache.none_builders"),
+        random_seed=42,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        cache_plan=cache_plan,
+    )
+
+    assert list(artifacts.histories) == [model_name]
+    assert artifacts.val_metrics[model_name]["top1"] == 0.6
+    assert artifacts.test_metrics[model_name]["top5"] == 0.8
 
 
 def test_select_deep_screened_model_names_keeps_best_probe_scores() -> None:

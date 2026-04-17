@@ -3,6 +3,7 @@ from __future__ import annotations
 from spotify.champion_alias import (
     best_deep_model_name,
     best_serveable_model,
+    preferred_serveable_model,
     read_champion_alias,
     resolve_prediction_run_dir,
     write_champion_alias,
@@ -75,3 +76,35 @@ def test_best_serveable_model_prefers_highest_valid_row(tmp_path) -> None:
     ]
 
     assert best_serveable_model(result_rows, run_dir=run_dir) == ("mlp", "classical")
+
+
+def test_preferred_serveable_model_uses_requested_promoted_model_when_valid(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    retrieval_path = run_dir / "retrieval" / "retrieval_reranker.joblib"
+    retrieval_path.parent.mkdir(parents=True)
+    retrieval_path.write_bytes(b"stub")
+    estimator_path = run_dir / "estimators" / "classical_mlp.joblib"
+    estimator_path.parent.mkdir(parents=True)
+    estimator_path.write_bytes(b"stub")
+
+    result_rows = [
+        {
+            "model_name": "mlp",
+            "model_type": "classical",
+            "val_top1": 0.60,
+            "estimator_artifact_path": str(estimator_path),
+        },
+        {
+            "model_name": "retrieval_reranker",
+            "model_type": "retrieval_reranker",
+            "val_top1": 0.55,
+            "retrieval_artifact_path": str(retrieval_path),
+        },
+    ]
+
+    assert preferred_serveable_model(
+        result_rows,
+        run_dir=run_dir,
+        preferred_model_name="retrieval_reranker",
+    ) == ("retrieval_reranker", "retrieval_reranker")
