@@ -203,6 +203,7 @@ def run_moonshot_lab(
         "stress_worst_end_risk": _safe_float(worst_safe_row.get("mean_end_risk")),
         "stress_benchmark_scenario": str((stress_benchmark or {}).get("benchmark_scenario", "")),
         "stress_benchmark_policy_name": str((stress_benchmark or {}).get("benchmark_policy_name", "")),
+        "stress_benchmark_selected_policy_name": str((stress_benchmark or {}).get("benchmark_selected_policy_name", "")),
         "stress_benchmark_reference_policy_name": str((stress_benchmark or {}).get("reference_policy_name", "")),
         "stress_benchmark_skip_risk": _safe_float((stress_benchmark or {}).get("skip_risk")),
         "stress_benchmark_end_risk": _safe_float((stress_benchmark or {}).get("end_risk")),

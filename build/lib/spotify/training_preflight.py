@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .data import PreparedData
-from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+from .run_artifacts import copy_file_if_changed, materialize_cached_file, safe_read_json, write_json
 
 
 DEEP_TRAINING_CACHE_SCHEMA_VERSION = "deep-training-cache-v1"
@@ -212,8 +212,8 @@ def _load_cached_deep_artifact(
     try:
         checkpoint_dest = output_dir / f"best_{model_name}.keras"
         prediction_dest = output_dir / "prediction_bundles" / f"deep_{model_name}.npz"
-        copy_file_if_changed(cache_paths.checkpoint_path, checkpoint_dest)
-        copy_file_if_changed(cache_paths.prediction_bundle_path, prediction_dest)
+        materialize_cached_file(cache_paths.checkpoint_path, checkpoint_dest)
+        materialize_cached_file(cache_paths.prediction_bundle_path, prediction_dest)
         fit_seconds = float(result_payload.get("fit_seconds", float("nan")))
     except Exception as exc:
         logger.warning("Deep-training cache load failed for %s (%s). Rebuilding.", model_name, exc)

@@ -51,6 +51,8 @@ class ModeConfig:
     surface_arc_weight: float
     surface_freshness_target: float
     surface_freshness_weight: float
+    surface_novelty_target: float
+    surface_novelty_weight: float
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         surface_arc_weight=0.18,
         surface_freshness_target=0.30,
         surface_freshness_weight=0.12,
+        surface_novelty_target=0.28,
+        surface_novelty_weight=0.06,
     ),
     "workout": ModeConfig(
         name="workout",
@@ -131,6 +135,8 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         surface_arc_weight=0.12,
         surface_freshness_target=0.74,
         surface_freshness_weight=0.30,
+        surface_novelty_target=0.72,
+        surface_novelty_weight=0.10,
     ),
     "commute": ModeConfig(
         name="commute",
@@ -159,6 +165,8 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         surface_arc_weight=0.14,
         surface_freshness_target=0.48,
         surface_freshness_weight=0.12,
+        surface_novelty_target=0.46,
+        surface_novelty_weight=0.05,
     ),
     "discovery": ModeConfig(
         name="discovery",
@@ -187,6 +195,8 @@ MODE_CONFIGS: dict[str, ModeConfig] = {
         surface_arc_weight=0.12,
         surface_freshness_target=0.88,
         surface_freshness_weight=0.44,
+        surface_novelty_target=0.94,
+        surface_novelty_weight=0.18,
     ),
 }
 
@@ -338,6 +348,14 @@ def _surface_reranked_indices(
 
     prob_ranks = _percentile_ranks(np.asarray(probs, dtype="float64")[shortlist])
     transition_ranks = _percentile_ranks(np.asarray(metric_arrays["transition_support"], dtype="float64")[shortlist])
+    novelty_values = np.asarray(
+        metric_arrays.get("novelty", np.zeros(candidate_count, dtype="float32")),
+        dtype="float64",
+    )
+    novelty_alignment = _target_alignment(
+        _percentile_ranks(novelty_values[shortlist]),
+        target=mode.surface_novelty_target,
+    )
     continuity_alignment = _target_alignment(
         _percentile_ranks(np.asarray(metric_arrays["continuity"], dtype="float64")[shortlist]),
         target=mode.surface_continuity_target,
@@ -354,6 +372,7 @@ def _surface_reranked_indices(
     surface = (
         float(mode.surface_probability_weight) * np.asarray(prob_ranks, dtype="float64")
         + float(mode.surface_transition_weight) * np.asarray(transition_ranks, dtype="float64")
+        + float(mode.surface_novelty_weight) * np.asarray(novelty_alignment, dtype="float64")
         + float(mode.surface_continuity_weight) * np.asarray(continuity_alignment, dtype="float64")
         + float(mode.surface_arc_weight) * np.asarray(arc_alignment, dtype="float64")
         + float(mode.surface_freshness_weight) * np.asarray(freshness_alignment, dtype="float64")
@@ -571,6 +590,10 @@ def _candidate_rows(
         multimodal_space=multimodal_space,
         digital_twin=digital_twin,
     )
+    metric_arrays = {
+        **metric_arrays,
+        "novelty": np.asarray(1.0 - multimodal_space.popularity, dtype="float32"),
+    }
     top_indices, surface_map = _surface_reranked_indices(
         probs=probs,
         adjusted_scores=adjusted,

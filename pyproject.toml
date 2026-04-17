@@ -60,6 +60,9 @@ include-package-data = true
 where = ["."]
 include = ["spotify*"]
 
+[tool.setuptools.exclude-package-data]
+"*" = [".DS_Store", "* 2.py"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

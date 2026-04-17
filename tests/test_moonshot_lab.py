@@ -114,6 +114,7 @@ def test_moonshot_lab_writes_component_artifacts_and_root_summary(tmp_path: Path
     assert str(payload["stress_worst_safe_policy"]).startswith("safe_")
     assert payload["stress_benchmark_scenario"] == "evening_drift"
     assert payload["stress_benchmark_policy_name"] == "safe_global"
+    assert str(payload["stress_benchmark_selected_policy_name"]).startswith("safe_routed_evening")
 
 
 def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:

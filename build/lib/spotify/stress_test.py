@@ -111,11 +111,12 @@ def _scenario_safe_policy(
 
 
 def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
+    canonical_safe_policy_name = "safe_global"
     benchmark_scenario = _resolve_env_name(
         "SPOTIFY_STRESS_BENCHMARK_SCENARIO",
         DEFAULT_STRESS_BENCHMARK_SCENARIO,
     )
-    benchmark_policy = _resolve_env_name(
+    requested_policy = _resolve_env_name(
         "SPOTIFY_STRESS_BENCHMARK_POLICY",
         DEFAULT_STRESS_BENCHMARK_POLICY,
     )
@@ -125,7 +126,8 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
     )
     policy_selection_mode = "exact_match"
     benchmark_row: dict[str, object] = {}
-    if benchmark_policy in {"safe_routed", "scenario_safe", "auto"}:
+    selected_policy_name = requested_policy
+    if requested_policy in {"safe_routed", "scenario_safe", "auto"}:
         routed_rows = [
             row
             for row in rows
@@ -134,7 +136,7 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
         ]
         if routed_rows:
             benchmark_row = min(routed_rows, key=lambda row: _safe_float(row.get("mean_skip_risk")))
-            benchmark_policy = str(benchmark_row.get("policy_name", "")).strip() or benchmark_policy
+            selected_policy_name = str(benchmark_row.get("policy_name", "")).strip() or requested_policy
             policy_selection_mode = "scenario_routed_alias"
     if not benchmark_row:
         benchmark_row = next(
@@ -142,10 +144,16 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
                 row
                 for row in rows
                 if str(row.get("scenario", "")).strip() == benchmark_scenario
-                and str(row.get("policy_name", "")).strip() == benchmark_policy
+                and str(row.get("policy_name", "")).strip() == requested_policy
             ),
             {},
         )
+        selected_policy_name = str(benchmark_row.get("policy_name", "")).strip() or requested_policy
+    benchmark_policy = (
+        canonical_safe_policy_name
+        if selected_policy_name.startswith("safe_")
+        else selected_policy_name
+    )
     reference_row = next(
         (
             row
@@ -176,6 +184,8 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
     return {
         "benchmark_scenario": benchmark_scenario,
         "benchmark_policy_name": benchmark_policy,
+        "benchmark_selected_policy_name": selected_policy_name,
+        "benchmark_requested_policy_name": requested_policy,
         "benchmark_policy_selection_mode": policy_selection_mode,
         "reference_policy_name": reference_policy,
         "available": bool(benchmark_row),
@@ -401,6 +411,8 @@ def run_stress_test_lab(
         [
             "benchmark_scenario",
             "benchmark_policy_name",
+            "benchmark_selected_policy_name",
+            "benchmark_requested_policy_name",
             "benchmark_policy_selection_mode",
             "reference_policy_name",
             "available",
@@ -424,7 +436,7 @@ def run_stress_test_lab(
         logger.info(
             "Stress-test benchmark scenario=%s policy=%s skip_risk=%.4f delta_vs_%s=%.4f",
             benchmark_payload["benchmark_scenario"],
-            benchmark_payload["benchmark_policy_name"],
+            benchmark_payload.get("benchmark_selected_policy_name") or benchmark_payload["benchmark_policy_name"],
             benchmark_payload["skip_risk"],
             benchmark_payload["reference_policy_name"],
             benchmark_payload["skip_risk_delta_vs_reference"],

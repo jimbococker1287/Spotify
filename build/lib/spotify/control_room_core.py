@@ -194,11 +194,13 @@ def _resolve_stress_benchmark(
         return {}
     benchmark_scenario = str(moonshot_summary.get("stress_benchmark_scenario", "")).strip()
     benchmark_policy = str(moonshot_summary.get("stress_benchmark_policy_name", "")).strip()
+    benchmark_selected_policy = str(moonshot_summary.get("stress_benchmark_selected_policy_name", "")).strip()
     if not benchmark_scenario or not benchmark_policy:
         return {}
     return {
         "benchmark_scenario": benchmark_scenario,
         "benchmark_policy_name": benchmark_policy,
+        "benchmark_selected_policy_name": benchmark_selected_policy,
         "reference_policy_name": str(moonshot_summary.get("stress_benchmark_reference_policy_name", "")).strip(),
         "available": True,
         "reference_available": bool(str(moonshot_summary.get("stress_benchmark_reference_policy_name", "")).strip()),
@@ -394,6 +396,7 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "stress_worst_skip_risk": _safe_float(moonshot_summary.get("stress_worst_skip_risk")) if isinstance(moonshot_summary, dict) else float("nan"),
         "stress_benchmark_scenario": str(stress_benchmark.get("benchmark_scenario", "")),
         "stress_benchmark_policy_name": str(stress_benchmark.get("benchmark_policy_name", "")),
+        "stress_benchmark_selected_policy_name": str(stress_benchmark.get("benchmark_selected_policy_name", "")),
         "stress_benchmark_skip_risk": _safe_float(stress_benchmark.get("skip_risk")),
         "stress_benchmark_skip_delta_vs_reference": _safe_float(stress_benchmark.get("skip_risk_delta_vs_reference")),
     }

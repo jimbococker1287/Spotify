@@ -192,8 +192,8 @@ def persist_to_sqlite(df, histories: dict[str, object], cpu_usage: list[float], 
 
         try:
             df.to_sql("spotify_history", conn, if_exists="replace", index=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Unable to persist spotify_history to SQLite at {db_path}") from exc
 
         cur.execute("DROP TABLE IF EXISTS final_accuracy")
         cur.execute("DROP TABLE IF EXISTS learning_curves")

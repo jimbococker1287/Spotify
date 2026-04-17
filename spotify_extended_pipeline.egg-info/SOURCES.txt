@@ -1,5 +1,6 @@
 README.md
 pyproject.toml
+setup.py
 spotify/__init__.py
 spotify/__main__.py
 spotify/analytics_db.py
@@ -29,7 +30,6 @@ spotify/control_room_selection.py
 spotify/control_room_triage.py
 spotify/creator_label_intelligence.py
 spotify/creator_label_intelligence_core.py
-spotify/data 2.py
 spotify/data.py
 spotify/data_preparation.py
 spotify/data_quality.py
@@ -161,7 +161,6 @@ spotify/serving.py
 spotify/session_knn.py
 spotify/storage_report.py
 spotify/stress_test.py
-spotify/taste_os_demo 2.py
 spotify/taste_os_demo.py
 spotify/taste_os_demo_core.py
 spotify/taste_os_http.py
