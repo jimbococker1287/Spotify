@@ -49,6 +49,9 @@ class PortfolioArtifactBundle:
     research_claims_json: Path
     research_claims_md: Path
     research_claims_payload: dict[str, Any]
+    research_publication_outline_md: Path | None
+    research_claim_support_md: Path | None
+    research_submission_readiness_md: Path | None
     safety_platform_contract_json: Path | None
     safety_platform_contract_md: Path | None
     safety_platform_contract_payload: dict[str, Any]
@@ -67,6 +70,9 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
     control_room_md = output_root / "analytics" / "control_room.md"
     research_claims_json = output_root / "analysis" / "research_claims" / "research_claims.json"
     research_claims_md = output_root / "analysis" / "research_claims" / "research_claims.md"
+    research_publication_outline_md = output_root / "analysis" / "research_claims" / "publication_outline.md"
+    research_claim_support_md = output_root / "analysis" / "research_claims" / "claim_support_matrix.md"
+    research_submission_readiness_md = output_root / "analysis" / "research_claims" / "submission_readiness.md"
 
     creator_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
     creator_manifest_paths = tuple(sorted(path for path in creator_dir.glob("*_report_family.json") if path.is_file()))
@@ -104,6 +110,12 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
     }
 
     research_claims_payload = _coerce_dict(safe_read_json(research_claims_json, default={}))
+    if not research_publication_outline_md.exists():
+        research_publication_outline_md = None
+    if not research_claim_support_md.exists():
+        research_claim_support_md = None
+    if not research_submission_readiness_md.exists():
+        research_submission_readiness_md = None
     research_run = _coerce_dict(research_claims_payload.get("run"))
     research_run_id = str(research_run.get("run_id", "")).strip()
     safety_platform_contract_json = (
@@ -153,6 +165,9 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         research_claims_json=research_claims_json,
         research_claims_md=research_claims_md,
         research_claims_payload=research_claims_payload,
+        research_publication_outline_md=research_publication_outline_md,
+        research_claim_support_md=research_claim_support_md,
+        research_submission_readiness_md=research_submission_readiness_md,
         safety_platform_contract_json=safety_platform_contract_json,
         safety_platform_contract_md=safety_platform_contract_md,
         safety_platform_contract_payload=safety_platform_contract_payload,

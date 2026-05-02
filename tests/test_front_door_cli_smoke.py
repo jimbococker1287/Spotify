@@ -40,9 +40,12 @@ def test_front_door_cli_smoke(tmp_path: Path) -> None:
     (creator / "scene.md").write_text("# Scene\n", encoding="utf-8")
     (creator / "seed.md").write_text("# Seed\n", encoding="utf-8")
     (creator / "scene_seed.md").write_text("# Scene Seed\n", encoding="utf-8")
+    (creator / "report_family.md").write_text("# Report Family\n", encoding="utf-8")
     (creator / "creator_report_family.json").write_text(
         '{"primary_report":"'
         + str((creator / "creator.md").resolve())
+        + '","artifact_index_markdown":"'
+        + str((creator / "report_family.md").resolve())
         + '","comparison_view_markdown":{"ranking_comparison":"'
         + str((creator / "ranking.md").resolve())
         + '","scene_comparison":"'
@@ -51,15 +54,26 @@ def test_front_door_cli_smoke(tmp_path: Path) -> None:
         + str((creator / "seed.md").resolve())
         + '","scene_seed_comparison":"'
         + str((creator / "scene_seed.md").resolve())
+        + '","opportunity_lane_comparison":"'
+        + str((creator / "scene_seed.md").resolve())
+        + '"},"brief_view_markdown":{"scene_strategy_watch":"'
+        + str((creator / "scene_seed.md").resolve())
         + '"}}',
         encoding="utf-8",
     )
     (analysis / "research_claims" / "research_claims.json").parent.mkdir(parents=True, exist_ok=True)
     (analysis / "research_claims" / "research_claims.json").write_text(
-        '{"run":{"run_id":"run_anchor"},"primary_claim":{"key":"shift_robustness","title":"Failure concentration","status":"analysis_ready","summary":"Repeated runs line up.","metrics":{"worst_robustness_gap":0.158,"consistent_slice_run_count":3,"repeated_run_count":3,"consistent_slice_rate":1.0,"target_drift_jsd":0.218,"selective_risk":0.439,"abstention_rate":0.463,"stress_skip_risk":0.439},"missing_checks":["mitigate repeat_from_prev=new"]},"backup_claim":{"key":"candidate_ranking","status":"promising_but_unlocked","summary":"Ranking is promising."},"benchmark_lock":{"benchmark_id":"smokebench-v3","comparison_ready":true},"believable_submission_path":true}',
+        '{"run":{"run_id":"run_anchor"},"primary_claim":{"key":"shift_robustness","title":"Failure concentration","status":"analysis_ready","summary":"Repeated runs line up.","metrics":{"worst_robustness_gap":0.158,"consistent_slice_run_count":3,"repeated_run_count":3,"consistent_slice_rate":1.0,"target_drift_jsd":0.218,"selective_risk":0.439,"abstention_rate":0.463,"stress_skip_risk":0.439},"missing_checks":["mitigate repeat_from_prev=new"]},"backup_claim":{"key":"candidate_ranking","status":"promising_but_unlocked","summary":"Ranking is promising."},"benchmark_lock":{"benchmark_id":"smokebench-v3","comparison_ready":true},"believable_submission_path":true,"submission_readiness":{"status":"analysis_ready","ready_for_external_review":true,"summary":["Primary claim is analysis ready."],"blockers":["mitigate repeat_from_prev=new"]}}',
         encoding="utf-8",
     )
     (analysis / "research_claims" / "research_claims.md").write_text("# Research Claims\n", encoding="utf-8")
+    (analysis / "research_claims" / "claim_support_matrix.md").write_text("# Claim Support Matrix\n", encoding="utf-8")
+    (analysis / "research_claims" / "submission_readiness.md").write_text("# Submission Readiness\n", encoding="utf-8")
+    (analysis / "research_claims" / "publication_outline.md").write_text("# Publication Outline\n", encoding="utf-8")
+    run_dir = output_root / "runs" / "run_anchor"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "safety_platform_contract.md").write_text("# Safety Platform Contract\n", encoding="utf-8")
+    (run_dir / "safety_platform_contract.json").write_text('{"benchmark_contract_version":"2026-week10-v1"}', encoding="utf-8")
     (history / "benchmark_lock_smokebench-v3_manifest.md").write_text("# Benchmark\n", encoding="utf-8")
     (history / "benchmark_lock_smokebench-v3_manifest.json").write_text('{"comparison_ready": true}', encoding="utf-8")
 

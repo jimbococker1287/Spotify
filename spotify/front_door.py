@@ -56,7 +56,7 @@ def build_front_door_report(output_dir: Path | str = "outputs") -> dict[str, obj
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(output_root),
         "title": "Spotify Personal Taste OS",
-        "subtitle": "One front door for the strongest product demo, operating review, creator strategy surface, and research claim.",
+        "subtitle": "One front door for the strongest product demo, creator strategy surface, operating review, and submission-shaped research claim.",
         "hero": {
             "headline": str(claim_report.get("headline", "")),
             "flagship_label": str(hero.get("label", "")),
@@ -72,6 +72,7 @@ def build_front_door_report(output_dir: Path | str = "outputs") -> dict[str, obj
             "primary_claim_title": str(primary_claim.get("title", "")),
             "primary_claim_status": str(primary_claim.get("status", "")),
             "primary_claim_summary": str(primary_claim.get("summary", "")),
+            "submission_status": str(_coerce_dict(claim_report.get("submission_readiness")).get("status", "")),
         },
         "spotlight_metrics": [
             dict(item)
@@ -80,6 +81,8 @@ def build_front_door_report(output_dir: Path | str = "outputs") -> dict[str, obj
         ][:6],
         "bridge_points": [str(item) for item in _coerce_list(claim_report.get("bridge_points"))],
         "review_sequence": [dict(item) for item in _coerce_list(claim_report.get("review_sequence")) if isinstance(item, dict)],
+        "branch_alignment": [dict(item) for item in _coerce_list(claim_report.get("branch_alignment")) if isinstance(item, dict)],
+        "submission_readiness": _coerce_dict(claim_report.get("submission_readiness")),
         "next_actions": [str(item) for item in _coerce_list(claim_report.get("next_actions"))[:4]],
         "branch_cards": branch_cards,
         "claim_to_demo": claim_report,
@@ -117,14 +120,27 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
         "",
     ]
     hero = _coerce_dict(report.get("hero"))
+    submission_readiness = _coerce_dict(report.get("submission_readiness"))
     md_lines.append(f"- Demo: `{hero.get('flagship_label', '')}`")
     md_lines.append(f"- Claim: `{hero.get('primary_claim_key', '')}` [{hero.get('primary_claim_status', '')}]")
+    md_lines.append(f"- Submission status: `{hero.get('submission_status', '')}`")
     md_lines.append(f"- Story: {hero.get('flagship_story', '')}")
     md_lines.append(f"- Outcome: {hero.get('flagship_outcome', '')}")
     md_lines.extend(["", "## Open First", ""])
     md_lines.append(f"- Claim-to-demo pack: `{copied_artifacts['claim_to_demo_md']}`")
     md_lines.append(f"- Talk track: `{copied_artifacts['claim_to_demo_talk_track_md']}`")
     md_lines.append(f"- Portfolio branches: `{copied_artifacts['branch_portfolio_md']}`")
+    md_lines.extend(["", "## Branch Alignment", ""])
+    for row in _coerce_list(report.get("branch_alignment")):
+        if not isinstance(row, dict):
+            continue
+        md_lines.append(f"- `{row.get('label', '')}` [{row.get('status', '')}]: {row.get('role_in_story', '')}")
+        md_lines.append(f"Audience: {row.get('audience', '')}")
+        md_lines.append(f"Success metric: {row.get('success_metric', '')}")
+    md_lines.extend(["", "## Submission Readiness", ""])
+    md_lines.append(f"- Status: `{submission_readiness.get('status', '')}`")
+    for item in _coerce_list(submission_readiness.get("summary")):
+        md_lines.append(f"- {item}")
     md_path = write_markdown(artifact_root / "front_door.md", md_lines)
 
     metric_cards = []
@@ -185,6 +201,25 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
 
     bridge_points = "".join(f"<li>{escape(str(item))}</li>" for item in _coerce_list(report.get("bridge_points")))
     next_actions = "".join(f"<li>{escape(str(item))}</li>" for item in _coerce_list(report.get("next_actions")))
+    submission_summary = "".join(f"<li>{escape(str(item))}</li>" for item in _coerce_list(submission_readiness.get("summary")))
+    branch_alignment_cards = []
+    for row in _coerce_list(report.get("branch_alignment")):
+        if not isinstance(row, dict):
+            continue
+        branch_alignment_cards.append(
+            f"""
+            <article class="alignment-card">
+              <div class="branch-card-top">
+                <span class="status-pill status-{escape(str(row.get("status", "")))}">{escape(str(row.get("status", "")))}</span>
+                <a class="branch-command" href="{escape(_file_href(row.get("artifact", "")))}">Open anchor</a>
+              </div>
+              <h3>{escape(str(row.get("label", "")))}</h3>
+              <p class="branch-signal">{escape(str(row.get("role_in_story", "")))}</p>
+              <p class="branch-audience">{escape(str(row.get("audience", "")))}</p>
+              <p class="branch-success"><strong>Success metric:</strong> {escape(str(row.get("success_metric", "")))}</p>
+            </article>
+            """.strip()
+        )
     html = f"""<!doctype html>
 <html lang="en">
   <head>
@@ -221,7 +256,7 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
       h1, h2, h3 {{ font-family: "Iowan Old Style", "Palatino Linotype", serif; margin: 0; }}
       h1 {{ font-size: clamp(2.5rem, 5vw, 4.5rem); line-height: 0.98; max-width: 10ch; }}
       .subtitle {{ max-width: 48rem; font-size: 1.08rem; line-height: 1.6; margin: 18px 0 28px; }}
-      .hero-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }}
+      .hero-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }}
       .hero-stat {{ padding: 16px; border-radius: 18px; background: rgba(255, 255, 255, 0.7); border: 1px solid rgba(17, 34, 29, 0.08); }}
       .hero-stat-label {{ font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(17, 34, 29, 0.68); margin: 0 0 6px; }}
       .hero-stat-value {{ font-size: 1.15rem; font-weight: 700; margin: 0; }}
@@ -243,7 +278,7 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
       .metric-value {{ margin: 0 0 8px; font-size: 2rem; font-weight: 700; }}
       .metric-why {{ margin: 0; line-height: 1.5; color: rgba(17, 34, 29, 0.8); }}
       .branch-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }}
-      .branch-card {{ padding: 22px; border-radius: 22px; background: rgba(255, 255, 255, 0.76); border: 1px solid rgba(17, 34, 29, 0.08); }}
+      .branch-card, .alignment-card {{ padding: 22px; border-radius: 22px; background: rgba(255, 255, 255, 0.76); border: 1px solid rgba(17, 34, 29, 0.08); }}
       .branch-card-top {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; }}
       .status-pill {{ display: inline-flex; align-items: center; padding: 6px 12px; border-radius: 999px; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.05em; }}
       .status-ready, .status-ready_with_gaps {{ background: rgba(31, 111, 120, 0.12); color: var(--teal); }}
@@ -268,11 +303,12 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
           <div class="hero-grid">
             <div class="hero-stat"><p class="hero-stat-label">Flagship Demo</p><p class="hero-stat-value">{escape(str(hero.get("flagship_label", "")))}</p></div>
             <div class="hero-stat"><p class="hero-stat-label">Primary Claim</p><p class="hero-stat-value">{escape(str(hero.get("primary_claim_key", "")))}</p></div>
+            <div class="hero-stat"><p class="hero-stat-label">Submission Status</p><p class="hero-stat-value">{escape(str(hero.get("submission_status", "")))}</p></div>
             <div class="hero-stat"><p class="hero-stat-label">Opening Artist</p><p class="hero-stat-value">{escape(str(hero.get("top_artist", "")))}</p></div>
           </div>
         </article>
         <aside class="panel">
-          <h2>Review This In Three Moves</h2>
+          <h2>Review This In {len(_coerce_list(report.get("review_sequence"))) or 3} Moves</h2>
           <ol class="review-list">{''.join(review_steps)}</ol>
         </aside>
       </section>
@@ -293,6 +329,11 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
       </section>
 
       <section class="section">
+        <div class="section-head"><div><h2>How The Branches Connect</h2><p>Weeks 11-12 are strongest when every branch has a distinct audience but a shared system story.</p></div></div>
+        <div class="branch-grid">{''.join(branch_alignment_cards)}</div>
+      </section>
+
+      <section class="section">
         <div class="section-head"><div><h2>Four Branches</h2><p>The repo is strongest when every new feature clearly strengthens one of these lanes.</p></div></div>
         <div class="branch-grid">{''.join(branch_cards)}</div>
       </section>
@@ -300,6 +341,8 @@ def write_front_door_artifacts(report: dict[str, object], *, output_dir: Path | 
       <section class="section">
         <div class="section-head"><div><h2>Next Moves</h2><p>These are the current follow-through items after the landing pass.</p></div></div>
         <article class="panel">
+          <p><strong>Submission status:</strong> {escape(str(submission_readiness.get("status", "")))}</p>
+          <ul class="next-actions">{submission_summary}</ul>
           <ul class="next-actions">{next_actions}</ul>
           <p><a href="{escape(_file_href(copied_artifacts["claim_to_demo_md"]))}">Open the full claim-to-demo pack</a> or <a href="{escape(_file_href(copied_artifacts["branch_portfolio_md"]))}">open the branch portfolio</a>.</p>
         </article>

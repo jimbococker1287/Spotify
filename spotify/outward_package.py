@@ -45,6 +45,7 @@ def _build_safety_research_showcase(
     benchmark_lock = _coerce_dict(research_claims_payload.get("benchmark_lock"))
     primary_claim = _coerce_dict(research_claims_payload.get("primary_claim"))
     backup_claim = _coerce_dict(research_claims_payload.get("backup_claim"))
+    submission_readiness = _coerce_dict(research_claims_payload.get("submission_readiness"))
     missing_checks = _coerce_list(primary_claim.get("missing_checks"))[:3]
     lines = [
         "# Safety And Research Showcase",
@@ -55,6 +56,7 @@ def _build_safety_research_showcase(
         f"- Research outline: `{(workspace_root / 'docs' / 'publication_outline.md').resolve()}`",
         f"- Primary claim: `{primary_claim.get('key', '')}` [{primary_claim.get('status', '')}]",
         f"- Backup claim: `{backup_claim.get('key', '')}` [{backup_claim.get('status', '')}]",
+        f"- Submission readiness: `{submission_readiness.get('status', 'n/a')}`",
         f"- Benchmark lock: `{benchmark_lock.get('benchmark_id', '')}` comparison_ready=`{benchmark_lock.get('comparison_ready', False)}`",
         f"- Believable submission path: `{research_claims_payload.get('believable_submission_path', False)}`",
         "",
@@ -62,6 +64,7 @@ def _build_safety_research_showcase(
         "",
         f"- {primary_claim.get('summary', '')}",
         f"- {backup_claim.get('summary', '')}",
+        *[f"- {item}" for item in _coerce_list(submission_readiness.get("summary"))[:2]],
         "",
         "## Current Gaps",
         "",
@@ -134,6 +137,21 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
             "benchmark_md": (
                 str(bundle.benchmark_manifest_md.resolve())
                 if bundle.benchmark_manifest_md and bundle.benchmark_manifest_md.exists()
+                else ""
+            ),
+            "claim_support_md": (
+                str(bundle.research_claim_support_md.resolve())
+                if bundle.research_claim_support_md and bundle.research_claim_support_md.exists()
+                else ""
+            ),
+            "submission_readiness_md": (
+                str(bundle.research_submission_readiness_md.resolve())
+                if bundle.research_submission_readiness_md and bundle.research_submission_readiness_md.exists()
+                else ""
+            ),
+            "publication_outline_md": (
+                str(bundle.research_publication_outline_md.resolve())
+                if bundle.research_publication_outline_md and bundle.research_publication_outline_md.exists()
                 else ""
             ),
             "status": str(branch_lookup.get("safety_research", {}).get("status", "")),
@@ -243,6 +261,24 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
             else None,
             package_root / "safety_research" / "benchmark_lock_manifest.md",
         ),
+        "claim_support_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("claim_support_md", "")))
+            if _coerce_dict(selected_artifacts.get("safety_research")).get("claim_support_md")
+            else None,
+            package_root / "safety_research" / "claim_support_matrix.md",
+        ),
+        "submission_readiness_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("submission_readiness_md", "")))
+            if _coerce_dict(selected_artifacts.get("safety_research")).get("submission_readiness_md")
+            else None,
+            package_root / "safety_research" / "submission_readiness.md",
+        ),
+        "publication_outline_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("publication_outline_md", "")))
+            if _coerce_dict(selected_artifacts.get("safety_research")).get("publication_outline_md")
+            else None,
+            package_root / "safety_research" / "publication_outline.md",
+        ),
     }
 
     safety_showcase_path = _build_safety_research_showcase(
@@ -322,6 +358,9 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
     lines.append(f"- Research claims: `{copied_artifacts['research_claims_md']}`")
     lines.append(f"- Safety platform contract: `{copied_artifacts['safety_platform_contract_md']}`")
     lines.append(f"- Benchmark manifest: `{copied_artifacts['benchmark_manifest_md']}`")
+    lines.append(f"- Claim support matrix: `{copied_artifacts['claim_support_md']}`")
+    lines.append(f"- Submission readiness: `{copied_artifacts['submission_readiness_md']}`")
+    lines.append(f"- Publication outline: `{copied_artifacts['publication_outline_md']}`")
     lines.append(f"- Safety showcase: `{safety_showcase_path.resolve()}`")
     lines.append("")
     lines.extend(["## Supporting Summaries", ""])

@@ -127,9 +127,18 @@ def _build_sample_outputs(output_root: Path) -> None:
             },
             "benchmark_lock": {"benchmark_id": "smokebench", "comparison_ready": False},
             "believable_submission_path": True,
+            "submission_readiness": {
+                "status": "analysis_ready",
+                "ready_for_external_review": True,
+                "summary": ["Primary claim is analysis ready.", "Benchmark lock still needs another pass."],
+                "blockers": ["Repeat seeds."],
+            },
         },
     )
     _write_text(output_root / "analysis" / "research_claims" / "research_claims.md", "# Research Claims\n")
+    _write_text(output_root / "analysis" / "research_claims" / "claim_support_matrix.md", "# Claim Support Matrix\n")
+    _write_text(output_root / "analysis" / "research_claims" / "submission_readiness.md", "# Submission Readiness\n")
+    _write_text(output_root / "analysis" / "research_claims" / "publication_outline.md", "# Publication Outline\n")
     _write_text(output_root / "history" / "benchmark_lock_smokebench_manifest.md", "# Benchmark\n")
     _write_json(
         output_root / "history" / "benchmark_lock_smokebench_manifest.json",
@@ -159,6 +168,9 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert (package_root / "creator_intelligence" / "scene_strategy_watch.md").exists()
     assert (package_root / "safety_research" / "research_claims.md").exists()
     assert (package_root / "safety_research" / "safety_platform_contract.md").exists()
+    assert (package_root / "safety_research" / "claim_support_matrix.md").exists()
+    assert (package_root / "safety_research" / "submission_readiness.md").exists()
+    assert (package_root / "safety_research" / "publication_outline.md").exists()
 
     package_payload = json.loads(paths["json"].read_text(encoding="utf-8"))
     assert "copied_artifacts" in package_payload
@@ -166,5 +178,7 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert package_payload["copied_artifacts"]["taste_os_md"]
     assert package_payload["copied_artifacts"]["creator_report_family_md"]
     assert package_payload["copied_artifacts"]["safety_platform_contract_md"]
+    assert package_payload["copied_artifacts"]["claim_support_md"]
+    assert package_payload["copied_artifacts"]["submission_readiness_md"]
     safety_showcase = paths["safety_research_showcase_md"].read_text(encoding="utf-8")
     assert "Believable submission path: `True`" in safety_showcase

@@ -91,6 +91,44 @@ def _build_sample_outputs(output_root: Path, *, aligned: bool) -> None:
     )
     _write_text(output_root / "analytics" / "control_room.md", "# Control Room\n")
 
+    creator_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
+    creator_primary = creator_dir / "creator.md"
+    creator_strategy = creator_dir / "scene_strategy_watch.md"
+    creator_supporting = creator_dir / "opportunity_lane.md"
+    creator_index = creator_dir / "creator_report_family.md"
+    ranking = creator_dir / "ranking.md"
+    scene = creator_dir / "scene.md"
+    seed = creator_dir / "seed.md"
+    scene_seed = creator_dir / "scene_seed.md"
+    for path in (
+        creator_primary,
+        creator_strategy,
+        creator_supporting,
+        creator_index,
+        ranking,
+        scene,
+        seed,
+        scene_seed,
+    ):
+        _write_text(path, f"# {path.stem}\n")
+    _write_json(
+        creator_dir / "creator_report_family.json",
+        {
+            "primary_report": str(creator_primary.resolve()),
+            "artifact_index_markdown": str(creator_index.resolve()),
+            "comparison_view_markdown": {
+                "ranking_comparison": str(ranking.resolve()),
+                "scene_comparison": str(scene.resolve()),
+                "seed_comparison": str(seed.resolve()),
+                "scene_seed_comparison": str(scene_seed.resolve()),
+                "opportunity_lane_comparison": str(creator_supporting.resolve()),
+            },
+            "brief_view_markdown": {
+                "scene_strategy_watch": str(creator_strategy.resolve()),
+            },
+        },
+    )
+
     _write_json(
         output_root / "analysis" / "research_claims" / "research_claims.json",
         {
@@ -110,14 +148,27 @@ def _build_sample_outputs(output_root: Path, *, aligned: bool) -> None:
                 "missing_checks": ["Repeat the slice analysis across more seeds."],
             },
             "backup_claim": {"key": "candidate_ranking", "status": "promising_but_unlocked", "summary": "Ranking is promising."},
+            "submission_readiness": {
+                "status": "analysis_ready",
+                "ready_for_external_review": True,
+                "summary": ["Primary claim is analysis ready.", "Benchmark work still needs one more pass."],
+                "blockers": ["Repeat the slice analysis across more seeds."],
+            },
         },
     )
     _write_text(output_root / "analysis" / "research_claims" / "research_claims.md", "# Research Claims\n")
+    _write_text(output_root / "analysis" / "research_claims" / "claim_support_matrix.md", "# Claim Support Matrix\n")
+    _write_text(output_root / "analysis" / "research_claims" / "submission_readiness.md", "# Submission Readiness\n")
+    _write_text(output_root / "analysis" / "research_claims" / "publication_outline.md", "# Publication Outline\n")
     _write_text(output_root / "history" / "benchmark_lock_smokebench-v3_manifest.md", "# Benchmark\n")
     _write_json(
         output_root / "history" / "benchmark_lock_smokebench-v3_manifest.json",
         {"benchmark_id": "smokebench-v3", "comparison_ready": True},
     )
+    run_dir = output_root / "runs" / research_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_text(run_dir / "safety_platform_contract.md", "# Safety Platform Contract\n")
+    _write_json(run_dir / "safety_platform_contract.json", {"benchmark_contract_version": "2026-week10-v1"})
 
 
 def test_claim_to_demo_prefers_safety_demo_for_shift_robustness(tmp_path: Path) -> None:
@@ -129,6 +180,9 @@ def test_claim_to_demo_prefers_safety_demo_for_shift_robustness(tmp_path: Path) 
     assert report["flagship_demo"]["label"] == "Commute / Friction Spike"
     assert report["primary_claim"]["key"] == "shift_robustness"
     assert report["coherence"]["aligned"] is False
+    assert report["submission_readiness"]["status"] == "analysis_ready"
+    assert len(report["branch_alignment"]) == 4
+    assert report["review_sequence"][1]["label"] == "Creator strategy proof"
     assert any("Regenerate the Taste OS showcase" in action for action in report["next_actions"])
 
 
@@ -146,3 +200,5 @@ def test_write_claim_to_demo_artifacts_copies_review_assets(tmp_path: Path) -> N
     assert "Claim To Demo Review Pack" in markdown
     assert "Commute / Friction Spike" in markdown
     assert "Worst supported robustness gap" in markdown
+    assert "Branch Alignment" in markdown
+    assert "Submission Readiness" in markdown

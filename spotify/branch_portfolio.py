@@ -192,7 +192,9 @@ def _build_safety_research_branch(bundle: PortfolioArtifactBundle, definition: d
     payload = bundle.research_claims_payload
     benchmark_lock = _coerce_dict(payload.get("benchmark_lock"))
     primary_claim = _coerce_dict(payload.get("primary_claim"))
+    submission_readiness = _coerce_dict(payload.get("submission_readiness"))
     primary_status = str(primary_claim.get("status", "")).strip()
+    submission_status = str(submission_readiness.get("status", "")).strip()
     believable = bool(payload.get("believable_submission_path"))
     benchmark_ready = bool(benchmark_lock.get("comparison_ready"))
     platform_contract_ready = bool(bundle.safety_platform_contract_md and bundle.safety_platform_contract_md.exists())
@@ -204,9 +206,15 @@ def _build_safety_research_branch(bundle: PortfolioArtifactBundle, definition: d
         summary = (
             f"Primary claim `{primary_claim.get('key', '')}` is `{primary_status or 'unknown'}` and benchmark "
             f"`{benchmark_id}` is `{('comparison-ready' if benchmark_ready else 'not comparison-ready')}`. "
-            f"Safety contract present=`{platform_contract_ready}`."
+            f"Submission readiness=`{submission_status or 'unknown'}`. Safety contract present=`{platform_contract_ready}`."
         )
     artifacts = [str(bundle.research_claims_md), str(bundle.research_claims_json)]
+    if bundle.research_publication_outline_md is not None:
+        artifacts.append(str(bundle.research_publication_outline_md))
+    if bundle.research_claim_support_md is not None:
+        artifacts.append(str(bundle.research_claim_support_md))
+    if bundle.research_submission_readiness_md is not None:
+        artifacts.append(str(bundle.research_submission_readiness_md))
     if bundle.safety_platform_contract_md is not None:
         artifacts.append(str(bundle.safety_platform_contract_md))
     if bundle.safety_platform_contract_json is not None:

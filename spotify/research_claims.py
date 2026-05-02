@@ -44,6 +44,19 @@ def _read_csv_rows(path: Path) -> list[dict[str, object]]:
         return [dict(row) for row in csv.DictReader(infile)]
 
 
+def _write_csv_rows(path: Path, rows: list[dict[str, object]]) -> Path | None:
+    if not rows:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return path
+
+
 def _analysis_prefix_for_model_type(model_type: str) -> str | None:
     normalized = str(model_type).strip().lower()
     if normalized == "deep":
@@ -696,6 +709,182 @@ def _publication_outline(primary_claim: dict[str, object], backup_claim: dict[st
     ]
 
 
+def _evidence_status(ready: bool | None) -> str:
+    if ready is None:
+        return "n/a"
+    return "ready" if ready else "gap"
+
+
+def _existing_artifact_count(paths: list[str]) -> int:
+    return sum(1 for path in paths if str(path).strip() and Path(str(path).strip()).exists())
+
+
+def _claim_support_row(
+    claim: dict[str, object],
+    *,
+    role: str,
+    benchmark_ready: bool,
+) -> dict[str, object]:
+    metrics = claim.get("metrics", {})
+    metrics = metrics if isinstance(metrics, dict) else {}
+    supporting_artifacts = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    missing_checks = [str(item).strip() for item in claim.get("missing_checks", []) if str(item).strip()]
+    claim_key = str(claim.get("key", "")).strip()
+
+    if claim_key == "shift_robustness":
+        repeated_ready = (
+            int(metrics.get("repeated_run_count", 0) or 0) >= 3
+            and int(metrics.get("consistent_slice_run_count", 0) or 0) >= 2
+        )
+        slice_ready = math.isfinite(_safe_float(metrics.get("worst_robustness_gap")))
+        risk_ready = all(
+            math.isfinite(_safe_float(metrics.get(key)))
+            for key in ("selective_risk", "abstention_rate", "stress_skip_risk")
+        )
+        benchmark_status = _evidence_status(None)
+    elif claim_key == "candidate_ranking":
+        repeated_ready = bool(metrics.get("benchmark_retrieval_ready"))
+        slice_ready = None
+        risk_ready = None
+        benchmark_status = _evidence_status(bool(metrics.get("benchmark_comparison_ready")) and benchmark_ready)
+    elif claim_key == "risk_aware_abstention":
+        repeated_ready = None
+        slice_ready = None
+        risk_ready = all(
+            math.isfinite(_safe_float(metrics.get(key)))
+            for key in ("selective_risk", "abstention_rate", "conformal_coverage")
+        ) and _safe_float(metrics.get("abstention_rate")) > 0.01
+        benchmark_status = _evidence_status(None)
+    else:
+        repeated_ready = None
+        slice_ready = None
+        risk_ready = math.isfinite(_safe_float(metrics.get("test_mean_delta")))
+        benchmark_status = _evidence_status(None)
+
+    artifact_count = len(supporting_artifacts)
+    existing_artifacts = _existing_artifact_count(supporting_artifacts)
+    artifact_pack_ready = artifact_count > 0 and existing_artifacts == artifact_count
+    live_signal_ready = _STATUS_RANK.get(str(claim.get("status", "")), 0) >= 1
+
+    return {
+        "claim_key": claim_key,
+        "role": role,
+        "status": str(claim.get("status", "")),
+        "live_signal_status": _evidence_status(live_signal_ready),
+        "benchmark_evidence_status": benchmark_status,
+        "repeated_evidence_status": _evidence_status(repeated_ready),
+        "slice_evidence_status": _evidence_status(slice_ready),
+        "risk_evidence_status": _evidence_status(risk_ready),
+        "artifact_pack_status": _evidence_status(artifact_pack_ready),
+        "supporting_artifact_count": artifact_count,
+        "existing_artifact_count": existing_artifacts,
+        "missing_check_count": len(missing_checks),
+        "next_gate": missing_checks[0] if missing_checks else "ready_to_package",
+    }
+
+
+def _build_submission_readiness(
+    *,
+    primary_claim: dict[str, object],
+    backup_claim: dict[str, object],
+    benchmark_lock: dict[str, object],
+    evaluation_tables: dict[str, object],
+    claim_support_matrix: list[dict[str, object]],
+    claim_gaps: list[str],
+) -> dict[str, object]:
+    primary_rank = _STATUS_RANK.get(str(primary_claim.get("status", "")), 0)
+    backup_rank = _STATUS_RANK.get(str(backup_claim.get("status", "")), 0)
+    benchmark_ready = bool(benchmark_lock.get("comparison_ready"))
+    primary_row = next((row for row in claim_support_matrix if str(row.get("role", "")) == "primary"), {})
+    backup_row = next((row for row in claim_support_matrix if str(row.get("role", "")) == "backup"), {})
+    run_leaderboard = evaluation_tables.get("run_leaderboard", [])
+    benchmark_table = evaluation_tables.get("benchmark_lock", [])
+    run_leaderboard = run_leaderboard if isinstance(run_leaderboard, list) else []
+    benchmark_table = benchmark_table if isinstance(benchmark_table, list) else []
+
+    checks = [
+        {
+            "key": "primary_claim_strength",
+            "status": "pass" if primary_rank >= 3 else "attention" if primary_rank >= 2 else "fail",
+            "detail": (
+                f"Primary claim `{primary_claim.get('key', '')}` is `{primary_claim.get('status', '')}`."
+            ),
+        },
+        {
+            "key": "backup_claim_strength",
+            "status": "pass" if backup_rank >= 1 else "fail",
+            "detail": (
+                f"Backup claim `{backup_claim.get('key', '')}` is `{backup_claim.get('status', '')}`."
+            ),
+        },
+        {
+            "key": "benchmark_lock",
+            "status": "pass" if benchmark_ready else "attention",
+            "detail": (
+                f"Benchmark lock `{benchmark_lock.get('benchmark_id', '')}` comparison_ready=`{benchmark_ready}`."
+            ),
+        },
+        {
+            "key": "evaluation_tables",
+            "status": "pass" if bool(run_leaderboard) and bool(benchmark_table) and bool(claim_support_matrix) else "fail",
+            "detail": (
+                f"Tables present: run_leaderboard=`{bool(run_leaderboard)}`, benchmark_lock=`{bool(benchmark_table)}`, "
+                f"claim_support_matrix=`{bool(claim_support_matrix)}`."
+            ),
+        },
+        {
+            "key": "artifact_pack",
+            "status": (
+                "pass"
+                if str(primary_row.get("artifact_pack_status", "")) == "ready"
+                and str(backup_row.get("artifact_pack_status", "")) in {"ready", "n/a", ""}
+                else "attention"
+            ),
+            "detail": (
+                f"Primary artifact pack is `{primary_row.get('artifact_pack_status', 'gap')}` and backup artifact pack is "
+                f"`{backup_row.get('artifact_pack_status', 'gap')}`."
+            ),
+        },
+        {
+            "key": "open_gaps",
+            "status": "pass" if len(claim_gaps) <= 2 else "attention",
+            "detail": f"Open claim gaps: `{len(claim_gaps)}`.",
+        },
+    ]
+
+    if primary_rank >= 4 and benchmark_ready and all(check["status"] == "pass" for check in checks):
+        status = "submission_candidate"
+    elif primary_rank >= 3 and backup_rank >= 1:
+        status = "analysis_ready"
+    elif primary_rank >= 2:
+        status = "promising_but_unlocked"
+    else:
+        status = "not_ready"
+
+    blockers = [
+        str(check["detail"])
+        for check in checks
+        if str(check.get("status", "")) in {"attention", "fail"}
+    ]
+    for item in claim_gaps[:3]:
+        if item not in blockers:
+            blockers.append(item)
+
+    summary = [
+        f"Primary claim is `{primary_claim.get('status', 'unknown')}` and backup claim is `{backup_claim.get('status', 'unknown')}`.",
+        f"Benchmark lock is `{('ready' if benchmark_ready else 'not ready')}` with `{len(claim_gaps)}` open claim gaps.",
+        f"Submission-readiness state is `{status}`.",
+    ]
+
+    return {
+        "status": status,
+        "ready_for_external_review": status in {"analysis_ready", "submission_candidate", "promising_but_unlocked"},
+        "checks": checks,
+        "blockers": blockers[:6],
+        "summary": summary,
+    }
+
+
 def build_research_claims_report(
     output_dir: Path,
     *,
@@ -796,6 +985,28 @@ def build_research_claims_report(
         "claim_gaps": claim_gaps[:8],
         "publication_outline": _publication_outline(primary_claim, backup_claim),
     }
+    role_map = {
+        str(primary_claim.get("key", "")): "primary",
+        str(backup_claim.get("key", "")): "backup",
+    }
+    claim_support_matrix = [
+        _claim_support_row(
+            claim,
+            role=role_map.get(str(claim.get("key", "")), "supporting"),
+            benchmark_ready=bool(report["benchmark_lock"]["comparison_ready"]),
+        )
+        for claim in claims
+        if isinstance(claim, dict)
+    ]
+    report["claim_support_matrix"] = claim_support_matrix
+    report["submission_readiness"] = _build_submission_readiness(
+        primary_claim=primary_claim,
+        backup_claim=backup_claim,
+        benchmark_lock=report["benchmark_lock"],
+        evaluation_tables=report["evaluation_tables"],
+        claim_support_matrix=claim_support_matrix,
+        claim_gaps=report["claim_gaps"],
+    )
     return report
 
 
@@ -816,6 +1027,25 @@ def write_research_claims_report(
     backup_claim = backup_claim if isinstance(backup_claim, dict) else {}
     benchmark_lock = report.get("benchmark_lock", {})
     benchmark_lock = benchmark_lock if isinstance(benchmark_lock, dict) else {}
+    claim_support_matrix = report.get("claim_support_matrix", [])
+    claim_support_matrix = claim_support_matrix if isinstance(claim_support_matrix, list) else []
+    submission_readiness = report.get("submission_readiness", {})
+    submission_readiness = submission_readiness if isinstance(submission_readiness, dict) else {}
+    evaluation_tables = report.get("evaluation_tables", {})
+    evaluation_tables = evaluation_tables if isinstance(evaluation_tables, dict) else {}
+
+    run_leaderboard_csv = _write_csv_rows(
+        artifact_dir / "run_leaderboard.csv",
+        [row for row in evaluation_tables.get("run_leaderboard", []) if isinstance(row, dict)],
+    )
+    benchmark_lock_csv = _write_csv_rows(
+        artifact_dir / "benchmark_lock_table.csv",
+        [row for row in evaluation_tables.get("benchmark_lock", []) if isinstance(row, dict)],
+    )
+    claim_support_csv = _write_csv_rows(
+        artifact_dir / "claim_support_matrix.csv",
+        [row for row in claim_support_matrix if isinstance(row, dict)],
+    )
 
     lines = [
         "# Research Claims",
@@ -873,6 +1103,23 @@ def write_research_claims_report(
             f"mean_val_top1=`{_format_metric(row.get('val_top1_mean'))}` ci95=`{_format_metric(row.get('val_top1_ci95'))}`"
         )
 
+    lines.extend(["", "## Claim Support Matrix", ""])
+    for row in claim_support_matrix:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"- `{row.get('role', '')}` `{row.get('claim_key', '')}` [{row.get('status', '')}] "
+            f"live=`{row.get('live_signal_status', '')}` benchmark=`{row.get('benchmark_evidence_status', '')}` "
+            f"repeated=`{row.get('repeated_evidence_status', '')}` slice=`{row.get('slice_evidence_status', '')}` "
+            f"risk=`{row.get('risk_evidence_status', '')}` artifacts=`{row.get('artifact_pack_status', '')}`"
+        )
+
+    lines.extend(["", "## Submission Readiness", ""])
+    lines.append(f"- Status: `{submission_readiness.get('status', '')}`")
+    lines.append(f"- Ready for external review: `{submission_readiness.get('ready_for_external_review', False)}`")
+    for item in submission_readiness.get("summary", []):
+        lines.append(f"- {item}")
+
     lines.extend(["", "## Missing Checks", ""])
     for item in report.get("claim_gaps", []):
         lines.append(f"- {item}")
@@ -903,7 +1150,61 @@ def write_research_claims_report(
 
     outline_path = artifact_dir / "publication_outline.md"
     outline_path.write_text("\n".join(outline_lines).rstrip() + "\n", encoding="utf-8")
-    return {"json": json_path, "md": md_path, "outline_md": outline_path}
+
+    claim_support_md_lines = [
+        "# Claim Support Matrix",
+        "",
+        f"- Run: `{(report.get('run', {}) if isinstance(report.get('run', {}), dict) else {}).get('run_id', '')}`",
+        "",
+    ]
+    for row in claim_support_matrix:
+        if not isinstance(row, dict):
+            continue
+        claim_support_md_lines.append(
+            f"- `{row.get('role', '')}` `{row.get('claim_key', '')}`: benchmark `{row.get('benchmark_evidence_status', '')}`, "
+            f"repeated `{row.get('repeated_evidence_status', '')}`, slice `{row.get('slice_evidence_status', '')}`, "
+            f"risk `{row.get('risk_evidence_status', '')}`, artifacts `{row.get('artifact_pack_status', '')}`."
+        )
+        claim_support_md_lines.append(f"Next gate: {row.get('next_gate', '')}")
+    claim_support_md = artifact_dir / "claim_support_matrix.md"
+    claim_support_md.write_text("\n".join(claim_support_md_lines).rstrip() + "\n", encoding="utf-8")
+
+    submission_readiness_json = artifact_dir / "submission_readiness.json"
+    submission_readiness_json.write_text(json.dumps(submission_readiness, indent=2), encoding="utf-8")
+    submission_readiness_md_lines = [
+        "# Submission Readiness",
+        "",
+        f"- Status: `{submission_readiness.get('status', '')}`",
+        f"- Ready for external review: `{submission_readiness.get('ready_for_external_review', False)}`",
+        "",
+        "## Summary",
+        "",
+    ]
+    for item in submission_readiness.get("summary", []):
+        submission_readiness_md_lines.append(f"- {item}")
+    submission_readiness_md_lines.extend(["", "## Checks", ""])
+    for item in submission_readiness.get("checks", []):
+        if not isinstance(item, dict):
+            continue
+        submission_readiness_md_lines.append(
+            f"- `{item.get('key', '')}` [{item.get('status', '')}]: {item.get('detail', '')}"
+        )
+    submission_readiness_md_lines.extend(["", "## Blockers", ""])
+    for item in submission_readiness.get("blockers", []):
+        submission_readiness_md_lines.append(f"- {item}")
+    submission_readiness_md = artifact_dir / "submission_readiness.md"
+    submission_readiness_md.write_text("\n".join(submission_readiness_md_lines).rstrip() + "\n", encoding="utf-8")
+    return {
+        "json": json_path,
+        "md": md_path,
+        "outline_md": outline_path,
+        "run_leaderboard_csv": run_leaderboard_csv or artifact_dir / "run_leaderboard.csv",
+        "benchmark_lock_csv": benchmark_lock_csv or artifact_dir / "benchmark_lock_table.csv",
+        "claim_support_csv": claim_support_csv or artifact_dir / "claim_support_matrix.csv",
+        "claim_support_md": claim_support_md,
+        "submission_readiness_json": submission_readiness_json,
+        "submission_readiness_md": submission_readiness_md,
+    }
 
 
 def main() -> int:
@@ -935,6 +1236,8 @@ def main() -> int:
     print(f"research_claims_json={paths['json']}")
     print(f"research_claims_md={paths['md']}")
     print(f"publication_outline_md={paths['outline_md']}")
+    print(f"claim_support_matrix_md={paths['claim_support_md']}")
+    print(f"submission_readiness_md={paths['submission_readiness_md']}")
     print(f"primary_claim={primary_claim.get('key', '')}")
     print(f"primary_status={primary_claim.get('status', '')}")
     print(f"backup_claim={backup_claim.get('key', '')}")
