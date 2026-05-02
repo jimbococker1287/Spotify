@@ -21,6 +21,14 @@ Outputs:
 - `outputs/analysis/day_90_launch/canonical_artifact_manifest.md`
 - `outputs/analysis/day_90_launch/delivery_checklist.md`
 
+After the closeout pass, Weeks 15-16 keep this package fresh with:
+
+```bash
+make show-ready-backfill
+make show-ready-maintenance
+python -m spotify.phase_readiness --scope weeks-1-16
+```
+
 ## Working Rule
 
 This package should not invent a cleaner story than the repo has earned.
@@ -37,3 +45,4 @@ It should:
 2. Open the claim-to-demo bridge.
 3. Follow the canonical Taste OS, Control Room, Creator Intelligence, and Safety / Research artifacts.
 4. End on the delivery checklist to confirm what is show-ready versus what still needs notes.
+5. Use the show-ready maintenance report to confirm the package is still aligned after later runs.

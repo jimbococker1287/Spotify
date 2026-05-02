@@ -899,6 +899,16 @@ Or via Make:
 make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
 ```
 
+Keep the outward-facing package current after Day 90:
+
+```bash
+make show-ready-backfill
+make show-ready-maintenance
+python -m spotify.phase_readiness --scope weeks-1-16
+```
+
+That post-launch loop backfills legacy creator and research artifacts, checks whether Taste OS / control room / research still share one review anchor, and reports whether the canonical launch package has gone stale after newer runs.
+
 Optional webhook alerts:
 
 ```bash

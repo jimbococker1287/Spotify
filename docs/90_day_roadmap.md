@@ -315,3 +315,37 @@ If a new idea appears during these 90 days, it should only be added if it clearl
 - recommender-safety / research platform
 
 If it does not, it should wait.
+
+## Post-Day-90 Sustainment
+
+### Week 15: Backfill the legacy package edges
+
+Primary outcome:
+
+- Older artifacts now meet the same packaging standard as the Day-90 surfaces.
+
+Milestones:
+
+- Backfill creator report-family indexes for legacy manifests.
+- Backfill the reusable safety-platform contract for the current research anchor when older runs missed it.
+- Refresh the outward-facing package and launch surfaces after those backfills.
+
+Exit criteria:
+
+- The launch package no longer depends on manual explanation for missing creator indexes or missing safety-platform contract files.
+
+### Week 16: Keep the package fresh
+
+Primary outcome:
+
+- Show-readiness becomes a maintainable operating loop instead of a one-time export.
+
+Milestones:
+
+- Track whether Taste OS, control room, and research claims still point at the same review anchor.
+- Track whether canonical launch artifacts are stale after newer runs.
+- Publish one readiness report that summarizes post-launch freshness and maintenance actions.
+
+Exit criteria:
+
+- There is a repeatable command path for backfilling, checking, and maintaining the outward-facing package after new runs land.

@@ -161,6 +161,8 @@ spotify/safe_policy.py
 spotify/safety_platform.py
 spotify/serving.py
 spotify/session_knn.py
+spotify/show_ready_backfill.py
+spotify/show_ready_maintenance.py
 spotify/storage_report.py
 spotify/stress_test.py
 spotify/taste_os_demo.py
@@ -250,6 +252,8 @@ tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
 tests/test_serving_analytics_and_session_knn.py
 tests/test_shared_helpers.py
+tests/test_show_ready_backfill.py
+tests/test_show_ready_maintenance.py
 tests/test_storage_report.py
 tests/test_stress_test.py
 tests/test_taste_os_demo.py

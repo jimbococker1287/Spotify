@@ -10,6 +10,7 @@ from .day_90_launch import build_day_90_launch_report
 from .branch_portfolio import build_branch_portfolio_report
 from .portfolio_artifacts import PortfolioArtifactBundle, load_portfolio_artifact_bundle
 from .run_artifacts import write_json, write_markdown
+from .show_ready_maintenance import build_show_ready_maintenance_report
 
 
 _STATUS_RANK = {"missing": 0, "attention": 1, "ready": 2}
@@ -17,6 +18,10 @@ _STATUS_RANK = {"missing": 0, "attention": 1, "ready": 2}
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _coerce_dict(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _coerce_list(value: object) -> list[Any]:
@@ -579,6 +584,70 @@ def _build_day_90_launch_status(root: Path, *, artifact_bundle: PortfolioArtifac
     }
 
 
+def _build_show_ready_maintenance_status(root: Path, *, artifact_bundle: PortfolioArtifactBundle) -> dict[str, Any]:
+    doc_paths = [
+        root / "docs/show_ready_maintenance.md",
+        root / "docs/day_90_launch.md",
+        root / "docs/90_day_roadmap.md",
+    ]
+    artifact_paths = [
+        root / "outputs/analytics/show_ready_backfill/show_ready_backfill.json",
+        root / "outputs/analytics/show_ready_backfill/show_ready_backfill.md",
+        root / "outputs/analytics/show_ready_maintenance/show_ready_maintenance.json",
+        root / "outputs/analytics/show_ready_maintenance/show_ready_maintenance.md",
+        root / "outputs/analysis/day_90_launch/day_90_launch.md",
+    ]
+    maintenance_report = build_show_ready_maintenance_report(root / "outputs")
+    anchor = _coerce_dict(maintenance_report.get("anchor_alignment"))
+    creator = _coerce_dict(maintenance_report.get("creator_index_coverage"))
+    safety = _coerce_dict(maintenance_report.get("safety_platform_contract"))
+    freshness = _coerce_dict(maintenance_report.get("canonical_artifact_freshness"))
+    cadence = _coerce_dict(maintenance_report.get("cadence"))
+
+    creator_ready = str(creator.get("status", "")) == "ready"
+    safety_ready = bool(safety.get("present"))
+    freshness_status = str(freshness.get("status", ""))
+    completeness = (
+        "ready"
+        if not _missing_paths(doc_paths, root) and creator_ready and safety_ready
+        else "attention"
+        if creator.get("manifest_count", 0) or safety.get("run_id")
+        else "missing"
+    )
+    operational = str(maintenance_report.get("overall_status", "")) or "missing"
+    efficiency = "ready" if freshness_status == "ready" else "attention" if freshness_status else "missing"
+
+    return {
+        "label": "Weeks 15-16",
+        "surface": "Show-Ready Maintenance",
+        "completeness_status": completeness,
+        "operational_status": operational,
+        "efficiency_status": efficiency,
+        "docs": [_relative(path, root) for path in doc_paths],
+        "artifacts": [_relative(path, root) for path in artifact_paths if path.exists()],
+        "missing_paths": _missing_paths(doc_paths, root),
+        "artifact_summary": _artifact_summary(artifact_paths),
+        "metrics": {
+            "overall_status": maintenance_report.get("overall_status", ""),
+            "anchor_alignment_status": anchor.get("status", ""),
+            "aligned_branch_count": anchor.get("aligned_branch_count", 0),
+            "tracked_branch_count": anchor.get("tracked_branch_count", 0),
+            "creator_manifest_count": creator.get("manifest_count", 0),
+            "indexed_creator_manifest_count": creator.get("indexed_count", 0),
+            "safety_platform_contract_present": safety.get("present", False),
+            "canonical_stale_count": freshness.get("stale_count", 0),
+            "cadence_status": cadence.get("cadence_status", ""),
+        },
+        "summary": str(maintenance_report.get("summary", "")).strip(),
+        "recommended_actions": [str(item) for item in _coerce_list(maintenance_report.get("next_actions")) if isinstance(item, str)],
+        "share_artifacts": [
+            _relative(root / "outputs/analytics/show_ready_backfill/show_ready_backfill.md", root),
+            _relative(root / "outputs/analytics/show_ready_maintenance/show_ready_maintenance.md", root),
+            _relative(root / "outputs/analysis/day_90_launch/day_90_launch.md", root),
+        ],
+    }
+
+
 def build_weeks_1_8_readiness_report(root: Path) -> dict[str, Any]:
     workspace_root = root.resolve()
     outputs_root = workspace_root / "outputs"
@@ -723,6 +792,56 @@ def build_weeks_1_14_readiness_report(root: Path) -> dict[str, Any]:
             "outputs/analysis/public_spotify/creator_label_intelligence/creator_label_intelligence_tame-impala-arctic-monkeys-phoebe-bridgers.md",
             "outputs/analysis/research_claims/research_claims.md",
             "outputs/analysis/day_90_launch/day_90_launch.md",
+        ],
+    }
+
+
+def build_weeks_1_16_readiness_report(root: Path) -> dict[str, Any]:
+    workspace_root = root.resolve()
+    outputs_root = workspace_root / "outputs"
+    latest_run = _latest_run_dir(outputs_root)
+    bundle = load_portfolio_artifact_bundle(outputs_root)
+
+    sections = [
+        _build_taste_os_status(workspace_root, artifact_bundle=bundle),
+        _build_control_room_status(workspace_root, artifact_bundle=bundle),
+        _build_creator_status(workspace_root, artifact_bundle=bundle),
+        _build_platform_research_status(workspace_root, artifact_bundle=bundle),
+        _build_integration_status(workspace_root, artifact_bundle=bundle),
+        _build_day_90_launch_status(workspace_root, artifact_bundle=bundle),
+        _build_show_ready_maintenance_status(workspace_root, artifact_bundle=bundle),
+    ]
+
+    completeness_status = _worst_status(*(row["completeness_status"] for row in sections))
+    operational_status = _worst_status(*(row["operational_status"] for row in sections))
+    efficiency_status = _worst_status(*(row["efficiency_status"] for row in sections))
+    show_ready_maintained = completeness_status == "ready" and efficiency_status == "ready"
+
+    next_actions: list[str] = []
+    for row in sections:
+        for action in row.get("recommended_actions", []):
+            if action not in next_actions:
+                next_actions.append(action)
+
+    return {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "workspace_root": str(workspace_root),
+        "outputs_root": str(outputs_root),
+        "latest_run_dir": str(latest_run.resolve()) if latest_run is not None else "",
+        "latest_run_timestamp": _isoformat(_timestamp(latest_run)) if latest_run is not None else None,
+        "weeks_1_16_show_ready_maintained": show_ready_maintained,
+        "overall": {
+            "completeness_status": completeness_status,
+            "operational_status": operational_status,
+            "efficiency_status": efficiency_status,
+        },
+        "sections": sections,
+        "next_actions": next_actions,
+        "fast_review_path": [
+            "outputs/analysis/day_90_launch/day_90_launch.md",
+            "outputs/analytics/show_ready_backfill/show_ready_backfill.md",
+            "outputs/analytics/show_ready_maintenance/show_ready_maintenance.md",
+            "outputs/analytics/weeks_1_16_readiness.md",
         ],
     }
 
@@ -902,6 +1021,63 @@ def write_weeks_1_14_readiness_report(report: dict[str, Any], *, output_dir: Pat
     return {"json": json_path, "md": md_path}
 
 
+def write_weeks_1_16_readiness_report(report: dict[str, Any], *, output_dir: Path) -> dict[str, Path]:
+    resolved_output_dir = output_dir.expanduser().resolve()
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = write_json(resolved_output_dir / "weeks_1_16_readiness.json", report)
+    md_path = resolved_output_dir / "weeks_1_16_readiness.md"
+
+    overall = report.get("overall", {})
+    overall = overall if isinstance(overall, dict) else {}
+    sections = report.get("sections", [])
+    sections = sections if isinstance(sections, list) else []
+    markdown_lines = [
+        "# Weeks 1-16 Readiness",
+        "",
+        f"- Show-ready is maintained: `{bool(report.get('weeks_1_16_show_ready_maintained', False))}`",
+        f"- Completeness: `{overall.get('completeness_status', '')}`",
+        f"- Operational health: `{overall.get('operational_status', '')}`",
+        f"- Efficiency: `{overall.get('efficiency_status', '')}`",
+        f"- Latest run dir: `{report.get('latest_run_dir', '')}`",
+        "",
+        "## Fast Review Path",
+        "",
+    ]
+    for item in report.get("fast_review_path", []):
+        markdown_lines.append(f"- `{item}`")
+    markdown_lines.extend(["", "## Section Status", ""])
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        markdown_lines.extend(
+            [
+                f"### {section.get('label', '')}: {section.get('surface', '')}",
+                "",
+                f"- Completeness: `{section.get('completeness_status', '')}`",
+                f"- Operational health: `{section.get('operational_status', '')}`",
+                f"- Efficiency: `{section.get('efficiency_status', '')}`",
+                f"- Summary: {section.get('summary', '')}",
+            ]
+        )
+        metrics = section.get("metrics", {})
+        metrics = metrics if isinstance(metrics, dict) else {}
+        for key, value in metrics.items():
+            markdown_lines.append(f"- {key}: `{value}`")
+        recommended_actions = section.get("recommended_actions", [])
+        recommended_actions = recommended_actions if isinstance(recommended_actions, list) else []
+        if recommended_actions:
+            markdown_lines.append("- Recommended actions:")
+            for action in recommended_actions:
+                markdown_lines.append(f"  - {action}")
+        markdown_lines.append("")
+    markdown_lines.extend(["## Next Actions", ""])
+    for action in report.get("next_actions", []):
+        markdown_lines.append(f"- {action}")
+
+    md_path = write_markdown(md_path, markdown_lines)
+    return {"json": json_path, "md": md_path}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m spotify.phase_readiness",
@@ -916,9 +1092,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scope",
         type=str,
-        default="weeks-1-14",
-        choices=("weeks-1-8", "weeks-1-13", "weeks-1-14"),
-        help="Whether to audit the early roadmap, the Week 1-13 stack, or the Day-90 closeout package.",
+        default="weeks-1-16",
+        choices=("weeks-1-8", "weeks-1-13", "weeks-1-14", "weeks-1-16"),
+        help="Whether to audit the early roadmap, the build-up to Day 90, the closeout package, or the post-launch maintenance layer.",
     )
     return parser.parse_args()
 
@@ -938,12 +1114,18 @@ def main() -> int:
         print(f"weeks_1_13_readiness_json={artifacts['json']}")
         print(f"weeks_1_13_readiness_md={artifacts['md']}")
         print(f"weeks_1_13_ready_for_day_90={report['weeks_1_13_ready_for_day_90']}")
-    else:
+    elif args.scope == "weeks-1-14":
         report = build_weeks_1_14_readiness_report(workspace_root)
         artifacts = write_weeks_1_14_readiness_report(report, output_dir=Path(args.output_dir))
         print(f"weeks_1_14_readiness_json={artifacts['json']}")
         print(f"weeks_1_14_readiness_md={artifacts['md']}")
         print(f"weeks_1_14_ready_for_showcase={report['weeks_1_14_ready_for_showcase']}")
+    else:
+        report = build_weeks_1_16_readiness_report(workspace_root)
+        artifacts = write_weeks_1_16_readiness_report(report, output_dir=Path(args.output_dir))
+        print(f"weeks_1_16_readiness_json={artifacts['json']}")
+        print(f"weeks_1_16_readiness_md={artifacts['md']}")
+        print(f"weeks_1_16_show_ready_maintained={report['weeks_1_16_show_ready_maintained']}")
     return 0
 
 

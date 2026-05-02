@@ -22,6 +22,8 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-branch-portfolio"] == "spotify.branch_portfolio:main"
     assert scripts["spotify-outward-package"] == "spotify.outward_package:main"
     assert scripts["spotify-day-90-launch"] == "spotify.day_90_launch:main"
+    assert scripts["spotify-show-ready-backfill"] == "spotify.show_ready_backfill:main"
+    assert scripts["spotify-show-ready-maintenance"] == "spotify.show_ready_maintenance:main"
     assert scripts["spotify-taste-os-demo"] == "spotify.taste_os_demo:main"
     assert scripts["spotify-taste-os-showcase"] == "spotify.taste_os_showcase:main"
     assert scripts["spotify-taste-os-serve"] == "spotify.taste_os_service:main"

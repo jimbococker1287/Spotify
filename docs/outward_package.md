@@ -8,6 +8,8 @@ Use `make outward-package` or `python -m spotify.outward_package` to assemble a 
 
 Use `make day-90-launch` when you want the final closeout layer on top of that package: canonical artifact manifest, delivery checklist, and ready-to-show status.
 
+After Day 90, use `make show-ready-backfill` and `make show-ready-maintenance` to keep that package aligned with newer runs and newer artifact formats.
+
 The package should include:
 
 - one flagship claim-to-demo review pack
@@ -28,3 +30,5 @@ The package should include:
 ## Honesty Rule
 
 The package should preserve the current state of the system, including any research or benchmark gaps. It is a polished presentation layer, not a marketing rewrite.
+
+That same rule applies after launch: if the showcase anchor, creator indexes, or safety-platform contract drift out of date, the maintenance layer should call that out instead of hiding it.
