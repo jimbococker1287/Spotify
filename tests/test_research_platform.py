@@ -115,8 +115,12 @@ def test_research_artifact_writers_emit_expected_files(tmp_path: Path) -> None:
     assert all(path.exists() for path in ablation_paths)
     assert all(path.exists() for path in significance_paths)
     protocol_payload = json.loads((tmp_path / "benchmark_protocol.json").read_text(encoding="utf-8"))
+    platform_payload = json.loads((tmp_path / "safety_platform_contract.json").read_text(encoding="utf-8"))
     assert protocol_payload["benchmark_contract"]["contract_version"] == "2026-week10-v1"
     assert protocol_payload["protocol"]["benchmark_lock"]["minimum_repeated_runs"] == 3
+    assert platform_payload["benchmark_contract_version"] == "2026-week10-v1"
+    assert platform_payload["reuse_summary"]["api_group_count"] >= 1
+    assert (tmp_path / "safety_platform_contract.md").exists()
 
 
 def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
@@ -145,6 +149,8 @@ def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
     )
 
     assert (run_dir / "analysis" / "robustness_summary.json").exists()
+    assert (run_dir / "analysis" / "robustness_benchmarks.json").exists()
+    assert (run_dir / "analysis" / "robustness_benchmarks.csv").exists()
     assert (run_dir / "analysis" / "robustness_guardrails.json").exists()
     assert (run_dir / "analysis" / "policy_simulation_summary.json").exists()
     assert robustness_artifacts
@@ -152,8 +158,14 @@ def test_robustness_and_policy_outputs_are_written(tmp_path: Path) -> None:
     robustness_summary = json.loads((run_dir / "analysis" / "robustness_summary.json").read_text(encoding="utf-8"))
     assert robustness_summary[0]["raw_max_top1_gap"] >= robustness_summary[0]["max_top1_gap"]
     guardrail_payload = json.loads((run_dir / "analysis" / "robustness_guardrails.json").read_text(encoding="utf-8"))
+    benchmark_payload = json.loads((run_dir / "analysis" / "robustness_benchmarks.json").read_text(encoding="utf-8"))
     assert guardrail_payload["segment"] == "repeat_from_prev"
     assert guardrail_payload["bucket"] == "new"
+    assert benchmark_payload["guardrail_benchmark_name"] == "repeat_from_prev_new"
+    assert benchmark_payload["focus_guardrail_benchmark_name"] == "repeat_from_prev_new__late_skip"
+    benchmark_names = {row["benchmark_name"] for row in benchmark_payload["rows"]}
+    assert "repeat_from_prev_new" in benchmark_names
+    assert "repeat_from_prev_new__late_skip" in benchmark_names
     summary_csv_lines = (run_dir / "analysis" / "robustness_summary.csv").read_text(encoding="utf-8").splitlines()
     guardrail_csv_lines = (run_dir / "analysis" / "robustness_guardrails.csv").read_text(encoding="utf-8").splitlines()
     assert summary_csv_lines[0].startswith("model_name,model_type,operational_model,")
@@ -227,6 +239,35 @@ def test_champion_gate_can_block_on_selective_risk(tmp_path: Path) -> None:
     assert result["status"] == "fail_selective_risk"
 
 
+def test_champion_gate_can_block_on_guardrail_gap(tmp_path: Path) -> None:
+    history_csv = tmp_path / "history.csv"
+    history_csv.write_text("run_id,model_name,val_top1\nrun_prev,retrieval_reranker,0.55\n", encoding="utf-8")
+
+    result = evaluate_champion_gate(
+        history_csv=history_csv,
+        current_run_id="run_a",
+        current_results=[{"model_name": "retrieval_reranker", "val_top1": 0.57}],
+        regression_threshold=0.05,
+        metric_source="val_top1",
+        require_profile_match=False,
+        current_risk_metrics={
+            "retrieval_reranker": {
+                "val_guardrail_gap": 0.12,
+                "test_guardrail_gap": 0.11,
+                "val_focus_guardrail_gap": 0.14,
+                "test_focus_guardrail_gap": 0.13,
+            }
+        },
+        max_guardrail_gap=0.10,
+        max_focus_guardrail_gap=0.13,
+    )
+
+    assert result["promoted"] is False
+    assert result["status"] == "fail_guardrail_gap"
+    assert result["challenger_guardrail_gap"] == 0.12
+    assert result["challenger_focus_guardrail_gap"] == 0.14
+
+
 def test_risk_metrics_backfill_from_prediction_bundle_for_missing_challenger_summary(tmp_path: Path) -> None:
     data = _prepared_data()
     run_dir = tmp_path / "run_a"
@@ -296,3 +337,45 @@ def test_risk_metrics_backfill_from_prediction_bundle_for_missing_challenger_sum
     assert gate["challenger_selective_risk"] == expected_selective_risk
     if expected_selective_risk > 0.0:
         assert gate["status"] == "fail_selective_risk"
+
+
+def test_load_current_risk_metrics_merges_robustness_guardrail_metrics(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_a"
+    analysis_dir = run_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    (analysis_dir / "retrieval_reranker_demo_model_confidence_summary.json").write_text(
+        json.dumps(
+            {
+                "val_selective_risk": 0.12,
+                "test_selective_risk": 0.18,
+                "val_abstention_rate": 0.05,
+                "test_abstention_rate": 0.07,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (analysis_dir / "robustness_summary.json").write_text(
+        json.dumps(
+            [
+                {
+                    "model_name": "demo_model",
+                    "val_guardrail_gap": 0.09,
+                    "test_guardrail_gap": 0.11,
+                    "val_focus_guardrail_gap": 0.12,
+                    "test_focus_guardrail_gap": 0.13,
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    metrics = _load_current_risk_metrics(
+        run_dir,
+        [{"model_name": "demo_model", "model_type": "retrieval_reranker"}],
+    )
+
+    assert metrics["demo_model"]["val_selective_risk"] == 0.12
+    assert metrics["demo_model"]["test_guardrail_gap"] == 0.11
+    assert metrics["demo_model"]["test_focus_guardrail_gap"] == 0.13

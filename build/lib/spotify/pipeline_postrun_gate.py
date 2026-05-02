@@ -35,6 +35,8 @@ def _resolve_gate_settings() -> dict[str, object]:
         champion_gate_significance_z = 1.96
     gate_max_selective_risk_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK", "").strip()
     gate_max_abstention_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE", "").strip()
+    gate_max_guardrail_gap_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_GUARDRAIL_GAP", "0.10").strip()
+    gate_max_focus_guardrail_gap_raw = os.getenv("SPOTIFY_CHAMPION_GATE_MAX_FOCUS_GUARDRAIL_GAP", "0.13").strip()
     try:
         gate_max_selective_risk = float(gate_max_selective_risk_raw) if gate_max_selective_risk_raw else None
     except Exception:
@@ -43,6 +45,16 @@ def _resolve_gate_settings() -> dict[str, object]:
         gate_max_abstention_rate = float(gate_max_abstention_raw) if gate_max_abstention_raw else None
     except Exception:
         gate_max_abstention_rate = None
+    try:
+        gate_max_guardrail_gap = float(gate_max_guardrail_gap_raw) if gate_max_guardrail_gap_raw else None
+    except Exception:
+        gate_max_guardrail_gap = 0.10
+    try:
+        gate_max_focus_guardrail_gap = (
+            float(gate_max_focus_guardrail_gap_raw) if gate_max_focus_guardrail_gap_raw else None
+        )
+    except Exception:
+        gate_max_focus_guardrail_gap = 0.13
     return {
         "threshold": champion_gate_threshold,
         "metric": champion_gate_metric,
@@ -51,6 +63,8 @@ def _resolve_gate_settings() -> dict[str, object]:
         "significance_z": champion_gate_significance_z,
         "max_selective_risk": gate_max_selective_risk,
         "max_abstention_rate": gate_max_abstention_rate,
+        "max_guardrail_gap": gate_max_guardrail_gap,
+        "max_focus_guardrail_gap": gate_max_focus_guardrail_gap,
     }
 
 
@@ -107,6 +121,8 @@ def run_champion_gate_and_alias(
             current_risk_metrics=current_risk_metrics,
             max_selective_risk=settings["max_selective_risk"],
             max_abstention_rate=settings["max_abstention_rate"],
+            max_guardrail_gap=settings["max_guardrail_gap"],
+            max_focus_guardrail_gap=settings["max_focus_guardrail_gap"],
         )
         _write_json_artifact(run_dir / "champion_gate.json", champion_gate, artifact_paths)
         logger.info(

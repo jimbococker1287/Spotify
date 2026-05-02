@@ -139,6 +139,8 @@ def refresh_champion_gate(
         significance_z = 1.96
     max_selective_risk = _safe_optional_float(existing_gate.get("max_selective_risk"))
     max_abstention_rate = _safe_optional_float(existing_gate.get("max_abstention_rate"))
+    max_guardrail_gap = _safe_optional_float(existing_gate.get("max_guardrail_gap"))
+    max_focus_guardrail_gap = _safe_optional_float(existing_gate.get("max_focus_guardrail_gap"))
     conformal_alpha = _safe_float(existing_gate.get("conformal_alpha"))
     if not math.isfinite(conformal_alpha):
         conformal_alpha = 0.10
@@ -168,6 +170,8 @@ def refresh_champion_gate(
         current_risk_metrics=current_risk_metrics,
         max_selective_risk=max_selective_risk,
         max_abstention_rate=max_abstention_rate,
+        max_guardrail_gap=max_guardrail_gap,
+        max_focus_guardrail_gap=max_focus_guardrail_gap,
     )
 
     champion_alias_payload: dict[str, object] = {

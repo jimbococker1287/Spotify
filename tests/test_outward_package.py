@@ -74,24 +74,34 @@ def _build_sample_outputs(output_root: Path) -> None:
     creator_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
     creator_main = creator_dir / "creator.md"
     scene_seed = creator_dir / "scene_seed.md"
+    opportunity_lane = creator_dir / "opportunity_lane.md"
+    scene_strategy = creator_dir / "scene_strategy_watch.md"
+    report_family_md = creator_dir / "creator_report_family.md"
     ranking = creator_dir / "ranking.md"
     scene = creator_dir / "scene.md"
     seed = creator_dir / "seed.md"
-    for path in (creator_main, scene_seed, ranking, scene, seed):
+    for path in (creator_main, scene_seed, opportunity_lane, scene_strategy, report_family_md, ranking, scene, seed):
         _write_text(path, f"# {path.stem}\n")
     _write_json(
         creator_dir / "creator_report_family.json",
         {
             "primary_report": str(creator_main),
+            "artifact_index_markdown": str(report_family_md),
             "comparison_view_markdown": {
                 "ranking_comparison": str(ranking),
                 "scene_comparison": str(scene),
                 "seed_comparison": str(seed),
                 "scene_seed_comparison": str(scene_seed),
+                "opportunity_lane_comparison": str(opportunity_lane),
             },
+            "brief_view_markdown": {"scene_strategy_watch": str(scene_strategy)},
         },
     )
 
+    run_dir = output_root / "runs" / "run_full_anchor"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_text(run_dir / "safety_platform_contract.md", "# Safety Platform Contract\n")
+    _write_json(run_dir / "safety_platform_contract.json", {"benchmark_contract_version": "2026-week10-v1"})
     _write_json(
         output_root / "analysis" / "research_claims" / "research_claims.json",
         {
@@ -145,11 +155,16 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert (package_root / "taste_os" / "taste_os_showcase.md").exists()
     assert (package_root / "control_room" / "control_room.md").exists()
     assert (package_root / "creator_intelligence" / "creator_label_intelligence.md").exists()
+    assert (package_root / "creator_intelligence" / "report_family.md").exists()
+    assert (package_root / "creator_intelligence" / "scene_strategy_watch.md").exists()
     assert (package_root / "safety_research" / "research_claims.md").exists()
+    assert (package_root / "safety_research" / "safety_platform_contract.md").exists()
 
     package_payload = json.loads(paths["json"].read_text(encoding="utf-8"))
     assert "copied_artifacts" in package_payload
     assert package_payload["copied_artifacts"]["claim_to_demo_md"]
     assert package_payload["copied_artifacts"]["taste_os_md"]
+    assert package_payload["copied_artifacts"]["creator_report_family_md"]
+    assert package_payload["copied_artifacts"]["safety_platform_contract_md"]
     safety_showcase = paths["safety_research_showcase_md"].read_text(encoding="utf-8")
     assert "Believable submission path: `True`" in safety_showcase

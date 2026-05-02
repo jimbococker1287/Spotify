@@ -74,10 +74,13 @@ def _artifact_summary(paths: list[Path]) -> dict[str, Any]:
 def _creator_manifest_status(path: Path) -> dict[str, Any]:
     payload = _read_json(path)
     primary_report = Path(str(payload.get("primary_report", "")))
+    report_family_md = Path(str(payload.get("artifact_index_markdown", ""))) if str(payload.get("artifact_index_markdown", "")).strip() else None
     comparison_md = payload.get("comparison_view_markdown", {})
     comparison_csv = payload.get("comparison_view_csv", {})
+    brief_md = payload.get("brief_view_markdown", {})
     comparison_md = comparison_md if isinstance(comparison_md, dict) else {}
     comparison_csv = comparison_csv if isinstance(comparison_csv, dict) else {}
+    brief_md = brief_md if isinstance(brief_md, dict) else {}
     expected_view_keys = {
         "ranking_comparison",
         "scene_comparison",
@@ -86,16 +89,22 @@ def _creator_manifest_status(path: Path) -> dict[str, Any]:
     }
     md_paths = {key: Path(str(value)) for key, value in comparison_md.items()}
     csv_paths = {key: Path(str(value)) for key, value in comparison_csv.items()}
+    brief_md_paths = {key: Path(str(value)) for key, value in brief_md.items()}
     all_view_keys = expected_view_keys & set(md_paths) & set(csv_paths)
     json_path = primary_report.with_suffix(".json")
     comparison_rows = {}
+    brief_row_counts = {}
     if json_path.exists():
         payload_json = _read_json(json_path)
         comparison_views = payload_json.get("comparison_views", {})
         comparison_views = comparison_views if isinstance(comparison_views, dict) else {}
+        brief_views = payload_json.get("brief_views", {})
+        brief_views = brief_views if isinstance(brief_views, dict) else {}
         for key in expected_view_keys:
             rows = comparison_views.get(key, [])
             comparison_rows[key] = len(rows) if isinstance(rows, list) else 0
+        for key, rows in brief_views.items():
+            brief_row_counts[str(key)] = len(rows) if isinstance(rows, list) else 0
     missing_paths = []
     for view_key in expected_view_keys:
         if view_key not in md_paths or not md_paths[view_key].exists():
@@ -106,6 +115,8 @@ def _creator_manifest_status(path: Path) -> dict[str, Any]:
         missing_paths.append(str(primary_report))
     if not json_path.exists():
         missing_paths.append(str(json_path))
+    if report_family_md is not None and not report_family_md.exists():
+        missing_paths.append(str(report_family_md))
 
     completeness = "ready" if not missing_paths and len(all_view_keys) == 4 else "missing"
     operational = "ready" if all(comparison_rows.get(key, 0) > 0 for key in expected_view_keys) else "attention"
@@ -113,9 +124,14 @@ def _creator_manifest_status(path: Path) -> dict[str, Any]:
         "stem": primary_report.stem,
         "primary_report": str(primary_report),
         "json_report": str(json_path),
+        "report_family_markdown": str(report_family_md) if report_family_md is not None else "",
         "completeness_status": completeness,
         "operational_status": operational,
         "comparison_rows": comparison_rows,
+        "brief_rows": brief_row_counts,
+        "comparison_view_count": len(md_paths),
+        "brief_view_count": len(brief_md_paths),
+        "artifact_index_present": bool(report_family_md is not None and report_family_md.exists()),
         "missing_paths": missing_paths,
     }
 
@@ -303,6 +319,8 @@ def _build_creator_status(root: Path, *, artifact_bundle: PortfolioArtifactBundl
     manifest_statuses = [_creator_manifest_status(path) for path in manifest_paths]
     complete_families = sum(1 for row in manifest_statuses if row["completeness_status"] == "ready")
     operational_families = sum(1 for row in manifest_statuses if row["operational_status"] == "ready")
+    indexed_families = sum(1 for row in manifest_statuses if bool(row.get("artifact_index_present")))
+    brief_view_families = sum(1 for row in manifest_statuses if int(row.get("brief_view_count", 0) or 0) > 0)
     completeness = (
         "ready"
         if doc_paths[0].exists() and len(manifest_paths) >= 3 and complete_families == len(manifest_paths)
@@ -315,6 +333,8 @@ def _build_creator_status(root: Path, *, artifact_bundle: PortfolioArtifactBundl
         recommended_actions.append("Generate at least three creator report families across different seed styles.")
     if operational_families < len(manifest_paths):
         recommended_actions.append("Fill any empty comparison views so ranking, scene, seed, and scene-vs-seed all stay legible.")
+    if indexed_families < len(manifest_paths):
+        recommended_actions.append("Regenerate creator report-family indexes so each brief ships with a shareable reading order.")
 
     share_artifacts = [row["primary_report"] for row in manifest_statuses[:3]]
     return {
@@ -331,10 +351,12 @@ def _build_creator_status(root: Path, *, artifact_bundle: PortfolioArtifactBundl
             "report_family_count": len(manifest_paths),
             "complete_report_family_count": complete_families,
             "operational_report_family_count": operational_families,
+            "indexed_report_family_count": indexed_families,
+            "brief_view_family_count": brief_view_families,
         },
         "summary": (
-            f"Creator intelligence has `{len(manifest_paths)}` report families, with `{complete_families}` complete "
-            f"and `{operational_families}` carrying non-empty comparison views."
+            f"Creator intelligence has `{len(manifest_paths)}` report families, with `{complete_families}` complete, "
+            f"`{operational_families}` carrying non-empty comparison views, and `{indexed_families}` shipping a report-family index."
         ),
         "recommended_actions": recommended_actions,
         "share_artifacts": [str(Path(path).resolve()) for path in share_artifacts],
@@ -366,6 +388,9 @@ def _build_platform_research_status(root: Path, *, artifact_bundle: PortfolioArt
     backup_status = str(backup_claim.get("status", "")).strip()
     benchmark_ready = bool(artifact_bundle.benchmark_manifest_payload.get("comparison_ready"))
     believable = bool(claims_payload.get("believable_submission_path"))
+    platform_contract_present = bool(
+        artifact_bundle.safety_platform_contract_md is not None and artifact_bundle.safety_platform_contract_md.exists()
+    )
 
     completeness = "ready" if not _missing_paths(doc_paths + artifact_paths, root) else "missing"
     operational = (
@@ -379,6 +404,8 @@ def _build_platform_research_status(root: Path, *, artifact_bundle: PortfolioArt
         recommended_actions.append("Finish the repeated-seed benchmark lock so the safety and research branch is comparison-ready.")
     if not believable:
         recommended_actions.append("Strengthen the claim pack until the primary and backup claims form a believable submission path.")
+    if not platform_contract_present:
+        recommended_actions.append("Regenerate research artifacts so the reusable safety-platform contract is published alongside the claim pack.")
 
     return {
         "label": "Weeks 9-11",
@@ -395,14 +422,17 @@ def _build_platform_research_status(root: Path, *, artifact_bundle: PortfolioArt
             "backup_claim_status": backup_status,
             "benchmark_comparison_ready": benchmark_ready,
             "believable_submission_path": believable,
+            "platform_contract_present": platform_contract_present,
         },
         "summary": (
             f"Safety and research currently carry primary claim status `{primary_status or 'unknown'}`, "
-            f"backup status `{backup_status or 'unknown'}`, and benchmark comparison-ready=`{benchmark_ready}`."
+            f"backup status `{backup_status or 'unknown'}`, benchmark comparison-ready=`{benchmark_ready}`, "
+            f"and platform-contract present=`{platform_contract_present}`."
         ),
         "recommended_actions": recommended_actions,
         "share_artifacts": [
             _relative(artifact_bundle.research_claims_md, root),
+            _relative(artifact_bundle.safety_platform_contract_md, root) if artifact_bundle.safety_platform_contract_md else "",
             _relative(artifact_bundle.benchmark_manifest_md, root) if artifact_bundle.benchmark_manifest_md else "",
         ],
     }

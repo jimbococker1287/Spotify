@@ -41,11 +41,17 @@ class PortfolioArtifactBundle:
     creator_manifest_path: Path | None
     creator_manifest: dict[str, Any]
     creator_primary_report_path: Path | None
+    creator_report_family_md_path: Path | None
     creator_comparison_markdown_paths: dict[str, Path]
     creator_comparison_csv_paths: dict[str, Path]
+    creator_brief_markdown_paths: dict[str, Path]
+    creator_brief_csv_paths: dict[str, Path]
     research_claims_json: Path
     research_claims_md: Path
     research_claims_payload: dict[str, Any]
+    safety_platform_contract_json: Path | None
+    safety_platform_contract_md: Path | None
+    safety_platform_contract_payload: dict[str, Any]
     benchmark_manifest_json: Path | None
     benchmark_manifest_md: Path | None
     benchmark_manifest_payload: dict[str, Any]
@@ -71,6 +77,11 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         if str(creator_manifest.get("primary_report", "")).strip()
         else None
     )
+    creator_report_family_md_path = (
+        Path(str(creator_manifest.get("artifact_index_markdown", "")).strip())
+        if str(creator_manifest.get("artifact_index_markdown", "")).strip()
+        else None
+    )
     creator_comparison_markdown_paths = {
         str(key): Path(str(value))
         for key, value in _coerce_dict(creator_manifest.get("comparison_view_markdown")).items()
@@ -81,6 +92,39 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         for key, value in _coerce_dict(creator_manifest.get("comparison_view_csv")).items()
         if str(value).strip()
     }
+    creator_brief_markdown_paths = {
+        str(key): Path(str(value))
+        for key, value in _coerce_dict(creator_manifest.get("brief_view_markdown")).items()
+        if str(value).strip()
+    }
+    creator_brief_csv_paths = {
+        str(key): Path(str(value))
+        for key, value in _coerce_dict(creator_manifest.get("brief_view_csv")).items()
+        if str(value).strip()
+    }
+
+    research_claims_payload = _coerce_dict(safe_read_json(research_claims_json, default={}))
+    research_run = _coerce_dict(research_claims_payload.get("run"))
+    research_run_id = str(research_run.get("run_id", "")).strip()
+    safety_platform_contract_json = (
+        output_root / "runs" / research_run_id / "safety_platform_contract.json"
+        if research_run_id
+        else None
+    )
+    safety_platform_contract_md = (
+        output_root / "runs" / research_run_id / "safety_platform_contract.md"
+        if research_run_id
+        else None
+    )
+    if safety_platform_contract_json is not None and not safety_platform_contract_json.exists():
+        safety_platform_contract_json = None
+    if safety_platform_contract_md is not None and not safety_platform_contract_md.exists():
+        safety_platform_contract_md = None
+    safety_platform_contract_payload = (
+        _coerce_dict(safe_read_json(safety_platform_contract_json, default={}))
+        if safety_platform_contract_json is not None
+        else {}
+    )
 
     history_dir = output_root / "history"
     benchmark_manifest_json = _latest_path(history_dir, "benchmark_lock_*_manifest.json")
@@ -101,11 +145,17 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         creator_manifest_path=creator_manifest_path,
         creator_manifest=creator_manifest,
         creator_primary_report_path=creator_primary_report_path,
+        creator_report_family_md_path=creator_report_family_md_path,
         creator_comparison_markdown_paths=creator_comparison_markdown_paths,
         creator_comparison_csv_paths=creator_comparison_csv_paths,
+        creator_brief_markdown_paths=creator_brief_markdown_paths,
+        creator_brief_csv_paths=creator_brief_csv_paths,
         research_claims_json=research_claims_json,
         research_claims_md=research_claims_md,
-        research_claims_payload=_coerce_dict(safe_read_json(research_claims_json, default={})),
+        research_claims_payload=research_claims_payload,
+        safety_platform_contract_json=safety_platform_contract_json,
+        safety_platform_contract_md=safety_platform_contract_md,
+        safety_platform_contract_payload=safety_platform_contract_payload,
         benchmark_manifest_json=benchmark_manifest_json,
         benchmark_manifest_md=benchmark_manifest_md,
         benchmark_manifest_payload=benchmark_manifest_payload,

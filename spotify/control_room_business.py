@@ -53,8 +53,11 @@ def build_next_bets(
         )
 
     stress_benchmark_skip_risk = safe_float(qoe.get("stress_benchmark_skip_risk"))
+    stress_benchmark_gate_status = str(qoe.get("stress_benchmark_gate_status", "")).strip().lower()
     stress_skip_risk = safe_float(qoe.get("stress_worst_skip_risk"))
-    if math.isfinite(stress_benchmark_skip_risk) and stress_benchmark_skip_risk >= 0.35:
+    if stress_benchmark_gate_status == "fail":
+        bets.append("The standing evening-drift stress benchmark is over its regression ceiling; fix that route before broadening the product surface.")
+    elif math.isfinite(stress_benchmark_skip_risk) and stress_benchmark_skip_risk >= 0.35:
         bets.append("The standing evening-drift stress benchmark is still too risky; treat it like a core safety metric, not a side lab.")
     elif math.isfinite(stress_skip_risk) and stress_skip_risk >= 0.35:
         bets.append("The moonshot stress lab is surfacing meaningful failure modes; promote one scenario into first-class regression checks.")
@@ -392,26 +395,46 @@ def build_review_actions(
                     f"Target drift JSD is `{format_metric(target_drift)}` and segment shift peaks at "
                     f"`{format_metric(safety.get('largest_segment_shift_value'))}` for {safety.get('largest_segment_shift_label', 'n/a')}."
                 ),
-                "inspect": ["analysis/data_drift_summary.json"],
+                "inspect": ["analysis/data_drift_brief.md", "analysis/data_drift_summary.json"],
             }
         )
 
     stress_benchmark_skip_risk = safe_float(qoe.get("stress_benchmark_skip_risk"))
     stress_benchmark_scenario = str(qoe.get("stress_benchmark_scenario", "")).strip()
-    stress_benchmark_policy = str(qoe.get("stress_benchmark_policy_name", "")).strip()
+    stress_benchmark_policy = (
+        str(qoe.get("stress_benchmark_selected_policy_name", "")).strip()
+        or str(qoe.get("stress_benchmark_policy_name", "")).strip()
+    )
+    stress_benchmark_gate_status = str(qoe.get("stress_benchmark_gate_status", "")).strip().lower()
+    stress_benchmark_gate_threshold = safe_float(qoe.get("stress_benchmark_gate_threshold"))
+    stress_benchmark_target_threshold = safe_float(qoe.get("stress_benchmark_target_threshold"))
     stress_skip_risk = safe_float(qoe.get("stress_worst_skip_risk"))
-    if math.isfinite(stress_benchmark_skip_risk) and stress_benchmark_skip_risk >= 0.35:
+    stress_target = stress_benchmark_target_threshold if math.isfinite(stress_benchmark_target_threshold) else 0.35
+    if math.isfinite(stress_benchmark_skip_risk) and (
+        stress_benchmark_gate_status == "fail" or stress_benchmark_skip_risk >= stress_target
+    ):
+        gate_phrase = (
+            f" It exceeds the regression ceiling `{format_metric(stress_benchmark_gate_threshold)}`."
+            if stress_benchmark_gate_status == "fail"
+            else f" Target is `{format_metric(stress_target)}` before this stops being a standing strategic finding."
+        )
         actions.append(
             {
-                "priority": "medium",
+                "priority": "high" if stress_benchmark_gate_status == "fail" else "medium",
                 "area": "stress_test",
-                "title": "Promote the worst stress scenario into regression checks",
+                "title": (
+                    "Bring the standing stress benchmark back under the regression ceiling"
+                    if stress_benchmark_gate_status == "fail"
+                    else "Promote the worst stress scenario into regression checks"
+                ),
                 "detail": (
                     f"Standing benchmark `{stress_benchmark_scenario or 'unknown'}` with policy "
                     f"`{stress_benchmark_policy or 'unknown'}` reaches skip risk `{format_metric(stress_benchmark_skip_risk)}`."
+                    f"{gate_phrase}"
                 ),
                 "inspect": [
                     "analysis/moonshot_summary.json",
+                    "analysis/stress_test/stress_test_benchmark_brief.md",
                     "analysis/stress_test/stress_test_benchmark.json",
                     "analysis/stress_test/stress_test_summary.json",
                 ],
@@ -435,6 +458,10 @@ def build_review_actions(
     abstention_rate = safe_float(safety.get("test_abstention_rate"))
     accepted_rate = safe_float(safety.get("test_accepted_rate"))
     operating_threshold = safe_float(safety.get("conformal_operating_threshold"))
+    raw_top_candidate = str(safety.get("raw_top_candidate_model_name", "")).strip()
+    eligible_candidate = str(safety.get("risk_eligible_candidate_model_name", "")).strip()
+    raw_blockers = safety.get("raw_top_candidate_risk_blockers", [])
+    raw_blockers = [str(item).strip() for item in raw_blockers] if isinstance(raw_blockers, list) else []
     if math.isfinite(selective_risk) and selective_risk >= 0.50 and (not math.isfinite(abstention_rate) or abstention_rate <= 0.01):
         actions.append(
             {
@@ -446,6 +473,24 @@ def build_review_actions(
                     f"(accepted=`{format_metric(accepted_rate)}`, operating_threshold=`{format_metric(operating_threshold)}`)."
                 ),
                 "inspect": ["analysis/*_conformal_summary.json"],
+            }
+        )
+    if (
+        raw_top_candidate
+        and eligible_candidate
+        and raw_top_candidate != eligible_candidate
+        and "abstention_rate" in raw_blockers
+    ):
+        actions.append(
+            {
+                "priority": "medium",
+                "area": "promotion",
+                "title": "Retune the raw winner's abstention before the next promotion decision",
+                "detail": (
+                    f"Raw top candidate `{raw_top_candidate}` is being screened out on abstention, so "
+                    f"`{eligible_candidate}` becomes the best risk-eligible alternative."
+                ),
+                "inspect": ["analysis/*_confidence_summary.json", "analysis/*_conformal_summary.json", "outputs/analytics/control_room.md"],
             }
         )
 

@@ -141,11 +141,31 @@ def test_run_report_lists_nested_moonshot_artifacts(tmp_path: Path) -> None:
         history_dir=history_dir,
         manifest={"run_id": "run_a", "profile": "full", "data_records": 12},
         results=[{"model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.6, "fit_seconds": 1.0}],
-        champion_gate={"status": "pass", "promoted": True, "metric_source": "val_top1", "threshold": 0.01, "regression": 0.0},
+        champion_gate={
+            "status": "pass",
+            "promoted": True,
+            "metric_source": "val_top1",
+            "threshold": 0.01,
+            "regression": 0.0,
+            "top_candidate_model_name": "retrieval_reranker",
+            "top_candidate_score": 0.61,
+            "top_candidate_risk_blockers": ["abstention_rate"],
+            "challenger_model_name": "blended_ensemble",
+            "challenger_score": 0.60,
+            "challenger_selection_reason": "highest_scoring_risk_eligible_candidate",
+            "selected_candidate_rank": 2,
+            "eligible_candidate_count": 1,
+            "challenger_selective_risk": 0.18,
+            "challenger_abstention_rate": 0.08,
+            "challenger_guardrail_gap": 0.09,
+            "challenger_focus_guardrail_gap": 0.12,
+        },
         history_csv=history_csv,
     )
 
     content = report_path.read_text(encoding="utf-8")
+    assert "Raw top candidate: `retrieval_reranker` (`0.6100`)" in content
+    assert "Risk-eligible selection reason: `highest_scoring_risk_eligible_candidate` rank=`2` eligible_count=`1`" in content
     assert "analysis/moonshot_summary.json" in content
     assert "analysis/multimodal/multimodal_artist_space_summary.json" in content
     assert "analysis/group_auto_dj/group_auto_dj_summary.json" in content

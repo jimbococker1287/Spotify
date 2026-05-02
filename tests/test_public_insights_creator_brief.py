@@ -3,10 +3,12 @@ from __future__ import annotations
 from spotify.public_insights import (
     _creator_brief_executive_summary,
     _creator_brief_migration_watch,
+    _creator_brief_opportunity_lane_comparison,
     _creator_brief_priority_shortlist,
     _creator_brief_ranking_comparison,
     _creator_brief_release_watch,
     _creator_brief_scene_comparison,
+    _creator_brief_scene_strategy_watch,
     _creator_brief_scene_seed_comparison,
     _creator_brief_seed_comparison,
 )
@@ -65,7 +67,10 @@ def _payload() -> dict[str, object]:
             {
                 "source_artist": "Artist A",
                 "target_artist": "Artist B",
+                "source_scene_id": 0,
+                "target_scene_id": 0,
                 "source_out_share": 0.41,
+                "target_in_share": 0.33,
             }
         ],
         "opportunities": [
@@ -170,6 +175,29 @@ def test_creator_brief_scene_seed_comparison_surfaces_cross_view() -> None:
     assert rows[0]["bridge_artist_count"] >= 1
 
 
+def test_creator_brief_opportunity_lane_comparison_surfaces_driver_and_posture() -> None:
+    rows = _creator_brief_opportunity_lane_comparison(_payload())
+
+    assert rows[0]["scene_name"] == "indie pop / alt z"
+    assert rows[0]["primary_driver"] in {"seed_adjacency", "release_whitespace"}
+    assert rows[0]["priority_now_count"] >= 1
+    assert rows[0]["lane_posture"] in {
+        "adjacency_expansion",
+        "cadence_capture",
+        "competitive_scene",
+        "watch",
+    }
+
+
+def test_creator_brief_scene_strategy_watch_combines_release_label_and_migration() -> None:
+    rows = _creator_brief_scene_strategy_watch(_payload())
+
+    assert rows[0]["scene_name"] == "indie pop / alt z"
+    assert rows[0]["release_whitespace_anchor_artist"] == "Artist C"
+    assert rows[0]["incoming_migration_share"] == 0.41
+    assert rows[0]["strategy_posture"] in {"accelerate_capture", "protect_window", "steady_watch"}
+
+
 def test_creator_brief_priority_shortlist_surfaces_rank_driver_and_seed_bridge() -> None:
     rows = _creator_brief_priority_shortlist(_payload())
 
@@ -195,3 +223,4 @@ def test_creator_brief_executive_summary_calls_out_scene_opportunity_and_migrati
     assert any("6" in line and "2" in line for line in lines)
     assert any("Emerging E" in line for line in lines)
     assert any("Artist A -> Artist B" in line for line in lines)
+    assert any("strongest opportunity lane" in line for line in lines)

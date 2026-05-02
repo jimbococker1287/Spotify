@@ -181,10 +181,41 @@ def _violation_row(*, key: str, label: str, current: object, maximum: float | No
     }
 
 
+def _control_room_gate_violation(
+    *,
+    key: str,
+    label: str,
+    status: object,
+    current: object,
+    maximum: object,
+) -> dict[str, object] | None:
+    if str(status).strip().lower() != "fail":
+        return None
+    current_value = _safe_float(current)
+    threshold = _safe_float(maximum)
+    if not math.isfinite(current_value) or not math.isfinite(threshold):
+        return {
+            "key": key,
+            "label": label,
+            "current": current_value,
+            "threshold": threshold,
+            "status": "fail",
+            "message": f"{label} is marked failed by the control-room gate.",
+        }
+    return {
+        "key": key,
+        "label": label,
+        "current": current_value,
+        "threshold": threshold,
+        "status": "fail",
+        "message": f"{label} is `{current_value:.3f}` which exceeds the control-room gate `{threshold:.3f}`.",
+    }
+
+
 def _violation_area(key: str) -> str:
     if key in {"robustness_gap", "repeat_from_prev_new_gap"}:
         return "robustness"
-    if key in {"stress_skip_risk", "stress_benchmark_skip_risk"}:
+    if key in {"stress_skip_risk", "stress_benchmark_skip_risk", "stress_benchmark_gate"}:
         return "stress_test"
     if key == "target_drift_jsd":
         return "drift"
@@ -482,6 +513,16 @@ def main() -> int:
         )
         if row is not None
     ]
+    if not any(str(row.get("key", "")) == "stress_benchmark_skip_risk" for row in violations):
+        gate_violation = _control_room_gate_violation(
+            key="stress_benchmark_gate",
+            label="Standing stress benchmark gate",
+            status=qoe.get("stress_benchmark_gate_status"),
+            current=qoe.get("stress_benchmark_skip_risk"),
+            maximum=qoe.get("stress_benchmark_gate_threshold"),
+        )
+        if gate_violation is not None:
+            violations.append(gate_violation)
     triage_json, triage_md = _write_triage_artifacts(
         outputs_dir=outputs_dir,
         control_room=control_room,

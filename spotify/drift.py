@@ -207,6 +207,86 @@ def _interpret_target_drift(
     }
 
 
+def _build_drift_brief(summary_payload: dict[str, object]) -> dict[str, object]:
+    target_drift = summary_payload.get("target_drift", {})
+    target_drift = target_drift if isinstance(target_drift, dict) else {}
+    largest_context_shift = summary_payload.get("largest_context_shift", {})
+    largest_context_shift = largest_context_shift if isinstance(largest_context_shift, dict) else {}
+    largest_segment_shift = summary_payload.get("largest_segment_shift", {})
+    largest_segment_shift = largest_segment_shift if isinstance(largest_segment_shift, dict) else {}
+    interpretation = summary_payload.get("drift_interpretation", {})
+    interpretation = interpretation if isinstance(interpretation, dict) else {}
+
+    target_jsd = _safe_float(target_drift.get("train_vs_test_jsd"))
+    segment_shift = _safe_float(largest_segment_shift.get("abs_share_shift"))
+    dominant_group = str(interpretation.get("dominant_context_driver", "")).strip() or "other"
+    status = "attention" if (math.isfinite(target_jsd) and target_jsd >= 0.15) else "stable"
+    if math.isfinite(segment_shift) and segment_shift >= 0.10:
+        status = "attention"
+
+    findings: list[str] = []
+    if math.isfinite(target_jsd):
+        findings.append(f"Target drift JSD is `{target_jsd:.3f}` from train to test.")
+    top_feature = str(largest_context_shift.get("feature", "")).strip()
+    top_context_gap = _safe_float(largest_context_shift.get("abs_std_mean_diff"))
+    if top_feature and math.isfinite(top_context_gap):
+        findings.append(f"Largest context shift is `{top_feature}` at `{top_context_gap:.3f}` standardized mean difference.")
+    segment_name = str(largest_segment_shift.get("segment", "")).strip()
+    bucket_name = str(largest_segment_shift.get("bucket", "")).strip()
+    if segment_name and bucket_name and math.isfinite(segment_shift):
+        findings.append(f"Largest segment-share shift is `{segment_name}={bucket_name}` at `{segment_shift:.3f}`.")
+    if interpretation.get("summary"):
+        findings.append(str(interpretation.get("summary")))
+
+    actions = [
+        "Inspect the top shifted context feature before treating ranking changes as pure model regressions.",
+        "Review the largest segment-share change and compare it against the latest promoted baseline.",
+        "Use the dominant drift family to decide whether the next fix belongs in calibration, routing, or data normalization.",
+    ]
+    inspect_paths = [
+        "analysis/data_drift_summary.json",
+        "analysis/context_feature_drift.csv",
+        "analysis/segment_drift.csv",
+        "analysis/context_feature_drift_by_group.csv",
+    ]
+    return {
+        "status": status,
+        "target_jsd": target_jsd,
+        "dominant_context_driver": dominant_group,
+        "largest_context_feature": top_feature,
+        "largest_context_shift": top_context_gap,
+        "largest_segment_label": f"{segment_name}={bucket_name}" if segment_name and bucket_name else "",
+        "largest_segment_shift": segment_shift,
+        "summary": findings[:4],
+        "recommended_actions": actions,
+        "inspect_paths": inspect_paths,
+    }
+
+
+def _build_drift_brief_markdown(brief_payload: dict[str, object]) -> list[str]:
+    lines = [
+        "# Data Drift Brief",
+        "",
+        f"- Status: `{brief_payload.get('status', 'unknown')}`",
+        f"- Target drift JSD: `{_safe_float(brief_payload.get('target_jsd')):.3f}`",
+        f"- Dominant context driver: `{brief_payload.get('dominant_context_driver', 'other')}`",
+        f"- Largest context feature: `{brief_payload.get('largest_context_feature', '')}`",
+        f"- Largest segment shift: `{brief_payload.get('largest_segment_label', '')}` at `{_safe_float(brief_payload.get('largest_segment_shift')):.3f}`",
+        "",
+        "## Summary",
+        "",
+    ]
+    for item in brief_payload.get("summary", []):
+        lines.append(f"- {item}")
+    lines.extend(["", "## Recommended Actions", ""])
+    for item in brief_payload.get("recommended_actions", []):
+        lines.append(f"- {item}")
+    lines.extend(["", "## Inspect Paths", ""])
+    for item in brief_payload.get("inspect_paths", []):
+        lines.append(f"- `{item}`")
+    return lines
+
+
 def run_drift_diagnostics(
     *,
     data: PreparedData,
@@ -282,6 +362,11 @@ def run_drift_diagnostics(
 
     summary_path = output_dir / "data_drift_summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    brief_payload = _build_drift_brief(summary_payload)
+    brief_json_path = output_dir / "data_drift_brief.json"
+    brief_json_path.write_text(json.dumps(brief_payload, indent=2), encoding="utf-8")
+    brief_md_path = output_dir / "data_drift_brief.md"
+    brief_md_path.write_text("\n".join(_build_drift_brief_markdown(brief_payload)).rstrip() + "\n", encoding="utf-8")
 
     context_csv = output_dir / "context_feature_drift.csv"
     _write_csv(
@@ -340,4 +425,4 @@ def run_drift_diagnostics(
         str(top_context.get("feature", "")),
     )
 
-    return [summary_path, context_csv, segment_csv, group_csv, context_plot, segment_plot]
+    return [summary_path, brief_json_path, brief_md_path, context_csv, segment_csv, group_csv, context_plot, segment_plot]

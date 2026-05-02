@@ -16,6 +16,15 @@ class _FakeHistory:
         self.history = {"val_sparse_categorical_accuracy": [score]}
 
 
+class _FakeMultiOutputHistory:
+    def __init__(self, score: float):
+        self.history = {
+            "val_sparse_categorical_accuracy": [score],
+            "artist_output_loss": [1.0],
+            "skip_output_loss": [0.1],
+        }
+
+
 def _logger() -> logging.Logger:
     logger = logging.getLogger("test-explainability")
     logger.handlers = []
@@ -186,3 +195,31 @@ def test_run_shap_analysis_reuses_cache_without_importing_shap_or_tensorflow(tmp
     assert second_path == output_dir_b / "shap_values.pkl"
     assert second_path.exists()
     assert second_path.read_bytes() == first_path.read_bytes()
+
+
+def test_run_shap_analysis_skips_multi_output_history_without_importing_tensorflow(tmp_path, monkeypatch) -> None:
+    model_path = tmp_path / "best_transformer.keras"
+    model_path.write_text("placeholder", encoding="utf-8")
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tensorflow" or name.startswith("tensorflow.") or name == "shap" or name.startswith("shap."):
+            raise AssertionError("Multi-output SHAP skip should not import shap or tensorflow")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    out_path = run_shap_analysis(
+        histories={"transformer": _FakeMultiOutputHistory(0.5)},
+        output_dir=tmp_path,
+        data=SimpleNamespace(
+            X_seq_train=np.arange(24, dtype="int32").reshape(8, 3),
+            X_ctx_train=np.arange(16, dtype="float32").reshape(8, 2),
+            X_seq_test=np.arange(18, dtype="int32").reshape(6, 3),
+            X_ctx_test=np.arange(12, dtype="float32").reshape(6, 2),
+        ),
+        logger=_logger(),
+    )
+
+    assert out_path is None

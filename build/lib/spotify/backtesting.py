@@ -115,6 +115,8 @@ def _backtesting_source_digest() -> str:
         "retrieval_common.py",
         "retrieval_training.py",
         "retrieval_reranking.py",
+        "retrieval_reranking_features.py",
+        "retrieval_reranking_runtime.py",
         "retrieval_seed_selection.py",
         "retrieval_seed_selection_runtime.py",
         "retrieval_seed_candidates.py",

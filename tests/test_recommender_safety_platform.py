@@ -10,6 +10,7 @@ import pandas as pd
 from spotify.recommender_safety import (
     SequenceSplitSnapshot,
     build_conformal_abstention_summary,
+    conformal_operating_policy_for_model_type,
     compute_context_feature_drift_rows,
     compute_segment_share_shift_rows,
     compute_target_distribution_drift,
@@ -135,6 +136,31 @@ def test_evaluate_promotion_gate_selects_best_risk_eligible_candidate(tmp_path: 
     assert result["challenger_selection_reason"] == "highest_scoring_risk_eligible_candidate"
     assert result["top_candidate_model_name"] == "risky_candidate"
     assert result["top_candidate_risk_blockers"] == ["selective_risk"]
+
+
+def test_conformal_operating_policy_for_model_type_specializes_retrieval_reranker() -> None:
+    retrieval_policy = conformal_operating_policy_for_model_type("retrieval_reranker")
+    ensemble_policy = conformal_operating_policy_for_model_type("ensemble")
+    default_policy = conformal_operating_policy_for_model_type("deep")
+
+    assert retrieval_policy == {
+        "env_prefix": "RETRIEVAL_RERANKER",
+        "enable_temperature_scaling": True,
+        "target_selective_risk": 0.46,
+        "min_accepted_rate": 0.72,
+    }
+    assert ensemble_policy == {
+        "env_prefix": "ENSEMBLE",
+        "enable_temperature_scaling": True,
+        "target_selective_risk": 0.47,
+        "min_accepted_rate": 0.68,
+    }
+    assert default_policy == {
+        "env_prefix": None,
+        "enable_temperature_scaling": False,
+        "target_selective_risk": 0.50,
+        "min_accepted_rate": 0.10,
+    }
 
 
 def test_generic_drift_helpers_support_custom_segments_and_targets() -> None:
@@ -379,3 +405,91 @@ def test_evaluate_promotion_gate_uses_worst_case_risk_metrics(tmp_path: Path) ->
     assert result["challenger_abstention_rate"] == 0.14
     assert result["promoted"] is False
     assert result["status"] == "fail_selective_risk"
+
+
+def test_evaluate_promotion_gate_blocks_on_guardrail_caps_and_prefers_focus_eligible_candidate(tmp_path: Path) -> None:
+    history_csv = tmp_path / "top1_history.csv"
+    _write_history(
+        history_csv,
+        [
+            {"run_id": "run_a", "profile": "prod", "model_name": "champion", "top1": 0.42},
+        ],
+        fieldnames=["run_id", "profile", "model_name", "top1"],
+    )
+
+    result = evaluate_promotion_gate(
+        history_csv=history_csv,
+        current_run_id="run_b",
+        current_rows=[
+            {"model_name": "guardrail_risky", "top1": 0.47},
+            {"model_name": "focus_eligible", "top1": 0.45},
+        ],
+        metric_name="top1",
+        regression_threshold=0.0,
+        current_profile="prod",
+        current_risk_metrics={
+            "guardrail_risky": {
+                "val_guardrail_gap": 0.12,
+                "test_guardrail_gap": 0.11,
+                "val_focus_guardrail_gap": 0.16,
+                "test_focus_guardrail_gap": 0.15,
+            },
+            "focus_eligible": {
+                "val_guardrail_gap": 0.08,
+                "test_guardrail_gap": 0.09,
+                "val_focus_guardrail_gap": 0.11,
+                "test_focus_guardrail_gap": 0.12,
+            },
+        },
+        max_guardrail_gap=0.10,
+        max_focus_guardrail_gap=0.13,
+    )
+
+    assert result["challenger_model_name"] == "focus_eligible"
+    assert result["promoted"] is True
+    assert result["status"] == "pass"
+    assert result["selected_candidate_rank"] == 2
+    assert result["top_candidate_model_name"] == "guardrail_risky"
+    assert result["top_candidate_risk_blockers"] == ["guardrail_gap", "focus_guardrail_gap"]
+    assert result["challenger_guardrail_gap"] == 0.09
+    assert result["challenger_focus_guardrail_gap"] == 0.12
+
+
+def test_evaluate_promotion_gate_allows_small_same_model_refresh_within_neutral_threshold(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_GATE_SAME_MODEL_NEUTRAL_THRESHOLD", "0.01")
+    history_csv = tmp_path / "top1_history.csv"
+    _write_history(
+        history_csv,
+        [
+            {"run_id": "run_a", "profile": "prod", "model_name": "retrieval_reranker", "top1": 0.3769},
+        ],
+        fieldnames=["run_id", "profile", "model_name", "top1"],
+    )
+
+    result = evaluate_promotion_gate(
+        history_csv=history_csv,
+        current_run_id="run_b",
+        current_rows=[{"model_name": "retrieval_reranker", "top1": 0.3695}],
+        metric_name="top1",
+        regression_threshold=0.005,
+        current_profile="prod",
+        current_risk_metrics={
+            "retrieval_reranker": {
+                "val_selective_risk": 0.40,
+                "val_abstention_rate": 0.304,
+                "val_guardrail_gap": 0.09,
+                "val_focus_guardrail_gap": 0.12,
+            }
+        },
+        max_selective_risk=0.50,
+        max_abstention_rate=0.30,
+        max_guardrail_gap=0.10,
+        max_focus_guardrail_gap=0.13,
+    )
+
+    assert result["promoted"] is True
+    assert result["status"] == "pass_same_model_refresh"
+    assert result["same_model_refresh_applied"] is True
+    assert result["same_model_neutral_threshold"] == 0.01
+    assert result["same_model_abstention_buffer"] == 0.02
+    assert result["challenger_selection_reason"] == "same_model_refresh_candidate"

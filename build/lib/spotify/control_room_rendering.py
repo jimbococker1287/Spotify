@@ -131,6 +131,7 @@ def build_control_room_markdown_lines(
             f"- Promotion: `{latest_run.get('promotion_status', '')}`",
             f"- Best model: `{latest_run.get('best_model_name', '')}` [{latest_run.get('best_model_type', '')}] val_top1=`{format_metric(latest_run.get('best_model_val_top1'))}` test_top1=`{format_metric(latest_run.get('best_model_test_top1'))}`",
             f"- Champion alias: `{latest_run.get('champion_model_name', '')}` [{latest_run.get('champion_model_type', '')}]",
+            f"- Serving model: `{latest_run.get('serving_model_name', '')}` [{latest_run.get('serving_model_type', '')}] reason=`{latest_run.get('serving_policy_reason', '')}` best_is_serving=`{latest_run.get('best_model_is_serving_model', '')}`",
             f"- Pipeline time: total=`{format_metric(latest_run.get('pipeline_total_seconds'))}`s measured=`{format_metric(latest_run.get('pipeline_measured_seconds'))}`s overhead=`{format_metric(latest_run.get('pipeline_unmeasured_overhead_seconds'))}`s",
             f"- Slowest phase: `{latest_run.get('pipeline_slowest_phase', '')}` duration=`{format_metric(latest_run.get('pipeline_slowest_phase_seconds'))}`s",
             "",
@@ -143,6 +144,25 @@ def build_control_room_markdown_lines(
             "## Safety",
             "",
             f"- Champion gate metric: `{safety.get('champion_gate_metric_source', '')}` regression=`{format_metric(safety.get('champion_gate_regression'))}`",
+            (
+                f"- Same-model refresh: `True` neutral_threshold=`{format_metric(safety.get('same_model_neutral_threshold'))}`"
+                if bool(safety.get("same_model_refresh_applied"))
+                else ""
+            ),
+            (
+                f"- Raw top candidate: `{safety.get('raw_top_candidate_model_name', '')}` "
+                f"score=`{format_metric(safety.get('raw_top_candidate_score'))}` "
+                f"blockers=`{', '.join(safety.get('raw_top_candidate_risk_blockers', [])) if isinstance(safety.get('raw_top_candidate_risk_blockers', []), list) and safety.get('raw_top_candidate_risk_blockers', []) else 'none'}`"
+            ),
+            (
+                f"- Risk-eligible candidate: `{safety.get('risk_eligible_candidate_model_name', '')}` "
+                f"score=`{format_metric(safety.get('risk_eligible_candidate_score'))}` "
+                f"reason=`{safety.get('risk_eligible_candidate_reason', '')}` rank=`{safe_int(safety.get('champion_gate_selected_candidate_rank'), default=0)}`"
+            ),
+            (
+                f"- Eligible candidate guardrails: gap=`{format_metric(safety.get('risk_eligible_candidate_guardrail_gap'))}` "
+                f"focus_gap=`{format_metric(safety.get('risk_eligible_candidate_focus_guardrail_gap'))}`"
+            ),
             f"- Target drift (train->test JSD): `{format_metric(safety.get('test_jsd_target_drift'))}`",
             f"- Largest context shift: `{safety.get('largest_context_shift_feature', '')}` value=`{format_metric(safety.get('largest_context_shift_value'))}`",
             f"- Largest segment shift: `{safety.get('largest_segment_shift_label', '')}` value=`{format_metric(safety.get('largest_segment_shift_value'))}`",
@@ -157,7 +177,8 @@ def build_control_room_markdown_lines(
             f"- Top friction feature: `{qoe.get('top_friction_feature', '')}` delta=`{format_metric(qoe.get('top_friction_mean_risk_delta'))}`",
             f"- Digital twin test AUC: `{format_metric(qoe.get('digital_twin_test_auc'))}` causal test AUC=`{format_metric(qoe.get('causal_test_auc_total'))}`",
             f"- Stress scenario: `{qoe.get('stress_worst_skip_scenario', '')}` skip_risk=`{format_metric(qoe.get('stress_worst_skip_risk'))}`",
-            f"- Standing stress benchmark: `{qoe.get('stress_benchmark_scenario', '')}` policy=`{qoe.get('stress_benchmark_policy_name', '')}` skip_risk=`{format_metric(qoe.get('stress_benchmark_skip_risk'))}` delta_vs_reference=`{format_metric(qoe.get('stress_benchmark_skip_delta_vs_reference'))}`",
+            f"- Standing stress benchmark: `{qoe.get('stress_benchmark_scenario', '')}` selected_policy=`{qoe.get('stress_benchmark_selected_policy_name') or qoe.get('stress_benchmark_policy_name', '')}` requested=`{qoe.get('stress_benchmark_requested_policy_name', '')}` family=`{qoe.get('stress_benchmark_policy_family') or qoe.get('stress_benchmark_canonical_policy_name', '')}` skip_risk=`{format_metric(qoe.get('stress_benchmark_skip_risk'))}` delta_vs_reference=`{format_metric(qoe.get('stress_benchmark_skip_delta_vs_reference'))}`",
+            f"- Standing stress gate: `{qoe.get('stress_benchmark_gate_status', '')}` threshold=`{format_metric(qoe.get('stress_benchmark_gate_threshold'))}` margin=`{format_metric(qoe.get('stress_benchmark_gate_margin'))}` target=`{format_metric(qoe.get('stress_benchmark_target_threshold'))}`",
             "",
             "## Since Last Strong Run",
             "",

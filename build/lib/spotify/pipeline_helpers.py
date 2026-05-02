@@ -10,7 +10,7 @@ import numpy as np
 from .config import PipelineConfig
 from .model_types import analysis_prefix_for_model_type
 from .probability_bundles import load_prediction_bundle
-from .recommender_safety import build_conformal_abstention_summary
+from .recommender_safety import build_conformal_abstention_summary, conformal_operating_policy_for_model_type
 from .run_artifacts import write_json
 from .tracking import MlflowTracker
 
@@ -85,6 +85,15 @@ def _risk_metrics_from_summary(summary_payload: dict[str, object]) -> dict[str, 
     }
 
 
+def _risk_metrics_from_robustness(summary_payload: dict[str, object]) -> dict[str, float]:
+    return {
+        "val_guardrail_gap": _safe_json_float(summary_payload.get("val_guardrail_gap", float("nan"))),
+        "test_guardrail_gap": _safe_json_float(summary_payload.get("test_guardrail_gap", float("nan"))),
+        "val_focus_guardrail_gap": _safe_json_float(summary_payload.get("val_focus_guardrail_gap", float("nan"))),
+        "test_focus_guardrail_gap": _safe_json_float(summary_payload.get("test_focus_guardrail_gap", float("nan"))),
+    }
+
+
 def _risk_metrics_complete(metrics: dict[str, float]) -> bool:
     required = (
         metrics.get("val_selective_risk", float("nan")),
@@ -93,6 +102,16 @@ def _risk_metrics_complete(metrics: dict[str, float]) -> bool:
         metrics.get("test_abstention_rate", float("nan")),
     )
     return all(not np.isnan(float(value)) for value in required)
+
+
+def _risk_metrics_present(metrics: dict[str, float]) -> bool:
+    for value in metrics.values():
+        try:
+            if not np.isnan(float(value)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _backfill_risk_summary(
@@ -115,6 +134,7 @@ def _backfill_risk_summary(
         val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
     except Exception:
         return {}
+    policy = conformal_operating_policy_for_model_type(model_type)
 
     conformal_payload = build_conformal_abstention_summary(
         tag=f"{prefix}_{model_name}",
@@ -123,10 +143,10 @@ def _backfill_risk_summary(
         test_proba=test_proba,
         test_y=np.asarray(test_y, dtype="int64"),
         alpha=float(conformal_alpha),
-        target_selective_risk=(0.45 if model_type in ("classical", "classical_tuned") else 0.50),
-        min_accepted_rate=(0.70 if model_type in ("classical", "classical_tuned") else 0.10),
-        env_prefix=("CLASSICAL" if model_type in ("classical", "classical_tuned") else None),
-        enable_temperature_scaling=bool(model_type in ("classical", "classical_tuned")),
+        target_selective_risk=float(policy["target_selective_risk"]),
+        min_accepted_rate=float(policy["min_accepted_rate"]),
+        env_prefix=(str(policy["env_prefix"]) if policy["env_prefix"] else None),
+        enable_temperature_scaling=bool(policy["enable_temperature_scaling"]),
     )
     if not isinstance(conformal_payload, dict):
         return {}
@@ -181,30 +201,47 @@ def _load_current_risk_metrics(
     analysis_dir = run_dir / "analysis"
     if not analysis_dir.exists():
         return metrics
+    robustness_by_model: dict[str, dict[str, object]] = {}
+    robustness_path = analysis_dir / "robustness_summary.json"
+    if robustness_path.exists():
+        try:
+            robustness_payload = json.loads(robustness_path.read_text(encoding="utf-8"))
+        except Exception:
+            robustness_payload = []
+        if isinstance(robustness_payload, list):
+            robustness_by_model = {
+                str(row.get("model_name", "")).strip(): row
+                for row in robustness_payload
+                if isinstance(row, dict) and str(row.get("model_name", "")).strip()
+            }
     for row in result_rows:
         model_name = str(row.get("model_name", "")).strip()
         model_type = str(row.get("model_type", "")).strip().lower()
         prefix = _analysis_prefix_for_model_type(model_type)
-        if not model_name or prefix is None:
+        if not model_name:
             continue
-        path = analysis_dir / f"{prefix}_{model_name}_confidence_summary.json"
-        payload = _existing_summary_payload(path)
-        row_metrics = _risk_metrics_from_summary(payload)
-        if (
-            not _risk_metrics_complete(row_metrics)
-            and val_y is not None
-            and test_y is not None
-        ):
-            backfilled = _backfill_risk_summary(
-                run_dir=run_dir,
-                row=row,
-                val_y=np.asarray(val_y),
-                test_y=np.asarray(test_y),
-                conformal_alpha=conformal_alpha,
-            )
-            if backfilled:
-                row_metrics = backfilled
-        if _risk_metrics_complete(row_metrics):
+        row_metrics: dict[str, float] = {}
+        if prefix is not None:
+            path = analysis_dir / f"{prefix}_{model_name}_confidence_summary.json"
+            payload = _existing_summary_payload(path)
+            row_metrics.update(_risk_metrics_from_summary(payload))
+            if (
+                not _risk_metrics_complete(row_metrics)
+                and val_y is not None
+                and test_y is not None
+            ):
+                backfilled = _backfill_risk_summary(
+                    run_dir=run_dir,
+                    row=row,
+                    val_y=np.asarray(val_y),
+                    test_y=np.asarray(test_y),
+                    conformal_alpha=conformal_alpha,
+                )
+                if backfilled:
+                    row_metrics.update(backfilled)
+        robustness_metrics = _risk_metrics_from_robustness(robustness_by_model.get(model_name, {}))
+        row_metrics.update(robustness_metrics)
+        if _risk_metrics_present(row_metrics):
             metrics[model_name] = row_metrics
     return metrics
 

@@ -33,21 +33,36 @@ def _create_creator_family(root: Path, stem: str, *, scene_seed_rows: int = 2) -
                 "scene_comparison": [{"scene_name": "scene-1"}],
                 "seed_comparison": [{"seed_artist": "Seed A"}],
                 "scene_seed_comparison": [{"scene_name": "scene-1"}] * scene_seed_rows,
-            }
+                "opportunity_lane_comparison": [{"scene_name": "scene-1", "primary_driver": "seed_adjacency"}],
+            },
+            "brief_views": {
+                "scene_strategy_watch": [{"scene_name": "scene-1", "strategy_posture": "accelerate_capture"}],
+            },
         },
     )
+    report_family_md = base_dir / f"{stem}_report_family.md"
+    _touch(report_family_md, "# report family\n")
     manifest = {
         "primary_report": str(primary_report.resolve()),
+        "artifact_index_markdown": str(report_family_md.resolve()),
         "comparison_view_markdown": {},
         "comparison_view_csv": {},
+        "brief_view_markdown": {},
+        "brief_view_csv": {},
     }
-    for key in ("ranking_comparison", "scene_comparison", "seed_comparison", "scene_seed_comparison"):
+    for key in ("ranking_comparison", "scene_comparison", "seed_comparison", "scene_seed_comparison", "opportunity_lane_comparison"):
         md_path = base_dir / f"{stem}_{key}.md"
         csv_path = base_dir / f"{stem}_{key}.csv"
         _touch(md_path, f"# {key}\n")
         _touch(csv_path, "col\n")
         manifest["comparison_view_markdown"][key] = str(md_path.resolve())
         manifest["comparison_view_csv"][key] = str(csv_path.resolve())
+    strategy_md = base_dir / f"{stem}_scene_strategy_watch.md"
+    strategy_csv = base_dir / f"{stem}_scene_strategy_watch.csv"
+    _touch(strategy_md, "# scene strategy watch\n")
+    _touch(strategy_csv, "col\n")
+    manifest["brief_view_markdown"]["scene_strategy_watch"] = str(strategy_md.resolve())
+    manifest["brief_view_csv"]["scene_strategy_watch"] = str(strategy_csv.resolve())
     _write_json(base_dir / f"{stem}_report_family.json", manifest)
 
 
@@ -288,6 +303,11 @@ def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_p
         },
     )
     _touch(tmp_path / "outputs/analysis/research_claims/research_claims.md")
+    _touch(tmp_path / "outputs/runs/run_003/safety_platform_contract.md")
+    _write_json(
+        tmp_path / "outputs/runs/run_003/safety_platform_contract.json",
+        {"benchmark_contract_version": "2026-week10-v1"},
+    )
     _write_json(
         tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.json",
         {"benchmark_id": "smokebench", "comparison_ready": True},
@@ -327,6 +347,7 @@ def test_phase_readiness_reports_weeks_1_13_when_all_branches_are_packaged(tmp_p
     assert report["overall"]["efficiency_status"] == "ready"
     assert len(report["sections"]) == 5
     assert report["sections"][3]["metrics"]["benchmark_comparison_ready"] is True
+    assert report["sections"][3]["metrics"]["platform_contract_present"] is True
     assert report["sections"][4]["metrics"]["primary_branch_count"] == 4
     assert report["sections"][4]["metrics"]["packaged_asset_count"] >= 7
 
@@ -414,6 +435,11 @@ def test_phase_readiness_prefers_manifest_backed_run_dir_over_partial_newer_dire
         },
     )
     _touch(tmp_path / "outputs/analysis/research_claims/research_claims.md")
+    _touch(tmp_path / "outputs/runs/run_complete/safety_platform_contract.md")
+    _write_json(
+        tmp_path / "outputs/runs/run_complete/safety_platform_contract.json",
+        {"benchmark_contract_version": "2026-week10-v1"},
+    )
     _write_json(tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.json", {"benchmark_id": "smokebench", "comparison_ready": True})
     _touch(tmp_path / "outputs/history/benchmark_lock_smokebench_manifest.md")
     _create_creator_family(tmp_path, "creator_label_intelligence_only")
@@ -421,7 +447,7 @@ def test_phase_readiness_prefers_manifest_backed_run_dir_over_partial_newer_dire
     _create_creator_family(tmp_path, "creator_label_intelligence_three")
 
     complete_run = tmp_path / "outputs/runs/run_complete"
-    complete_run.mkdir(parents=True)
+    complete_run.mkdir(parents=True, exist_ok=True)
     _write_json(complete_run / "run_manifest.json", {"run_id": "run_complete"})
     partial_run = tmp_path / "outputs/runs/run_partial_newer"
     partial_run.mkdir(parents=True)

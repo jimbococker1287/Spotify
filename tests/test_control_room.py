@@ -31,6 +31,15 @@ def _write_run_fixture(
     stress_scenario: str,
     backtest_rows: int = 4,
     optuna_rows: int = 0,
+    top_candidate_model_name: str | None = None,
+    top_candidate_score: float | None = None,
+    top_candidate_risk_blockers: list[str] | None = None,
+    challenger_model_name: str | None = None,
+    challenger_score: float | None = None,
+    challenger_selection_reason: str | None = None,
+    selected_candidate_rank: int | None = None,
+    challenger_guardrail_gap: float | None = None,
+    challenger_focus_guardrail_gap: float | None = None,
 ) -> None:
     run_dir = output_dir / "runs" / run_id
     analysis_dir = run_dir / "analysis"
@@ -58,6 +67,19 @@ def _write_run_fixture(
                     "promoted": promoted,
                     "metric_source": "backtest_top1",
                     "regression": gate_regression,
+                    "top_candidate_model_name": top_candidate_model_name or best_model_name,
+                    "top_candidate_score": top_candidate_score if top_candidate_score is not None else test_top1,
+                    "top_candidate_risk_blockers": top_candidate_risk_blockers or [],
+                    "challenger_model_name": challenger_model_name or best_model_name,
+                    "challenger_score": challenger_score if challenger_score is not None else test_top1,
+                    "challenger_selection_reason": challenger_selection_reason or "top_scoring_candidate",
+                    "selected_candidate_rank": selected_candidate_rank if selected_candidate_rank is not None else 1,
+                    "challenger_guardrail_gap": (
+                        challenger_guardrail_gap if challenger_guardrail_gap is not None else robustness_gap
+                    ),
+                    "challenger_focus_guardrail_gap": (
+                        challenger_focus_guardrail_gap if challenger_focus_guardrail_gap is not None else robustness_gap
+                    ),
                 },
                 "champion_alias": champion_alias,
             },
@@ -253,6 +275,15 @@ def test_build_control_room_report_summarizes_latest_run(tmp_path: Path) -> None
                     "promoted": True,
                     "metric_source": "backtest_top1",
                     "regression": -0.01,
+                    "top_candidate_model_name": "retrieval_reranker",
+                    "top_candidate_score": 0.58,
+                    "top_candidate_risk_blockers": [],
+                    "challenger_model_name": "retrieval_reranker",
+                    "challenger_score": 0.58,
+                    "challenger_selection_reason": "top_scoring_candidate",
+                    "selected_candidate_rank": 1,
+                    "challenger_guardrail_gap": 0.19,
+                    "challenger_focus_guardrail_gap": 0.17,
                 },
                 "champion_alias": {
                     "model_name": "retrieval_reranker",
@@ -355,10 +386,80 @@ def test_build_control_room_report_summarizes_latest_run(tmp_path: Path) -> None
     assert report["latest_run"]["run_id"] == "run_a"
     assert report["latest_run"]["promoted"] is True
     assert report["latest_run"]["best_model_name"] == "retrieval_reranker"
+    assert report["latest_run"]["serving_model_name"] == "retrieval_reranker"
+    assert report["latest_run"]["best_model_is_serving_model"] is True
+    assert report["latest_run"]["serving_policy_reason"] == "champion_alias_matches_raw_val_leader"
     assert report["safety"]["largest_context_shift_feature"] == "tech_stutter_events_24h"
+    assert report["safety"]["raw_top_candidate_model_name"] == "retrieval_reranker"
+    assert report["safety"]["risk_eligible_candidate_model_name"] == "retrieval_reranker"
+    assert report["safety"]["champion_gate_selected_candidate_rank"] == 1
     assert report["qoe"]["stress_worst_skip_scenario"] == "high_friction_spike"
+    assert report["qoe"]["stress_benchmark_gate_threshold"] == 0.45
+    assert report["qoe"]["stress_benchmark_target_threshold"] == 0.35
     assert report["leaderboards"]["experiment_top_models"][0]["model_name"] == "retrieval_reranker"
     assert report["next_bets"]
+
+
+def test_control_room_makes_serving_policy_explicit_when_alias_differs_from_leader(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    run_dir = output_dir / "runs" / "run_alias"
+    run_dir.mkdir(parents=True)
+
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run_alias",
+                "run_name": "alias-check",
+                "profile": "full",
+                "timestamp": "2026-03-22T20:00:00",
+                "champion_gate": {
+                    "status": "pass",
+                    "promoted": True,
+                    "metric_source": "backtest_top1",
+                    "regression": -0.01,
+                    "challenger_model_name": "retrieval_reranker",
+                    "challenger_selection_reason": "same_model_refresh_candidate",
+                },
+                "champion_alias": {
+                    "model_name": "retrieval_reranker",
+                    "model_type": "retrieval_reranker",
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "run_results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "model_name": "blended_ensemble",
+                    "model_type": "ensemble",
+                    "val_top1": 0.62,
+                    "test_top1": 0.60,
+                },
+                {
+                    "model_name": "retrieval_reranker",
+                    "model_type": "retrieval_reranker",
+                    "val_top1": 0.60,
+                    "test_top1": 0.61,
+                },
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["latest_run"]["best_model_name"] == "blended_ensemble"
+    assert report["latest_run"]["champion_model_name"] == "retrieval_reranker"
+    assert report["latest_run"]["serving_model_name"] == "retrieval_reranker"
+    assert report["latest_run"]["best_model_is_serving_model"] is False
+    assert (
+        report["latest_run"]["serving_policy_reason"]
+        == "champion_alias_prefers_promoted_risk_eligible_model_over_raw_val_leader"
+    )
 
 
 def test_control_room_compares_latest_run_to_last_promoted_baseline(tmp_path: Path) -> None:
@@ -439,6 +540,16 @@ def test_control_room_compares_latest_run_to_last_promoted_baseline(tmp_path: Pa
     assert any(action["area"] == "promotion" for action in report["review_actions"])
     assert any(action["area"] == "robustness" for action in report["review_actions"])
     assert any(action["area"] == "stress_test" for action in report["review_actions"])
+    assert any(
+        action["area"] == "drift" and "analysis/data_drift_brief.md" in action["inspect"]
+        for action in report["review_actions"]
+        if isinstance(action.get("inspect"), list)
+    )
+    assert any(
+        action["area"] == "stress_test" and "analysis/stress_test/stress_test_benchmark_brief.md" in action["inspect"]
+        for action in report["review_actions"]
+        if isinstance(action.get("inspect"), list)
+    )
 
 
 def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> None:
@@ -474,6 +585,10 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert payload["async_handoff"]["status"]
     markdown = md_path.read_text(encoding="utf-8")
     assert "Control Room" in markdown
+    assert "Raw top candidate" in markdown
+    assert "Risk-eligible candidate" in markdown
+    assert "Serving model" in markdown
+    assert "Standing stress gate" in markdown
     assert "Operating Rhythm" in markdown
     assert "Ops Health" in markdown
     assert "Ops Coverage" in markdown
@@ -482,6 +597,65 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert "Weekly Window" in markdown
     assert "Review Actions" in markdown
     assert "Async Handoff" in markdown
+
+
+def test_control_room_adds_review_action_when_raw_winner_is_blocked_by_abstention(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "val_top1": 0.60},
+            {"run_id": "run_a", "model_name": "blended_ensemble", "model_type": "ensemble", "val_top1": 0.58},
+        ]
+    ).to_csv(history_dir / "experiment_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {"run_id": "run_a", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "top1": 0.59},
+            {"run_id": "run_a", "model_name": "blended_ensemble", "model_type": "ensemble", "top1": 0.57},
+        ]
+    ).to_csv(history_dir / "backtest_history.csv", index=False)
+
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-03-22T20:00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="blended_ensemble",
+        best_model_type="ensemble",
+        val_top1=0.58,
+        test_top1=0.57,
+        gate_regression=0.02,
+        drift_jsd=0.16,
+        ece=0.08,
+        selective_risk=0.18,
+        abstention_rate=0.09,
+        robustness_gap=0.10,
+        stress_skip_risk=0.31,
+        stress_scenario="evening_drift",
+        top_candidate_model_name="retrieval_reranker",
+        top_candidate_score=0.59,
+        top_candidate_risk_blockers=["abstention_rate"],
+        challenger_model_name="blended_ensemble",
+        challenger_score=0.57,
+        challenger_selection_reason="highest_scoring_risk_eligible_candidate",
+        selected_candidate_rank=2,
+        challenger_guardrail_gap=0.10,
+        challenger_focus_guardrail_gap=0.12,
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["safety"]["raw_top_candidate_model_name"] == "retrieval_reranker"
+    assert report["safety"]["raw_top_candidate_risk_blockers"] == ["abstention_rate"]
+    assert report["safety"]["risk_eligible_candidate_model_name"] == "blended_ensemble"
+    assert any(
+        action["title"] == "Retune the raw winner's abstention before the next promotion decision"
+        for action in report["review_actions"]
+    )
 
 
 def test_control_room_history_and_weekly_summary_track_multiple_runs(tmp_path: Path) -> None:

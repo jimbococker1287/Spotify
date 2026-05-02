@@ -15,10 +15,18 @@ from .run_artifacts import write_csv_rows
 
 DEFAULT_GUARDRAIL_SEGMENT = "repeat_from_prev"
 DEFAULT_GUARDRAIL_BUCKET = "new"
+DEFAULT_FOCUS_BENCHMARK_SUFFIX = "late_skip"
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
     return write_csv_rows(path, rows, fieldnames=fieldnames)
+
+
+def _slugify(raw: str) -> str:
+    value = "".join(char if str(char).isalnum() else "_" for char in str(raw).strip().lower())
+    while "__" in value:
+        value = value.replace("__", "_")
+    return value.strip("_") or "slice"
 
 
 def _topk_accuracy(proba: np.ndarray, y_true: np.ndarray, k: int) -> float:
@@ -153,6 +161,123 @@ def _find_slice_row(
     )
 
 
+def _find_benchmark_row(
+    rows: list[dict[str, object]],
+    *,
+    benchmark_name: str,
+    split: str,
+) -> dict[str, object]:
+    return next(
+        (
+            row
+            for row in rows
+            if str(row.get("benchmark_name", "")).strip() == benchmark_name
+            and str(row.get("split", "")).strip() == split
+        ),
+        {},
+    )
+
+
+def _benchmark_name(segment: str, bucket: str, *, suffix: str | None = None) -> str:
+    base = f"{_slugify(segment)}_{_slugify(bucket)}"
+    if suffix:
+        return f"{base}__{_slugify(suffix)}"
+    return base
+
+
+def _benchmark_rows(
+    *,
+    model_name: str,
+    model_type: str,
+    operational_model: bool,
+    split: str,
+    frame: pd.DataFrame,
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    guardrail_segment: str,
+    guardrail_bucket: str,
+) -> list[dict[str, object]]:
+    frame_resolved = frame.reset_index(drop=True)
+    y_arr = np.asarray(y_true).reshape(-1)
+    proba_arr = np.asarray(proba, dtype="float32")
+    n = min(len(frame_resolved), len(y_arr), len(proba_arr))
+    if n <= 0:
+        return []
+    frame_resolved = frame_resolved.iloc[:n].reset_index(drop=True)
+    y_arr = y_arr[:n]
+    proba_arr = proba_arr[:n]
+    pred = np.argmax(proba_arr, axis=1)
+    conf = np.max(proba_arr, axis=1)
+    global_top1 = float(np.mean(pred == y_arr))
+    bucket_map = _bucket_map(frame_resolved)
+    default_values = np.full(n, "", dtype=object)
+    guardrail_values = np.asarray(bucket_map.get(guardrail_segment, default_values), dtype=object)
+    session_phase = np.asarray(bucket_map.get("session_phase", default_values), dtype=object)
+    skip_flag = np.asarray(bucket_map.get("skip_flag", default_values), dtype=object)
+    benchmark_specs = [
+        {
+            "benchmark_name": _benchmark_name(guardrail_segment, guardrail_bucket),
+            "benchmark_scope": "guardrail",
+            "segment": guardrail_segment,
+            "bucket": guardrail_bucket,
+            "session_phase": "",
+            "skip_flag": "",
+            "mask": guardrail_values == guardrail_bucket,
+        },
+        {
+            "benchmark_name": _benchmark_name(
+                guardrail_segment,
+                guardrail_bucket,
+                suffix=DEFAULT_FOCUS_BENCHMARK_SUFFIX,
+            ),
+            "benchmark_scope": DEFAULT_FOCUS_BENCHMARK_SUFFIX,
+            "segment": guardrail_segment,
+            "bucket": guardrail_bucket,
+            "session_phase": "late",
+            "skip_flag": "skip",
+            "mask": (
+                (guardrail_values == guardrail_bucket)
+                & (session_phase == "late")
+                & (skip_flag == "skip")
+            ),
+        },
+    ]
+
+    rows: list[dict[str, object]] = []
+    for spec in benchmark_specs:
+        mask = np.asarray(spec["mask"], dtype=bool)
+        count = int(np.sum(mask))
+        top1 = float(np.mean(pred[mask] == y_arr[mask])) if count > 0 else float("nan")
+        top5 = _topk_accuracy(proba_arr[mask], y_arr[mask], 5) if count > 0 else float("nan")
+        mean_confidence = float(np.mean(conf[mask])) if count > 0 else float("nan")
+        top1_gap = (
+            float(max(global_top1 - top1, 0.0))
+            if math.isfinite(global_top1) and math.isfinite(top1)
+            else float("nan")
+        )
+        rows.append(
+            {
+                "model_name": model_name,
+                "model_type": model_type,
+                "operational_model": operational_model,
+                "split": split,
+                "benchmark_name": str(spec["benchmark_name"]),
+                "benchmark_scope": str(spec["benchmark_scope"]),
+                "segment": str(spec["segment"]),
+                "bucket": str(spec["bucket"]),
+                "session_phase": str(spec["session_phase"]),
+                "skip_flag": str(spec["skip_flag"]),
+                "count": count,
+                "top1": top1,
+                "top5": top5,
+                "mean_confidence": mean_confidence,
+                "global_top1": global_top1,
+                "top1_gap": top1_gap,
+            }
+        )
+    return rows
+
+
 def _build_guardrail_payload(
     summary_rows: list[dict[str, object]],
     *,
@@ -253,6 +378,13 @@ def run_robustness_slice_evaluation(
         if str(row.get("model_name", "")).strip()
     }
     guardrail_segment, guardrail_bucket = _resolve_guardrail_target()
+    guardrail_benchmark_name = _benchmark_name(guardrail_segment, guardrail_bucket)
+    focus_guardrail_benchmark_name = _benchmark_name(
+        guardrail_segment,
+        guardrail_bucket,
+        suffix=DEFAULT_FOCUS_BENCHMARK_SUFFIX,
+    )
+    benchmark_rows: list[dict[str, object]] = []
 
     for row in results:
         model_name = str(row.get("model_name", "")).strip()
@@ -273,6 +405,14 @@ def run_robustness_slice_evaluation(
         if aligned_n > 0:
             test_global_top1[model_name] = float(np.mean(test_pred[:aligned_n] == test_truth[:aligned_n]))
             test_row_counts[model_name] = int(aligned_n)
+        model_type = model_type_by_name.get(model_name, "")
+        operational_model = model_type in {
+            "classical",
+            "classical_tuned",
+            "retrieval",
+            "retrieval_reranker",
+            "ensemble",
+        }
         val_metrics = _segment_metrics(
             model_name=model_name,
             split="val",
@@ -289,6 +429,32 @@ def run_robustness_slice_evaluation(
         )
         slice_rows.extend(val_metrics)
         slice_rows.extend(test_metrics)
+        benchmark_rows.extend(
+            _benchmark_rows(
+                model_name=model_name,
+                model_type=model_type,
+                operational_model=operational_model,
+                split="val",
+                frame=val_frame,
+                proba=val_proba,
+                y_true=data.y_val,
+                guardrail_segment=guardrail_segment,
+                guardrail_bucket=guardrail_bucket,
+            )
+        )
+        benchmark_rows.extend(
+            _benchmark_rows(
+                model_name=model_name,
+                model_type=model_type,
+                operational_model=operational_model,
+                split="test",
+                frame=test_frame,
+                proba=test_proba,
+                y_true=data.y_test,
+                guardrail_segment=guardrail_segment,
+                guardrail_bucket=guardrail_bucket,
+            )
+        )
 
     if not slice_rows:
         return []
@@ -312,12 +478,26 @@ def run_robustness_slice_evaluation(
             if math.isfinite(global_top1)
             else float(max_top1 - float(worst["top1"]))
         )
-        guardrail_row = _find_slice_row(model_rows, segment=guardrail_segment, bucket=guardrail_bucket)
-        guardrail_top1 = _safe_metric(guardrail_row.get("top1"))
-        guardrail_gap = (
-            float(max(global_top1 - guardrail_top1, 0.0))
-            if math.isfinite(global_top1) and math.isfinite(guardrail_top1)
-            else float("nan")
+        benchmark_model_rows = [row for row in benchmark_rows if str(row.get("model_name", "")) == model_name]
+        val_guardrail_row = _find_benchmark_row(
+            benchmark_model_rows,
+            benchmark_name=guardrail_benchmark_name,
+            split="val",
+        )
+        test_guardrail_row = _find_benchmark_row(
+            benchmark_model_rows,
+            benchmark_name=guardrail_benchmark_name,
+            split="test",
+        )
+        val_focus_guardrail_row = _find_benchmark_row(
+            benchmark_model_rows,
+            benchmark_name=focus_guardrail_benchmark_name,
+            split="val",
+        )
+        test_focus_guardrail_row = _find_benchmark_row(
+            benchmark_model_rows,
+            benchmark_name=focus_guardrail_benchmark_name,
+            split="test",
         )
         summary_rows.append(
             {
@@ -345,9 +525,26 @@ def run_robustness_slice_evaluation(
                 ),
                 "guardrail_segment": guardrail_segment,
                 "guardrail_bucket": guardrail_bucket,
-                "guardrail_top1": guardrail_top1,
-                "guardrail_gap": guardrail_gap,
-                "guardrail_bucket_count": int(guardrail_row.get("count", 0) or 0),
+                "guardrail_benchmark_name": guardrail_benchmark_name,
+                "focus_guardrail_benchmark_name": focus_guardrail_benchmark_name,
+                "val_guardrail_top1": _safe_metric(val_guardrail_row.get("top1")),
+                "val_guardrail_gap": _safe_metric(val_guardrail_row.get("top1_gap")),
+                "val_guardrail_bucket_count": int(val_guardrail_row.get("count", 0) or 0),
+                "test_guardrail_top1": _safe_metric(test_guardrail_row.get("top1")),
+                "test_guardrail_gap": _safe_metric(test_guardrail_row.get("top1_gap")),
+                "test_guardrail_bucket_count": int(test_guardrail_row.get("count", 0) or 0),
+                "val_focus_guardrail_top1": _safe_metric(val_focus_guardrail_row.get("top1")),
+                "val_focus_guardrail_gap": _safe_metric(val_focus_guardrail_row.get("top1_gap")),
+                "val_focus_guardrail_bucket_count": int(val_focus_guardrail_row.get("count", 0) or 0),
+                "test_focus_guardrail_top1": _safe_metric(test_focus_guardrail_row.get("top1")),
+                "test_focus_guardrail_gap": _safe_metric(test_focus_guardrail_row.get("top1_gap")),
+                "test_focus_guardrail_bucket_count": int(test_focus_guardrail_row.get("count", 0) or 0),
+                "guardrail_top1": _safe_metric(test_guardrail_row.get("top1")),
+                "guardrail_gap": _safe_metric(test_guardrail_row.get("top1_gap")),
+                "guardrail_bucket_count": int(test_guardrail_row.get("count", 0) or 0),
+                "focus_guardrail_top1": _safe_metric(test_focus_guardrail_row.get("top1")),
+                "focus_guardrail_gap": _safe_metric(test_focus_guardrail_row.get("top1_gap")),
+                "focus_guardrail_bucket_count": int(test_focus_guardrail_row.get("count", 0) or 0),
             }
         )
     summary_rows.sort(key=lambda row: float(row["max_top1_gap"]), reverse=True)
@@ -356,6 +553,13 @@ def run_robustness_slice_evaluation(
         segment=guardrail_segment,
         bucket=guardrail_bucket,
     )
+    benchmark_payload = {
+        "guardrail_benchmark_name": guardrail_benchmark_name,
+        "focus_guardrail_benchmark_name": focus_guardrail_benchmark_name,
+        "segment": guardrail_segment,
+        "bucket": guardrail_bucket,
+        "rows": benchmark_rows,
+    }
 
     csv_path = _write_csv(
         analysis_dir / "robustness_slices.csv",
@@ -380,13 +584,54 @@ def run_robustness_slice_evaluation(
             "worst_bucket_share",
             "guardrail_segment",
             "guardrail_bucket",
+            "guardrail_benchmark_name",
+            "focus_guardrail_benchmark_name",
+            "val_guardrail_top1",
+            "val_guardrail_gap",
+            "val_guardrail_bucket_count",
+            "test_guardrail_top1",
+            "test_guardrail_gap",
+            "test_guardrail_bucket_count",
+            "val_focus_guardrail_top1",
+            "val_focus_guardrail_gap",
+            "val_focus_guardrail_bucket_count",
+            "test_focus_guardrail_top1",
+            "test_focus_guardrail_gap",
+            "test_focus_guardrail_bucket_count",
             "guardrail_top1",
             "guardrail_gap",
             "guardrail_bucket_count",
+            "focus_guardrail_top1",
+            "focus_guardrail_gap",
+            "focus_guardrail_bucket_count",
         ],
     )
     summary_json = analysis_dir / "robustness_summary.json"
     summary_json.write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
+    benchmark_csv = _write_csv(
+        analysis_dir / "robustness_benchmarks.csv",
+        benchmark_rows,
+        [
+            "model_name",
+            "model_type",
+            "operational_model",
+            "split",
+            "benchmark_name",
+            "benchmark_scope",
+            "segment",
+            "bucket",
+            "session_phase",
+            "skip_flag",
+            "count",
+            "top1",
+            "top5",
+            "mean_confidence",
+            "global_top1",
+            "top1_gap",
+        ],
+    )
+    benchmark_json = analysis_dir / "robustness_benchmarks.json"
+    benchmark_json.write_text(json.dumps(benchmark_payload, indent=2), encoding="utf-8")
     guardrail_csv = _write_csv(
         analysis_dir / "robustness_guardrails.csv",
         list(guardrail_payload.get("models", [])),
@@ -404,7 +649,7 @@ def run_robustness_slice_evaluation(
     )
     guardrail_json = analysis_dir / "robustness_guardrails.json"
     guardrail_json.write_text(json.dumps(guardrail_payload, indent=2), encoding="utf-8")
-    artifacts: list[Path] = [csv_path, summary_csv, summary_json, guardrail_csv, guardrail_json]
+    artifacts: list[Path] = [csv_path, summary_csv, summary_json, benchmark_csv, benchmark_json, guardrail_csv, guardrail_json]
     plot_path = _plot_max_gaps(summary_rows, analysis_dir / "robustness_gap.png")
     if plot_path is not None:
         artifacts.append(plot_path)

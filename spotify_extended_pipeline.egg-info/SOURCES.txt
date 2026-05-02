@@ -128,6 +128,7 @@ spotify/public_insights_core.py
 spotify/public_insights_creator_brief.py
 spotify/public_insights_graph.py
 spotify/public_insights_handlers.py
+spotify/public_insights_index.py
 spotify/ranking.py
 spotify/recommender_safety.py
 spotify/reporting.py

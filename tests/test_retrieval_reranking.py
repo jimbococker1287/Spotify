@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from spotify.retrieval_common import RetrievalServingArtifact
@@ -49,3 +51,90 @@ def test_predict_reranked_probabilities_penalizes_ambiguous_immediate_repeats() 
     assert proba.shape == (1, 4)
     assert float(proba[0, 3]) > float(proba[0, 2])
     assert np.isclose(float(proba.sum()), 1.0)
+
+
+def test_predict_reranked_probabilities_boosts_escape_candidates_in_late_skip_contexts() -> None:
+    artifact = RetrievalServingArtifact(
+        model_name="retrieval_reranker",
+        candidate_k=4,
+        artist_embeddings=np.array(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.8, 0.2],
+                [0.2, 0.9],
+            ],
+            dtype="float32",
+        ),
+        sequence_projection=np.eye(2, dtype="float32"),
+        context_projection=np.zeros((6, 2), dtype="float32"),
+        item_bias=np.zeros(4, dtype="float32"),
+        popularity=np.array([0.5, 0.4, 0.3, 0.2], dtype="float32"),
+        context_feature_names=(
+            "session_position",
+            "skipped",
+            "session_skip_rate_so_far",
+            "session_repeat_ratio_so_far",
+            "is_artist_repeat_from_prev",
+            "prev_artist_transition_rate_smooth",
+        ),
+        reranker=_ConstantReranker(),
+    )
+
+    seq_batch = np.array([[0, 1, 2, 2], [0, 1, 2, 2]], dtype="int32")
+    ctx_batch = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.1],
+            [12.0, 1.0, 0.9, 0.8, 0.0, 0.9],
+        ],
+        dtype="float32",
+    )
+    session_vec = np.array([[0.7, 0.3], [0.7, 0.3]], dtype="float32")
+    retrieval_scores = np.array(
+        [
+            [1.2, 1.1, 1.31, 1.29],
+            [1.2, 1.1, 1.31, 1.29],
+        ],
+        dtype="float32",
+    )
+
+    proba = _predict_reranked_probabilities(
+        seq_batch=seq_batch,
+        ctx_batch=ctx_batch,
+        session_vec=session_vec,
+        retrieval_scores=retrieval_scores,
+        artifact=artifact,
+    )
+
+    low_escape_margin = float(proba[0, 3] - proba[0, 2])
+    high_escape_margin = float(proba[1, 3] - proba[1, 2])
+    assert high_escape_margin > low_escape_margin
+    assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+def test_predict_reranked_probabilities_supports_cached_artifacts_without_context_feature_names() -> None:
+    legacy_artifact = SimpleNamespace(
+        candidate_k=4,
+        artist_embeddings=np.array(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.8, 0.2],
+                [0.2, 0.9],
+            ],
+            dtype="float32",
+        ),
+        popularity=np.array([0.5, 0.4, 0.3, 0.2], dtype="float32"),
+        reranker=_ConstantReranker(),
+    )
+
+    proba = _predict_reranked_probabilities(
+        seq_batch=np.array([[0, 1, 2, 2]], dtype="int32"),
+        ctx_batch=np.zeros((1, 1), dtype="float32"),
+        session_vec=np.array([[0.7, 0.3]], dtype="float32"),
+        retrieval_scores=np.array([[1.2, 1.1, 1.31, 1.29]], dtype="float32"),
+        artifact=legacy_artifact,
+    )
+
+    assert proba.shape == (1, 4)
+    assert np.allclose(proba.sum(axis=1), 1.0)

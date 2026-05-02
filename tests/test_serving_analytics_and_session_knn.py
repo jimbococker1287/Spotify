@@ -272,7 +272,7 @@ def test_analytics_db_refresh_returns_none_when_duckdb_connect_fails(tmp_path: P
     assert db_path is None
 
 
-def test_analytics_db_refresh_returns_none_when_duckdb_locked_by_other_process(tmp_path: Path) -> None:
+def test_analytics_db_refresh_uses_fallback_db_when_primary_is_locked(tmp_path: Path) -> None:
     logger = logging.getLogger("spotify.test.analytics.external_lock")
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
@@ -332,7 +332,9 @@ def test_analytics_db_refresh_returns_none_when_duckdb_locked_by_other_process(t
             raw_df=pd.DataFrame(),
         )
 
-        assert refreshed_path is None
+        assert refreshed_path is not None
+        assert Path(refreshed_path).exists()
+        assert Path(refreshed_path).name == "spotify_analytics.refresh.duckdb"
     finally:
         if proc.poll() is None:
             proc.terminate()

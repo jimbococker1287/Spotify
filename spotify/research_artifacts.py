@@ -9,6 +9,7 @@ import numpy as np
 
 from .benchmark_contract import describe_canonical_benchmark_contract
 from .run_artifacts import write_csv_rows
+from .safety_platform import describe_minimal_safety_api, describe_spotify_integration_map
 
 
 def _safe_float(value) -> float:
@@ -23,6 +24,70 @@ def _safe_float(value) -> float:
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> Path:
     return write_csv_rows(path, rows, fieldnames=fieldnames)
+
+
+def _write_safety_platform_contract(
+    *,
+    output_dir: Path,
+    run_id: str,
+    profile: str,
+    contract: dict[str, object],
+) -> list[Path]:
+    minimal_api = describe_minimal_safety_api()
+    integration_map = describe_spotify_integration_map()
+    payload = {
+        "run_id": str(run_id).strip(),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "profile": str(profile).strip(),
+        "benchmark_contract_version": str(contract.get("contract_version", "")),
+        "benchmark_contract_mode": str(contract.get("comparison_mode", "")),
+        "minimal_safety_api": minimal_api,
+        "spotify_integration_map": integration_map,
+        "reuse_summary": {
+            "api_group_count": int(len(minimal_api)),
+            "wrapper_count": int(len(integration_map)),
+            "required_run_artifact_count": int(len(contract.get("required_run_artifacts", []))),
+        },
+        "portability_notes": [
+            "The minimal safety API is designed to run outside this Spotify project as long as split snapshots and probability outputs are available.",
+            "The benchmark contract stays fixed so repeated-run comparisons can survive refactors and product-surface changes.",
+            "Spotify-specific wrappers are documented separately from the reusable safety entrypoints.",
+        ],
+    }
+    json_path = output_dir / "safety_platform_contract.json"
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    md_lines = [
+        "# Safety Platform Contract",
+        "",
+        f"- Run ID: `{payload['run_id']}`",
+        f"- Profile: `{payload['profile']}`",
+        f"- Benchmark contract version: `{payload['benchmark_contract_version']}`",
+        f"- Benchmark comparison mode: `{payload['benchmark_contract_mode']}`",
+        f"- Reusable API groups: `{payload['reuse_summary']['api_group_count']}`",
+        f"- Spotify wrappers: `{payload['reuse_summary']['wrapper_count']}`",
+        "",
+        "## Portability Notes",
+        "",
+    ]
+    for item in payload["portability_notes"]:
+        md_lines.append(f"- {item}")
+    md_lines.extend(["", "## Minimal Safety API", ""])
+    for group in minimal_api:
+        md_lines.append(
+            f"- `{group['key']}`: {group['purpose']} Entrypoints `{', '.join(group['entrypoints'])}`."
+        )
+    md_lines.extend(["", "## Spotify Integration Map", ""])
+    for row in integration_map:
+        md_lines.append(
+            f"- `{row['platform_group']}` -> `{row['spotify_module']}:{row['wrapper_entrypoint']}`: {row['purpose']}"
+        )
+    md_lines.extend(["", "## Benchmark Lock Tie-In", ""])
+    for item in contract.get("required_run_artifacts", []):
+        md_lines.append(f"- `{item}`")
+    md_path = output_dir / "safety_platform_contract.md"
+    md_path.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
+    return [json_path, md_path]
 
 
 def _paired_significance_rows(backtest_rows: list[dict[str, object]], top_models: list[str]) -> list[dict[str, object]]:
@@ -159,7 +224,7 @@ def write_benchmark_protocol(
     for item in contract["stability_rules"]:
         md_lines.append(f"- {item}")
     md_path.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
-    return [json_path, md_path]
+    return [json_path, md_path, *_write_safety_platform_contract(output_dir=output_dir, run_id=run_id, profile=profile, contract=contract)]
 
 
 def write_experiment_registry(

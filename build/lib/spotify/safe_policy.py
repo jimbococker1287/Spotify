@@ -71,6 +71,8 @@ _SCENARIO_VARIANT_DELTAS: dict[str, tuple[tuple[str, dict[str, float]], ...]] = 
         ("evening_comfort_max", {"transition": -0.05, "continuity": 0.45, "repeat": 0.45, "novelty": -0.40}),
         ("evening_repeat_guard", {"transition": -0.25, "continuity": 0.40, "repeat": 0.55, "novelty": -0.40}),
         ("evening_transition_min", {"transition": -0.35, "continuity": 0.45, "repeat": 0.50, "novelty": -0.45}),
+        ("evening_deep_continuity", {"transition": -0.45, "continuity": 0.60, "repeat": 0.70, "novelty": -0.55}),
+        ("evening_ultra_stable", {"transition": -0.55, "continuity": 0.75, "repeat": 0.85, "novelty": -0.65}),
     ),
     "listener_fatigue": (
         ("fatigue_anchor", {"transition": -0.10, "continuity": 0.25, "repeat": 0.35, "novelty": -0.25}),
@@ -308,11 +310,14 @@ def _scenario_adjusted_policy(
         base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.15
         base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.10)
     elif scenario_name == "evening_drift":
-        base_policy = dict(policy_map.get("normal_friction", base_policy))
-        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.35
-        base_policy["repeat"] = base_policy.get("repeat", 0.0) + 0.15
-        base_policy["transition"] = max(0.0, base_policy.get("transition", 0.0) - 0.10)
-        base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.30)
+        # Evening drift is the standing stress benchmark, so route from the
+        # stress-validated global safe policy instead of the normal-friction
+        # bucket when those disagree.
+        base_policy = dict(global_policy)
+        base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.45
+        base_policy["repeat"] = base_policy.get("repeat", 0.0) + 0.25
+        base_policy["transition"] = max(0.0, base_policy.get("transition", 0.0) - 0.15)
+        base_policy["novelty"] = max(0.0, base_policy.get("novelty", 0.0) - 0.35)
     elif scenario_name == "listener_fatigue":
         base_policy = dict(policy_map.get("high_friction", base_policy))
         base_policy["continuity"] = base_policy.get("continuity", 0.0) + 0.20
@@ -374,6 +379,14 @@ def _scenario_policy_candidates(
             route_name,
             _apply_policy_delta(variant_base, delta),
         )
+    if scenario_name == "evening_drift":
+        for variant_name, delta in _SCENARIO_VARIANT_DELTAS.get(scenario_name, ()):
+            route_name = f"safe_routed_{route_slug}__global_variant_{variant_name}"
+            _append(
+                f"global_variant:{variant_name}",
+                route_name,
+                _apply_policy_delta(global_policy, delta),
+            )
     return candidates
 
 

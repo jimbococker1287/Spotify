@@ -79,6 +79,8 @@ def _validation_top1(
         context_projection=retrieval_artifact.context_projection,
         item_bias=retrieval_artifact.item_bias,
         popularity=retrieval_artifact.popularity,
+        context_feature_names=tuple(getattr(retrieval_artifact, "context_feature_names", ()) or ()),
+        transition_prior=getattr(retrieval_artifact, "transition_prior", None),
         ann_index=retrieval_artifact.ann_index,
         reranker=estimator,
     )
@@ -102,6 +104,7 @@ def _fit_reranker(
     y_val: np.ndarray | None,
     retrieval_artifact: RetrievalServingArtifact,
     random_seed: int,
+    context_feature_names: tuple[str, ...] | list[str] | None,
 ) -> object:
     train_cap = _env_int("SPOTIFY_RERANKER_TRAIN_ROWS", 12_000)
     rng = np.random.default_rng(random_seed)
@@ -124,11 +127,13 @@ def _fit_reranker(
     features = _candidate_feature_matrix(
         seq_batch=seq_fit,
         ctx_batch=ctx_fit,
+        context_feature_names=context_feature_names,
         session_vec=session_vec,
         candidate_ids=candidate_ids,
         candidate_scores=candidate_scores,
         artist_embeddings=retrieval_artifact.artist_embeddings,
         popularity=retrieval_artifact.popularity,
+        transition_prior=getattr(retrieval_artifact, "transition_prior", None),
     )
     labels = (candidate_ids == y_fit.reshape(-1, 1)).astype("int8").reshape(-1)
 
@@ -142,7 +147,10 @@ def _fit_reranker(
     )
     sample_weight = _reranker_sample_weights(
         seq_batch=seq_fit,
+        ctx_batch=ctx_fit,
+        context_feature_names=context_feature_names,
         candidate_ids=candidate_ids,
+        transition_prior=getattr(retrieval_artifact, "transition_prior", None),
         y_true=y_fit,
     )
 
@@ -209,11 +217,13 @@ def _predict_reranked_probabilities(
         feature_block = _candidate_feature_matrix(
             seq_batch=seq_arr[start:end],
             ctx_batch=ctx_arr[start:end],
+            context_feature_names=tuple(getattr(artifact, "context_feature_names", ()) or ()),
             session_vec=session_arr[start:end],
             candidate_ids=candidate_ids[start:end],
             candidate_scores=candidate_scores[start:end],
             artist_embeddings=artifact.artist_embeddings,
             popularity=artifact.popularity,
+            transition_prior=getattr(artifact, "transition_prior", None),
         )
         rerank_scores = np.asarray(artifact.reranker.predict_proba(feature_block), dtype="float32")[:, positive_index]
         row_count = end - start
@@ -223,8 +233,11 @@ def _predict_reranked_probabilities(
         rerank_scores += 1e-3 * _softmax_rows(candidate_scores[start:end])
         rerank_scores = _apply_repeat_mitigation(
             seq_batch=seq_arr[start:end],
+            ctx_batch=ctx_arr[start:end],
+            context_feature_names=tuple(getattr(artifact, "context_feature_names", ()) or ()),
             candidate_ids=candidate_ids[start:end],
             candidate_scores=candidate_scores[start:end],
+            transition_prior=getattr(artifact, "transition_prior", None),
             rerank_scores=rerank_scores,
         )
         rows = np.arange(row_count, dtype="int64")[:, None]

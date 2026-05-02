@@ -187,3 +187,51 @@ def test_champion_gate_prefers_current_alias_baseline_when_available(tmp_path) -
     assert result["champion_run_id"] == "run_alias"
     assert result["champion_model_name"] == "retrieval_reranker"
     assert result["metric_source"] == "backtest_top1"
+
+
+def test_champion_gate_marks_same_model_neutral_refresh_as_pass(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SPOTIFY_GATE_SAME_MODEL_NEUTRAL_THRESHOLD", "0.01")
+    outputs_dir = tmp_path / "outputs"
+    history_dir = outputs_dir / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_csv = history_dir / "history.csv"
+    _write_history(history_csv, [])
+    backtest_history_csv = history_dir / "backtest_history.csv"
+    _write_backtest_history(
+        backtest_history_csv,
+        [
+            {"run_id": "run_alias", "profile": "full", "model_name": "retrieval_reranker", "top1": 0.38},
+            {"run_id": "run_alias", "profile": "full", "model_name": "retrieval_reranker", "top1": 0.374},
+        ],
+    )
+    _write_champion_alias(outputs_dir, run_id="run_alias", model_name="retrieval_reranker", profile="full")
+
+    result = evaluate_champion_gate(
+        history_csv=history_csv,
+        backtest_history_csv=backtest_history_csv,
+        current_run_id="run_current",
+        current_results=[{"model_name": "retrieval_reranker", "val_top1": 0.01}],
+        current_backtest_rows=[
+            {"model_name": "retrieval_reranker", "top1": 0.371},
+            {"model_name": "retrieval_reranker", "top1": 0.368},
+        ],
+        regression_threshold=0.005,
+        current_profile="full",
+        current_risk_metrics={
+            "retrieval_reranker": {
+                "val_selective_risk": 0.40,
+                "val_abstention_rate": 0.29,
+                "val_guardrail_gap": 0.09,
+                "val_focus_guardrail_gap": 0.12,
+            }
+        },
+        max_selective_risk=0.50,
+        max_abstention_rate=0.30,
+        max_guardrail_gap=0.10,
+        max_focus_guardrail_gap=0.13,
+    )
+
+    assert result["metric_source"] == "backtest_top1"
+    assert result["promoted"] is True
+    assert result["status"] == "pass_same_model_refresh"
+    assert result["same_model_refresh_applied"] is True

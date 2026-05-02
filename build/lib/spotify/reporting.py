@@ -851,6 +851,10 @@ def write_run_report(
     lines.append(f"- Metric source: `{metric_source}`")
     lines.append(f"- Threshold: `{_safe_float(champion_gate.get('threshold')):.6f}`")
     lines.append(f"- Regression: `{_safe_float(champion_gate.get('regression')):.6f}`")
+    if bool(champion_gate.get("same_model_refresh_applied", False)):
+        lines.append(
+            f"- Same-model refresh: `True` neutral_threshold=`{_safe_float(champion_gate.get('same_model_neutral_threshold')):.6f}`"
+        )
     lines.append(
         f"- Previous champion: `{champion_gate.get('champion_run_id', '')}` / "
         f"`{champion_gate.get('champion_model_name', '')}`"
@@ -859,6 +863,24 @@ def write_run_report(
     lines.append(
         f"- Current challenger: `{champion_gate.get('challenger_model_name', '')}` "
         f"(`{challenger_score:.4f}`)"
+    )
+    lines.append(
+        f"- Raw top candidate: `{champion_gate.get('top_candidate_model_name', '')}` "
+        f"(`{_safe_float(champion_gate.get('top_candidate_score')):.4f}`)"
+    )
+    blockers = champion_gate.get("top_candidate_risk_blockers", [])
+    blocker_text = ", ".join(str(item) for item in blockers if str(item).strip()) if isinstance(blockers, list) and blockers else "none"
+    lines.append(f"- Raw top candidate blockers: `{blocker_text}`")
+    lines.append(
+        f"- Risk-eligible selection reason: `{champion_gate.get('challenger_selection_reason', '')}` "
+        f"rank=`{int(_safe_float(champion_gate.get('selected_candidate_rank')) or 0)}` "
+        f"eligible_count=`{int(_safe_float(champion_gate.get('eligible_candidate_count')) or 0)}`"
+    )
+    lines.append(
+        f"- Challenger safety: selective_risk=`{_safe_float(champion_gate.get('challenger_selective_risk')):.4f}` "
+        f"abstention=`{_safe_float(champion_gate.get('challenger_abstention_rate')):.4f}` "
+        f"guardrail_gap=`{_safe_float(champion_gate.get('challenger_guardrail_gap')):.4f}` "
+        f"focus_gap=`{_safe_float(champion_gate.get('challenger_focus_guardrail_gap')):.4f}`"
     )
     lines.append("")
     lines.append("## Model Results")
@@ -941,6 +963,7 @@ def write_run_report(
             "*group_auto_dj*.csv",
             "*stress_test*.json",
             "*stress_test*.csv",
+            "public_insights_index.*",
             "*_reliability.png",
             "*_segment_metrics.csv",
             "*_top_errors.csv",

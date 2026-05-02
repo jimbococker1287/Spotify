@@ -11,9 +11,9 @@ import pandas as pd
 from .benchmarks import ClassicalFeatureBundle, build_classical_estimator, build_classical_feature_bundle, sample_rows
 from .data import PreparedData
 from .probability_bundles import load_prediction_bundle
-from .recommender_safety import build_conformal_abstention_summary
+from .recommender_safety import build_conformal_abstention_summary, conformal_operating_policy_for_model_type
 from .run_artifacts import write_csv_rows
-from .uncertainty import apply_temperature_scaling, fit_temperature_scaling
+from .uncertainty import apply_temperature_scaling, fit_ece_guarded_temperature_scaling
 
 
 def _slugify(raw: str) -> str:
@@ -384,13 +384,21 @@ def _save_prediction_diagnostics(
     val_eval_proba = np.asarray(val_proba, dtype="float32")
     test_eval_proba = np.asarray(test_proba, dtype="float32")
     calibration_temperature = 1.0
+    calibration_candidate_temperature = 1.0
+    calibration_raw_val_ece = float("nan")
+    calibration_candidate_val_ece = float("nan")
     probability_calibration_method = "raw"
     if enable_temperature_scaling:
         val_y_local = _encode_labels_to_local_indices(np.asarray(val_y), class_labels)
-        calibration_temperature = fit_temperature_scaling(val_eval_proba, val_y_local)
-        val_eval_proba = apply_temperature_scaling(val_eval_proba, calibration_temperature)
-        test_eval_proba = apply_temperature_scaling(test_eval_proba, calibration_temperature)
-        probability_calibration_method = "temperature_scaling"
+        calibration_selection = fit_ece_guarded_temperature_scaling(val_eval_proba, val_y_local)
+        calibration_temperature = float(calibration_selection["temperature"])
+        calibration_candidate_temperature = float(calibration_selection["candidate_temperature"])
+        calibration_raw_val_ece = _to_float(calibration_selection["raw_val_ece"])
+        calibration_candidate_val_ece = _to_float(calibration_selection["calibrated_val_ece"])
+        probability_calibration_method = str(calibration_selection["method"])
+        if bool(calibration_selection["accepted"]):
+            val_eval_proba = apply_temperature_scaling(val_eval_proba, calibration_temperature)
+            test_eval_proba = apply_temperature_scaling(test_eval_proba, calibration_temperature)
 
     val_stats = _prediction_stats(val_eval_proba, val_y, class_labels=class_labels)
     test_stats = _prediction_stats(test_eval_proba, test_y, class_labels=class_labels)
@@ -439,6 +447,9 @@ def _save_prediction_diagnostics(
         "conformal_enabled": bool(enable_conformal),
         "probability_calibration_method": probability_calibration_method,
         "probability_calibration_temperature": float(calibration_temperature),
+        "probability_calibration_candidate_temperature": float(calibration_candidate_temperature),
+        "probability_calibration_raw_val_ece": _to_float(calibration_raw_val_ece),
+        "probability_calibration_candidate_val_ece": _to_float(calibration_candidate_val_ece),
     }
 
     summary_path = output_dir / f"{safe_tag}_confidence_summary.json"
@@ -579,6 +590,7 @@ def run_extended_evaluation(
                     val_proba = _extract_artist_proba(val_pred)
                     test_proba = _extract_artist_proba(test_pred)
                 try:
+                    policy = conformal_operating_policy_for_model_type("deep")
                     artifacts.extend(
                         _save_prediction_diagnostics(
                             tag=f"deep_{deep_name}",
@@ -592,6 +604,10 @@ def run_extended_evaluation(
                             label_lookup=label_lookup,
                             enable_conformal=enable_conformal,
                             conformal_alpha=conformal_alpha,
+                            conformal_env_prefix=policy["env_prefix"],
+                            enable_temperature_scaling=bool(policy["enable_temperature_scaling"]),
+                            conformal_target_selective_risk=float(policy["target_selective_risk"]),
+                            conformal_min_accepted_rate=float(policy["min_accepted_rate"]),
                         )
                     )
                     logger.info("Saved extended diagnostics for deep model: %s", deep_name)
@@ -619,6 +635,7 @@ def run_extended_evaluation(
             prediction_bundle_raw = str(best_classical.get("prediction_bundle_path", "")).strip()
             prediction_bundle_path = Path(prediction_bundle_raw) if prediction_bundle_raw else None
             try:
+                policy = conformal_operating_policy_for_model_type(row_type)
                 if prediction_bundle_path is not None and prediction_bundle_path.exists():
                     val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
                     artifacts.extend(
@@ -635,10 +652,10 @@ def run_extended_evaluation(
                             class_labels=None,
                             enable_conformal=enable_conformal,
                             conformal_alpha=conformal_alpha,
-                            conformal_env_prefix="CLASSICAL",
-                            enable_temperature_scaling=True,
-                            conformal_target_selective_risk=0.45,
-                            conformal_min_accepted_rate=0.70,
+                            conformal_env_prefix=policy["env_prefix"],
+                            enable_temperature_scaling=bool(policy["enable_temperature_scaling"]),
+                            conformal_target_selective_risk=float(policy["target_selective_risk"]),
+                            conformal_min_accepted_rate=float(policy["min_accepted_rate"]),
                         )
                     )
                     logger.info("Saved extended diagnostics for classical model: %s", model_name)
@@ -675,10 +692,10 @@ def run_extended_evaluation(
                                 class_labels=(classes if classes.size else None),
                                 enable_conformal=enable_conformal,
                                 conformal_alpha=conformal_alpha,
-                                conformal_env_prefix="CLASSICAL",
-                                enable_temperature_scaling=True,
-                                conformal_target_selective_risk=0.45,
-                                conformal_min_accepted_rate=0.70,
+                                conformal_env_prefix=policy["env_prefix"],
+                                enable_temperature_scaling=bool(policy["enable_temperature_scaling"]),
+                                conformal_target_selective_risk=float(policy["target_selective_risk"]),
+                                conformal_min_accepted_rate=float(policy["min_accepted_rate"]),
                             )
                         )
                         logger.info("Saved extended diagnostics for classical model: %s", model_name)
@@ -699,6 +716,7 @@ def run_extended_evaluation(
             continue
         try:
             val_proba, test_proba = load_prediction_bundle(prediction_bundle_path)
+            policy = conformal_operating_policy_for_model_type(model_type)
             artifacts.extend(
                 _save_prediction_diagnostics(
                     tag=f"{model_type}_{model_name}",
@@ -713,6 +731,10 @@ def run_extended_evaluation(
                     class_labels=None,
                     enable_conformal=enable_conformal,
                     conformal_alpha=conformal_alpha,
+                    conformal_env_prefix=policy["env_prefix"],
+                    enable_temperature_scaling=bool(policy["enable_temperature_scaling"]),
+                    conformal_target_selective_risk=float(policy["target_selective_risk"]),
+                    conformal_min_accepted_rate=float(policy["min_accepted_rate"]),
                 )
             )
             logger.info("Saved extended diagnostics for retrieval model: %s", model_name)

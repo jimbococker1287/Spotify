@@ -52,27 +52,38 @@ def _build_sample_outputs(output_root: Path) -> None:
     creator_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
     primary_report = creator_dir / "sample.md"
     scene_seed_view = creator_dir / "sample_scene_seed_view.md"
+    opportunity_lane_view = creator_dir / "sample_opportunity_lane_view.md"
+    scene_strategy_view = creator_dir / "sample_scene_strategy_watch.md"
     ranking_view = creator_dir / "sample_ranking_view.md"
     scene_view = creator_dir / "sample_scene_view.md"
     seed_view = creator_dir / "sample_seed_view.md"
-    for path in (primary_report, scene_seed_view, ranking_view, scene_view, seed_view):
+    report_family_md = creator_dir / "sample_report_family.md"
+    for path in (primary_report, scene_seed_view, opportunity_lane_view, scene_strategy_view, ranking_view, scene_view, seed_view, report_family_md):
         _write_text(path, f"# {path.stem}\n")
     _write_json(
         creator_dir / "sample_report_family.json",
         {
             "primary_report": str(primary_report),
+            "artifact_index_markdown": str(report_family_md),
             "comparison_view_markdown": {
                 "ranking_comparison": str(ranking_view),
                 "scene_comparison": str(scene_view),
                 "seed_comparison": str(seed_view),
                 "scene_seed_comparison": str(scene_seed_view),
+                "opportunity_lane_comparison": str(opportunity_lane_view),
             },
+            "brief_view_markdown": {"scene_strategy_watch": str(scene_strategy_view)},
         },
     )
 
+    run_dir = output_root / "runs" / "run_full_anchor"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_text(run_dir / "safety_platform_contract.md", "# Safety Contract\n")
+    _write_json(run_dir / "safety_platform_contract.json", {"benchmark_contract_version": "2026-week10-v1"})
     _write_json(
         output_root / "analysis" / "research_claims" / "research_claims.json",
         {
+            "run": {"run_id": "run_full_anchor"},
             "primary_claim": {"key": "shift_robustness", "status": "analysis_ready"},
             "backup_claim": {"key": "candidate_ranking", "status": "promising_but_unlocked"},
             "benchmark_lock": {"benchmark_id": "smokebench", "comparison_ready": False},
@@ -101,6 +112,8 @@ def test_build_branch_portfolio_report_distinguishes_four_primary_branches(tmp_p
     assert branches["safety_research"]["status"] == "ready_with_gaps"
     assert "audience" in branches["taste_os"]
     assert "success_metric" in branches["safety_research"]
+    assert any("report_family.md" in artifact for artifact in branches["creator_intelligence"]["artifacts"])
+    assert any("safety_platform_contract.md" in artifact for artifact in branches["safety_research"]["artifacts"])
 
 
 def test_write_branch_portfolio_artifacts_creates_markdown_and_json(tmp_path: Path) -> None:
@@ -116,4 +129,3 @@ def test_write_branch_portfolio_artifacts_creates_markdown_and_json(tmp_path: Pa
     assert "Higher-Level Branch Map" in markdown
     assert "Personal Taste OS" in markdown
     assert "Priority Rules" in markdown
-

@@ -13,6 +13,7 @@ from .pipeline_artifact_cache import (
     source_digest_for_paths,
     stable_payload_digest,
 )
+from .public_insights_index import write_public_insights_index
 
 _THIS_SOURCE = Path(__file__).resolve()
 
@@ -372,6 +373,22 @@ def write_postrun_reports(
     write_control_room_report,
     write_run_report,
 ) -> None:
+    with phase_recorder.phase("public_insights_index") as phase:
+        try:
+            public_index_json, public_index_md = write_public_insights_index(
+                output_dir=config.output_dir,
+                destination_dir=run_dir / "analysis" / "public_spotify",
+                max_reports=25,
+            )
+        except Exception as exc:
+            logger.warning("Public Spotify insights index generation failed but the run will continue: %s", exc)
+            phase["status"] = "warning"
+            phase["warning"] = str(exc)
+        else:
+            artifact_paths.extend([public_index_json, public_index_md])
+            phase["json_path"] = public_index_json
+            phase["markdown_path"] = public_index_md
+
     with phase_recorder.phase("run_report") as phase:
         report_path = write_run_report(
             run_dir=run_dir,

@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from spotify.evaluation import _build_label_lookup
-from spotify.pipeline_postrun_reporting import write_research_artifacts
+from spotify.pipeline_postrun_reporting import write_postrun_reports, write_research_artifacts
 from spotify.reporting import persist_to_sqlite, restore_deep_reporting_artifacts, save_deep_reporting_artifacts
 from spotify.run_timing import RunPhaseRecorder
 
@@ -247,3 +247,54 @@ def test_write_research_artifacts_reuses_cached_analysis_summaries(tmp_path: Pat
     assert (second_run_dir / "analysis" / "ablation_summary.json").exists()
     assert (second_run_dir / "analysis" / "backtest_significance.csv").exists()
     assert (second_run_dir / "analysis" / "backtest_significance.json").exists()
+
+
+def test_write_postrun_reports_indexes_public_insights(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    run_dir = output_dir / "runs" / "run_a"
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True)
+    history_csv = history_dir / "experiment_history.csv"
+    history_csv.write_text("run_id,model_name,val_top1\n", encoding="utf-8")
+    radar_dir = output_dir / "analysis" / "public_spotify" / "personal_release_radar"
+    radar_dir.mkdir(parents=True)
+    (radar_dir / "radar.json").write_text(
+        '{"command":"personal-release-radar","priority_releases":[{"album_name":"Fresh","artist_name":"Artist"}]}',
+        encoding="utf-8",
+    )
+    (radar_dir / "radar.md").write_text("# Radar\n", encoding="utf-8")
+    artifact_paths: list[Path] = []
+
+    def _write_run_report(**kwargs):
+        path = kwargs["run_dir"] / "run_report.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("report", encoding="utf-8")
+        return path
+
+    def _write_control_room_report(output_root: Path, *, top_n: int):
+        assert output_root == output_dir
+        assert top_n == 5
+        json_path = output_root / "control_room.json"
+        md_path = output_root / "control_room.md"
+        json_path.write_text("{}", encoding="utf-8")
+        md_path.write_text("# Control\n", encoding="utf-8")
+        return json_path, md_path
+
+    write_postrun_reports(
+        artifact_paths=artifact_paths,
+        champion_gate={},
+        config=SimpleNamespace(output_dir=output_dir),
+        history_csv=history_csv,
+        history_dir=history_dir,
+        logger=_logger("postrun-public-insights"),
+        manifest={"run_id": "run_a"},
+        phase_recorder=RunPhaseRecorder(run_id="run_a"),
+        result_rows=[],
+        run_dir=run_dir,
+        write_control_room_report=_write_control_room_report,
+        write_run_report=_write_run_report,
+    )
+
+    index_path = run_dir / "analysis" / "public_spotify" / "public_insights_index.json"
+    assert index_path.exists()
+    assert index_path in artifact_paths

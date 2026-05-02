@@ -66,6 +66,8 @@ def test_run_drift_diagnostics_writes_expected_artifacts(tmp_path: Path) -> None
 
     expected = {
         tmp_path / "data_drift_summary.json",
+        tmp_path / "data_drift_brief.json",
+        tmp_path / "data_drift_brief.md",
         tmp_path / "context_feature_drift.csv",
         tmp_path / "segment_drift.csv",
         tmp_path / "context_feature_drift_by_group.csv",
@@ -79,6 +81,10 @@ def test_run_drift_diagnostics_writes_expected_artifacts(tmp_path: Path) -> None
     assert "target_drift" in summary
     assert "context_drift_by_group" in summary
     assert "drift_interpretation" in summary
+    brief = json.loads((tmp_path / "data_drift_brief.json").read_text(encoding="utf-8"))
+    assert brief["status"] in {"stable", "attention"}
+    assert brief["inspect_paths"][0] == "analysis/data_drift_summary.json"
+    assert "Data Drift Brief" in (tmp_path / "data_drift_brief.md").read_text(encoding="utf-8")
 
 
 def test_run_temporal_backtest_supports_deep_models_via_injected_runner(tmp_path: Path, monkeypatch) -> None:

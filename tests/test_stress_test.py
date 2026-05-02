@@ -96,6 +96,8 @@ def test_run_stress_test_lab_samples_sessions_and_logs_progress(
     assert tmp_path / "stress_test_summary.json" in paths
     assert tmp_path / "stress_test_benchmark.csv" in paths
     assert tmp_path / "stress_test_benchmark.json" in paths
+    assert tmp_path / "stress_test_benchmark_brief.json" in paths
+    assert tmp_path / "stress_test_benchmark_brief.md" in paths
 
     payload = json.loads((tmp_path / "stress_test_summary.json").read_text(encoding="utf-8"))
     assert len(payload) == len(stress_test.SCENARIOS) * 3
@@ -106,7 +108,9 @@ def test_run_stress_test_lab_samples_sessions_and_logs_progress(
     assert {row["policy_family"] for row in payload} == {"baseline", "safe"}
     benchmark = json.loads((tmp_path / "stress_test_benchmark.json").read_text(encoding="utf-8"))
     assert benchmark["benchmark_scenario"] == "evening_drift"
-    assert benchmark["benchmark_policy_name"] == "safe_global"
+    assert benchmark["benchmark_policy_name"] == "safe_routed_evening"
+    assert benchmark["benchmark_policy_family"] == "safe"
+    assert benchmark["benchmark_canonical_policy_name"] == "safe_global"
     assert benchmark["benchmark_selected_policy_name"] == "safe_routed_evening"
     assert benchmark["benchmark_requested_policy_name"] == "safe_routed"
     assert benchmark["benchmark_policy_selection_mode"] == "scenario_routed_alias"
@@ -114,7 +118,15 @@ def test_run_stress_test_lab_samples_sessions_and_logs_progress(
     assert benchmark["reference_available"] is True
     assert benchmark["skip_risk"] == 0.25
     assert benchmark["skip_risk_delta_vs_reference"] == 0.0
-    assert benchmark["scenario_count_for_policy"] == 5
+    assert benchmark["scenario_count_for_policy"] == 1
+    assert benchmark["benchmark_guard_threshold"] == pytest.approx(0.45)
+    assert benchmark["benchmark_target_threshold"] == pytest.approx(0.35)
+    assert benchmark["benchmark_gate_status"] == "pass"
+    assert benchmark["benchmark_target_status"] == "pass"
+    benchmark_brief = json.loads((tmp_path / "stress_test_benchmark_brief.json").read_text(encoding="utf-8"))
+    assert benchmark_brief["selected_policy_name"] == "safe_routed_evening"
+    assert benchmark_brief["status"] == "pass"
+    assert "Stress Test Benchmark Brief" in (tmp_path / "stress_test_benchmark_brief.md").read_text(encoding="utf-8")
 
     assert "Stress-test lab evaluating 3/6 held-out sessions" in caplog.text
     assert "Stress-test benchmark scenario=evening_drift policy=safe_routed_evening" in caplog.text
@@ -172,7 +184,30 @@ def test_run_stress_test_lab_prefers_learned_scenario_policy_names(
 
     benchmark = json.loads((tmp_path / "stress_test_benchmark.json").read_text(encoding="utf-8"))
     assert benchmark["benchmark_scenario"] == "evening_drift"
-    assert benchmark["benchmark_policy_name"] == "safe_global"
+    assert benchmark["benchmark_policy_name"] == "safe_routed_evening__learned"
+    assert benchmark["benchmark_policy_family"] == "safe"
+    assert benchmark["benchmark_canonical_policy_name"] == "safe_global"
     assert benchmark["benchmark_selected_policy_name"] == "safe_routed_evening__learned"
     assert benchmark["benchmark_policy_selection_mode"] == "scenario_routed_alias"
     assert benchmark["skip_risk"] == pytest.approx(0.18)
+    assert benchmark["benchmark_gate_status"] == "pass"
+
+
+def test_scenario_safe_policy_evening_fallback_uses_global_safe_base() -> None:
+    safe_policy = SimpleNamespace(
+        global_policy={"transition": 0.8, "continuity": 0.4, "novelty": 0.1, "repeat": 0.9},
+        policy_map={
+            "normal_friction": {"transition": 1.1, "continuity": 0.1, "novelty": 0.0, "repeat": 0.8},
+        },
+    )
+
+    policy_name, weights = stress_test._scenario_safe_policy(
+        safe_policy=safe_policy,
+        scenario_name="evening_drift",
+    )
+
+    assert policy_name == "safe_routed_evening"
+    assert weights["transition"] == pytest.approx(0.65)
+    assert weights["continuity"] == pytest.approx(0.85)
+    assert weights["novelty"] == pytest.approx(0.0)
+    assert weights["repeat"] == pytest.approx(1.15)

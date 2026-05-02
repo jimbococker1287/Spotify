@@ -9,6 +9,31 @@ from .retrieval_reranking import _fit_reranker, _predict_reranked_probabilities
 from .retrieval_training import _ann_recall_and_latency, _build_ann_index
 
 
+def _build_transition_prior_matrix(data) -> np.ndarray:
+    num_artists = max(1, int(getattr(data, "num_artists", 0) or 0))
+    seq_train = np.asarray(getattr(data, "X_seq_train", np.empty((0, 0), dtype="int32")), dtype="int32")
+    y_train = np.asarray(getattr(data, "y_train", np.empty((0,), dtype="int32")), dtype="int32").reshape(-1)
+    if seq_train.ndim != 2 or len(seq_train) == 0 or len(seq_train) != len(y_train):
+        return np.full((num_artists, num_artists), 1.0 / float(num_artists), dtype="float32")
+
+    last_artist = seq_train[:, -1].astype("int32", copy=False)
+    valid = (
+        (last_artist >= 0)
+        & (last_artist < num_artists)
+        & (y_train >= 0)
+        & (y_train < num_artists)
+    )
+    counts = np.zeros((num_artists, num_artists), dtype="float32")
+    if np.any(valid):
+        np.add.at(counts, (last_artist[valid], y_train[valid]), 1.0)
+    global_counts = np.bincount(np.clip(y_train[valid], 0, num_artists - 1), minlength=num_artists).astype("float32")
+    counts += 0.35 * global_counts.reshape(1, -1)
+    counts += 0.25
+    row_sums = counts.sum(axis=1, keepdims=True)
+    row_sums[row_sums <= 0.0] = 1.0
+    return (counts / row_sums).astype("float32", copy=False)
+
+
 @dataclass
 class RetrievalBaselineEvaluation:
     retrieval_artifact: RetrievalServingArtifact
@@ -47,6 +72,7 @@ def evaluate_retrieval_baseline(
     top_k: int,
 ) -> RetrievalBaselineEvaluation:
     ann_index = _build_ann_index(np.asarray(artist_embeddings, dtype="float32"), random_seed=random_seed)
+    transition_prior = _build_transition_prior_matrix(data)
     retrieval_artifact = RetrievalServingArtifact(
         model_name="retrieval_dual_encoder",
         candidate_k=top_k,
@@ -55,6 +81,8 @@ def evaluate_retrieval_baseline(
         context_projection=np.asarray(context_projection, dtype="float32"),
         item_bias=np.asarray(item_bias, dtype="float32"),
         popularity=np.asarray(popularity, dtype="float32"),
+        context_feature_names=tuple(getattr(data, "context_features", ()) or ()),
+        transition_prior=transition_prior,
         ann_index=ann_index,
         reranker=None,
     )
@@ -113,6 +141,7 @@ def train_and_evaluate_reranker(
         y_val=data.y_val,
         retrieval_artifact=baseline.retrieval_artifact,
         random_seed=random_seed,
+        context_feature_names=tuple(getattr(data, "context_features", ()) or ()),
     )
 
     reranker_artifact = RetrievalServingArtifact(
@@ -123,6 +152,10 @@ def train_and_evaluate_reranker(
         context_projection=baseline.retrieval_artifact.context_projection,
         item_bias=baseline.retrieval_artifact.item_bias,
         popularity=baseline.retrieval_artifact.popularity,
+        context_feature_names=tuple(getattr(baseline.retrieval_artifact, "context_feature_names", ()) or ()),
+        transition_prior=np.asarray(getattr(baseline.retrieval_artifact, "transition_prior", None), dtype="float32")
+        if getattr(baseline.retrieval_artifact, "transition_prior", None) is not None
+        else None,
         reranker=reranker_estimator,
     )
     val_rerank_proba = _predict_reranked_probabilities(

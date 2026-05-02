@@ -39,6 +39,8 @@ from .run_artifacts import safe_read_json as _safe_read_json
 from .run_artifacts import write_json, write_markdown
 
 _OPERATIONAL_REVIEW_AREAS = frozenset({"instrumentation", "cadence"})
+_STRESS_BENCHMARK_GUARD_THRESHOLD = 0.45
+_STRESS_BENCHMARK_TARGET_THRESHOLD = 0.35
 
 
 def _analysis_prefix_for_model_type(model_type: str) -> str | None:
@@ -71,6 +73,46 @@ def _freshness_rank(age_hours: float) -> int:
     if age_hours <= 24 * 30:
         return 1
     return 0
+
+
+def _threshold_status(value: object, threshold: float) -> str:
+    metric = _safe_float(value)
+    if not math.isfinite(metric):
+        return "unknown"
+    return "pass" if metric <= threshold + 1e-12 else "fail"
+
+
+def _serving_policy_snapshot(
+    *,
+    alias: dict[str, object],
+    best_result: dict[str, object],
+    gate: dict[str, object],
+) -> dict[str, object]:
+    champion_name = str(alias.get("model_name", "")).strip()
+    champion_type = str(alias.get("model_type", "")).strip()
+    best_name = str(best_result.get("model_name", "")).strip()
+    best_type = str(best_result.get("model_type", "")).strip()
+
+    serving_name = champion_name or best_name
+    serving_type = champion_type or best_type
+    best_is_serving = bool(serving_name and best_name and serving_name == best_name)
+    if not serving_name:
+        reason = "no_serving_candidate_available"
+    elif best_is_serving:
+        reason = "champion_alias_matches_raw_val_leader"
+    elif bool(gate.get("promoted")) and champion_name:
+        reason = "champion_alias_prefers_promoted_risk_eligible_model_over_raw_val_leader"
+    elif champion_name:
+        reason = "champion_alias_pins_existing_serving_model"
+    else:
+        reason = "fallback_to_raw_val_leader"
+
+    return {
+        "serving_model_name": serving_name,
+        "serving_model_type": serving_type,
+        "best_model_is_serving_model": best_is_serving,
+        "serving_policy_reason": reason,
+    }
 
 
 def _load_run_results(run_dir: Path) -> list[dict[str, object]]:
@@ -313,6 +355,7 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
     top_friction_rows = friction_summary.get("top_friction_features", []) if isinstance(friction_summary, dict) else []
     top_friction = top_friction_rows[0] if isinstance(top_friction_rows, list) and top_friction_rows else {}
     worst_robustness = robustness_summary[0] if isinstance(robustness_summary, list) and robustness_summary else {}
+    serving_policy = _serving_policy_snapshot(alias=alias, best_result=best_result, gate=gate)
 
     run = {
         "run_id": str(manifest.get("run_id", "")),
@@ -330,6 +373,7 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "best_model_type": str(best_result.get("model_type", "")),
         "best_model_val_top1": _safe_float(best_result.get("val_top1")),
         "best_model_test_top1": _safe_float(best_result.get("test_top1")),
+        **serving_policy,
         "pipeline_total_seconds": _safe_float(phase_timings.get("total_seconds")),
         "pipeline_measured_seconds": _safe_float(phase_timings.get("measured_seconds")),
         "pipeline_unmeasured_overhead_seconds": _safe_float(phase_timings.get("unmeasured_overhead_seconds")),
@@ -354,6 +398,21 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "champion_gate_status": str(gate.get("status", "unknown")),
         "champion_gate_metric_source": str(gate.get("metric_source", "")),
         "champion_gate_regression": _safe_float(gate.get("regression")),
+        "same_model_refresh_applied": bool(gate.get("same_model_refresh_applied", False)),
+        "same_model_neutral_threshold": _safe_float(gate.get("same_model_neutral_threshold")),
+        "champion_gate_selected_candidate_rank": _safe_int(gate.get("selected_candidate_rank"), default=0),
+        "raw_top_candidate_model_name": str(gate.get("top_candidate_model_name", "")),
+        "raw_top_candidate_score": _safe_float(gate.get("top_candidate_score")),
+        "raw_top_candidate_risk_blockers": (
+            [str(item) for item in gate.get("top_candidate_risk_blockers", []) if str(item).strip()]
+            if isinstance(gate.get("top_candidate_risk_blockers", []), list)
+            else []
+        ),
+        "risk_eligible_candidate_model_name": str(gate.get("challenger_model_name", "")),
+        "risk_eligible_candidate_score": _safe_float(gate.get("challenger_score")),
+        "risk_eligible_candidate_reason": str(gate.get("challenger_selection_reason", "")),
+        "risk_eligible_candidate_guardrail_gap": _safe_float(gate.get("challenger_guardrail_gap")),
+        "risk_eligible_candidate_focus_guardrail_gap": _safe_float(gate.get("challenger_focus_guardrail_gap")),
         "largest_context_shift_feature": str(largest_context_shift.get("feature", "")),
         "largest_context_shift_value": _safe_float(largest_context_shift.get("max_abs_std_mean_diff")),
         "largest_segment_shift_label": (
@@ -382,6 +441,16 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "repeat_from_prev_new_count": repeat_guardrail_count,
     }
 
+    stress_selected_policy = str(stress_benchmark.get("benchmark_selected_policy_name", "")).strip()
+    stress_policy_name = str(stress_benchmark.get("benchmark_policy_name", "")).strip()
+    stress_display_policy = stress_selected_policy or stress_policy_name
+    stress_policy_family = str(stress_benchmark.get("benchmark_policy_family", "")).strip()
+    if not stress_policy_family and stress_display_policy:
+        stress_policy_family = "safe" if stress_display_policy.startswith("safe_") else "baseline"
+    stress_canonical_policy = str(stress_benchmark.get("benchmark_canonical_policy_name", "")).strip()
+    if not stress_canonical_policy and stress_policy_family == "safe":
+        stress_canonical_policy = "safe_global"
+
     qoe = {
         "friction_status": str(friction_summary.get("status", "")) if isinstance(friction_summary, dict) else "",
         "friction_feature_count": _safe_int(friction_summary.get("friction_feature_count")) if isinstance(friction_summary, dict) else 0,
@@ -395,10 +464,25 @@ def _build_run_health_snapshot(manifest: dict[str, object]) -> dict[str, dict[st
         "stress_worst_skip_scenario": str(moonshot_summary.get("stress_worst_skip_scenario", "")) if isinstance(moonshot_summary, dict) else "",
         "stress_worst_skip_risk": _safe_float(moonshot_summary.get("stress_worst_skip_risk")) if isinstance(moonshot_summary, dict) else float("nan"),
         "stress_benchmark_scenario": str(stress_benchmark.get("benchmark_scenario", "")),
-        "stress_benchmark_policy_name": str(stress_benchmark.get("benchmark_policy_name", "")),
-        "stress_benchmark_selected_policy_name": str(stress_benchmark.get("benchmark_selected_policy_name", "")),
+        "stress_benchmark_policy_name": stress_policy_name,
+        "stress_benchmark_policy_family": stress_policy_family,
+        "stress_benchmark_canonical_policy_name": stress_canonical_policy,
+        "stress_benchmark_selected_policy_name": stress_selected_policy,
+        "stress_benchmark_requested_policy_name": str(stress_benchmark.get("benchmark_requested_policy_name", "")),
+        "stress_benchmark_policy_selection_mode": str(stress_benchmark.get("benchmark_policy_selection_mode", "")),
         "stress_benchmark_skip_risk": _safe_float(stress_benchmark.get("skip_risk")),
         "stress_benchmark_skip_delta_vs_reference": _safe_float(stress_benchmark.get("skip_risk_delta_vs_reference")),
+        "stress_benchmark_gate_threshold": _STRESS_BENCHMARK_GUARD_THRESHOLD,
+        "stress_benchmark_gate_status": _threshold_status(
+            stress_benchmark.get("skip_risk"),
+            _STRESS_BENCHMARK_GUARD_THRESHOLD,
+        ),
+        "stress_benchmark_gate_margin": _STRESS_BENCHMARK_GUARD_THRESHOLD - _safe_float(stress_benchmark.get("skip_risk")),
+        "stress_benchmark_target_threshold": _STRESS_BENCHMARK_TARGET_THRESHOLD,
+        "stress_benchmark_target_status": _threshold_status(
+            stress_benchmark.get("skip_risk"),
+            _STRESS_BENCHMARK_TARGET_THRESHOLD,
+        ),
     }
     missing_summaries = [
         filename

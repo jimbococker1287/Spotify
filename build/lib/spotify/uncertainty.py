@@ -78,6 +78,37 @@ def _negative_log_likelihood(proba: np.ndarray, y_true: np.ndarray) -> float:
     return float(-np.mean(np.log(clipped)))
 
 
+def expected_calibration_error(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    n_bins: int = 15,
+) -> float:
+    proba_arr = _as_2d_float_array(proba)
+    y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
+    if proba_arr.shape[0] == 0 or proba_arr.shape[0] != y_arr.shape[0]:
+        return float("nan")
+    valid = _valid_label_mask(y_arr, proba_arr.shape[1])
+    if not np.any(valid):
+        return float("nan")
+
+    confidences = np.max(proba_arr[valid], axis=1)
+    predictions = np.argmax(proba_arr[valid], axis=1)
+    correct = (predictions == y_arr[valid]).astype("float64")
+    edges = np.linspace(0.0, 1.0, max(2, int(n_bins) + 1))
+    ece = 0.0
+    total = float(len(confidences))
+    for left, right in zip(edges[:-1], edges[1:]):
+        if right >= 1.0:
+            mask = (confidences >= left) & (confidences <= right)
+        else:
+            mask = (confidences >= left) & (confidences < right)
+        if not np.any(mask):
+            continue
+        ece += (float(np.sum(mask)) / total) * abs(float(np.mean(confidences[mask])) - float(np.mean(correct[mask])))
+    return float(ece)
+
+
 def fit_temperature_scaling(proba: np.ndarray, y_true: np.ndarray) -> float:
     proba_arr = _as_2d_float_array(proba)
     y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
@@ -102,6 +133,29 @@ def fit_temperature_scaling(proba: np.ndarray, y_true: np.ndarray) -> float:
             best_nll = nll
             best_temp = float(temp)
     return best_temp
+
+
+def fit_ece_guarded_temperature_scaling(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    n_bins: int = 15,
+) -> dict[str, object]:
+    proba_arr = _as_2d_float_array(proba).astype("float32", copy=False)
+    y_arr = np.asarray(y_true, dtype="int64").reshape(-1)
+    raw_ece = expected_calibration_error(proba_arr, y_arr, n_bins=n_bins)
+    temperature = fit_temperature_scaling(proba_arr, y_arr)
+    calibrated = apply_temperature_scaling(proba_arr, temperature)
+    calibrated_ece = expected_calibration_error(calibrated, y_arr, n_bins=n_bins)
+    accepted = bool(np.isfinite(calibrated_ece) and (not np.isfinite(raw_ece) or calibrated_ece <= raw_ece + 1e-12))
+    return {
+        "accepted": accepted,
+        "method": "temperature_scaling" if accepted else "raw_ece_guardrail",
+        "temperature": float(temperature if accepted else 1.0),
+        "candidate_temperature": float(temperature),
+        "raw_val_ece": float(raw_ece),
+        "calibrated_val_ece": float(calibrated_ece),
+    }
 
 
 def fit_split_conformal_classifier(

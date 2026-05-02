@@ -15,14 +15,14 @@ from .public_catalog import SpotifyArtistMetadata, SpotifyPublicCatalogClient, S
 from .public_insights_cli import build_public_insights_parser
 from .public_insights_creator_brief import (
     CreatorBriefHandlerDeps,
-    _creator_brief_executive_summary,
-    _creator_brief_migration_watch,
-    _creator_brief_priority_shortlist,
-    _creator_brief_ranking_comparison,
-    _creator_brief_release_watch,
-    _creator_brief_scene_comparison,
-    _creator_brief_scene_seed_comparison,
-    _creator_brief_seed_comparison,
+    _creator_brief_executive_summary as _creator_brief_executive_summary,
+    _creator_brief_migration_watch as _creator_brief_migration_watch,
+    _creator_brief_priority_shortlist as _creator_brief_priority_shortlist,
+    _creator_brief_ranking_comparison as _creator_brief_ranking_comparison,
+    _creator_brief_release_watch as _creator_brief_release_watch,
+    _creator_brief_scene_comparison as _creator_brief_scene_comparison,
+    _creator_brief_scene_seed_comparison as _creator_brief_scene_seed_comparison,
+    _creator_brief_seed_comparison as _creator_brief_seed_comparison,
     build_creator_label_intelligence_handler,
 )
 from .public_insights_graph import (
@@ -32,7 +32,7 @@ from .public_insights_graph import (
     _playlist_diff,
     _playlist_snapshot,
     _recent_history,
-    _release_state_rows,
+    _release_state_rows as _release_state_rows,
     _seed_nodes_for_bridges,
     _top_artists_from_history,
     _top_tracks_from_history,
@@ -63,6 +63,27 @@ class _OfflineSpotifyPublicCatalogClient:
 
     def get_album(self, album_id_or_uri: str, *, market: str | None = None) -> dict[str, Any]:
         return {"id": album_id_or_uri, "label": ""}
+
+    def get_album_tracks(
+        self,
+        album_id_or_uri: str,
+        *,
+        limit: int = 50,
+        market: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def get_artist_top_tracks(
+        self,
+        artist_id_or_uri: str,
+        *,
+        market: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def get_new_releases(self, *, market: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        return []
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -127,7 +148,10 @@ def _release_state_path(output_dir: Path, artist_slug: str) -> Path:
 
 
 def _build_client(args: argparse.Namespace) -> SpotifyPublicCatalogClient | _OfflineSpotifyPublicCatalogClient:
-    client = SpotifyPublicCatalogClient.from_env(market=str(args.spotify_market or "US"))
+    client = SpotifyPublicCatalogClient.from_env(
+        market=str(args.spotify_market or "US"),
+        backend=getattr(args, "spotify_catalog_backend", None),
+    )
     if client is None:
         if str(getattr(args, "command", "")).strip() == "creator-label-intelligence":
             return _OfflineSpotifyPublicCatalogClient()  # type: ignore[return-value]

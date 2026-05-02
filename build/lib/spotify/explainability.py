@@ -56,6 +56,14 @@ def _extract_artist_predictions(prediction) -> np.ndarray:
     return np.asarray(prediction)
 
 
+def _history_looks_multi_output(history) -> bool:
+    history_map = getattr(history, "history", {})
+    if not isinstance(history_map, dict):
+        return False
+    keys = {str(key) for key in history_map}
+    return any(key.startswith("skip_output_") for key in keys) or any(key.startswith("artist_output_") for key in keys)
+
+
 def _shap_cache_enabled_from_env() -> bool:
     raw = os.getenv("SPOTIFY_CACHE_SHAP", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
@@ -154,6 +162,10 @@ def run_shap_analysis(
             copy_file_if_changed(cache_path, out_path)
             logger.info("Reused SHAP cache for %s", best_name)
             return out_path
+
+    if _history_looks_multi_output(histories.get(best_name)):
+        logger.info("Skipping SHAP analysis: best model (%s) is multi-output.", best_name)
+        return None
 
     try:
         import shap

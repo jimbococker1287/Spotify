@@ -5,6 +5,124 @@ import numpy as np
 from .retrieval_common import _env_int
 
 
+def _context_feature_lookup(context_feature_names: tuple[str, ...] | list[str] | None) -> dict[str, int]:
+    return {
+        str(name).strip(): idx
+        for idx, name in enumerate(tuple(context_feature_names or ()))
+        if str(name).strip()
+    }
+
+
+def _context_feature_column(
+    ctx_batch: np.ndarray,
+    *,
+    feature_name: str,
+    feature_lookup: dict[str, int],
+) -> np.ndarray:
+    ctx_arr = np.asarray(ctx_batch, dtype="float32")
+    if ctx_arr.ndim != 2:
+        return np.zeros((0,), dtype="float32")
+    feature_idx = feature_lookup.get(feature_name)
+    if feature_idx is None or feature_idx < 0 or feature_idx >= ctx_arr.shape[1]:
+        return np.zeros((ctx_arr.shape[0],), dtype="float32")
+    column = ctx_arr[:, feature_idx]
+    return np.nan_to_num(column.astype("float32", copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _transition_context_signals(
+    *,
+    ctx_batch: np.ndarray,
+    context_feature_names: tuple[str, ...] | list[str] | None,
+) -> dict[str, np.ndarray]:
+    ctx_arr = np.asarray(ctx_batch, dtype="float32")
+    if ctx_arr.ndim != 2:
+        return {
+            "transition_pressure": np.zeros((0,), dtype="float32"),
+            "transition_support": np.zeros((0,), dtype="float32"),
+            "late_session": np.zeros((0,), dtype="float32"),
+            "skip_context": np.zeros((0,), dtype="float32"),
+            "repeat_context": np.zeros((0,), dtype="float32"),
+            "new_from_prev_context": np.zeros((0,), dtype="float32"),
+        }
+    feature_lookup = _context_feature_lookup(context_feature_names)
+    skipped = np.clip(_context_feature_column(ctx_arr, feature_name="skipped", feature_lookup=feature_lookup), 0.0, 1.0)
+    session_position = np.clip(
+        _context_feature_column(ctx_arr, feature_name="session_position", feature_lookup=feature_lookup) / 10.0,
+        0.0,
+        1.5,
+    )
+    session_skip_rate = np.clip(
+        _context_feature_column(ctx_arr, feature_name="session_skip_rate_so_far", feature_lookup=feature_lookup),
+        0.0,
+        1.0,
+    )
+    session_repeat_ratio = np.clip(
+        _context_feature_column(ctx_arr, feature_name="session_repeat_ratio_so_far", feature_lookup=feature_lookup),
+        0.0,
+        1.0,
+    )
+    is_repeat_from_prev = np.clip(
+        _context_feature_column(ctx_arr, feature_name="is_artist_repeat_from_prev", feature_lookup=feature_lookup),
+        0.0,
+        1.0,
+    )
+    transition_rate = np.clip(
+        _context_feature_column(
+            ctx_arr,
+            feature_name="prev_artist_transition_rate_smooth",
+            feature_lookup=feature_lookup,
+        ),
+        0.0,
+        1.0,
+    )
+    late_session = np.clip(session_position - 0.30, 0.0, 1.0)
+    skip_context = np.clip((0.55 * skipped) + (0.45 * session_skip_rate), 0.0, 1.0)
+    repeat_context = np.clip(session_repeat_ratio + (0.50 * is_repeat_from_prev), 0.0, 1.5)
+    new_from_prev_context = np.clip(1.0 - is_repeat_from_prev, 0.0, 1.0)
+    transition_support = np.clip((0.60 * transition_rate) + (0.40 * new_from_prev_context), 0.0, 1.0)
+    transition_pressure = np.clip(
+        (0.28 * skip_context)
+        + (0.24 * late_session)
+        + (0.20 * repeat_context)
+        + (0.16 * new_from_prev_context)
+        + (0.12 * transition_support),
+        0.0,
+        1.5,
+    ).astype("float32", copy=False)
+    return {
+        "transition_pressure": transition_pressure,
+        "transition_support": transition_support.astype("float32", copy=False),
+        "late_session": late_session.astype("float32", copy=False),
+        "skip_context": skip_context.astype("float32", copy=False),
+        "repeat_context": repeat_context.astype("float32", copy=False),
+        "new_from_prev_context": new_from_prev_context.astype("float32", copy=False),
+    }
+
+
+def _candidate_transition_prior(
+    *,
+    seq_batch: np.ndarray,
+    candidate_ids: np.ndarray,
+    transition_prior: np.ndarray | None,
+) -> np.ndarray:
+    seq_arr = np.asarray(seq_batch, dtype="int32")
+    candidates = np.asarray(candidate_ids, dtype="int32")
+    transition_arr = np.asarray(transition_prior, dtype="float32") if transition_prior is not None else None
+    if (
+        transition_arr is None
+        or transition_arr.ndim != 2
+        or seq_arr.ndim != 2
+        or candidates.ndim != 2
+        or len(seq_arr) != len(candidates)
+        or transition_arr.shape[0] <= 0
+        or transition_arr.shape[1] <= 0
+    ):
+        return np.zeros(candidates.shape, dtype="float32")
+    last_artist = np.clip(seq_arr[:, -1].astype("int32", copy=False), 0, transition_arr.shape[0] - 1)
+    candidate_clipped = np.clip(candidates.astype("int32", copy=False), 0, transition_arr.shape[1] - 1)
+    return transition_arr[last_artist[:, None], candidate_clipped].astype("float32", copy=False)
+
+
 def _repeat_candidate_features(
     *,
     seq_batch: np.ndarray,
@@ -31,11 +149,13 @@ def _candidate_feature_matrix(
     *,
     seq_batch: np.ndarray,
     ctx_batch: np.ndarray,
+    context_feature_names: tuple[str, ...] | list[str] | None,
     session_vec: np.ndarray,
     candidate_ids: np.ndarray,
     candidate_scores: np.ndarray,
     artist_embeddings: np.ndarray,
     popularity: np.ndarray,
+    transition_prior: np.ndarray | None,
 ) -> np.ndarray:
     seq_arr = np.asarray(seq_batch, dtype="int32")
     ctx_arr = np.asarray(ctx_batch, dtype="float32")
@@ -56,12 +176,46 @@ def _candidate_feature_matrix(
     popularity_values = np.asarray(popularity, dtype="float32")[candidates]
     similarity_last = np.sum(cand_emb * last_emb[:, None, :], axis=2, dtype="float32")
     similarity_session = np.sum(cand_emb * session_vec[:, None, :], axis=2, dtype="float32")
+    similarity_delta = similarity_session - similarity_last
     repeat_pressure = np.clip((0.55 * is_last_artist) + (0.25 * recent_match_3) + (0.20 * occurrence_fraction), 0.0, 1.5)
     novelty_support = np.clip(1.0 - np.minimum(1.0, occurrence_fraction + (0.35 * recent_match_3)), 0.0, 1.0)
     never_seen = 1.0 - in_session
+    candidate_transition_prior = _candidate_transition_prior(
+        seq_batch=seq_arr,
+        candidate_ids=candidates,
+        transition_prior=transition_prior,
+    )
+    transition_prior_delta = candidate_transition_prior - popularity_values
+    transition_signals = _transition_context_signals(
+        ctx_batch=ctx_arr,
+        context_feature_names=context_feature_names,
+    )
+    transition_pressure = np.broadcast_to(
+        transition_signals["transition_pressure"].reshape(-1, 1),
+        candidates.shape,
+    )
+    transition_support = np.broadcast_to(
+        transition_signals["transition_support"].reshape(-1, 1),
+        candidates.shape,
+    )
+    late_session = np.broadcast_to(
+        transition_signals["late_session"].reshape(-1, 1),
+        candidates.shape,
+    )
+    skip_context = np.broadcast_to(
+        transition_signals["skip_context"].reshape(-1, 1),
+        candidates.shape,
+    )
+    repeat_context = np.broadcast_to(
+        transition_signals["repeat_context"].reshape(-1, 1),
+        candidates.shape,
+    )
+    new_from_prev_context = np.broadcast_to(
+        transition_signals["new_from_prev_context"].reshape(-1, 1),
+        candidates.shape,
+    )
 
-    scalar_features = np.stack(
-        [
+    scalar_feature_blocks = [
             scores,
             score_margin,
             rank_normalized,
@@ -71,14 +225,25 @@ def _candidate_feature_matrix(
             is_last_artist,
             similarity_last,
             similarity_session,
+            similarity_delta,
+            candidate_transition_prior,
+            transition_prior_delta,
             recent_match_3,
             recent_match_5,
             never_seen,
             repeat_pressure,
             novelty_support,
-        ],
-        axis=2,
-    ).reshape(-1, 14)
+            transition_pressure,
+            transition_support,
+            late_session,
+            skip_context,
+            repeat_context,
+            new_from_prev_context,
+            transition_pressure * novelty_support,
+            transition_pressure * repeat_pressure,
+            transition_pressure * similarity_delta,
+        ]
+    scalar_features = np.stack(scalar_feature_blocks, axis=2).reshape(-1, len(scalar_feature_blocks))
 
     repeated_ctx = np.repeat(ctx_arr.astype("float32", copy=False), candidates.shape[1], axis=0)
     return np.concatenate([scalar_features.astype("float32", copy=False), repeated_ctx], axis=1)
@@ -87,7 +252,10 @@ def _candidate_feature_matrix(
 def _reranker_sample_weights(
     *,
     seq_batch: np.ndarray,
+    ctx_batch: np.ndarray,
+    context_feature_names: tuple[str, ...] | list[str] | None,
     candidate_ids: np.ndarray,
+    transition_prior: np.ndarray | None,
     y_true: np.ndarray,
 ) -> np.ndarray:
     seq_arr = np.asarray(seq_batch, dtype="int32")
@@ -100,22 +268,44 @@ def _reranker_sample_weights(
         seq_batch=seq_arr,
         candidate_ids=candidates,
     )
+    transition_signals = _transition_context_signals(
+        ctx_batch=ctx_batch,
+        context_feature_names=context_feature_names,
+    )
+    transition_pressure = np.clip(
+        transition_signals["transition_pressure"].reshape(-1, 1),
+        0.0,
+        1.5,
+    )
+    candidate_transition = _candidate_transition_prior(
+        seq_batch=seq_arr,
+        candidate_ids=candidates,
+        transition_prior=transition_prior,
+    )
     last_artist = seq_arr[:, -1].astype("int32")
     target_is_new_from_prev = (y_arr != last_artist).astype("float32").reshape(-1, 1)
     labels = (candidates == y_arr.reshape(-1, 1)).astype("float32")
 
     weights = np.ones(candidates.shape, dtype="float32")
-    weights += 1.75 * labels * target_is_new_from_prev
-    weights += 1.10 * (1.0 - labels) * is_last_artist * target_is_new_from_prev
-    weights += 0.35 * (1.0 - labels) * (in_session - is_last_artist).clip(min=0.0) * target_is_new_from_prev
+    weights += (1.25 + (1.35 * transition_pressure)) * labels * target_is_new_from_prev
+    weights += (0.85 + (1.10 * transition_pressure)) * (1.0 - labels) * is_last_artist * target_is_new_from_prev
+    weights += (
+        0.25 + (0.70 * transition_pressure)
+    ) * (1.0 - labels) * (in_session - is_last_artist).clip(min=0.0) * target_is_new_from_prev
+    weights += (
+        0.55 * transition_pressure * candidate_transition
+    ) * (1.0 - labels) * target_is_new_from_prev
     return weights.reshape(-1)
 
 
 def _apply_repeat_mitigation(
     *,
     seq_batch: np.ndarray,
+    ctx_batch: np.ndarray,
+    context_feature_names: tuple[str, ...] | list[str] | None,
     candidate_ids: np.ndarray,
     candidate_scores: np.ndarray,
+    transition_prior: np.ndarray | None,
     rerank_scores: np.ndarray,
 ) -> np.ndarray:
     occurrence_fraction, _, is_last_artist, recent_match_3, _ = _repeat_candidate_features(
@@ -139,11 +329,24 @@ def _apply_repeat_mitigation(
 
     repeat_pressure = np.clip((0.50 * occurrence_fraction) + (0.25 * recent_match_3) + (0.50 * is_last_artist), 0.0, 1.5)
     novelty_support = np.clip(1.0 - np.minimum(1.0, occurrence_fraction + (0.35 * recent_match_3)), 0.0, 1.0)
+    candidate_transition = _candidate_transition_prior(
+        seq_batch=seq_batch,
+        candidate_ids=candidate_ids,
+        transition_prior=transition_prior,
+    )
+    transition_signals = _transition_context_signals(
+        ctx_batch=ctx_batch,
+        context_feature_names=context_feature_names,
+    )
+    transition_pressure = np.clip(transition_signals["transition_pressure"].reshape(-1, 1), 0.0, 1.5)
+    transition_support = np.clip(transition_signals["transition_support"].reshape(-1, 1), 0.0, 1.0)
+    escape_multiplier = 1.0 + (0.75 * transition_pressure) + (0.30 * transition_support)
 
     adjusted = np.asarray(rerank_scores, dtype="float32").copy()
-    adjusted *= np.exp(-repeat_penalty * ambiguity * repeat_pressure)
-    adjusted *= np.exp(-immediate_repeat_penalty * ambiguity * is_last_artist)
-    adjusted *= 1.0 + (novelty_boost * ambiguity * novelty_support)
+    adjusted *= np.exp(-repeat_penalty * ambiguity * repeat_pressure * escape_multiplier)
+    adjusted *= np.exp(-immediate_repeat_penalty * ambiguity * is_last_artist * escape_multiplier)
+    adjusted *= 1.0 + (novelty_boost * ambiguity * novelty_support * escape_multiplier)
+    adjusted *= 1.0 + (0.24 * ambiguity * transition_pressure * candidate_transition * novelty_support)
     adjusted = np.clip(adjusted, 1e-6, None)
     adjusted /= adjusted.sum(axis=1, keepdims=True)
     return adjusted.astype("float32", copy=False)

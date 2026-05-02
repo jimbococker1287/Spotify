@@ -4,6 +4,13 @@ Week 9 turns the safety layer into a reusable platform surface instead of leavin
 
 Week 10 then freezes the comparison side of that platform with the benchmark contract in `docs/benchmark_contract.md`, so safety claims and benchmark claims use the same stable operating language.
 
+The current run-level export for that story is:
+
+- `outputs/runs/<run_id>/benchmark_protocol.json`
+- `outputs/runs/<run_id>/benchmark_protocol.md`
+- `outputs/runs/<run_id>/safety_platform_contract.json`
+- `outputs/runs/<run_id>/safety_platform_contract.md`
+
 ## Platform Split
 
 The reusable core lives in:
@@ -34,6 +41,8 @@ The minimum public API is organized into four groups:
    `build_conformal_abstention_summary`
 
 The curated Week 9 export surface is in `spotify/safety_platform.py`, which re-exports those primitives and describes how the Spotify wrappers map onto them.
+
+The matching artifact writer lives in `spotify/research_artifacts.py`, which emits the benchmark protocol and the safety-platform contract from completed runs.
 
 ## Spotify Integration Map
 

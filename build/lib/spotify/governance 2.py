@@ -38,6 +38,8 @@ def _map_platform_gate(
         "significance_z": _to_float(gate.get("significance_z")),
         "significance_margin": _to_float(gate.get("significance_margin")),
         "significant_lift": gate.get("significant_lift"),
+        "same_model_refresh_applied": bool(gate.get("same_model_refresh_applied", False)),
+        "same_model_neutral_threshold": _to_float(gate.get("same_model_neutral_threshold")),
         "threshold": _to_float(gate.get("threshold")),
         "regression": _to_float(gate.get("regression")),
         "champion_run_id": str(gate.get("champion_run_id", "")).strip(),
@@ -55,8 +57,12 @@ def _map_platform_gate(
         "challenger_backtest_count": (challenger_count if metric_source == "backtest_top1" else 0.0),
         "max_selective_risk": _to_float(gate.get("max_selective_risk")),
         "max_abstention_rate": _to_float(gate.get("max_abstention_rate")),
+        "max_guardrail_gap": _to_float(gate.get("max_guardrail_gap")),
+        "max_focus_guardrail_gap": _to_float(gate.get("max_focus_guardrail_gap")),
         "challenger_selective_risk": _to_float(gate.get("challenger_selective_risk")),
         "challenger_abstention_rate": _to_float(gate.get("challenger_abstention_rate")),
+        "challenger_guardrail_gap": _to_float(gate.get("challenger_guardrail_gap")),
+        "challenger_focus_guardrail_gap": _to_float(gate.get("challenger_focus_guardrail_gap")),
         "selected_candidate_rank": int(_to_float(gate.get("selected_candidate_rank")) or 0),
         "eligible_candidate_count": int(_to_float(gate.get("eligible_candidate_count")) or 0),
         "challenger_selection_reason": str(gate.get("challenger_selection_reason", "")).strip(),
@@ -129,6 +135,8 @@ def evaluate_champion_gate(
     current_risk_metrics: dict[str, dict[str, float]] | None = None,
     max_selective_risk: float | None = None,
     max_abstention_rate: float | None = None,
+    max_guardrail_gap: float | None = None,
+    max_focus_guardrail_gap: float | None = None,
 ) -> dict[str, object]:
     threshold = max(0.0, float(regression_threshold))
     source = str(metric_source).strip().lower()
@@ -161,6 +169,8 @@ def evaluate_champion_gate(
             current_risk_metrics=current_risk_metrics,
             max_selective_risk=max_selective_risk,
             max_abstention_rate=max_abstention_rate,
+            max_guardrail_gap=max_guardrail_gap,
+            max_focus_guardrail_gap=max_focus_guardrail_gap,
             preferred_champion_run_id=preferred_run_id,
             preferred_champion_model_name=preferred_model_name,
         )
@@ -184,6 +194,8 @@ def evaluate_champion_gate(
         current_risk_metrics=current_risk_metrics,
         max_selective_risk=max_selective_risk,
         max_abstention_rate=max_abstention_rate,
+        max_guardrail_gap=max_guardrail_gap,
+        max_focus_guardrail_gap=max_focus_guardrail_gap,
         preferred_champion_run_id=preferred_run_id,
         preferred_champion_model_name=preferred_model_name,
     )

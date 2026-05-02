@@ -40,6 +40,7 @@ def _build_safety_research_showcase(
     workspace_root: Path,
     package_root: Path,
     research_claims_payload: dict[str, object],
+    safety_platform_contract_md: str,
 ) -> Path:
     benchmark_lock = _coerce_dict(research_claims_payload.get("benchmark_lock"))
     primary_claim = _coerce_dict(research_claims_payload.get("primary_claim"))
@@ -50,6 +51,7 @@ def _build_safety_research_showcase(
         "",
         f"- Reusable API surface: `{(workspace_root / 'spotify' / 'safety_platform.py').resolve()}`",
         f"- Benchmark contract: `{(workspace_root / 'docs' / 'benchmark_contract.md').resolve()}`",
+        f"- Safety platform contract: `{safety_platform_contract_md}`",
         f"- Research outline: `{(workspace_root / 'docs' / 'publication_outline.md').resolve()}`",
         f"- Primary claim: `{primary_claim.get('key', '')}` [{primary_claim.get('status', '')}]",
         f"- Backup claim: `{backup_claim.get('key', '')}` [{backup_claim.get('status', '')}]",
@@ -99,10 +101,24 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
                 if bundle.creator_primary_report_path and bundle.creator_primary_report_path.exists()
                 else ""
             ),
+            "report_family_md": (
+                str(bundle.creator_report_family_md_path.resolve())
+                if bundle.creator_report_family_md_path and bundle.creator_report_family_md_path.exists()
+                else ""
+            ),
             "supporting_md": (
-                str(bundle.creator_comparison_markdown_paths["scene_seed_comparison"].resolve())
+                str(bundle.creator_comparison_markdown_paths["opportunity_lane_comparison"].resolve())
+                if bundle.creator_comparison_markdown_paths.get("opportunity_lane_comparison")
+                and bundle.creator_comparison_markdown_paths["opportunity_lane_comparison"].exists()
+                else str(bundle.creator_comparison_markdown_paths["scene_seed_comparison"].resolve())
                 if bundle.creator_comparison_markdown_paths.get("scene_seed_comparison")
                 and bundle.creator_comparison_markdown_paths["scene_seed_comparison"].exists()
+                else ""
+            ),
+            "strategy_md": (
+                str(bundle.creator_brief_markdown_paths["scene_strategy_watch"].resolve())
+                if bundle.creator_brief_markdown_paths.get("scene_strategy_watch")
+                and bundle.creator_brief_markdown_paths["scene_strategy_watch"].exists()
                 else ""
             ),
             "status": str(branch_lookup.get("creator_intelligence", {}).get("status", "")),
@@ -110,6 +126,11 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
         "safety_research": {
             "label": "Safety and research showcase",
             "source_md": str(bundle.research_claims_md.resolve()) if bundle.research_claims_md.exists() else "",
+            "platform_contract_md": (
+                str(bundle.safety_platform_contract_md.resolve())
+                if bundle.safety_platform_contract_md and bundle.safety_platform_contract_md.exists()
+                else ""
+            ),
             "benchmark_md": (
                 str(bundle.benchmark_manifest_md.resolve())
                 if bundle.benchmark_manifest_md and bundle.benchmark_manifest_md.exists()
@@ -186,17 +207,35 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
             else None,
             package_root / "creator_intelligence" / "creator_label_intelligence.md",
         ),
+        "creator_report_family_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("report_family_md", "")))
+            if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("report_family_md")
+            else None,
+            package_root / "creator_intelligence" / "report_family.md",
+        ),
         "creator_scene_seed_md": _copy_if_exists(
             Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("supporting_md", "")))
             if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("supporting_md")
             else None,
-            package_root / "creator_intelligence" / "scene_seed_view.md",
+            package_root / "creator_intelligence" / "supporting_view.md",
+        ),
+        "creator_strategy_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("strategy_md", "")))
+            if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("strategy_md")
+            else None,
+            package_root / "creator_intelligence" / "scene_strategy_watch.md",
         ),
         "research_claims_md": _copy_if_exists(
             Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("source_md", "")))
             if _coerce_dict(selected_artifacts.get("safety_research")).get("source_md")
             else None,
             package_root / "safety_research" / "research_claims.md",
+        ),
+        "safety_platform_contract_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("platform_contract_md", "")))
+            if _coerce_dict(selected_artifacts.get("safety_research")).get("platform_contract_md")
+            else None,
+            package_root / "safety_research" / "safety_platform_contract.md",
         ),
         "benchmark_manifest_md": _copy_if_exists(
             Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("benchmark_md", "")))
@@ -210,6 +249,10 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
         workspace_root=Path(str(report.get("workspace_root", output_root.parent))).expanduser().resolve(),
         package_root=package_root,
         research_claims_payload=_coerce_dict(report.get("research_claims")),
+        safety_platform_contract_md=(
+            copied_artifacts.get("safety_platform_contract_md")
+            or str((Path(str(report.get("workspace_root", output_root.parent))).expanduser().resolve() / "spotify" / "safety_platform.py").resolve())
+        ),
     )
 
     four_branch_summary_md = package_root / "four_branch_summary.md"
@@ -273,8 +316,11 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
     lines.append(f"- Taste OS showcase: `{copied_artifacts['taste_os_md']}`")
     lines.append(f"- Control-room sample: `{copied_artifacts['control_room_md']}`")
     lines.append(f"- Creator brief: `{copied_artifacts['creator_primary_md']}`")
-    lines.append(f"- Creator scene-vs-seed view: `{copied_artifacts['creator_scene_seed_md']}`")
+    lines.append(f"- Creator report-family index: `{copied_artifacts['creator_report_family_md']}`")
+    lines.append(f"- Creator supporting view: `{copied_artifacts['creator_scene_seed_md']}`")
+    lines.append(f"- Creator scene strategy watch: `{copied_artifacts['creator_strategy_md']}`")
     lines.append(f"- Research claims: `{copied_artifacts['research_claims_md']}`")
+    lines.append(f"- Safety platform contract: `{copied_artifacts['safety_platform_contract_md']}`")
     lines.append(f"- Benchmark manifest: `{copied_artifacts['benchmark_manifest_md']}`")
     lines.append(f"- Safety showcase: `{safety_showcase_path.resolve()}`")
     lines.append("")

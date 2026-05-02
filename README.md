@@ -678,6 +678,14 @@ export SPOTIFY_CLIENT_ID=...
 export SPOTIFY_CLIENT_SECRET=...
 ```
 
+The default transport uses the raw Spotify Web API client in this repo. If you want to route supported catalog calls through Spotipy, use either `--spotify-catalog-backend spotipy` or:
+
+```bash
+export SPOTIFY_PUBLIC_CATALOG_BACKEND=spotipy
+```
+
+Public API responses are cached by default under `outputs/cache/public_spotify/` and live requests are paced to reduce Spotify `429` rate-limit errors. Use `--spotify-cache-mode off` for a fresh live check, `--spotify-cache-ttl-hours 24` to shorten cache lifetime, or `--spotify-request-interval-seconds 0.5` for bigger catalog/radar runs.
+
 Artist explainer for your recent top artists:
 
 ```bash
@@ -688,6 +696,18 @@ Release tracker for favorite artists:
 
 ```bash
 python -m spotify.public_insights release-tracker --top-n 10 --since-days 120
+```
+
+Public top tracks for favorite artists:
+
+```bash
+python -m spotify.public_insights artist-top-tracks --artists "Taylor Swift|SZA" --track-limit 10
+```
+
+New releases in a market:
+
+```bash
+python -m spotify.public_insights --spotify-market US new-releases --limit 20
 ```
 
 Market availability check for your recent top tracks:
@@ -702,10 +722,28 @@ Discography timeline:
 python -m spotify.public_insights discography --top-n 5 --album-limit 20
 ```
 
+Artist catalog completeness audit:
+
+```bash
+python -m spotify.public_insights artist-catalog-completeness --artists "Taylor Swift|SZA" --album-limit 20 --track-limit 50
+```
+
+Album deep dive with local-history coverage:
+
+```bash
+python -m spotify.public_insights album-profile --album spotify:album:<id> --track-limit 50
+```
+
 Public playlist viewer:
 
 ```bash
 python -m spotify.public_insights playlist-view --playlist https://open.spotify.com/playlist/<id>
+```
+
+Playlist intelligence:
+
+```bash
+python -m spotify.public_insights playlist-intelligence --playlist https://open.spotify.com/playlist/<id> --item-limit 100
 ```
 
 Discovery console:
@@ -738,6 +776,18 @@ Release inbox:
 
 ```bash
 python -m spotify.public_insights release-inbox --top-n 10 --since-days 120
+```
+
+Personal release radar:
+
+```bash
+python -m spotify.public_insights personal-release-radar --top-n 10 --since-days 120 --include-related
+```
+
+If a larger release radar hits API warnings, rerun with a smaller batch first:
+
+```bash
+python -m spotify.public_insights personal-release-radar --top-n 3 --since-days 365 --per-artist-limit 20
 ```
 
 Playlist diff tracker:
@@ -776,13 +826,19 @@ Cross-media taste graph:
 python -m spotify.public_insights cross-media-taste-graph --lookback-days 180 --bridge-limit 6
 ```
 
+Summarize recent public-insights artifacts and decide what to open next:
+
+```bash
+python -m spotify.public_insights summary --max-reports 25
+```
+
 Or use the Make target:
 
 ```bash
 make public-insights EXTRA_ARGS='explain-artists --top-n 5'
 ```
 
-Artifacts are written under `outputs/analysis/public_spotify/`.
+Artifacts are written under `outputs/analysis/public_spotify/`. Full pipeline runs also write a display-only public insights index into `runs/<run_id>/analysis/public_spotify/`; these reports remain link-out/reporting artifacts and are not used as training features.
 
 ## Roadmaps
 

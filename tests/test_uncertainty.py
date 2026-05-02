@@ -5,6 +5,7 @@ import numpy as np
 from spotify.uncertainty import (
     calibration_from_payload,
     conformal_prediction_sets,
+    fit_ece_guarded_temperature_scaling,
     fit_operating_abstention_threshold,
     fit_split_conformal_classifier,
     summarize_prediction_sets,
@@ -101,6 +102,22 @@ def test_calibration_from_payload_rehydrates_dataclass() -> None:
     assert calibration.operating_threshold == 0.72
     assert calibration.abstention_threshold == 0.72
     assert calibration.sample_count == 12
+
+
+def test_ece_guarded_temperature_scaling_keeps_raw_when_nll_choice_worsens_ece() -> None:
+    proba = np.array(
+        ([[0.55, 0.35, 0.10]] * 8) + ([[0.95, 0.04, 0.01]] * 2),
+        dtype="float32",
+    )
+    y_true = np.array(([0] * 8) + ([1] * 2), dtype="int32")
+
+    selection = fit_ece_guarded_temperature_scaling(proba, y_true)
+
+    assert selection["accepted"] is False
+    assert selection["method"] == "raw_ece_guardrail"
+    assert selection["temperature"] == 1.0
+    assert selection["candidate_temperature"] != 1.0
+    assert selection["calibrated_val_ece"] > selection["raw_val_ece"]
 
 
 def test_fit_operating_abstention_threshold_can_raise_threshold_when_risk_is_concentrated() -> None:

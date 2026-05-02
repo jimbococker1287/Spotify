@@ -70,6 +70,8 @@ class RetrievalServingArtifact:
     context_projection: np.ndarray
     item_bias: np.ndarray
     popularity: np.ndarray
+    context_feature_names: tuple[str, ...] = ()
+    transition_prior: np.ndarray | None = None
     ann_index: RandomProjectionANNIndex | None = None
     reranker: object | None = None
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +33,34 @@ def _collect_run_analysis_summaries(output_dir: Path, filename: str) -> pd.DataF
     return rows_to_frame(collect_run_analysis_rows(output_dir, filename))
 
 
+def _duckdb_retry_policy() -> tuple[int, float]:
+    try:
+        retries = int(str(os.getenv("SPOTIFY_ANALYTICS_DB_RETRIES", "3")).strip())
+    except Exception:
+        retries = 3
+    retries = max(0, retries)
+    try:
+        sleep_seconds = float(str(os.getenv("SPOTIFY_ANALYTICS_DB_RETRY_SLEEP_S", "0.35")).strip())
+    except Exception:
+        sleep_seconds = 0.35
+    return retries, max(0.0, sleep_seconds)
+
+
+def _connect_duckdb_with_retries(*, duckdb, target_path: Path, retries: int, sleep_seconds: float):
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return duckdb.connect(str(target_path)), attempt
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            time.sleep(sleep_seconds)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unable to connect DuckDB database at {target_path}")
+
+
 def refresh_analytics_database(
     *,
     data_dir: Path,
@@ -48,6 +78,7 @@ def refresh_analytics_database(
     analytics_dir = output_dir / "analytics"
     analytics_dir.mkdir(parents=True, exist_ok=True)
     db_path = analytics_dir / "spotify_analytics.duckdb"
+    fallback_db_path = analytics_dir / "spotify_analytics.refresh.duckdb"
 
     if raw_df is None:
         from .data import load_streaming_history
@@ -63,11 +94,35 @@ def refresh_analytics_database(
     policy_summary = _collect_run_analysis_summaries(output_dir, "policy_simulation_summary.json")
     moonshot_summary = _collect_run_analysis_summaries(output_dir, "moonshot_summary.json")
 
+    retries, sleep_seconds = _duckdb_retry_policy()
+    connected_path = db_path
+    fallback_used = False
+    retry_attempts = 0
     try:
-        con = duckdb.connect(str(db_path))
+        con, retry_attempts = _connect_duckdb_with_retries(
+            duckdb=duckdb,
+            target_path=db_path,
+            retries=retries,
+            sleep_seconds=sleep_seconds,
+        )
     except Exception as exc:
-        logger.warning("DuckDB analytics refresh skipped because the database is busy or unavailable: %s", exc)
-        return None
+        logger.warning(
+            "Primary DuckDB analytics database is busy or unavailable after %d attempt(s): %s",
+            retries + 1,
+            exc,
+        )
+        try:
+            con, _ = _connect_duckdb_with_retries(
+                duckdb=duckdb,
+                target_path=fallback_db_path,
+                retries=0,
+                sleep_seconds=sleep_seconds,
+            )
+            connected_path = fallback_db_path
+            fallback_used = True
+        except Exception as fallback_exc:
+            logger.warning("DuckDB analytics refresh skipped because fallback database creation failed: %s", fallback_exc)
+            return None
     try:
         _replace_table(con, "raw_streaming_history", raw_df)
         _replace_table(con, "experiment_history", experiment_history)
@@ -245,5 +300,16 @@ def refresh_analytics_database(
     finally:
         con.close()
 
-    logger.info("Analytics DuckDB refreshed: %s", db_path)
-    return db_path
+    if fallback_used:
+        logger.warning(
+            "Analytics DuckDB refreshed to fallback path because the primary database is locked: %s",
+            connected_path,
+        )
+    else:
+        logger.info(
+            "Analytics DuckDB refreshed: %s (attempt=%d/%d)",
+            connected_path,
+            retry_attempts + 1,
+            retries + 1,
+        )
+    return connected_path
