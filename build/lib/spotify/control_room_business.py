@@ -395,7 +395,7 @@ def build_review_actions(
                     f"Target drift JSD is `{format_metric(target_drift)}` and segment shift peaks at "
                     f"`{format_metric(safety.get('largest_segment_shift_value'))}` for {safety.get('largest_segment_shift_label', 'n/a')}."
                 ),
-                "inspect": ["analysis/data_drift_summary.json"],
+                "inspect": ["analysis/data_drift_brief.md", "analysis/data_drift_summary.json"],
             }
         )
 
@@ -434,6 +434,7 @@ def build_review_actions(
                 ),
                 "inspect": [
                     "analysis/moonshot_summary.json",
+                    "analysis/stress_test/stress_test_benchmark_brief.md",
                     "analysis/stress_test/stress_test_benchmark.json",
                     "analysis/stress_test/stress_test_summary.json",
                 ],

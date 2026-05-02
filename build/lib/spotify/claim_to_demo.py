@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .branch_portfolio import build_branch_portfolio_report
 from .portfolio_artifacts import load_portfolio_artifact_bundle
 from .run_artifacts import copy_file_if_changed, write_json, write_markdown
 
@@ -76,6 +77,55 @@ def _run_id_from_path_string(value: object) -> str:
         return ""
     path = Path(raw_value)
     return path.name if path.name else raw_value
+
+
+def _existing_path(raw_path: object) -> Path | None:
+    path_text = str(raw_path).strip()
+    if not path_text:
+        return None
+    path = Path(path_text).expanduser()
+    if not path.exists():
+        return None
+    return path.resolve()
+
+
+def _path_text(path: Path | None) -> str:
+    return str(path.resolve()) if path is not None and path.exists() else ""
+
+
+def _build_submission_readiness(
+    research_claims_payload: dict[str, object],
+    primary_claim: dict[str, object],
+) -> dict[str, object]:
+    payload = _coerce_dict(research_claims_payload.get("submission_readiness"))
+    if payload:
+        return {
+            "status": str(payload.get("status", "")).strip(),
+            "ready_for_external_review": bool(payload.get("ready_for_external_review")),
+            "summary": [str(item) for item in _coerce_list(payload.get("summary")) if str(item).strip()],
+            "blockers": [str(item) for item in _coerce_list(payload.get("blockers")) if str(item).strip()],
+        }
+
+    believable = bool(research_claims_payload.get("believable_submission_path"))
+    primary_status = str(primary_claim.get("status", "")).strip() or "unknown"
+    fallback_status = "analysis_ready" if believable else primary_status
+    return {
+        "status": fallback_status,
+        "ready_for_external_review": believable,
+        "summary": [
+            f"Primary claim `{str(primary_claim.get('key', '')).strip() or 'n/a'}` is `{primary_status}`.",
+            f"Believable submission path is `{believable}`.",
+        ],
+        "blockers": [str(item) for item in _coerce_list(primary_claim.get("missing_checks")) if str(item).strip()][:3],
+    }
+
+
+def _branch_lookup(report: dict[str, object]) -> dict[str, dict[str, object]]:
+    lookup: dict[str, dict[str, object]] = {}
+    for branch in _coerce_list(report.get("branches")):
+        if isinstance(branch, dict):
+            lookup[str(branch.get("key", "")).strip()] = branch
+    return lookup
 
 
 def _choose_demo_examples(
@@ -266,12 +316,15 @@ def _evidence_scoreboard(
 def build_claim_to_demo_report(output_dir: Path | str = "outputs") -> dict[str, object]:
     output_root = Path(output_dir).expanduser().resolve()
     bundle = load_portfolio_artifact_bundle(output_root, refresh=True)
+    branch_report = build_branch_portfolio_report(output_root, artifact_bundle=bundle)
+    branch_lookup = _branch_lookup(branch_report)
 
     showcase_payload = bundle.taste_os_showcase_payload
     control_room_payload = bundle.control_room_payload
     research_claims_payload = bundle.research_claims_payload
     primary_claim = _coerce_dict(research_claims_payload.get("primary_claim"))
     backup_claim = _coerce_dict(research_claims_payload.get("backup_claim"))
+    submission_readiness = _build_submission_readiness(research_claims_payload, primary_claim)
 
     flagship_demo, supporting_demo = _choose_demo_examples(
         showcase_payload=showcase_payload,
@@ -288,13 +341,47 @@ def build_claim_to_demo_report(output_dir: Path | str = "outputs") -> dict[str, 
         research_run_id=str(research_run.get("run_id", "")).strip(),
     )
 
-    flagship_demo_path = Path(str(flagship_demo.get("demo_md_path", "")).strip()) if flagship_demo.get("demo_md_path") else None
+    flagship_demo_path = _existing_path(flagship_demo.get("demo_md_path"))
+    creator_primary_path = bundle.creator_primary_report_path.resolve() if bundle.creator_primary_report_path and bundle.creator_primary_report_path.exists() else None
+    creator_report_family_path = (
+        bundle.creator_report_family_md_path.resolve()
+        if bundle.creator_report_family_md_path and bundle.creator_report_family_md_path.exists()
+        else None
+    )
+    creator_strategy_path = None
+    if bundle.creator_brief_markdown_paths.get("scene_strategy_watch") and bundle.creator_brief_markdown_paths["scene_strategy_watch"].exists():
+        creator_strategy_path = bundle.creator_brief_markdown_paths["scene_strategy_watch"].resolve()
+    creator_supporting_path = None
+    for key in ("opportunity_lane_comparison", "scene_seed_comparison", "scene_comparison"):
+        candidate = bundle.creator_comparison_markdown_paths.get(key)
+        if candidate and candidate.exists():
+            creator_supporting_path = candidate.resolve()
+            break
+    creator_review_path = creator_strategy_path or creator_supporting_path or creator_report_family_path or creator_primary_path
+    research_claim_support_path = bundle.research_claim_support_md.resolve() if bundle.research_claim_support_md else None
+    research_submission_readiness_path = (
+        bundle.research_submission_readiness_md.resolve() if bundle.research_submission_readiness_md else None
+    )
+    research_publication_outline_path = (
+        bundle.research_publication_outline_md.resolve() if bundle.research_publication_outline_md else None
+    )
+    safety_platform_contract_path = (
+        bundle.safety_platform_contract_md.resolve() if bundle.safety_platform_contract_md and bundle.safety_platform_contract_md.exists() else None
+    )
 
     bridge_points = _flagship_bridge_points(
         flagship_demo=flagship_demo,
         primary_claim=primary_claim,
         control_room_payload=control_room_payload,
     )
+    if creator_review_path is not None:
+        bridge_points.append(
+            "Creator intelligence proves the same taste graph can become a strategy brief, not just a listener-facing demo."
+        )
+    if safety_platform_contract_path is not None:
+        bridge_points.append(
+            "The safety platform contract shows that the research story is backed by a reusable API and benchmark surface, not only a single narrative artifact."
+        )
     scoreboard = _evidence_scoreboard(
         showcase_payload=showcase_payload,
         flagship_demo=flagship_demo,
@@ -302,36 +389,97 @@ def build_claim_to_demo_report(output_dir: Path | str = "outputs") -> dict[str, 
         control_room_payload=control_room_payload,
     )
 
-    review_sequence = [
+    review_sequence: list[dict[str, object]] = [
         {
             "step": 1,
             "label": "Product proof",
-            "artifact": str(flagship_demo_path.resolve()) if flagship_demo_path and flagship_demo_path.exists() else str(bundle.taste_os_showcase_md.resolve()),
+            "artifact": _path_text(flagship_demo_path) or str(bundle.taste_os_showcase_md.resolve()),
             "why": "Start with the strongest adaptive demo because it makes the system feel tangible immediately.",
-        },
-        {
-            "step": 2,
-            "label": "Operator proof",
-            "artifact": str(bundle.control_room_md.resolve()),
-            "why": "Show that the same system is reviewable operationally and not just visually convincing.",
-        },
-        {
-            "step": 3,
-            "label": "Research proof",
-            "artifact": str(bundle.research_claims_md.resolve()),
-            "why": "Close by showing the strongest claim and the benchmark context behind it.",
-        },
+        }
     ]
+    if creator_review_path is not None:
+        review_sequence.append(
+            {
+                "step": len(review_sequence) + 1,
+                "label": "Creator strategy proof",
+                "artifact": str(creator_review_path),
+                "why": "Show that the same system can also produce a decision-ready creator or label strategy surface.",
+            }
+        )
+    review_sequence.extend(
+        [
+            {
+                "step": len(review_sequence) + 1,
+                "label": "Operator proof",
+                "artifact": str(bundle.control_room_md.resolve()),
+                "why": "Show that the same system is reviewable operationally and not just visually convincing.",
+            },
+            {
+                "step": len(review_sequence) + 2,
+                "label": "Research proof",
+                "artifact": _path_text(research_submission_readiness_path)
+                or _path_text(research_claim_support_path)
+                or str(bundle.research_claims_md.resolve()),
+                "why": "Close by showing the strongest claim, its support matrix, and the current submission-readiness state.",
+            },
+        ]
+    )
+
+    branch_alignment_specs = [
+        (
+            "taste_os",
+            "Product front door for the adaptive listening story.",
+            _path_text(flagship_demo_path) or str(bundle.taste_os_showcase_md.resolve()),
+        ),
+        (
+            "creator_intelligence",
+            "External strategy branch that turns the same taste graph into creator and label opportunity views.",
+            _path_text(creator_review_path) or _path_text(creator_primary_path),
+        ),
+        (
+            "control_room",
+            "Operating layer that reviews the same system asynchronously after a run.",
+            str(bundle.control_room_md.resolve()),
+        ),
+        (
+            "safety_research",
+            "Evidence and platform branch that makes the story benchmarked, reusable, and publication-shaped.",
+            _path_text(research_submission_readiness_path)
+            or _path_text(research_claim_support_path)
+            or _path_text(safety_platform_contract_path)
+            or str(bundle.research_claims_md.resolve()),
+        ),
+    ]
+    branch_alignment = []
+    for branch_key, role_in_story, artifact in branch_alignment_specs:
+        branch = _coerce_dict(branch_lookup.get(branch_key))
+        branch_alignment.append(
+            {
+                "key": branch_key,
+                "label": str(branch.get("label", branch_key)).strip(),
+                "status": str(branch.get("status", "missing")).strip(),
+                "audience": str(branch.get("audience", "")).strip(),
+                "success_metric": str(branch.get("success_metric", "")).strip(),
+                "live_signal": str(branch.get("live_signal", "")).strip(),
+                "role_in_story": role_in_story,
+                "artifact": artifact,
+            }
+        )
 
     next_actions = list(coherence.get("recommended_actions", []))
+    if creator_review_path is None:
+        next_actions.append("Regenerate the creator-intelligence report family so the flagship review has a strategy branch, not just product and ops.")
     for item in _coerce_list(primary_claim.get("missing_checks"))[:2]:
         if isinstance(item, str) and item not in next_actions:
+            next_actions.append(item)
+    for item in submission_readiness.get("blockers", [])[:2]:
+        if item not in next_actions:
             next_actions.append(item)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(output_root),
-        "headline": "One package that connects the strongest product demo to the strongest research claim.",
+        "headline": "One package that connects the strongest product demo to creator strategy, operator review, and the leading research claim.",
         "coherence": coherence,
         "primary_claim": {
             "key": str(primary_claim.get("key", "")),
@@ -365,19 +513,23 @@ def build_claim_to_demo_report(output_dir: Path | str = "outputs") -> dict[str, 
             "top_artist": str(supporting_demo.get("top_artist", "")),
             "demo_md_path": str(supporting_demo.get("demo_md_path", "")),
         },
+        "submission_readiness": submission_readiness,
+        "branch_alignment": branch_alignment,
         "review_sequence": review_sequence,
         "bridge_points": bridge_points,
         "evidence_scoreboard": scoreboard,
         "talk_tracks": {
             "ninety_second": [
                 f"Taste OS is the product surface, and `{str(flagship_demo.get('label', '')).strip() or 'the flagship demo'}` is the fastest proof that the modes really behave differently.",
+                "Creator intelligence shows that the same taste system can be repackaged as a strategy brief for a different audience without inventing a new platform.",
                 f"The strongest repo-level claim is `{str(primary_claim.get('key', '')).strip() or 'the current primary claim'}`, which frames the same system as a measurable robustness and drift problem.",
-                "Control room evidence sits in the middle so the story moves from product feel to operational reality to research credibility.",
+                "Control room evidence and submission-readiness artifacts keep the story grounded in operating and research reality rather than vibes.",
             ],
             "three_minute": [
                 "Open with the flagship Taste OS example and explain what changed in the route after the session event.",
+                "Show the creator strategy artifact next so the audience sees that the same taste graph powers a second product surface with a distinct reader and decision style.",
                 "Move to the control room and show that the run is healthy operationally while the strategic safety findings are still explicit.",
-                "Close on the primary claim and benchmark context so the external story ends on evidence rather than vibes.",
+                "Close on the claim-support matrix and submission-readiness pack so the external story ends on evidence rather than vibes.",
             ],
         },
         "source_artifacts": {
@@ -385,6 +537,14 @@ def build_claim_to_demo_report(output_dir: Path | str = "outputs") -> dict[str, 
             "control_room_md": str(bundle.control_room_md.resolve()),
             "research_claims_md": str(bundle.research_claims_md.resolve()),
             "benchmark_manifest_md": str(bundle.benchmark_manifest_md.resolve()) if bundle.benchmark_manifest_md else "",
+            "creator_primary_md": _path_text(creator_primary_path),
+            "creator_report_family_md": _path_text(creator_report_family_path),
+            "creator_strategy_md": _path_text(creator_strategy_path),
+            "creator_supporting_md": _path_text(creator_supporting_path),
+            "safety_platform_contract_md": _path_text(safety_platform_contract_path),
+            "research_claim_support_md": _path_text(research_claim_support_path),
+            "submission_readiness_md": _path_text(research_submission_readiness_path),
+            "publication_outline_md": _path_text(research_publication_outline_path),
         },
         "next_actions": next_actions,
     }
@@ -413,8 +573,16 @@ def write_claim_to_demo_artifacts(
         "flagship_demo_md": _copy_if_exists(flagship_demo.get("demo_md_path"), artifact_root / "taste_os" / "flagship_demo.md"),
         "supporting_demo_md": _copy_if_exists(supporting_demo.get("demo_md_path"), artifact_root / "taste_os" / "supporting_demo.md"),
         "control_room_md": _copy_if_exists(source_artifacts.get("control_room_md"), artifact_root / "control_room" / "control_room.md"),
+        "creator_primary_md": _copy_if_exists(source_artifacts.get("creator_primary_md"), artifact_root / "creator" / "creator_primary.md"),
+        "creator_report_family_md": _copy_if_exists(source_artifacts.get("creator_report_family_md"), artifact_root / "creator" / "creator_report_family.md"),
+        "creator_strategy_md": _copy_if_exists(source_artifacts.get("creator_strategy_md"), artifact_root / "creator" / "scene_strategy_watch.md"),
+        "creator_supporting_md": _copy_if_exists(source_artifacts.get("creator_supporting_md"), artifact_root / "creator" / "supporting_view.md"),
         "research_claims_md": _copy_if_exists(source_artifacts.get("research_claims_md"), artifact_root / "research" / "research_claims.md"),
         "benchmark_manifest_md": _copy_if_exists(source_artifacts.get("benchmark_manifest_md"), artifact_root / "research" / "benchmark_lock_manifest.md"),
+        "research_claim_support_md": _copy_if_exists(source_artifacts.get("research_claim_support_md"), artifact_root / "research" / "claim_support_matrix.md"),
+        "submission_readiness_md": _copy_if_exists(source_artifacts.get("submission_readiness_md"), artifact_root / "research" / "submission_readiness.md"),
+        "publication_outline_md": _copy_if_exists(source_artifacts.get("publication_outline_md"), artifact_root / "research" / "publication_outline.md"),
+        "safety_platform_contract_md": _copy_if_exists(source_artifacts.get("safety_platform_contract_md"), artifact_root / "research" / "safety_platform_contract.md"),
     }
 
     json_payload = {**report, "copied_artifacts": copied_artifacts}
@@ -450,6 +618,19 @@ def write_claim_to_demo_artifacts(
         md_lines.append(f"- `{row.get('step', '')}`. {row.get('label', '')}: `{row.get('artifact', '')}`")
         md_lines.append(str(row.get("why", "")))
     md_lines.append("")
+    md_lines.append("## Branch Alignment")
+    md_lines.append("")
+    for row in _coerce_list(report.get("branch_alignment")):
+        if not isinstance(row, dict):
+            continue
+        md_lines.append(
+            f"- `{row.get('label', '')}` [{row.get('status', '')}]: {row.get('role_in_story', '')}"
+        )
+        md_lines.append(f"Audience: {row.get('audience', '')}")
+        md_lines.append(f"Success metric: {row.get('success_metric', '')}")
+        if str(row.get("artifact", "")).strip():
+            md_lines.append(f"Anchor artifact: `{row.get('artifact', '')}`")
+    md_lines.append("")
     md_lines.append("## Bridge Points")
     md_lines.append("")
     for item in _coerce_list(report.get("bridge_points")):
@@ -462,6 +643,16 @@ def write_claim_to_demo_artifacts(
             continue
         md_lines.append(f"- {row.get('label', '')}: `{row.get('formatted_value', '')}`")
         md_lines.append(str(row.get("why_it_matters", "")))
+    md_lines.append("")
+    md_lines.append("## Submission Readiness")
+    md_lines.append("")
+    submission_readiness = _coerce_dict(report.get("submission_readiness"))
+    md_lines.append(f"- Status: `{submission_readiness.get('status', '')}`")
+    md_lines.append(f"- Ready for external review: `{submission_readiness.get('ready_for_external_review', False)}`")
+    for item in _coerce_list(submission_readiness.get("summary")):
+        md_lines.append(f"- {item}")
+    for item in _coerce_list(submission_readiness.get("blockers"))[:3]:
+        md_lines.append(f"- Blocker: {item}")
     md_lines.append("")
     md_lines.append("## Next Actions")
     md_lines.append("")

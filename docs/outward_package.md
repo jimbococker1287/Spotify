@@ -1,10 +1,12 @@
 # Outward-Facing Package
 
-Week 13 turns the repository into something that can be shown quickly and coherently.
+Weeks 13-14 turn the repository into something that can be shown quickly, coherently, and honestly.
 
 ## Working Rule
 
 Use `make outward-package` or `python -m spotify.outward_package` to assemble a share-ready package from already-generated artifacts.
+
+Use `make day-90-launch` when you want the final closeout layer on top of that package: canonical artifact manifest, delivery checklist, and ready-to-show status.
 
 The package should include:
 

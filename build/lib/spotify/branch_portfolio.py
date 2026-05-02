@@ -162,16 +162,22 @@ def _build_control_room_branch(bundle: PortfolioArtifactBundle, definition: dict
 
 def _build_creator_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
     existing_views = [path for path in bundle.creator_comparison_markdown_paths.values() if path.exists()]
+    existing_brief_views = [path for path in bundle.creator_brief_markdown_paths.values() if path.exists()]
     primary_report = bundle.creator_primary_report_path
+    report_family_index = bundle.creator_report_family_md_path
     ready = primary_report is not None and primary_report.exists() and len(existing_views) >= 4
     status = _status_bucket(ready=ready, attention=bundle.creator_manifest_path is not None)
     summary = (
-        f"Latest creator family exposes `{len(existing_views)}` comparison views plus a primary strategy brief."
+        f"Latest creator family exposes `{len(existing_views)}` comparison views, `{len(existing_brief_views)}` brief views, "
+        f"and `{('has' if report_family_index and report_family_index.exists() else 'does not have')}` a report-family index."
         if bundle.creator_manifest
         else "Creator-intelligence report-family artifacts are missing."
     )
     artifacts = [str(primary_report)] if primary_report is not None else []
     artifacts.extend(str(path) for path in existing_views)
+    artifacts.extend(str(path) for path in existing_brief_views)
+    if report_family_index is not None and report_family_index.exists():
+        artifacts.append(str(report_family_index))
     if bundle.creator_manifest_path is not None:
         artifacts.append(str(bundle.creator_manifest_path))
     return {
@@ -186,9 +192,12 @@ def _build_safety_research_branch(bundle: PortfolioArtifactBundle, definition: d
     payload = bundle.research_claims_payload
     benchmark_lock = _coerce_dict(payload.get("benchmark_lock"))
     primary_claim = _coerce_dict(payload.get("primary_claim"))
+    submission_readiness = _coerce_dict(payload.get("submission_readiness"))
     primary_status = str(primary_claim.get("status", "")).strip()
+    submission_status = str(submission_readiness.get("status", "")).strip()
     believable = bool(payload.get("believable_submission_path"))
     benchmark_ready = bool(benchmark_lock.get("comparison_ready"))
+    platform_contract_ready = bool(bundle.safety_platform_contract_md and bundle.safety_platform_contract_md.exists())
     ready = bundle.research_claims_md.exists() and believable and primary_status in {"analysis_ready", "submission_candidate"}
     status = _status_bucket(ready=ready, attention=bundle.research_claims_md.exists(), gaps=ready and not benchmark_ready)
     summary = "Research-claim artifacts are missing."
@@ -196,9 +205,20 @@ def _build_safety_research_branch(bundle: PortfolioArtifactBundle, definition: d
         benchmark_id = str(benchmark_lock.get("benchmark_id", "")).strip() or "n/a"
         summary = (
             f"Primary claim `{primary_claim.get('key', '')}` is `{primary_status or 'unknown'}` and benchmark "
-            f"`{benchmark_id}` is `{('comparison-ready' if benchmark_ready else 'not comparison-ready')}`."
+            f"`{benchmark_id}` is `{('comparison-ready' if benchmark_ready else 'not comparison-ready')}`. "
+            f"Submission readiness=`{submission_status or 'unknown'}`. Safety contract present=`{platform_contract_ready}`."
         )
     artifacts = [str(bundle.research_claims_md), str(bundle.research_claims_json)]
+    if bundle.research_publication_outline_md is not None:
+        artifacts.append(str(bundle.research_publication_outline_md))
+    if bundle.research_claim_support_md is not None:
+        artifacts.append(str(bundle.research_claim_support_md))
+    if bundle.research_submission_readiness_md is not None:
+        artifacts.append(str(bundle.research_submission_readiness_md))
+    if bundle.safety_platform_contract_md is not None:
+        artifacts.append(str(bundle.safety_platform_contract_md))
+    if bundle.safety_platform_contract_json is not None:
+        artifacts.append(str(bundle.safety_platform_contract_json))
     if bundle.benchmark_manifest_md is not None:
         artifacts.append(str(bundle.benchmark_manifest_md))
     if bundle.benchmark_manifest_json is not None:

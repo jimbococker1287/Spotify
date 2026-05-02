@@ -33,6 +33,7 @@ spotify/creator_label_intelligence_core.py
 spotify/data.py
 spotify/data_preparation.py
 spotify/data_quality.py
+spotify/day_90_launch.py
 spotify/digital_twin.py
 spotify/drift.py
 spotify/ensemble.py
@@ -203,6 +204,7 @@ tests/test_control_room_guard.py
 tests/test_creator_label_intelligence.py
 tests/test_data_discovery.py
 tests/test_data_quality_gate.py
+tests/test_day_90_launch.py
 tests/test_digital_twin.py
 tests/test_drift_and_backtesting.py
 tests/test_env_loader.py

@@ -317,6 +317,136 @@ def _creator_brief_ranking_comparison(payload: dict[str, Any]) -> list[dict[str,
     return rows
 
 
+def _creator_brief_opportunity_lane_comparison(payload: dict[str, Any]) -> list[dict[str, object]]:
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+    scenes = payload.get("scenes", [])
+    scenes = scenes if isinstance(scenes, list) else []
+    release_whitespace = payload.get("release_whitespace", [])
+    release_whitespace = release_whitespace if isinstance(release_whitespace, list) else []
+    fan_migration = payload.get("fan_migration", [])
+    fan_migration = fan_migration if isinstance(fan_migration, list) else []
+
+    scene_lookup = {
+        str(row.get("scene_name", "")).strip(): row
+        for row in scenes
+        if isinstance(row, dict) and str(row.get("scene_name", "")).strip()
+    }
+    artist_scene_lookup = {
+        str(row.get("artist_name", "")).strip(): str(row.get("scene_name", "")).strip()
+        for row in opportunities
+        if isinstance(row, dict)
+        and str(row.get("artist_name", "")).strip()
+        and str(row.get("scene_name", "")).strip()
+    }
+
+    whitespace_by_scene: dict[str, dict[str, object]] = {}
+    for row in release_whitespace:
+        if not isinstance(row, dict):
+            continue
+        scene_name = str(row.get("scene_name", "")).strip()
+        if not scene_name:
+            continue
+        current_best = whitespace_by_scene.get(scene_name)
+        if current_best is None or float(row.get("release_whitespace_score", 0.0) or 0.0) > float(
+            current_best.get("release_whitespace_score", 0.0) or 0.0
+        ):
+            whitespace_by_scene[scene_name] = row
+
+    incoming_migration_by_scene: dict[str, float] = {}
+    for row in fan_migration:
+        if not isinstance(row, dict):
+            continue
+        scene_name = ""
+        if isinstance(row.get("target_scene_id"), int):
+            scene_name = next(
+                (
+                    str(scene.get("scene_name", "")).strip()
+                    for scene in scenes
+                    if isinstance(scene, dict) and int(scene.get("scene_id", -1)) == int(row.get("target_scene_id"))
+                ),
+                "",
+            )
+        if not scene_name:
+            scene_name = artist_scene_lookup.get(str(row.get("target_artist", "")).strip(), "")
+        if not scene_name:
+            continue
+        share = float(row.get("source_out_share", 0.0) or 0.0)
+        incoming_migration_by_scene[scene_name] = max(incoming_migration_by_scene.get(scene_name, 0.0), share)
+
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in opportunities:
+        if not isinstance(row, dict):
+            continue
+        scene_name = str(row.get("scene_name", "")).strip() or "unmapped"
+        primary_driver = str(row.get("primary_driver", "")).strip() or "unassigned"
+        grouped.setdefault((scene_name, primary_driver), []).append(row)
+
+    rows: list[dict[str, object]] = []
+    for (scene_name, primary_driver), lane_rows in grouped.items():
+        scene_row = scene_lookup.get(scene_name, {})
+        best = max(lane_rows, key=lambda row: float(row.get("opportunity_score", 0.0) or 0.0))
+        whitespace_row = whitespace_by_scene.get(scene_name, {})
+        avg_score = sum(float(row.get("opportunity_score", 0.0) or 0.0) for row in lane_rows) / max(len(lane_rows), 1)
+        priority_now_count = sum(1 for row in lane_rows if str(row.get("opportunity_band", "")) == "priority_now")
+        watchlist_count = sum(1 for row in lane_rows if str(row.get("opportunity_band", "")) == "watchlist")
+        seed_bridge_count = len(
+            {
+                str(seed_artist).strip()
+                for lane_row in lane_rows
+                for seed_artist in (
+                    lane_row.get("connected_seed_artists", [])
+                    if isinstance(lane_row.get("connected_seed_artists", []), list)
+                    else []
+                )
+                if str(seed_artist).strip()
+            }
+        )
+        incoming_migration_share = float(incoming_migration_by_scene.get(scene_name, 0.0))
+        whitespace_score = float(whitespace_row.get("release_whitespace_score", 0.0) or 0.0)
+        release_pressure = float(scene_row.get("scene_release_pressure", 0.0) or 0.0)
+        label_concentration = float(scene_row.get("scene_label_concentration", 0.0) or 0.0)
+        if primary_driver == "release_whitespace" and whitespace_score >= 1.0:
+            lane_posture = "cadence_capture"
+        elif primary_driver == "fan_migration" and incoming_migration_share >= 0.20:
+            lane_posture = "migration_capture"
+        elif label_concentration >= 0.80 and release_pressure >= 0.80:
+            lane_posture = "competitive_scene"
+        elif primary_driver == "seed_adjacency":
+            lane_posture = "adjacency_expansion"
+        else:
+            lane_posture = "watch"
+        rows.append(
+            {
+                "scene_name": scene_name,
+                "primary_driver": primary_driver,
+                "lane_posture": lane_posture,
+                "opportunity_count": int(len(lane_rows)),
+                "priority_now_count": int(priority_now_count),
+                "watchlist_count": int(watchlist_count),
+                "avg_opportunity_score": round(float(avg_score), 4),
+                "top_opportunity_artist": str(best.get("artist_name", "")),
+                "top_opportunity_score": float(best.get("opportunity_score", 0.0) or 0.0),
+                "seed_bridge_count": int(seed_bridge_count),
+                "incoming_migration_share": incoming_migration_share,
+                "release_whitespace_score": whitespace_score,
+                "scene_local_play_share": float(scene_row.get("scene_local_play_share", 0.0) or 0.0),
+                "scene_release_pressure": release_pressure,
+                "scene_label_concentration": label_concentration,
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            int(row["priority_now_count"]),
+            float(row["avg_opportunity_score"]),
+            float(row["incoming_migration_share"]),
+            float(row["release_whitespace_score"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
 def _creator_brief_scene_seed_comparison(payload: dict[str, Any]) -> list[dict[str, object]]:
     opportunities = payload.get("opportunities", [])
     opportunities = opportunities if isinstance(opportunities, list) else []
@@ -376,11 +506,153 @@ def _creator_brief_scene_seed_comparison(payload: dict[str, Any]) -> list[dict[s
     return rows
 
 
+def _creator_brief_scene_strategy_watch(payload: dict[str, Any]) -> list[dict[str, object]]:
+    scenes = payload.get("scenes", [])
+    scenes = scenes if isinstance(scenes, list) else []
+    opportunities = payload.get("opportunities", [])
+    opportunities = opportunities if isinstance(opportunities, list) else []
+    release_whitespace = payload.get("release_whitespace", [])
+    release_whitespace = release_whitespace if isinstance(release_whitespace, list) else []
+    fan_migration = payload.get("fan_migration", [])
+    fan_migration = fan_migration if isinstance(fan_migration, list) else []
+
+    artist_scene_lookup = {
+        str(row.get("artist_name", "")).strip(): str(row.get("scene_name", "")).strip()
+        for row in opportunities
+        if isinstance(row, dict)
+        and str(row.get("artist_name", "")).strip()
+        and str(row.get("scene_name", "")).strip()
+    }
+    opportunity_rows_by_scene: dict[str, list[dict[str, object]]] = {}
+    for row in opportunities:
+        if not isinstance(row, dict):
+            continue
+        scene_name = str(row.get("scene_name", "")).strip() or "unmapped"
+        opportunity_rows_by_scene.setdefault(scene_name, []).append(row)
+
+    whitespace_by_scene: dict[str, dict[str, object]] = {}
+    for row in release_whitespace:
+        if not isinstance(row, dict):
+            continue
+        scene_name = str(row.get("scene_name", "")).strip()
+        if not scene_name:
+            continue
+        current_best = whitespace_by_scene.get(scene_name)
+        if current_best is None or float(row.get("release_whitespace_score", 0.0) or 0.0) > float(
+            current_best.get("release_whitespace_score", 0.0) or 0.0
+        ):
+            whitespace_by_scene[scene_name] = row
+
+    incoming_migration_by_scene: dict[str, float] = {}
+    outgoing_migration_by_scene: dict[str, float] = {}
+    for row in fan_migration:
+        if not isinstance(row, dict):
+            continue
+        target_scene_name = ""
+        if isinstance(row.get("target_scene_id"), int):
+            target_scene_name = next(
+                (
+                    str(scene.get("scene_name", "")).strip()
+                    for scene in scenes
+                    if isinstance(scene, dict) and int(scene.get("scene_id", -1)) == int(row.get("target_scene_id"))
+                ),
+                "",
+            )
+        if not target_scene_name:
+            target_scene_name = artist_scene_lookup.get(str(row.get("target_artist", "")).strip(), "")
+        source_scene_name = ""
+        if isinstance(row.get("source_scene_id"), int):
+            source_scene_name = next(
+                (
+                    str(scene.get("scene_name", "")).strip()
+                    for scene in scenes
+                    if isinstance(scene, dict) and int(scene.get("scene_id", -1)) == int(row.get("source_scene_id"))
+                ),
+                "",
+            )
+        if not source_scene_name:
+            source_scene_name = artist_scene_lookup.get(str(row.get("source_artist", "")).strip(), "")
+        share = float(row.get("source_out_share", 0.0) or 0.0)
+        if target_scene_name:
+            incoming_migration_by_scene[target_scene_name] = max(incoming_migration_by_scene.get(target_scene_name, 0.0), share)
+        if source_scene_name:
+            outgoing_migration_by_scene[source_scene_name] = max(outgoing_migration_by_scene.get(source_scene_name, 0.0), share)
+
+    lane_rows = _creator_brief_opportunity_lane_comparison(payload)
+    top_lane_by_scene: dict[str, dict[str, object]] = {}
+    for row in lane_rows:
+        scene_name = str(row.get("scene_name", "")).strip()
+        if scene_name and scene_name not in top_lane_by_scene:
+            top_lane_by_scene[scene_name] = row
+
+    rows: list[dict[str, object]] = []
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        scene_name = str(scene.get("scene_name", "")).strip()
+        scene_opportunities = opportunity_rows_by_scene.get(scene_name, [])
+        priority_now_count = sum(
+            1 for row in scene_opportunities if str(row.get("opportunity_band", "")).strip() == "priority_now"
+        )
+        whitespace_row = whitespace_by_scene.get(scene_name, {})
+        top_lane = top_lane_by_scene.get(scene_name, {})
+        incoming_share = float(incoming_migration_by_scene.get(scene_name, 0.0))
+        outgoing_share = float(outgoing_migration_by_scene.get(scene_name, 0.0))
+        release_pressure = float(scene.get("scene_release_pressure", 0.0) or 0.0)
+        label_concentration = float(scene.get("scene_label_concentration", 0.0) or 0.0)
+        whitespace_score = float(whitespace_row.get("release_whitespace_score", 0.0) or 0.0)
+        if incoming_share >= 0.20 and whitespace_score >= 1.0:
+            posture = "accelerate_capture"
+            action_note = "Inbound listener movement and release whitespace are both present, so this scene can support a deliberate push now."
+        elif label_concentration >= 0.80 and release_pressure >= 0.80:
+            posture = "protect_window"
+            action_note = "Label concentration and release pressure are both high, so any launch here needs sharper timing and partner awareness."
+        elif outgoing_share >= 0.20:
+            posture = "defend_audience"
+            action_note = "Listener outflow is visible, so use this scene to stabilize audience retention before expanding elsewhere."
+        elif release_pressure >= 0.80:
+            posture = "refresh_catalog"
+            action_note = "Release pressure is elevated without strong inflow yet, so catalog freshness is the main lever."
+        else:
+            posture = "steady_watch"
+            action_note = "The scene is viable but not urgent; keep it in the brief as a supporting lane."
+        rows.append(
+            {
+                "scene_name": scene_name,
+                "strategy_posture": posture,
+                "action_note": action_note,
+                "scene_local_play_share": float(scene.get("scene_local_play_share", 0.0) or 0.0),
+                "scene_release_pressure": release_pressure,
+                "scene_label_concentration": label_concentration,
+                "incoming_migration_share": incoming_share,
+                "outgoing_migration_share": outgoing_share,
+                "release_whitespace_anchor_artist": str(whitespace_row.get("artist_name", "")),
+                "release_whitespace_score": whitespace_score,
+                "opportunity_count": int(len(scene_opportunities)),
+                "priority_now_count": int(priority_now_count),
+                "top_lane_driver": str(top_lane.get("primary_driver", "")),
+                "top_lane_posture": str(top_lane.get("lane_posture", "")),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            int(row["priority_now_count"]),
+            float(row["incoming_migration_share"]),
+            float(row["scene_release_pressure"]),
+            float(row["scene_local_play_share"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
 def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
     summary = payload.get("graph_summary", {})
     summary = summary if isinstance(summary, dict) else {}
     scene_comparison = _creator_brief_scene_comparison(payload)
     seed_comparison = _creator_brief_seed_comparison(payload)
+    opportunity_lanes = _creator_brief_opportunity_lane_comparison(payload)
+    scene_strategy_watch = _creator_brief_scene_strategy_watch(payload)
     release_whitespace = payload.get("release_whitespace", [])
     release_whitespace = release_whitespace if isinstance(release_whitespace, list) else []
     fan_migration = payload.get("fan_migration", [])
@@ -398,6 +670,11 @@ def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
         top_scene = scene_comparison[0]
         lines.append(
             f"The strongest current scene is `{top_scene['scene_name']}` with local play share `{top_scene['scene_local_play_share']:.3f}` and `{top_scene['opportunity_count']}` mapped opportunities."
+        )
+    if opportunity_lanes:
+        top_lane = opportunity_lanes[0]
+        lines.append(
+            f"The strongest opportunity lane is `{top_lane['scene_name']} / {top_lane['primary_driver']}` with average score `{top_lane['avg_opportunity_score']:.3f}` across `{top_lane['opportunity_count']}` candidates."
         )
     if opportunities:
         top_opportunity = opportunities[0]
@@ -429,7 +706,12 @@ def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
             lines.append(
                 f"The strongest fan-migration route is `{top_migration.get('source_artist', '')} -> {top_migration.get('target_artist', '')}` at share `{float(top_migration.get('source_out_share', 0.0) or 0.0):.3f}`."
             )
-    return lines[:5]
+    if scene_strategy_watch:
+        top_scene_strategy = scene_strategy_watch[0]
+        lines.append(
+            f"Strategically, `{top_scene_strategy['scene_name']}` is in `{top_scene_strategy['strategy_posture']}` mode because release pressure is `{top_scene_strategy['scene_release_pressure']:.3f}` and inbound migration is `{top_scene_strategy['incoming_migration_share']:.3f}`."
+        )
+    return lines[:6]
 
 
 def _creator_brief_priority_shortlist(payload: dict[str, Any]) -> list[dict[str, object]]:
@@ -592,11 +874,13 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             "scene_comparison": _creator_brief_scene_comparison(payload),
             "seed_comparison": _creator_brief_seed_comparison(payload),
             "scene_seed_comparison": _creator_brief_scene_seed_comparison(payload),
+            "opportunity_lane_comparison": _creator_brief_opportunity_lane_comparison(payload),
         }
         payload["brief_views"] = {
             "priority_shortlist": _creator_brief_priority_shortlist(payload),
             "migration_watch": _creator_brief_migration_watch(payload),
             "release_watch": _creator_brief_release_watch(payload),
+            "scene_strategy_watch": _creator_brief_scene_strategy_watch(payload),
         }
         payload["report_family"] = {
             "mode": "standalone_report_family_nested_under_public_insights",
@@ -606,6 +890,24 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 "scene_comparison",
                 "seed_comparison",
                 "scene_seed_comparison",
+                "opportunity_lane_comparison",
+            ],
+            "brief_views": [
+                "priority_shortlist",
+                "migration_watch",
+                "release_watch",
+                "scene_strategy_watch",
+            ],
+            "reading_order": [
+                "primary_report",
+                "ranking_comparison",
+                "opportunity_lane_comparison",
+                "scene_comparison",
+                "scene_strategy_watch",
+                "seed_comparison",
+                "scene_seed_comparison",
+                "migration_watch",
+                "release_watch",
             ],
         }
 
@@ -647,6 +949,14 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 f"release pressure `{row['scene_release_pressure']:.3f}`, label concentration `{row['scene_label_concentration']:.3f}`, "
                 f"seed coverage `{seed_text}`, top opportunity `{row['top_opportunity_artist'] or 'n/a'}`"
             )
+        markdown_lines.extend(["", "## Opportunity Lanes", ""])
+        for row in payload["comparison_views"]["opportunity_lane_comparison"][:12]:
+            markdown_lines.append(
+                f"- {row['scene_name']} / {row['primary_driver']}: posture `{row['lane_posture']}`, "
+                f"avg score `{row['avg_opportunity_score']:.3f}`, opportunities `{row['opportunity_count']}`, "
+                f"priority `{row['priority_now_count']}`, seed bridges `{row['seed_bridge_count']}`, "
+                f"inbound migration `{row['incoming_migration_share']:.3f}`, whitespace `{row['release_whitespace_score']:.3f}`"
+            )
         markdown_lines.extend(["", "## Seed Comparison", ""])
         for row in payload["comparison_views"]["seed_comparison"][:10]:
             markdown_lines.append(
@@ -677,6 +987,14 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 )
         else:
             markdown_lines.append("- Public-catalog release metadata was unavailable for this run, so whitespace stayed empty.")
+        markdown_lines.extend(["", "## Scene Strategy Watch", ""])
+        for row in payload["brief_views"]["scene_strategy_watch"][:10]:
+            markdown_lines.append(
+                f"- {row['scene_name']}: posture `{row['strategy_posture']}`, release pressure `{row['scene_release_pressure']:.3f}`, "
+                f"label concentration `{row['scene_label_concentration']:.3f}`, inbound migration `{row['incoming_migration_share']:.3f}`, "
+                f"outbound migration `{row['outgoing_migration_share']:.3f}`, whitespace anchor `{row['release_whitespace_anchor_artist'] or 'n/a'}`. "
+                f"{row['action_note']}"
+            )
         markdown_lines.extend(["", "## Opportunity Scoreboard", ""])
         for row in payload["opportunities"][:10]:
             markdown_lines.append(
@@ -793,11 +1111,56 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                     ],
                 ],
             ),
+            "opportunity_lane_comparison": _write_markdown_lines(
+                report_dir / f"{stem}_opportunity_lane_view.md",
+                [
+                    "# Creator Opportunity Lane View",
+                    "",
+                    f"- Seeds: `{', '.join(artists)}`",
+                    "",
+                    "## Lane Table",
+                    "",
+                    *[
+                        (
+                            f"- {row['scene_name']} / {row['primary_driver']}: posture `{row['lane_posture']}`, "
+                            f"avg `{row['avg_opportunity_score']:.3f}`, priority `{row['priority_now_count']}`, "
+                            f"bridges `{row['seed_bridge_count']}`, migration `{row['incoming_migration_share']:.3f}`, "
+                            f"whitespace `{row['release_whitespace_score']:.3f}`"
+                        )
+                        for row in payload["comparison_views"]["opportunity_lane_comparison"]
+                    ],
+                ],
+            ),
         }
         family_manifest = {
             "primary_report": str(md_path),
+            "primary_report_json": str(json_path),
             "comparison_view_markdown": {label: str(path) for label, path in view_markdown_paths.items()},
             "comparison_view_csv": {},
+            "brief_view_markdown": {},
+            "brief_view_csv": {},
+            "reading_order": list(payload["report_family"]["reading_order"]),
+        }
+        brief_markdown_paths = {
+            "scene_strategy_watch": _write_markdown_lines(
+                report_dir / f"{stem}_scene_strategy_watch.md",
+                [
+                    "# Creator Scene Strategy Watch",
+                    "",
+                    f"- Seeds: `{', '.join(artists)}`",
+                    "",
+                    "## Strategy Table",
+                    "",
+                    *[
+                        (
+                            f"- {row['scene_name']}: posture `{row['strategy_posture']}`, release `{row['scene_release_pressure']:.3f}`, "
+                            f"label concentration `{row['scene_label_concentration']:.3f}`, incoming `{row['incoming_migration_share']:.3f}`, "
+                            f"outgoing `{row['outgoing_migration_share']:.3f}`. {row['action_note']}"
+                        )
+                        for row in payload["brief_views"]["scene_strategy_watch"]
+                    ],
+                ],
+            ),
         }
         csv_paths = {
             "artist_adjacency": _write_csv_rows(report_dir / f"{stem}_artist_adjacency.csv", payload["artist_adjacency"]),
@@ -826,6 +1189,10 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 report_dir / f"{stem}_scene_seed_comparison.csv",
                 payload["comparison_views"]["scene_seed_comparison"],
             ),
+            "opportunity_lane_comparison": _write_csv_rows(
+                report_dir / f"{stem}_opportunity_lane_comparison.csv",
+                payload["comparison_views"]["opportunity_lane_comparison"],
+            ),
             "priority_shortlist": _write_csv_rows(
                 report_dir / f"{stem}_priority_shortlist.csv",
                 payload["brief_views"]["priority_shortlist"],
@@ -838,12 +1205,62 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 report_dir / f"{stem}_release_watch.csv",
                 payload["brief_views"]["release_watch"],
             ),
+            "scene_strategy_watch": _write_csv_rows(
+                report_dir / f"{stem}_scene_strategy_watch.csv",
+                payload["brief_views"]["scene_strategy_watch"],
+            ),
         }
         family_manifest["comparison_view_csv"] = {
             label: str(path)
             for label, path in csv_paths.items()
             if label.endswith("comparison") and path is not None
         }
+        family_manifest["brief_view_markdown"] = {label: str(path) for label, path in brief_markdown_paths.items()}
+        family_manifest["brief_view_csv"] = {
+            label: str(path)
+            for label, path in csv_paths.items()
+            if label in {"priority_shortlist", "migration_watch", "release_watch", "scene_strategy_watch"} and path is not None
+        }
+        family_manifest_md_path = _write_markdown_lines(
+            report_dir / f"{stem}_report_family.md",
+            [
+                "# Creator Report Family",
+                "",
+                f"- Primary report: `{md_path.name}`",
+                f"- Primary report JSON: `{json_path.name}`",
+                f"- Packaging mode: `{payload['report_family']['mode']}`",
+                "",
+                "## Reading Order",
+                "",
+                *[f"- `{item}`" for item in payload["report_family"]["reading_order"]],
+                "",
+                "## Comparison Views",
+                "",
+                *[
+                    f"- `{label}`: markdown `{Path(path).name}`"
+                    for label, path in family_manifest["comparison_view_markdown"].items()
+                ],
+                "",
+                "## Brief Views",
+                "",
+                *[
+                    f"- `{label}`: markdown `{Path(path).name}`"
+                    for label, path in family_manifest["brief_view_markdown"].items()
+                ],
+                "",
+                "## Data Tables",
+                "",
+                *[
+                    f"- `{label}`: `{Path(str(path)).name}`"
+                    for label, path in family_manifest["comparison_view_csv"].items()
+                ],
+                *[
+                    f"- `{label}`: `{Path(str(path)).name}`"
+                    for label, path in family_manifest["brief_view_csv"].items()
+                ],
+            ],
+        )
+        family_manifest["artifact_index_markdown"] = str(family_manifest_md_path)
         family_manifest_path = write_json(report_dir / f"{stem}_report_family.json", family_manifest)
         print(f"creator_label_intelligence_json={json_path}")
         print(f"creator_label_intelligence_md={md_path}")
@@ -852,7 +1269,10 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 print(f"creator_label_intelligence_{label}_csv={path}")
         for label, path in view_markdown_paths.items():
             print(f"creator_label_intelligence_{label}_md={path}")
+        for label, path in brief_markdown_paths.items():
+            print(f"creator_label_intelligence_{label}_md={path}")
         print(f"creator_label_intelligence_report_family_json={family_manifest_path}")
+        print(f"creator_label_intelligence_report_family_md={family_manifest_md_path}")
         print(f"creator_label_intelligence_nodes={payload['graph_summary']['node_count']}")
         print(f"creator_label_intelligence_scenes={payload['graph_summary']['scene_count']}")
         print(f"creator_label_intelligence_opportunities={payload['graph_summary']['opportunity_count']}")
@@ -865,10 +1285,12 @@ __all__ = [
     "CreatorBriefHandlerDeps",
     "_creator_brief_executive_summary",
     "_creator_brief_migration_watch",
+    "_creator_brief_opportunity_lane_comparison",
     "_creator_brief_priority_shortlist",
     "_creator_brief_ranking_comparison",
     "_creator_brief_release_watch",
     "_creator_brief_scene_comparison",
+    "_creator_brief_scene_strategy_watch",
     "_creator_brief_scene_seed_comparison",
     "_creator_brief_seed_comparison",
     "build_creator_label_intelligence_handler",

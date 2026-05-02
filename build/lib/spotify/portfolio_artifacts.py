@@ -41,11 +41,20 @@ class PortfolioArtifactBundle:
     creator_manifest_path: Path | None
     creator_manifest: dict[str, Any]
     creator_primary_report_path: Path | None
+    creator_report_family_md_path: Path | None
     creator_comparison_markdown_paths: dict[str, Path]
     creator_comparison_csv_paths: dict[str, Path]
+    creator_brief_markdown_paths: dict[str, Path]
+    creator_brief_csv_paths: dict[str, Path]
     research_claims_json: Path
     research_claims_md: Path
     research_claims_payload: dict[str, Any]
+    research_publication_outline_md: Path | None
+    research_claim_support_md: Path | None
+    research_submission_readiness_md: Path | None
+    safety_platform_contract_json: Path | None
+    safety_platform_contract_md: Path | None
+    safety_platform_contract_payload: dict[str, Any]
     benchmark_manifest_json: Path | None
     benchmark_manifest_md: Path | None
     benchmark_manifest_payload: dict[str, Any]
@@ -61,6 +70,9 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
     control_room_md = output_root / "analytics" / "control_room.md"
     research_claims_json = output_root / "analysis" / "research_claims" / "research_claims.json"
     research_claims_md = output_root / "analysis" / "research_claims" / "research_claims.md"
+    research_publication_outline_md = output_root / "analysis" / "research_claims" / "publication_outline.md"
+    research_claim_support_md = output_root / "analysis" / "research_claims" / "claim_support_matrix.md"
+    research_submission_readiness_md = output_root / "analysis" / "research_claims" / "submission_readiness.md"
 
     creator_dir = output_root / "analysis" / "public_spotify" / "creator_label_intelligence"
     creator_manifest_paths = tuple(sorted(path for path in creator_dir.glob("*_report_family.json") if path.is_file()))
@@ -69,6 +81,11 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
     creator_primary_report_path = (
         Path(str(creator_manifest.get("primary_report", "")).strip())
         if str(creator_manifest.get("primary_report", "")).strip()
+        else None
+    )
+    creator_report_family_md_path = (
+        Path(str(creator_manifest.get("artifact_index_markdown", "")).strip())
+        if str(creator_manifest.get("artifact_index_markdown", "")).strip()
         else None
     )
     creator_comparison_markdown_paths = {
@@ -81,6 +98,45 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         for key, value in _coerce_dict(creator_manifest.get("comparison_view_csv")).items()
         if str(value).strip()
     }
+    creator_brief_markdown_paths = {
+        str(key): Path(str(value))
+        for key, value in _coerce_dict(creator_manifest.get("brief_view_markdown")).items()
+        if str(value).strip()
+    }
+    creator_brief_csv_paths = {
+        str(key): Path(str(value))
+        for key, value in _coerce_dict(creator_manifest.get("brief_view_csv")).items()
+        if str(value).strip()
+    }
+
+    research_claims_payload = _coerce_dict(safe_read_json(research_claims_json, default={}))
+    if not research_publication_outline_md.exists():
+        research_publication_outline_md = None
+    if not research_claim_support_md.exists():
+        research_claim_support_md = None
+    if not research_submission_readiness_md.exists():
+        research_submission_readiness_md = None
+    research_run = _coerce_dict(research_claims_payload.get("run"))
+    research_run_id = str(research_run.get("run_id", "")).strip()
+    safety_platform_contract_json = (
+        output_root / "runs" / research_run_id / "safety_platform_contract.json"
+        if research_run_id
+        else None
+    )
+    safety_platform_contract_md = (
+        output_root / "runs" / research_run_id / "safety_platform_contract.md"
+        if research_run_id
+        else None
+    )
+    if safety_platform_contract_json is not None and not safety_platform_contract_json.exists():
+        safety_platform_contract_json = None
+    if safety_platform_contract_md is not None and not safety_platform_contract_md.exists():
+        safety_platform_contract_md = None
+    safety_platform_contract_payload = (
+        _coerce_dict(safe_read_json(safety_platform_contract_json, default={}))
+        if safety_platform_contract_json is not None
+        else {}
+    )
 
     history_dir = output_root / "history"
     benchmark_manifest_json = _latest_path(history_dir, "benchmark_lock_*_manifest.json")
@@ -101,11 +157,20 @@ def _load_portfolio_artifact_bundle_cached(output_root_str: str) -> PortfolioArt
         creator_manifest_path=creator_manifest_path,
         creator_manifest=creator_manifest,
         creator_primary_report_path=creator_primary_report_path,
+        creator_report_family_md_path=creator_report_family_md_path,
         creator_comparison_markdown_paths=creator_comparison_markdown_paths,
         creator_comparison_csv_paths=creator_comparison_csv_paths,
+        creator_brief_markdown_paths=creator_brief_markdown_paths,
+        creator_brief_csv_paths=creator_brief_csv_paths,
         research_claims_json=research_claims_json,
         research_claims_md=research_claims_md,
-        research_claims_payload=_coerce_dict(safe_read_json(research_claims_json, default={})),
+        research_claims_payload=research_claims_payload,
+        research_publication_outline_md=research_publication_outline_md,
+        research_claim_support_md=research_claim_support_md,
+        research_submission_readiness_md=research_submission_readiness_md,
+        safety_platform_contract_json=safety_platform_contract_json,
+        safety_platform_contract_md=safety_platform_contract_md,
+        safety_platform_contract_payload=safety_platform_contract_payload,
         benchmark_manifest_json=benchmark_manifest_json,
         benchmark_manifest_md=benchmark_manifest_md,
         benchmark_manifest_payload=benchmark_manifest_payload,

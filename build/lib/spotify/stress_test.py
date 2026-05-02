@@ -22,6 +22,8 @@ DEFAULT_STRESS_TEST_BATCH_SIZE = 256
 DEFAULT_STRESS_BENCHMARK_SCENARIO = "evening_drift"
 DEFAULT_STRESS_BENCHMARK_POLICY = "safe_routed"
 DEFAULT_STRESS_BENCHMARK_REFERENCE_POLICY = "baseline_exploit"
+DEFAULT_STRESS_BENCHMARK_GUARD_THRESHOLD = 0.45
+DEFAULT_STRESS_BENCHMARK_TARGET_THRESHOLD = 0.35
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
@@ -181,6 +183,15 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
     benchmark_end_risk = _safe_float(benchmark_row.get("mean_end_risk"))
     reference_skip_risk = _safe_float(reference_row.get("mean_skip_risk"))
     reference_end_risk = _safe_float(reference_row.get("mean_end_risk"))
+    guard_threshold = float(DEFAULT_STRESS_BENCHMARK_GUARD_THRESHOLD)
+    target_threshold = float(DEFAULT_STRESS_BENCHMARK_TARGET_THRESHOLD)
+    gate_status = "unknown"
+    gate_margin = float("nan")
+    target_status = "unknown"
+    if np.isfinite(benchmark_skip_risk):
+        gate_status = "pass" if benchmark_skip_risk <= guard_threshold + 1e-12 else "fail"
+        gate_margin = float(guard_threshold - benchmark_skip_risk)
+        target_status = "pass" if benchmark_skip_risk <= target_threshold + 1e-12 else "fail"
     return {
         "benchmark_scenario": benchmark_scenario,
         "benchmark_policy_name": benchmark_policy,
@@ -215,7 +226,86 @@ def _build_stress_benchmark(rows: list[dict[str, object]]) -> dict[str, object]:
         "evaluated_sessions": int(benchmark_row.get("evaluated_sessions", 0) or 0),
         "total_test_sessions": int(benchmark_row.get("total_test_sessions", 0) or 0),
         "sample_fraction": _safe_float(benchmark_row.get("sample_fraction")),
+        "benchmark_guard_threshold": guard_threshold,
+        "benchmark_target_threshold": target_threshold,
+        "benchmark_gate_status": gate_status,
+        "benchmark_gate_margin": gate_margin,
+        "benchmark_target_status": target_status,
     }
+
+
+def _build_stress_benchmark_brief(benchmark_payload: dict[str, object]) -> dict[str, object]:
+    benchmark_skip_risk = _safe_float(benchmark_payload.get("skip_risk"))
+    reference_skip_risk = _safe_float(benchmark_payload.get("reference_skip_risk"))
+    delta_vs_reference = _safe_float(benchmark_payload.get("skip_risk_delta_vs_reference"))
+    guard_threshold = _safe_float(benchmark_payload.get("benchmark_guard_threshold"))
+    target_threshold = _safe_float(benchmark_payload.get("benchmark_target_threshold"))
+    summary: list[str] = []
+    if np.isfinite(benchmark_skip_risk):
+        summary.append(
+            f"Standing benchmark `{benchmark_payload.get('benchmark_scenario', 'unknown')}` is at skip risk `{benchmark_skip_risk:.3f}`."
+        )
+    if np.isfinite(delta_vs_reference) and benchmark_payload.get("reference_policy_name"):
+        summary.append(
+            f"Delta versus `{benchmark_payload.get('reference_policy_name')}` is `{delta_vs_reference:.3f}`."
+        )
+    if np.isfinite(guard_threshold):
+        summary.append(
+            f"Regression ceiling is `{guard_threshold:.3f}` with gate status `{benchmark_payload.get('benchmark_gate_status', 'unknown')}`."
+        )
+    if np.isfinite(target_threshold):
+        summary.append(f"Longer-term target threshold is `{target_threshold:.3f}`.")
+
+    return {
+        "status": str(benchmark_payload.get("benchmark_gate_status", "unknown")),
+        "benchmark_scenario": str(benchmark_payload.get("benchmark_scenario", "")),
+        "selected_policy_name": str(
+            benchmark_payload.get("benchmark_selected_policy_name")
+            or benchmark_payload.get("benchmark_policy_name", "")
+        ),
+        "reference_policy_name": str(benchmark_payload.get("reference_policy_name", "")),
+        "skip_risk": benchmark_skip_risk,
+        "reference_skip_risk": reference_skip_risk,
+        "skip_risk_delta_vs_reference": delta_vs_reference,
+        "guard_threshold": guard_threshold,
+        "target_threshold": target_threshold,
+        "summary": summary[:4],
+        "recommended_actions": [
+            "Inspect the selected route and the reference baseline in the benchmark artifact before changing the policy search.",
+            "Use the standing benchmark as the first regression check when iterating on safe routing.",
+            "Only treat the scenario as healthy once the skip risk clears both the regression ceiling and the target threshold.",
+        ],
+        "inspect_paths": [
+            "analysis/stress_test/stress_test_benchmark.json",
+            "analysis/stress_test/stress_test_summary.json",
+            "analysis/moonshot_summary.json",
+        ],
+    }
+
+
+def _build_stress_benchmark_brief_markdown(brief_payload: dict[str, object]) -> list[str]:
+    lines = [
+        "# Stress Test Benchmark Brief",
+        "",
+        f"- Status: `{brief_payload.get('status', 'unknown')}`",
+        f"- Scenario: `{brief_payload.get('benchmark_scenario', '')}`",
+        f"- Selected policy: `{brief_payload.get('selected_policy_name', '')}`",
+        f"- Reference policy: `{brief_payload.get('reference_policy_name', '')}`",
+        f"- Skip risk: `{_safe_float(brief_payload.get('skip_risk')):.3f}`",
+        f"- Delta vs reference: `{_safe_float(brief_payload.get('skip_risk_delta_vs_reference')):.3f}`",
+        "",
+        "## Summary",
+        "",
+    ]
+    for item in brief_payload.get("summary", []):
+        lines.append(f"- {item}")
+    lines.extend(["", "## Recommended Actions", ""])
+    for item in brief_payload.get("recommended_actions", []):
+        lines.append(f"- {item}")
+    lines.extend(["", "## Inspect Paths", ""])
+    for item in brief_payload.get("inspect_paths", []):
+        lines.append(f"- `{item}`")
+    return lines
 
 
 def run_stress_test_lab(
@@ -436,10 +526,23 @@ def run_stress_test_lab(
             "evaluated_sessions",
             "total_test_sessions",
             "sample_fraction",
+            "benchmark_guard_threshold",
+            "benchmark_target_threshold",
+            "benchmark_gate_status",
+            "benchmark_gate_margin",
+            "benchmark_target_status",
         ],
     )
     benchmark_path = output_dir / "stress_test_benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark_payload, indent=2), encoding="utf-8")
+    benchmark_brief_payload = _build_stress_benchmark_brief(benchmark_payload)
+    benchmark_brief_json = output_dir / "stress_test_benchmark_brief.json"
+    benchmark_brief_json.write_text(json.dumps(benchmark_brief_payload, indent=2), encoding="utf-8")
+    benchmark_brief_md = output_dir / "stress_test_benchmark_brief.md"
+    benchmark_brief_md.write_text(
+        "\n".join(_build_stress_benchmark_brief_markdown(benchmark_brief_payload)).rstrip() + "\n",
+        encoding="utf-8",
+    )
     if bool(benchmark_payload.get("available")):
         logger.info(
             "Stress-test benchmark scenario=%s policy=%s skip_risk=%.4f delta_vs_%s=%.4f",
@@ -455,4 +558,4 @@ def run_stress_test_lab(
         sampled_sessions,
         total_sessions,
     )
-    return [csv_path, summary_path, benchmark_csv, benchmark_path]
+    return [csv_path, summary_path, benchmark_csv, benchmark_path, benchmark_brief_json, benchmark_brief_md]

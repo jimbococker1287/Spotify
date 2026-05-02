@@ -21,3 +21,5 @@ Review order:
 3. Open the branch portfolio if you want the repo-wide map.
 
 The landing page should stay lightweight and opinionated. It is not meant to replace the deeper markdown packs; it is meant to make the first five minutes clear.
+
+For the final Day-90 package, this page becomes the opening move inside `make day-90-launch`.
