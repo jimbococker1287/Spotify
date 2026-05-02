@@ -161,7 +161,7 @@ def test_taste_os_service_plans_session_and_persists_artifacts(tmp_path: Path, m
 
     load_calls = {"count": 0}
 
-    def _fake_context_loader(run_dir: Path, data_dir: Path, include_video: bool, logger: logging.Logger) -> PredictionInputContext:
+    def _fake_context_loader(run_dir: Path, data_dir: Path, include_video: bool, logger: logging.Logger, **kwargs) -> PredictionInputContext:
         _ = (run_dir, data_dir, include_video, logger)
         load_calls["count"] += 1
         return PredictionInputContext(
@@ -258,7 +258,7 @@ def test_taste_os_service_feedback_memory_seeds_future_sessions(tmp_path: Path, 
     monkeypatch.setattr(
         taste_os_service,
         "load_prediction_input_context",
-        lambda run_dir, data_dir, include_video, logger: PredictionInputContext(
+        lambda run_dir, data_dir, include_video, logger, **kwargs: PredictionInputContext(
             artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
             artist_to_label={"Artist A": 0, "Artist B": 1, "Artist C": 2, "Artist D": 3},
             sequence_length=2,
@@ -352,7 +352,7 @@ def test_taste_os_service_page_html_exposes_browser_surface(tmp_path: Path, monk
     monkeypatch.setattr(
         taste_os_service,
         "load_prediction_input_context",
-        lambda run_dir, data_dir, include_video, logger: PredictionInputContext(
+        lambda run_dir, data_dir, include_video, logger, **kwargs: PredictionInputContext(
             artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
             artist_to_label={"Artist A": 0, "Artist B": 1, "Artist C": 2, "Artist D": 3},
             sequence_length=2,

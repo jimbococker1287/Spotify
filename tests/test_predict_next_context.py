@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import spotify.data as data_module
-from spotify.predict_next import load_prediction_input_context
+from spotify.predict_next import build_prediction_serving_bundle, load_prediction_input_context
 
 
 class _StubScaler:
@@ -86,3 +86,62 @@ def test_load_prediction_input_context_uses_persistent_cache(tmp_path: Path, mon
 
     assert load_calls["count"] == 2
     assert third.latest_sequence_names == ["Artist B", "Artist C"]
+
+
+def test_load_prediction_input_context_can_require_serving_bundle(tmp_path: Path, monkeypatch) -> None:
+    run_dir = tmp_path / "outputs" / "runs" / "run_a"
+    run_dir.mkdir(parents=True)
+    data_dir = tmp_path / "data" / "raw"
+    data_dir.mkdir(parents=True)
+    (data_dir / "Streaming_History_Audio_2024_0.json").write_text("[]", encoding="utf-8")
+
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps(
+            {
+                "artist_labels": ["Artist A", "Artist B", "Artist C"],
+                "context_features": ["hour", "offline", "tech_playback_errors_24h"],
+                "skew_context_features": ["tech_playback_errors_24h"],
+                "sequence_length": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    joblib.dump(_StubScaler(mean=[0.0, 0.0, 0.0], scale=[1.0, 1.0, 1.0]), run_dir / "context_scaler.joblib")
+
+    engineered = pd.DataFrame(
+        {
+            "ts": [1, 2, 3],
+            "artist_label": [0, 1, 2],
+            "hour": [9.0, 10.0, 11.0],
+            "offline": [0.0, 0.0, 0.0],
+            "tech_playback_errors_24h": [0.0, 1.0, 3.0],
+        }
+    )
+
+    monkeypatch.setattr(data_module, "load_streaming_history", lambda data_dir, include_video, logger: pd.DataFrame({"ts": [1, 2, 3]}))
+    monkeypatch.setattr(data_module, "engineer_features", lambda df, max_artists, logger, artist_classes: engineered.copy())
+    monkeypatch.setattr(data_module, "append_technical_log_features", lambda df, data_dir, logger: df.copy())
+    monkeypatch.setattr(data_module, "append_audio_features", lambda df, enable_spotify_features, logger: df.copy())
+
+    logger = logging.getLogger("spotify.test.predict_next_context.bundle")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    bundle_path = build_prediction_serving_bundle(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        include_video=False,
+        logger=logger,
+    )
+
+    context = load_prediction_input_context(
+        run_dir=run_dir,
+        data_dir=None,
+        include_video=False,
+        logger=logger,
+        prefer_serving_bundle=True,
+        require_serving_bundle=True,
+    )
+
+    assert bundle_path.exists()
+    assert context.latest_sequence_names == ["Artist B", "Artist C"]

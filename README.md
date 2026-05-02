@@ -36,6 +36,9 @@ The current system already includes:
 - Benchmark lock runs with seed-based confidence intervals
 - Prediction CLI for serving top-k next-artist recommendations
 - Conformal uncertainty diagnostics with abstaining prediction support
+- Materialized serving bundles for bundle-only online inference
+- Production-style ASGI APIs with versioned routes, request IDs, rate limiting, and metrics
+- Durable SQLite-backed Taste OS feedback and session state
 
 ## Product Direction
 
@@ -121,6 +124,8 @@ source .venv/bin/activate
 spotify-lab --help
 spotify-predict --help
 spotify-serve --help
+spotify-build-serving-bundle --help
+spotify-serve-api --help
 spotify-public-insights --help
 spotify-compare-public --help
 spotify-control-room --help
@@ -528,6 +533,15 @@ Or via Make:
 make taste-os-showcase EXTRA_ARGS='--top-k 5'
 ```
 
+Build a serving bundle once so online services can run without rebuilding request context from raw history files:
+
+```bash
+python -m spotify.serving_bundle \
+  --run-dir outputs/runs/<run_id> \
+  --data-dir data/raw \
+  --all-contexts
+```
+
 Serve Taste OS session plans over HTTP:
 
 ```bash
@@ -552,7 +566,27 @@ That service exposes a browser UI at `GET /taste-os`, plus:
 - `POST /taste-os/session`
 - `POST /taste-os/feedback`
 
-It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now keeps a lightweight feedback-memory store that can seed future sessions when `use_feedback_memory` is enabled.
+It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now stores feedback/session state in `taste_os_state.sqlite3` under the same output directory. The older JSON/JSONL files are still exported as compatibility snapshots.
+
+For the production-style ASGI surface with versioned endpoints, request IDs, rate limiting, and metrics:
+
+```bash
+python -m spotify.service_api \
+  --app taste-os \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8010
+```
+
+The ASGI surface adds:
+
+- `GET /v1/health`
+- `GET /v1/metrics`
+- `GET /v1/taste-os/catalog`
+- `GET /v1/taste-os/history`
+- `POST /v1/taste-os/session`
+- `POST /v1/taste-os/feedback`
 
 The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
@@ -632,12 +666,31 @@ curl -s -X POST http://127.0.0.1:8000/predict \
   -d '{"top_k":5,"recent_artists":["Artist A","Artist B","Artist C"]}'
 ```
 
+For the production-style ASGI surface that prefers materialized serving bundles, exposes `/v1` routes, and adds request telemetry:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+That API exposes:
+
+- `GET /v1/health`
+- `GET /v1/metrics`
+- `POST /v1/predict`
+- OpenAPI at `GET /openapi.json`
+
 Optional token auth + request limits:
 
 - Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
 - Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
 - Errors return structured payloads: `{"error":{"code","message","details"}}`.
 - When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
+- The ASGI surface adds `X-Request-ID` headers, route-level telemetry at `/metrics`, and in-process request-rate limiting.
 
 ## Public Comparison
 
@@ -844,23 +897,34 @@ Artifacts are written under `outputs/analysis/public_spotify/`. Full pipeline ru
 
 See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the demo contract, `docs/taste_os_demo_walkthrough.md` for a guided demo flow, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
-## Docker (Prediction Service)
+## Docker (Serving APIs)
 
 Build:
 
 ```bash
-docker build -t spotify-predict-service .
+docker build -t spotify-serving-api .
 ```
 
-Run (mount project outputs and raw data):
+Run the prediction API:
 
 ```bash
 docker run --rm -p 8000:8000 \
+  -e SERVICE_MODE=predict \
   -e RUN_DIR=/app/outputs/models/champion \
-  -e DATA_DIR=/app/data/raw \
   -v "$(pwd)/outputs:/app/outputs" \
-  -v "$(pwd)/data/raw:/app/data/raw:ro" \
-  spotify-predict-service
+  spotify-serving-api
+```
+
+Run the Taste OS API:
+
+```bash
+docker run --rm -p 8010:8010 \
+  -e SERVICE_MODE=taste-os \
+  -e PORT=8010 \
+  -e RUN_DIR=/app/outputs/models/champion \
+  -e TASTE_OS_OUTPUT_DIR=/app/outputs/analysis/taste_os_service \
+  -v "$(pwd)/outputs:/app/outputs" \
+  spotify-serving-api
 ```
 
 The container includes a `/health` Docker healthcheck.
@@ -872,6 +936,8 @@ GitHub Actions CI is defined in `.github/workflows/ci.yml` and runs on push/PR:
 - `ruff`
 - `mypy`
 - `pytest`
+- wheel build smoke
+- Docker image build smoke
 
 ## Scheduling + Alerts
 

@@ -1,5 +1,6 @@
 catboost>=1.2
 duckdb>=1.1
+fastapi>=0.115
 joblib>=1.4
 matplotlib>=3.9
 numpy>=1.26
@@ -10,6 +11,7 @@ scikit-learn>=1.5
 tensorflow>=2.16
 mlflow>=2.17
 optuna>=3.6
+uvicorn>=0.30
 
 # Optional extras
 spotipy>=2.24

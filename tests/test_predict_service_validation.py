@@ -76,7 +76,7 @@ def test_prediction_service_reuses_cached_context_until_source_files_change(tmp_
 
     load_calls = {"count": 0}
 
-    def _fake_context_loader(run_dir: Path, data_dir: Path, include_video: bool, logger: logging.Logger) -> PredictionInputContext:
+    def _fake_context_loader(run_dir: Path, data_dir: Path, include_video: bool, logger: logging.Logger, **kwargs) -> PredictionInputContext:
         load_calls["count"] += 1
         return PredictionInputContext(
             artist_labels=["A", "B", "C"],
@@ -165,7 +165,7 @@ def test_prediction_service_can_abstain_with_conformal_summary(tmp_path: Path, m
     monkeypatch.setattr(
         predict_service,
         "load_prediction_input_context",
-        lambda run_dir, data_dir, include_video, logger: PredictionInputContext(
+        lambda run_dir, data_dir, include_video, logger, **kwargs: PredictionInputContext(
             artist_labels=["A", "B", "C"],
             artist_to_label={"A": 0, "B": 1, "C": 2},
             sequence_length=2,

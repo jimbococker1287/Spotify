@@ -84,7 +84,12 @@ def _parse_args() -> argparse.Namespace:
         help="Path to outputs/runs/<run_id> or outputs/models/champion. Defaults to champion alias.",
     )
     parser.add_argument("--model-name", type=str, default=None, help="Optional serveable model name override.")
-    parser.add_argument("--data-dir", type=str, default="data/raw", help="Path to raw Streaming_History JSON files.")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data/raw",
+        help="Optional raw Streaming_History JSON directory used only when a serving bundle is missing.",
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8000, help="HTTP port.")
     parser.add_argument("--max-top-k", type=int, default=env_max_top_k, help="Maximum top_k value accepted by the API.")
@@ -98,6 +103,11 @@ def _parse_args() -> argparse.Namespace:
         "--include-video",
         action="store_true",
         help="Include video history files by default when rebuilding request context.",
+    )
+    parser.add_argument(
+        "--require-serving-bundle",
+        action="store_true",
+        help="Fail fast unless the run already has a materialized prediction serving bundle.",
     )
     return parser.parse_args()
 
@@ -306,19 +316,21 @@ class PredictionService:
     def __init__(
         self,
         run_dir: Path,
-        data_dir: Path,
+        data_dir: Path | None,
         model_name: str,
         include_video: bool,
         max_top_k: int,
         auth_token: str | None,
         logger: logging.Logger,
+        require_serving_bundle: bool = False,
     ):
         self.run_dir = run_dir
-        self.data_dir = data_dir
+        self.data_dir = data_dir.expanduser().resolve() if isinstance(data_dir, Path) else None
         self.include_video = include_video
         self.max_top_k = max(1, int(max_top_k))
         self.auth_token = auth_token
         self.logger = logger
+        self.require_serving_bundle = bool(require_serving_bundle)
         self._context_lock = threading.Lock()
         self._predict_lock = threading.Lock()
         self._context_cache: dict[bool, _PredictionContextCacheEntry] = {}
@@ -346,10 +358,11 @@ class PredictionService:
         except Exception as exc:
             logger.info("Prediction context warm-up skipped: %s", exc)
         logger.info(
-            "Loaded serveable predictor: model=%s type=%s conformal=%s",
+            "Loaded serveable predictor: model=%s type=%s conformal=%s bundle_required=%s",
             self.model_name,
             self.model_type,
             bool(self._conformal_calibration),
+            self.require_serving_bundle,
         )
 
     def _load_conformal_calibration(self, model_row: dict[str, object]) -> SplitConformalCalibration | None:
@@ -386,6 +399,7 @@ class PredictionService:
             run_dir=self.run_dir,
             data_dir=self.data_dir,
             include_video=include_video,
+            prefer_serving_bundle=True,
         )
 
     def _get_prediction_context(self, *, include_video: bool) -> PredictionInputContext:
@@ -404,12 +418,27 @@ class PredictionService:
                 data_dir=self.data_dir,
                 include_video=include_video,
                 logger=self.logger,
+                prefer_serving_bundle=True,
+                require_serving_bundle=self.require_serving_bundle,
             )
             self._context_cache[include_video] = _PredictionContextCacheEntry(
                 signature=signature,
                 context=context,
             )
             return context
+
+    def health_payload(self) -> dict[str, object]:
+        return {
+            "status": "ok",
+            "model_name": self.model_name,
+            "model_type": self.model_type,
+            "run_dir": str(self.run_dir),
+            "max_top_k": self.max_top_k,
+            "requires_auth": bool(self.auth_token),
+            "conformal_enabled": bool(self._conformal_calibration),
+            "data_dir_configured": bool(self.data_dir),
+            "require_serving_bundle": self.require_serving_bundle,
+        }
 
     def predict(
         self,
@@ -539,18 +568,7 @@ def _build_handler(service: PredictionService):
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path.rstrip("/") == "/health":
-                self._send_json(
-                    200,
-                    {
-                        "status": "ok",
-                        "model_name": service.model_name,
-                        "model_type": service.model_type,
-                        "run_dir": str(service.run_dir),
-                        "max_top_k": service.max_top_k,
-                        "requires_auth": bool(service.auth_token),
-                        "conformal_enabled": bool(service._conformal_calibration),
-                    },
-                )
+                self._send_json(200, service.health_payload())
                 return
             self._send_error(404, code="not_found", message="Resource not found.")
 
@@ -618,7 +636,7 @@ def main() -> int:
     logger = logging.getLogger("spotify.predict_service")
 
     run_dir, champion_alias_model_name = resolve_prediction_run_dir(args.run_dir)
-    data_dir = Path(args.data_dir).expanduser().resolve()
+    data_dir = Path(args.data_dir).expanduser().resolve() if str(args.data_dir).strip() else None
     model_row = resolve_model_row(
         run_dir,
         explicit_model_name=args.model_name,
@@ -634,6 +652,7 @@ def main() -> int:
         max_top_k=max(1, int(args.max_top_k)),
         auth_token=(str(args.auth_token).strip() if args.auth_token else None),
         logger=logger,
+        require_serving_bundle=bool(args.require_serving_bundle),
     )
     server = ThreadingHTTPServer((str(args.host), int(args.port)), _build_handler(service))
     logger.info("Prediction service listening on http://%s:%d", args.host, int(args.port))

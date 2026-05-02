@@ -29,3 +29,9 @@ jobs:
 
       - name: Pytest
         run: python -m pytest -q
+
+      - name: Build Wheel
+        run: python -m pip wheel . --no-deps --no-build-isolation -w dist
+
+      - name: Docker Build
+        run: docker build -t spotify-service-ci .
