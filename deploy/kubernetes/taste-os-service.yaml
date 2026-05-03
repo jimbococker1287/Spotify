@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spotify-taste-os-api
+spec:
+  selector:
+    app: spotify-taste-os-api
+  ports:
+    - name: http
+      port: 8010
+      targetPort: http

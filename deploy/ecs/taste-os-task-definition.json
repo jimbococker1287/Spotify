@@ -1,0 +1,73 @@
+{
+  "family": "spotify-taste-os-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/spotifyTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/spotifyTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "spotify-taste-os-api",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/spotify-serving-api:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8010,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "SERVICE_MODE", "value": "taste-os" },
+        { "name": "PORT", "value": "8010" },
+        { "name": "RUN_DIR", "value": "/app/outputs/deployments/registry/channels/stable" },
+        { "name": "TASTE_OS_OUTPUT_DIR", "value": "/app/outputs/analysis/taste_os_service" },
+        { "name": "REQUEST_RATE_LIMIT", "value": "240" },
+        { "name": "RATE_LIMIT_BACKEND", "value": "redis" },
+        { "name": "REDIS_URL", "value": "redis://redis.internal:6379/0" },
+        { "name": "AUTH_MODE", "value": "token_or_jwt" },
+        { "name": "AUTH_SCOPE", "value": "all" },
+        { "name": "JWT_ALGORITHMS", "value": "RS256" },
+        { "name": "JWT_ISSUER", "value": "https://issuer.example.com/" },
+        { "name": "JWT_AUDIENCE", "value": "spotify-taste-os" },
+        { "name": "JWT_REQUIRED_SCOPES", "value": "taste-os:write" }
+      ],
+      "secrets": [
+        { "name": "AUTH_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:spotify/auth-token" },
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:spotify/jwt-secret" },
+        { "name": "TASTE_OS_DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:spotify/taste-os-db-url" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "spotify-outputs",
+          "containerPath": "/app/outputs",
+          "readOnly": false
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/spotify-taste-os-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python - <<'PY'\nimport os,sys,urllib.request\nport=os.getenv('PORT','8010')\nurl=f'http://127.0.0.1:{port}/readyz'\nr=urllib.request.urlopen(url,timeout=3)\nsys.exit(0 if r.status==200 else 1)\nPY"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "spotify-outputs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-CHANGE_ME",
+        "rootDirectory": "/"
+      }
+    }
+  ]
+}

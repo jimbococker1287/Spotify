@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spotify-predict-config
+data:
+  SERVICE_MODE: predict
+  RUN_DIR: /app/outputs/deployments/registry/channels/stable
+  REQUEST_RATE_LIMIT: "240"
+  RATE_LIMIT_BACKEND: redis
+  REDIS_URL: redis://spotify-redis:6379/0
+  OTEL_ENABLED: "1"
+  AUTH_MODE: token_or_jwt
+  AUTH_SCOPE: all
+  JWT_ALGORITHMS: RS256
+  JWT_ISSUER: https://issuer.example.com/
+  JWT_AUDIENCE: spotify-predict
+  JWT_REQUIRED_SCOPES: predict:write

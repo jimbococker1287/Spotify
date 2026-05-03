@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spotify-taste-os-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spotify-taste-os-api
+  template:
+    metadata:
+      labels:
+        app: spotify-taste-os-api
+    spec:
+      containers:
+        - name: spotify-taste-os-api
+          image: ghcr.io/your-org/spotify-serving-api:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: spotify-taste-os-config
+            - secretRef:
+                name: spotify-taste-os-secret
+          ports:
+            - containerPort: 8010
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: outputs
+              mountPath: /app/outputs
+      volumes:
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: spotify-outputs-pvc

@@ -131,3 +131,29 @@ def test_taste_os_state_store_migrates_legacy_files(tmp_path: Path) -> None:
     assert feedback_store["event_count"] == 1
     assert store.recent_feedback(limit=1)[0]["artist_name"] == "Artist D"
     assert store.recent_sessions(limit=1)[0]["session_id"] == "taste-os-seed"
+
+
+def test_taste_os_state_store_supports_database_url(tmp_path: Path) -> None:
+    db_path = tmp_path / "outputs" / "analysis" / "taste_os_service" / "state.sqlite3"
+    logger = logging.getLogger("spotify.test.taste_os_state.database_url")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    store = TasteOSStateStore(
+        db_path=None,
+        database_url=f"sqlite:///{db_path.as_posix()}",
+        logger=logger,
+    )
+
+    store.record_feedback(
+        timestamp="2026-05-02T12:30:00Z",
+        session_id="taste-os-url",
+        artist_name="Artist E",
+        signal="repeat",
+        notes=None,
+    )
+
+    health = store.health_payload()
+    assert health["backend"] == "sqlite"
+    assert health["reachable"] is True
+    assert store.feedback_store()["event_count"] == 1

@@ -87,6 +87,12 @@ def parse_taste_os_args() -> argparse.Namespace:
         default="",
         help="Optional SQLite path for durable Taste OS feedback/session state. Defaults under the output dir.",
     )
+    parser.add_argument(
+        "--state-db-url",
+        type=str,
+        default=os.getenv("TASTE_OS_DATABASE_URL", ""),
+        help="Optional SQLAlchemy database URL for durable Taste OS feedback/session state. Overrides --state-db when set.",
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8010, help="HTTP port.")
     parser.add_argument("--max-top-k", type=int, default=env_max_top_k, help="Maximum top_k value accepted by the API.")

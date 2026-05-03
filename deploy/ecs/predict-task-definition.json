@@ -1,0 +1,70 @@
+{
+  "family": "spotify-predict-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/spotifyTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/spotifyTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "spotify-predict-api",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/spotify-serving-api:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "SERVICE_MODE", "value": "predict" },
+        { "name": "RUN_DIR", "value": "/app/outputs/deployments/registry/channels/stable" },
+        { "name": "REQUEST_RATE_LIMIT", "value": "240" },
+        { "name": "RATE_LIMIT_BACKEND", "value": "redis" },
+        { "name": "REDIS_URL", "value": "redis://redis.internal:6379/0" },
+        { "name": "AUTH_MODE", "value": "token_or_jwt" },
+        { "name": "AUTH_SCOPE", "value": "all" },
+        { "name": "JWT_ALGORITHMS", "value": "RS256" },
+        { "name": "JWT_ISSUER", "value": "https://issuer.example.com/" },
+        { "name": "JWT_AUDIENCE", "value": "spotify-predict" },
+        { "name": "JWT_REQUIRED_SCOPES", "value": "predict:write" }
+      ],
+      "secrets": [
+        { "name": "AUTH_TOKEN", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:spotify/auth-token" },
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:spotify/jwt-secret" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "spotify-outputs",
+          "containerPath": "/app/outputs",
+          "readOnly": false
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/spotify-predict-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python - <<'PY'\nimport os,sys,urllib.request\nport=os.getenv('PORT','8000')\nurl=f'http://127.0.0.1:{port}/readyz'\nr=urllib.request.urlopen(url,timeout=3)\nsys.exit(0 if r.status==200 else 1)\nPY"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "spotify-outputs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-CHANGE_ME",
+        "rootDirectory": "/"
+      }
+    }
+  ]
+}

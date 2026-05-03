@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-import sqlite3
-from typing import Any, cast
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, create_engine, event, func, select, text
+from sqlalchemy.engine import Engine
 
 
-def _read_json_document(path: Path) -> dict[str, object]:
-    if not path.exists():
+def _read_json_document(path: Path | None) -> dict[str, object]:
+    if path is None or not path.exists():
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -17,8 +20,8 @@ def _read_json_document(path: Path) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _read_jsonl_rows(path: Path) -> list[dict[str, object]]:
-    if not path.exists():
+def _read_jsonl_rows(path: Path | None) -> list[dict[str, object]]:
+    if path is None or not path.exists():
         return []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -68,110 +71,168 @@ def _coerce_recent_artists(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _database_url_from_path(path: Path) -> str:
+    return f"sqlite:///{path.expanduser().resolve().as_posix()}"
+
+
+def _sqlite_path_from_database_url(database_url: str) -> Path | None:
+    parsed = urlsplit(database_url)
+    scheme = parsed.scheme.strip().lower()
+    if not scheme.startswith("sqlite"):
+        return None
+    if not parsed.path:
+        return None
+    return Path(parsed.path).expanduser()
+
+
+def _database_backend_name(database_url: str) -> str:
+    scheme = urlsplit(database_url).scheme.strip().lower()
+    if not scheme:
+        return "sqlite"
+    return scheme.split("+", 1)[0]
+
+
+def _redact_database_url(database_url: str) -> str:
+    if not database_url:
+        return ""
+    parts = urlsplit(database_url)
+    netloc = parts.netloc
+    if "@" in netloc:
+        auth, host = netloc.rsplit("@", 1)
+        user = auth.split(":", 1)[0].strip()
+        netloc = f"{user}:***@{host}" if user else f"***@{host}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 class TasteOSStateStore:
     def __init__(
         self,
         *,
-        db_path: Path,
+        db_path: Path | None = None,
         logger: logging.Logger,
+        database_url: str | None = None,
         legacy_feedback_memory_path: Path | None = None,
         legacy_feedback_event_log_path: Path | None = None,
         legacy_session_history_path: Path | None = None,
     ) -> None:
-        self.db_path = db_path.expanduser().resolve()
+        if db_path is None and not str(database_url or "").strip():
+            raise ValueError("TasteOSStateStore requires either db_path or database_url.")
+
         self.logger = logger
         self.legacy_feedback_memory_path = legacy_feedback_memory_path
         self.legacy_feedback_event_log_path = legacy_feedback_event_log_path
         self.legacy_session_history_path = legacy_session_history_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.db_path = db_path.expanduser().resolve() if db_path is not None else None
+        if self.db_path is not None:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        resolved_database_url = str(database_url or "").strip()
+        if not resolved_database_url:
+            assert self.db_path is not None
+            resolved_database_url = _database_url_from_path(self.db_path)
+        self.database_url = resolved_database_url
+        self.database_url_redacted = _redact_database_url(resolved_database_url)
+        self.backend_name = _database_backend_name(resolved_database_url)
+        if self.backend_name == "sqlite" and self.db_path is None:
+            sqlite_path = _sqlite_path_from_database_url(resolved_database_url)
+            if sqlite_path is not None:
+                sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+
+        connect_args: dict[str, object] = {}
+        if self.backend_name == "sqlite":
+            connect_args["check_same_thread"] = False
+
+        self.engine: Engine = create_engine(
+            resolved_database_url,
+            future=True,
+            pool_pre_ping=True,
+            connect_args=connect_args,
+        )
+
+        if self.backend_name == "sqlite":
+            @event.listens_for(self.engine, "connect")
+            def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA synchronous=NORMAL")
+                finally:
+                    cursor.close()
+
+        self.metadata = MetaData()
+        self.feedback_artist_stats = Table(
+            "feedback_artist_stats",
+            self.metadata,
+            Column("artist_key", String(512), primary_key=True),
+            Column("artist_name", String(512), nullable=False),
+            Column("like_count", Integer, nullable=False, default=0),
+            Column("repeat_count", Integer, nullable=False, default=0),
+            Column("skip_count", Integer, nullable=False, default=0),
+            Column("dislike_count", Integer, nullable=False, default=0),
+            Column("last_signal", String(64), nullable=False, default=""),
+            Column("last_session_id", String(256), nullable=False, default=""),
+            Column("updated_at", String(64), nullable=False, default=""),
+        )
+        self.feedback_events = Table(
+            "feedback_events",
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("timestamp", String(64), nullable=False),
+            Column("session_id", String(256), nullable=False),
+            Column("artist_name", String(512), nullable=False),
+            Column("signal", String(64), nullable=False),
+            Column("notes", Text, nullable=False, default=""),
+            Index("idx_feedback_events_timestamp", "timestamp"),
+        )
+        self.session_history = Table(
+            "session_history",
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("session_id", String(256), nullable=False, unique=True),
+            Column("created_at", String(64), nullable=False),
+            Column("mode", String(128), nullable=False, default=""),
+            Column("scenario", String(128), nullable=False, default=""),
+            Column("top_artist", String(512), nullable=False, default=""),
+            Column("adaptive_replans", Integer, nullable=False, default=0),
+            Column("safe_route_steps", Integer, nullable=False, default=0),
+            Column("effective_recent_artists_json", Text, nullable=False, default="[]"),
+            Column("used_feedback_memory", Integer, nullable=False, default=0),
+            Column("persisted", Integer, nullable=False, default=0),
+            Index("idx_session_history_created_at", "created_at"),
+        )
+
         self._initialize()
         self._migrate_legacy_if_needed()
         self.sync_legacy_snapshots()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _initialize(self) -> None:
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS feedback_artist_stats (
-                    artist_key TEXT PRIMARY KEY,
-                    artist_name TEXT NOT NULL,
-                    like_count INTEGER NOT NULL DEFAULT 0,
-                    repeat_count INTEGER NOT NULL DEFAULT 0,
-                    skip_count INTEGER NOT NULL DEFAULT 0,
-                    dislike_count INTEGER NOT NULL DEFAULT 0,
-                    last_signal TEXT NOT NULL DEFAULT '',
-                    last_session_id TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS feedback_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    artist_name TEXT NOT NULL,
-                    signal TEXT NOT NULL,
-                    notes TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS session_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    mode TEXT NOT NULL DEFAULT '',
-                    scenario TEXT NOT NULL DEFAULT '',
-                    top_artist TEXT NOT NULL DEFAULT '',
-                    adaptive_replans INTEGER NOT NULL DEFAULT 0,
-                    safe_route_steps INTEGER NOT NULL DEFAULT 0,
-                    effective_recent_artists_json TEXT NOT NULL DEFAULT '[]',
-                    used_feedback_memory INTEGER NOT NULL DEFAULT 0,
-                    persisted INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_feedback_events_timestamp ON feedback_events(timestamp DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_session_history_created_at ON session_history(created_at DESC)"
-            )
+        self.metadata.create_all(self.engine)
 
-    def _table_count(self, table_name: str) -> int:
-        with self._connect() as conn:
-            row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
-        return int((row["count"] if row is not None else 0) or 0)
+    def _table_count(self, table: Table) -> int:
+        with self.engine.connect() as conn:
+            count = conn.execute(select(func.count()).select_from(table)).scalar_one()
+        return int(count or 0)
 
     def _migrate_legacy_if_needed(self) -> None:
         has_state = any(
             (
-                self._table_count("feedback_artist_stats") > 0,
-                self._table_count("feedback_events") > 0,
-                self._table_count("session_history") > 0,
+                self._table_count(self.feedback_artist_stats) > 0,
+                self._table_count(self.feedback_events) > 0,
+                self._table_count(self.session_history) > 0,
             )
         )
         if has_state:
             return
 
         migrated = False
-        memory_rows = _read_json_document(self.legacy_feedback_memory_path) if self.legacy_feedback_memory_path else {}
-        event_rows = _read_jsonl_rows(self.legacy_feedback_event_log_path) if self.legacy_feedback_event_log_path else []
-        session_rows = _read_jsonl_rows(self.legacy_session_history_path) if self.legacy_session_history_path else []
+        memory_rows = _read_json_document(self.legacy_feedback_memory_path)
+        event_rows = _read_jsonl_rows(self.legacy_feedback_event_log_path)
+        session_rows = _read_jsonl_rows(self.legacy_session_history_path)
 
-        with self._connect() as conn:
+        with self.engine.begin() as conn:
             artists_obj = memory_rows.get("artists", {})
-            artists = cast(dict[str, object], artists_obj) if isinstance(artists_obj, dict) else {}
+            artists = artists_obj if isinstance(artists_obj, dict) else {}
             for raw_key, raw_stats in artists.items():
                 if not isinstance(raw_stats, dict):
                     continue
@@ -179,84 +240,101 @@ class TasteOSStateStore:
                 if not artist_name:
                     continue
                 conn.execute(
-                    """
-                    INSERT OR REPLACE INTO feedback_artist_stats (
-                        artist_key, artist_name, like_count, repeat_count, skip_count, dislike_count,
-                        last_signal, last_session_id, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        _artist_key(artist_name),
-                        artist_name,
-                        _coerce_int(raw_stats.get("like_count", 0)),
-                        _coerce_int(raw_stats.get("repeat_count", 0)),
-                        _coerce_int(raw_stats.get("skip_count", 0)),
-                        _coerce_int(raw_stats.get("dislike_count", 0)),
-                        str(raw_stats.get("last_signal", "")),
-                        str(raw_stats.get("last_session_id", "")),
-                        str(raw_stats.get("updated_at", "")),
-                    ),
+                    self.feedback_artist_stats.insert().values(
+                        artist_key=_artist_key(artist_name),
+                        artist_name=artist_name,
+                        like_count=_coerce_int(raw_stats.get("like_count", 0)),
+                        repeat_count=_coerce_int(raw_stats.get("repeat_count", 0)),
+                        skip_count=_coerce_int(raw_stats.get("skip_count", 0)),
+                        dislike_count=_coerce_int(raw_stats.get("dislike_count", 0)),
+                        last_signal=str(raw_stats.get("last_signal", "")),
+                        last_session_id=str(raw_stats.get("last_session_id", "")),
+                        updated_at=str(raw_stats.get("updated_at", "")),
+                    )
                 )
                 migrated = True
 
             for row in event_rows:
                 conn.execute(
-                    """
-                    INSERT INTO feedback_events (timestamp, session_id, artist_name, signal, notes)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(row.get("timestamp", "")),
-                        str(row.get("session_id", "")),
-                        str(row.get("artist_name", "")),
-                        str(row.get("signal", "")),
-                        str(row.get("notes", "")),
-                    ),
+                    self.feedback_events.insert().values(
+                        timestamp=str(row.get("timestamp", "")),
+                        session_id=str(row.get("session_id", "")),
+                        artist_name=str(row.get("artist_name", "")),
+                        signal=str(row.get("signal", "")),
+                        notes=str(row.get("notes", "")),
+                    )
                 )
                 migrated = True
 
             for row in session_rows:
                 conn.execute(
-                    """
-                    INSERT OR IGNORE INTO session_history (
-                        session_id, created_at, mode, scenario, top_artist, adaptive_replans,
-                        safe_route_steps, effective_recent_artists_json, used_feedback_memory, persisted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(row.get("session_id", "")),
-                        str(row.get("created_at", "")),
-                        str(row.get("mode", "")),
-                        str(row.get("scenario", "")),
-                        str(row.get("top_artist", "")),
-                        _coerce_int(row.get("adaptive_replans", 0)),
-                        _coerce_int(row.get("safe_route_steps", 0)),
-                        json.dumps(_coerce_recent_artists(row.get("effective_recent_artists"))),
-                        1 if bool(row.get("used_feedback_memory")) else 0,
-                        1 if bool(row.get("persisted")) else 0,
-                    ),
+                    self.session_history.insert().values(
+                        session_id=str(row.get("session_id", "")),
+                        created_at=str(row.get("created_at", "")),
+                        mode=str(row.get("mode", "")),
+                        scenario=str(row.get("scenario", "")),
+                        top_artist=str(row.get("top_artist", "")),
+                        adaptive_replans=_coerce_int(row.get("adaptive_replans", 0)),
+                        safe_route_steps=_coerce_int(row.get("safe_route_steps", 0)),
+                        effective_recent_artists_json=json.dumps(_coerce_recent_artists(row.get("effective_recent_artists"))),
+                        used_feedback_memory=1 if bool(row.get("used_feedback_memory")) else 0,
+                        persisted=1 if bool(row.get("persisted")) else 0,
+                    )
                 )
                 migrated = True
 
         if migrated:
-            self.logger.info("Migrated legacy Taste OS state into %s", self.db_path)
+            self.logger.info("Migrated legacy Taste OS state into %s", self.database_url_redacted)
+
+    def ping(self) -> bool:
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            self.logger.exception("Taste OS state store ping failed")
+            return False
+
+    def health_payload(self) -> dict[str, object]:
+        return {
+            "backend": self.backend_name,
+            "database_url": self.database_url_redacted,
+            "db_path": str(self.db_path) if self.db_path is not None else "",
+            "legacy_snapshot_export": any(
+                path is not None
+                for path in (
+                    self.legacy_feedback_memory_path,
+                    self.legacy_feedback_event_log_path,
+                    self.legacy_session_history_path,
+                )
+            ),
+            "reachable": self.ping(),
+        }
 
     def feedback_store(self) -> dict[str, object]:
-        with self._connect() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT artist_key, artist_name, like_count, repeat_count, skip_count, dislike_count,
-                       last_signal, last_session_id, updated_at
-                FROM feedback_artist_stats
-                ORDER BY updated_at DESC, artist_name ASC
-                """
-            ).fetchall()
+                select(
+                    self.feedback_artist_stats.c.artist_key,
+                    self.feedback_artist_stats.c.artist_name,
+                    self.feedback_artist_stats.c.like_count,
+                    self.feedback_artist_stats.c.repeat_count,
+                    self.feedback_artist_stats.c.skip_count,
+                    self.feedback_artist_stats.c.dislike_count,
+                    self.feedback_artist_stats.c.last_signal,
+                    self.feedback_artist_stats.c.last_session_id,
+                    self.feedback_artist_stats.c.updated_at,
+                ).order_by(
+                    self.feedback_artist_stats.c.updated_at.desc(),
+                    self.feedback_artist_stats.c.artist_name.asc(),
+                )
+            ).mappings().all()
             summary = conn.execute(
-                """
-                SELECT COUNT(*) AS event_count, COALESCE(MAX(timestamp), '') AS updated_at
-                FROM feedback_events
-                """
-            ).fetchone()
+                select(
+                    func.count().label("event_count"),
+                    func.coalesce(func.max(self.feedback_events.c.timestamp), "").label("updated_at"),
+                ).select_from(self.feedback_events)
+            ).mappings().one()
 
         artists: dict[str, dict[str, object]] = {}
         for row in rows:
@@ -273,23 +351,25 @@ class TasteOSStateStore:
             }
         return {
             "artists": artists,
-            "event_count": int((summary["event_count"] if summary is not None else 0) or 0),
-            "updated_at": str((summary["updated_at"] if summary is not None else "") or ""),
+            "event_count": int(summary["event_count"] or 0),
+            "updated_at": str(summary["updated_at"] or ""),
         }
 
     def recent_feedback(self, *, limit: int) -> list[dict[str, object]]:
         if limit <= 0:
             return []
-        with self._connect() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT timestamp, session_id, artist_name, signal, notes
-                FROM feedback_events
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall()
+                select(
+                    self.feedback_events.c.timestamp,
+                    self.feedback_events.c.session_id,
+                    self.feedback_events.c.artist_name,
+                    self.feedback_events.c.signal,
+                    self.feedback_events.c.notes,
+                )
+                .order_by(self.feedback_events.c.id.desc())
+                .limit(int(limit))
+            ).mappings().all()
         return [
             {
                 "timestamp": str(row["timestamp"] or ""),
@@ -304,17 +384,23 @@ class TasteOSStateStore:
     def recent_sessions(self, *, limit: int) -> list[dict[str, object]]:
         if limit <= 0:
             return []
-        with self._connect() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT session_id, created_at, mode, scenario, top_artist, adaptive_replans,
-                       safe_route_steps, effective_recent_artists_json, used_feedback_memory, persisted
-                FROM session_history
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall()
+                select(
+                    self.session_history.c.session_id,
+                    self.session_history.c.created_at,
+                    self.session_history.c.mode,
+                    self.session_history.c.scenario,
+                    self.session_history.c.top_artist,
+                    self.session_history.c.adaptive_replans,
+                    self.session_history.c.safe_route_steps,
+                    self.session_history.c.effective_recent_artists_json,
+                    self.session_history.c.used_feedback_memory,
+                    self.session_history.c.persisted,
+                )
+                .order_by(self.session_history.c.id.desc())
+                .limit(int(limit))
+            ).mappings().all()
         result: list[dict[str, object]] = []
         for row in rows:
             try:
@@ -350,28 +436,24 @@ class TasteOSStateStore:
         normalized_signal = str(signal).strip().lower()
         counter_name = f"{normalized_signal}_count"
         artist_row_key = _artist_key(normalized_artist_name)
-        with self._connect() as conn:
+        with self.engine.begin() as conn:
             conn.execute(
-                """
-                INSERT INTO feedback_events (timestamp, session_id, artist_name, signal, notes)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    str(timestamp),
-                    str(session_id),
-                    normalized_artist_name,
-                    normalized_signal,
-                    str(notes or ""),
-                ),
+                self.feedback_events.insert().values(
+                    timestamp=str(timestamp),
+                    session_id=str(session_id),
+                    artist_name=normalized_artist_name,
+                    signal=normalized_signal,
+                    notes=str(notes or ""),
+                )
             )
             row = conn.execute(
-                """
-                SELECT like_count, repeat_count, skip_count, dislike_count
-                FROM feedback_artist_stats
-                WHERE artist_key = ?
-                """,
-                (artist_row_key,),
-            ).fetchone()
+                select(
+                    self.feedback_artist_stats.c.like_count,
+                    self.feedback_artist_stats.c.repeat_count,
+                    self.feedback_artist_stats.c.skip_count,
+                    self.feedback_artist_stats.c.dislike_count,
+                ).where(self.feedback_artist_stats.c.artist_key == artist_row_key)
+            ).mappings().first()
             counts = {
                 "like_count": int((row["like_count"] if row is not None else 0) or 0),
                 "repeat_count": int((row["repeat_count"] if row is not None else 0) or 0),
@@ -379,34 +461,29 @@ class TasteOSStateStore:
                 "dislike_count": int((row["dislike_count"] if row is not None else 0) or 0),
             }
             counts[counter_name] = int(counts.get(counter_name, 0)) + 1
-            conn.execute(
-                """
-                INSERT INTO feedback_artist_stats (
-                    artist_key, artist_name, like_count, repeat_count, skip_count, dislike_count,
-                    last_signal, last_session_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(artist_key) DO UPDATE SET
-                    artist_name=excluded.artist_name,
-                    like_count=excluded.like_count,
-                    repeat_count=excluded.repeat_count,
-                    skip_count=excluded.skip_count,
-                    dislike_count=excluded.dislike_count,
-                    last_signal=excluded.last_signal,
-                    last_session_id=excluded.last_session_id,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    artist_row_key,
-                    normalized_artist_name,
-                    int(counts["like_count"]),
-                    int(counts["repeat_count"]),
-                    int(counts["skip_count"]),
-                    int(counts["dislike_count"]),
-                    normalized_signal,
-                    str(session_id),
-                    str(timestamp),
-                ),
-            )
+            values = {
+                "artist_name": normalized_artist_name,
+                "like_count": int(counts["like_count"]),
+                "repeat_count": int(counts["repeat_count"]),
+                "skip_count": int(counts["skip_count"]),
+                "dislike_count": int(counts["dislike_count"]),
+                "last_signal": normalized_signal,
+                "last_session_id": str(session_id),
+                "updated_at": str(timestamp),
+            }
+            if row is None:
+                conn.execute(
+                    self.feedback_artist_stats.insert().values(
+                        artist_key=artist_row_key,
+                        **values,
+                    )
+                )
+            else:
+                conn.execute(
+                    self.feedback_artist_stats.update()
+                    .where(self.feedback_artist_stats.c.artist_key == artist_row_key)
+                    .values(**values)
+                )
         self.sync_legacy_snapshots()
         return {
             "timestamp": str(timestamp),
@@ -417,27 +494,38 @@ class TasteOSStateStore:
         }
 
     def record_session_history(self, row: dict[str, object]) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO session_history (
-                    session_id, created_at, mode, scenario, top_artist, adaptive_replans,
-                    safe_route_steps, effective_recent_artists_json, used_feedback_memory, persisted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(row.get("session_id", "")),
-                    str(row.get("created_at", "")),
-                    str(row.get("mode", "")),
-                    str(row.get("scenario", "")),
-                    str(row.get("top_artist", "")),
-                    _coerce_int(row.get("adaptive_replans", 0)),
-                    _coerce_int(row.get("safe_route_steps", 0)),
-                    json.dumps(_coerce_recent_artists(row.get("effective_recent_artists")), sort_keys=True),
-                    1 if bool(row.get("used_feedback_memory")) else 0,
-                    1 if bool(row.get("persisted")) else 0,
-                ),
-            )
+        session_id = str(row.get("session_id", ""))
+        values = {
+            "created_at": str(row.get("created_at", "")),
+            "mode": str(row.get("mode", "")),
+            "scenario": str(row.get("scenario", "")),
+            "top_artist": str(row.get("top_artist", "")),
+            "adaptive_replans": _coerce_int(row.get("adaptive_replans", 0)),
+            "safe_route_steps": _coerce_int(row.get("safe_route_steps", 0)),
+            "effective_recent_artists_json": json.dumps(
+                _coerce_recent_artists(row.get("effective_recent_artists")),
+                sort_keys=True,
+            ),
+            "used_feedback_memory": 1 if bool(row.get("used_feedback_memory")) else 0,
+            "persisted": 1 if bool(row.get("persisted")) else 0,
+        }
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(self.session_history.c.id).where(self.session_history.c.session_id == session_id)
+            ).scalar_one_or_none()
+            if existing is None:
+                conn.execute(
+                    self.session_history.insert().values(
+                        session_id=session_id,
+                        **values,
+                    )
+                )
+            else:
+                conn.execute(
+                    self.session_history.update()
+                    .where(self.session_history.c.session_id == session_id)
+                    .values(**values)
+                )
         self.sync_legacy_snapshots()
 
     def sync_legacy_snapshots(self) -> None:

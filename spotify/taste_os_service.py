@@ -17,6 +17,7 @@ from .env import load_local_env
 from .multimodal import MultimodalArtistSpace
 from .predict_next import (
     PredictionInputContext,
+    _prediction_serving_bundle_path,
     _prepare_inputs,
     load_prediction_input_context,
     prediction_source_signature,
@@ -100,6 +101,7 @@ class TasteOSService:
         auth_token: str | None,
         logger: logging.Logger,
         state_db_path: Path | None = None,
+        state_database_url: str | None = None,
         require_serving_bundle: bool = False,
         digital_twin: ListenerDigitalTwinArtifact | None = None,
         multimodal_space: MultimodalArtistSpace | None = None,
@@ -121,10 +123,12 @@ class TasteOSService:
         self.feedback_event_log_path = self.output_dir / "feedback_events.jsonl"
         self.session_history_path = self.output_dir / "session_history.jsonl"
         self.state_db_path = (state_db_path or (self.output_dir / "taste_os_state.sqlite3")).expanduser().resolve()
+        self.state_database_url = str(state_database_url or "").strip() or None
         self.require_serving_bundle = bool(require_serving_bundle)
         self.state_store = TasteOSStateStore(
-            db_path=self.state_db_path,
+            db_path=(None if self.state_database_url else self.state_db_path),
             logger=logger,
+            database_url=self.state_database_url,
             legacy_feedback_memory_path=self.feedback_memory_path,
             legacy_feedback_event_log_path=self.feedback_event_log_path,
             legacy_session_history_path=self.session_history_path,
@@ -404,6 +408,8 @@ class TasteOSService:
         return candidate
 
     def health_payload(self) -> dict[str, object]:
+        bundle_path = _prediction_serving_bundle_path(self.run_dir, include_video=self.include_video)
+        state_health = self.state_store.health_payload()
         return {
             "status": "ok",
             "model_name": self.model_name,
@@ -411,10 +417,20 @@ class TasteOSService:
             "run_dir": str(self.run_dir),
             "output_dir": str(self.output_dir),
             "state_db_path": str(self.state_db_path),
+            "state_database_url": str(state_health.get("database_url", "")),
+            "state_backend": str(state_health.get("backend", "")),
+            "state_reachable": bool(state_health.get("reachable", False)),
             "max_top_k": self.max_top_k,
             "requires_auth": bool(self.auth_token),
             "data_dir_configured": bool(self.data_dir),
             "require_serving_bundle": self.require_serving_bundle,
+            "serving_bundle_path": str(bundle_path),
+            "serving_bundle_present": bundle_path.exists(),
+            "input_source_mode": (
+                "serving_bundle"
+                if bundle_path.exists()
+                else ("raw_history_fallback" if self.data_dir is not None else "bundle_required")
+            ),
             "mode_count": len(MODE_CONFIGS),
             "scenario_count": len(SCENARIOS),
         }
@@ -563,6 +579,7 @@ def main() -> int:
     data_dir = Path(args.data_dir).expanduser().resolve() if str(args.data_dir).strip() else None
     output_dir = Path(args.output_dir).expanduser().resolve()
     state_db_path = Path(args.state_db).expanduser().resolve() if str(args.state_db).strip() else None
+    state_database_url = str(getattr(args, "state_db_url", "") or "").strip() or None
     model_row = resolve_model_row(
         run_dir,
         explicit_model_name=args.model_name,
@@ -580,6 +597,7 @@ def main() -> int:
         auth_token=(str(args.auth_token).strip() if args.auth_token else None),
         logger=logger,
         state_db_path=state_db_path,
+        state_database_url=state_database_url,
         require_serving_bundle=bool(args.require_serving_bundle),
     )
     server = ThreadingHTTPServer((str(args.host), int(args.port)), _build_handler(service))

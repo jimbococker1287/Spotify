@@ -17,6 +17,7 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-serve-api"] == "spotify.service_api:main"
     assert scripts["spotify-predict-api"] == "spotify.service_api:main_predict"
     assert scripts["spotify-taste-os-api"] == "spotify.service_api:main_taste_os"
+    assert scripts["spotify-deploy-release"] == "spotify.deployment_registry:main"
     assert scripts["spotify-public-insights"] == "spotify.public_insights:main"
     assert scripts["spotify-compare-public"] == "spotify.compare_public:main"
     assert scripts["spotify-control-room"] == "spotify.control_room:main"

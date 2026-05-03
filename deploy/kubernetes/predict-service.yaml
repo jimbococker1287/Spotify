@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spotify-predict-api
+spec:
+  selector:
+    app: spotify-predict-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

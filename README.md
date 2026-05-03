@@ -37,8 +37,9 @@ The current system already includes:
 - Prediction CLI for serving top-k next-artist recommendations
 - Conformal uncertainty diagnostics with abstaining prediction support
 - Materialized serving bundles for bundle-only online inference
-- Production-style ASGI APIs with versioned routes, request IDs, rate limiting, and metrics
-- Durable SQLite-backed Taste OS feedback and session state
+- Production-style ASGI APIs with versioned routes, request IDs, readiness probes, Prometheus-style metrics, and OpenTelemetry-friendly trace IDs
+- Durable SQL-backed Taste OS feedback and session state with local SQLite and SQLAlchemy database URL support
+- Deployment registry channels for stable/canary rollout metadata and release packaging
 
 ## Product Direction
 
@@ -566,7 +567,7 @@ That service exposes a browser UI at `GET /taste-os`, plus:
 - `POST /taste-os/session`
 - `POST /taste-os/feedback`
 
-It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now stores feedback/session state in `taste_os_state.sqlite3` under the same output directory. The older JSON/JSONL files are still exported as compatibility snapshots.
+It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now stores feedback/session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
 
 For the production-style ASGI surface with versioned endpoints, request IDs, rate limiting, and metrics:
 
@@ -582,11 +583,20 @@ python -m spotify.service_api \
 The ASGI surface adds:
 
 - `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
 - `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
 - `GET /v1/taste-os/catalog`
 - `GET /v1/taste-os/history`
 - `POST /v1/taste-os/session`
 - `POST /v1/taste-os/feedback`
+
+Useful production flags:
+
+- `--state-db-url postgresql+psycopg://...` to move Taste OS state onto a shared SQL backend
+- `--rate-limit-backend redis --redis-url redis://...` for multi-instance request limiting
+- `--disable-otel` to turn off request spans / trace IDs when needed
 
 The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
@@ -680,17 +690,73 @@ python -m spotify.service_api \
 That API exposes:
 
 - `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
 - `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
 - `POST /v1/predict`
 - OpenAPI at `GET /openapi.json`
 
-Optional token auth + request limits:
+Optional auth + request limits:
 
 - Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
+- Set `--auth-mode jwt` with `--jwks-url https://...` or `--jwt-secret ...` for JWT validation.
+- Use `--jwt-issuer`, `--jwt-audience`, and `--jwt-required-scopes` to make the API OAuth-provider-ready when your gateway or IdP issues JWT bearer tokens.
+- Use `--auth-scope all` to protect reads as well as mutations.
 - Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
 - Errors return structured payloads: `{"error":{"code","message","details"}}`.
 - When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
-- The ASGI surface adds `X-Request-ID` headers, route-level telemetry at `/metrics`, and in-process request-rate limiting.
+- The ASGI surface adds `X-Request-ID` and `X-Trace-ID` headers, route-level telemetry at `/metrics`, Prometheus exposition at `/metrics/prometheus`, and shared Redis-backed rate limiting when configured.
+
+## Deployment Registry
+
+Publish a promoted run into the deployment registry and activate the `stable` channel:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable
+```
+
+That writes:
+
+- `outputs/deployments/registry/releases/<run_id>/deployment_release.json`
+- `outputs/deployments/registry/channels/<channel>/deployment_channel.json`
+- `outputs/deployments/registry/channels/<channel>/alias.json`
+
+Because the channel directory exports a normal `alias.json`, the serving APIs can point directly at it:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --require-serving-bundle
+```
+
+If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
+
+To publish the copied release artifacts directly to a remote target, add `--publish-artifacts`. Supported targets are:
+
+- `file:///shared/releases`
+- `s3://bucket/prefix`
+- `gs://bucket/prefix`
+
+Example:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable \
+  --artifact-base-uri s3://spotify-prod-releases/runs \
+  --publish-artifacts
+```
+
+Deployment templates live in:
+
+- `deploy/kubernetes/`
+- `deploy/ecs/`
 
 ## Public Comparison
 
@@ -927,7 +993,17 @@ docker run --rm -p 8010:8010 \
   spotify-serving-api
 ```
 
-The container includes a `/health` Docker healthcheck.
+The container includes a `/readyz` Docker healthcheck.
+
+New container envs:
+
+- `TASTE_OS_DATABASE_URL` to use a shared SQL backend for Taste OS state
+- `RATE_LIMIT_BACKEND=redis` plus `REDIS_URL=redis://...` for shared rate limiting
+- `AUTH_MODE=token|jwt|token_or_jwt|off`
+- `AUTH_SCOPE=mutations|all`
+- `JWT_SECRET=...` or `JWKS_URL=https://...`
+- `JWT_ISSUER=...`, `JWT_AUDIENCE=...`, `JWT_REQUIRED_SCOPES=...`
+- `OTEL_ENABLED=0` to disable request spans / trace IDs
 
 ## CI
 
@@ -963,6 +1039,12 @@ Or via Make:
 
 ```bash
 make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
+```
+
+Publish a promoted run into the deployment registry:
+
+```bash
+make deploy-release EXTRA_ARGS='--run-dir outputs/runs/<run_id> --registry-root outputs/deployments/registry --channel stable'
 ```
 
 Keep the outward-facing package current after Day 90:

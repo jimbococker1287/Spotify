@@ -18,6 +18,7 @@ from .champion_alias import resolve_prediction_run_dir
 from .env import load_local_env
 from .predict_next import (
     PredictionInputContext,
+    _prediction_serving_bundle_path,
     _prepare_inputs,
     load_prediction_input_context,
     prediction_source_signature,
@@ -428,6 +429,7 @@ class PredictionService:
             return context
 
     def health_payload(self) -> dict[str, object]:
+        bundle_path = _prediction_serving_bundle_path(self.run_dir, include_video=self.include_video)
         return {
             "status": "ok",
             "model_name": self.model_name,
@@ -438,6 +440,13 @@ class PredictionService:
             "conformal_enabled": bool(self._conformal_calibration),
             "data_dir_configured": bool(self.data_dir),
             "require_serving_bundle": self.require_serving_bundle,
+            "serving_bundle_path": str(bundle_path),
+            "serving_bundle_present": bundle_path.exists(),
+            "input_source_mode": (
+                "serving_bundle"
+                if bundle_path.exists()
+                else ("raw_history_fallback" if self.data_dir is not None else "bundle_required")
+            ),
         }
 
     def predict(

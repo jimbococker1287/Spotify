@@ -13,6 +13,7 @@ from spotify.multimodal import MultimodalArtistSpace
 from spotify.predict_next import PredictionInputContext
 from spotify.predict_service import PredictionService
 from spotify.safe_policy import SafeBanditPolicyArtifact
+from spotify.service_auth import ApiAuthenticator, ApiAuthSettings
 from spotify.service_api import create_prediction_app, create_taste_os_app
 import spotify.taste_os_service as taste_os_service
 from spotify.taste_os_service import TasteOSService
@@ -125,6 +126,8 @@ def test_prediction_api_supports_auth_metrics_and_rate_limits(tmp_path: Path, mo
         json.dumps({"artist_labels": ["A", "B", "C"], "sequence_length": 2}),
         encoding="utf-8",
     )
+    (run_dir / "analysis" / "serving").mkdir(parents=True)
+    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
 
     monkeypatch.setattr(
         predict_service,
@@ -168,6 +171,10 @@ def test_prediction_api_supports_auth_metrics_and_rate_limits(tmp_path: Path, mo
     assert authorized.headers["x-request-id"]
     assert authorized.json()["predictions"][0]["artist_name"] == "A"
 
+    ready = client.get("/v1/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+
     limited = client.post(
         "/v1/predict",
         json={"top_k": 2},
@@ -178,6 +185,112 @@ def test_prediction_api_supports_auth_metrics_and_rate_limits(tmp_path: Path, mo
     metrics = client.get("/v1/metrics")
     assert metrics.status_code == 200
     assert metrics.json()["telemetry"]["total_request_count"] >= 3
+    assert metrics.json()["rate_limit_backend"] == "memory"
+    assert metrics.json()["auth"]["enabled"] is True
+    assert metrics.json()["auth"]["mode"] == "token"
+
+    prometheus = client.get("/v1/metrics/prometheus")
+    assert prometheus.status_code == 200
+    assert "spotify_service_request_total" in prometheus.text
+
+
+def test_prediction_api_supports_jwt_auth_with_scope_checks(tmp_path: Path, monkeypatch) -> None:
+    import jwt
+    jwt_secret = "jwt-secret-for-tests-with-32-bytes"
+
+    run_dir = tmp_path / "outputs" / "runs" / "run_a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps({"artist_labels": ["A", "B", "C"], "sequence_length": 2}),
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "serving").mkdir(parents=True)
+    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
+
+    monkeypatch.setattr(
+        predict_service,
+        "resolve_model_row",
+        lambda run_dir, explicit_model_name, alias_model_name: {"model_name": "dummy", "model_type": "classical"},
+    )
+    monkeypatch.setattr(predict_service, "load_predictor", lambda run_dir, row, artist_labels: _PredictStub())
+    monkeypatch.setattr(
+        predict_service,
+        "load_prediction_input_context",
+        lambda run_dir, data_dir, include_video, logger, **kwargs: _prediction_context(),
+    )
+
+    logger = logging.getLogger("spotify.test.service_api.predict.jwt")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    service = PredictionService(
+        run_dir=run_dir,
+        data_dir=None,
+        model_name="dummy",
+        include_video=False,
+        max_top_k=5,
+        auth_token=None,
+        logger=logger,
+        require_serving_bundle=False,
+    )
+    authenticator = ApiAuthenticator(
+        settings=ApiAuthSettings.from_values(
+            mode="jwt",
+            scope="all",
+            legacy_token=None,
+            jwt_secret=jwt_secret,
+            jwks_url=None,
+            jwt_algorithms="HS256",
+            jwt_issuer="https://issuer.spotify.test",
+            jwt_audience="spotify-predict",
+            jwt_required_scopes="predict:write",
+            jwt_leeway_seconds=0,
+        ),
+        logger=logger,
+    )
+    app = create_prediction_app(service=service, logger=logger, request_rate_limit=10, authenticator=authenticator)
+    client = TestClient(app)
+
+    missing_scope = jwt.encode(
+        {
+            "sub": "listener-123",
+            "iss": "https://issuer.spotify.test",
+            "aud": "spotify-predict",
+            "scope": "taste-os:write",
+        },
+        jwt_secret,
+        algorithm="HS256",
+    )
+    denied = client.post(
+        "/v1/predict",
+        json={"top_k": 2},
+        headers={"Authorization": f"Bearer {missing_scope}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "insufficient_scope"
+
+    allowed_token = jwt.encode(
+        {
+            "sub": "listener-123",
+            "iss": "https://issuer.spotify.test",
+            "aud": "spotify-predict",
+            "scope": "predict:write taste-os:write",
+        },
+        jwt_secret,
+        algorithm="HS256",
+    )
+    allowed = client.post(
+        "/v1/predict",
+        json={"top_k": 2},
+        headers={"Authorization": f"Bearer {allowed_token}"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers["x-request-id"]
+
+    metrics = client.get("/v1/metrics")
+    assert metrics.status_code == 200
+    assert metrics.json()["auth"]["mode"] == "jwt"
+    assert metrics.json()["auth"]["jwt_required_scopes"] == ["predict:write"]
 
 
 def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeypatch) -> None:
@@ -187,6 +300,8 @@ def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeyp
         json.dumps({"artist_labels": ["Artist A", "Artist B", "Artist C", "Artist D"], "sequence_length": 2}),
         encoding="utf-8",
     )
+    (run_dir / "analysis" / "serving").mkdir(parents=True)
+    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
 
     monkeypatch.setattr(
         taste_os_service,
@@ -213,7 +328,10 @@ def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeyp
         max_top_k=5,
         auth_token=None,
         logger=logger,
-        state_db_path=tmp_path / "outputs" / "analysis" / "taste_os_service" / "taste_os_state.sqlite3",
+        state_db_path=None,
+        state_database_url=(
+            f"sqlite:///{(tmp_path / 'outputs' / 'analysis' / 'taste_os_service' / 'taste_os_state.sqlite3').as_posix()}"
+        ),
         require_serving_bundle=False,
         digital_twin=_twin(),
         multimodal_space=_space(),
@@ -248,3 +366,104 @@ def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeyp
     metrics = client.get("/metrics")
     assert metrics.status_code == 200
     assert metrics.json()["telemetry"]["total_request_count"] >= 4
+    assert metrics.json()["health"]["state_backend"] == "sqlite"
+
+    ready = client.get("/v1/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+
+    prometheus = client.get("/v1/metrics/prometheus")
+    assert prometheus.status_code == 200
+    assert "spotify_service_state_backend_reachable" in prometheus.text
+
+
+def test_prediction_api_supports_redis_rate_limit_backend(tmp_path: Path, monkeypatch) -> None:
+    run_dir = tmp_path / "outputs" / "runs" / "run_a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps({"artist_labels": ["A", "B", "C"], "sequence_length": 2}),
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "serving").mkdir(parents=True)
+    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
+
+    monkeypatch.setattr(
+        predict_service,
+        "resolve_model_row",
+        lambda run_dir, explicit_model_name, alias_model_name: {"model_name": "dummy", "model_type": "classical"},
+    )
+    monkeypatch.setattr(predict_service, "load_predictor", lambda run_dir, row, artist_labels: _PredictStub())
+    monkeypatch.setattr(
+        predict_service,
+        "load_prediction_input_context",
+        lambda run_dir, data_dir, include_video, logger, **kwargs: _prediction_context(),
+    )
+
+    class _FakeRedisPipeline:
+        def __init__(self, counts: dict[str, int]) -> None:
+            self._counts = counts
+            self._key = ""
+
+        def incr(self, key: str) -> "_FakeRedisPipeline":
+            self._key = key
+            return self
+
+        def expire(self, key: str, ttl: int) -> "_FakeRedisPipeline":
+            _ = (key, ttl)
+            return self
+
+        def execute(self) -> list[object]:
+            count = int(self._counts.get(self._key, 0)) + 1
+            self._counts[self._key] = count
+            return [count, True]
+
+    class _FakeRedisClient:
+        def __init__(self) -> None:
+            self.counts: dict[str, int] = {}
+
+        def pipeline(self) -> _FakeRedisPipeline:
+            return _FakeRedisPipeline(self.counts)
+
+    fake_client = _FakeRedisClient()
+    monkeypatch.setattr("redis.Redis.from_url", lambda url: fake_client)
+
+    logger = logging.getLogger("spotify.test.service_api.predict.redis")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    service = PredictionService(
+        run_dir=run_dir,
+        data_dir=None,
+        model_name="dummy",
+        include_video=False,
+        max_top_k=5,
+        auth_token="token-123",
+        logger=logger,
+        require_serving_bundle=False,
+    )
+    app = create_prediction_app(
+        service=service,
+        logger=logger,
+        request_rate_limit=1,
+        rate_limit_backend="redis",
+        redis_url="redis://fake",
+    )
+    client = TestClient(app)
+
+    first = client.post(
+        "/v1/predict",
+        json={"top_k": 2},
+        headers={"Authorization": "Bearer token-123"},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/v1/predict",
+        json={"top_k": 2},
+        headers={"Authorization": "Bearer token-123"},
+    )
+    assert second.status_code == 429
+
+    metrics = client.get("/v1/metrics")
+    assert metrics.status_code == 200
+    assert metrics.json()["rate_limit_backend"] == "redis"
