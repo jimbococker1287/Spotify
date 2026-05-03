@@ -5,11 +5,8 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from .run_artifacts import collect_run_analysis_rows
-from .run_artifacts import collect_run_manifests
-from .run_artifacts import collect_run_results
-from .run_artifacts import rows_to_frame
-from .run_artifacts import safe_read_csv as _safe_read_csv
+from .analytics_warehouse import build_analytics_warehouse_bundle
+from .analytics_warehouse import write_analytics_warehouse
 
 
 def _replace_table(con, table_name: str, df: pd.DataFrame) -> None:
@@ -19,18 +16,6 @@ def _replace_table(con, table_name: str, df: pd.DataFrame) -> None:
         con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM {relation_name}")
     else:
         con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT CAST(NULL AS VARCHAR) AS _empty WHERE 1=0")
-
-
-def _collect_run_manifests(output_dir: Path) -> pd.DataFrame:
-    return rows_to_frame(collect_run_manifests(output_dir))
-
-
-def _collect_run_results(output_dir: Path) -> pd.DataFrame:
-    return rows_to_frame(collect_run_results(output_dir))
-
-
-def _collect_run_analysis_summaries(output_dir: Path, filename: str) -> pd.DataFrame:
-    return rows_to_frame(collect_run_analysis_rows(output_dir, filename))
 
 
 def _duckdb_retry_policy() -> tuple[int, float]:
@@ -69,6 +54,20 @@ def refresh_analytics_database(
     logger,
     raw_df: pd.DataFrame | None = None,
 ) -> Path | None:
+    if raw_df is None:
+        from .data import load_streaming_history
+
+        raw_df = load_streaming_history(data_dir, include_video=include_video, logger=logger)
+
+    warehouse_bundle = build_analytics_warehouse_bundle(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=include_video,
+        logger=logger,
+        raw_df=raw_df,
+    )
+    write_analytics_warehouse(warehouse_bundle, logger=logger)
+
     try:
         import duckdb
     except Exception as exc:
@@ -79,20 +78,6 @@ def refresh_analytics_database(
     analytics_dir.mkdir(parents=True, exist_ok=True)
     db_path = analytics_dir / "spotify_analytics.duckdb"
     fallback_db_path = analytics_dir / "spotify_analytics.refresh.duckdb"
-
-    if raw_df is None:
-        from .data import load_streaming_history
-
-        raw_df = load_streaming_history(data_dir, include_video=include_video, logger=logger)
-    experiment_history = _safe_read_csv(output_dir / "history" / "experiment_history.csv")
-    backtest_history = _safe_read_csv(output_dir / "history" / "backtest_history.csv")
-    benchmark_history = _safe_read_csv(output_dir / "history" / "benchmark_history.csv")
-    optuna_history = _safe_read_csv(output_dir / "history" / "optuna_history.csv")
-    run_manifests = _collect_run_manifests(output_dir)
-    run_results = _collect_run_results(output_dir)
-    robustness_summary = _collect_run_analysis_summaries(output_dir, "robustness_summary.json")
-    policy_summary = _collect_run_analysis_summaries(output_dir, "policy_simulation_summary.json")
-    moonshot_summary = _collect_run_analysis_summaries(output_dir, "moonshot_summary.json")
 
     retries, sleep_seconds = _duckdb_retry_policy()
     connected_path = db_path
@@ -124,18 +109,19 @@ def refresh_analytics_database(
             logger.warning("DuckDB analytics refresh skipped because fallback database creation failed: %s", fallback_exc)
             return None
     try:
-        _replace_table(con, "raw_streaming_history", raw_df)
-        _replace_table(con, "experiment_history", experiment_history)
-        _replace_table(con, "backtest_history", backtest_history)
-        _replace_table(con, "benchmark_history", benchmark_history)
-        _replace_table(con, "optuna_history", optuna_history)
-        _replace_table(con, "run_manifests", run_manifests)
-        _replace_table(con, "run_results", run_results)
-        _replace_table(con, "robustness_summary", robustness_summary)
-        _replace_table(con, "policy_summary", policy_summary)
-        _replace_table(con, "moonshot_summary", moonshot_summary)
+        for table_name, table_df in warehouse_bundle.tables().items():
+            _replace_table(con, table_name, table_df)
 
-        if {"run_id", "timestamp"}.issubset(set(run_manifests.columns)) and {"run_id"}.issubset(set(run_results.columns)):
+        run_manifests = warehouse_bundle.bronze["run_manifests"]
+        run_results = warehouse_bundle.bronze["run_results"]
+        experiment_history = warehouse_bundle.bronze["experiment_history"]
+        backtest_history = warehouse_bundle.bronze["backtest_history"]
+        benchmark_history = warehouse_bundle.bronze["benchmark_history"]
+        robustness_summary = warehouse_bundle.bronze["robustness_summary"]
+        policy_summary = warehouse_bundle.bronze["policy_summary"]
+        moonshot_summary = warehouse_bundle.bronze["moonshot_summary"]
+
+        if {"run_id", "run_timestamp"}.issubset(set(run_manifests.columns)) and {"run_id"}.issubset(set(run_results.columns)):
             con.execute(
                 """
                 CREATE OR REPLACE VIEW latest_run_results AS
@@ -144,7 +130,7 @@ def refresh_analytics_database(
                 JOIN (
                   SELECT run_id
                   FROM run_manifests
-                  ORDER BY timestamp DESC NULLS LAST, run_id DESC
+                  ORDER BY run_timestamp DESC NULLS LAST, run_id DESC
                   LIMIT 1
                 ) latest
                   ON rr.run_id = latest.run_id
@@ -200,11 +186,11 @@ def refresh_analytics_database(
         if {
             "run_id",
             "profile",
-            "timestamp",
-            "champion_gate.promoted",
-            "champion_gate.metric_source",
-            "champion_alias.model_name",
-            "champion_alias.model_type",
+            "run_timestamp",
+            "champion_gate_promoted",
+            "champion_gate_metric_source",
+            "champion_alias_model_name",
+            "champion_alias_model_type",
         }.issubset(set(run_manifests.columns)):
             con.execute(
                 """
@@ -212,13 +198,13 @@ def refresh_analytics_database(
                 SELECT
                   run_id,
                   profile,
-                  "timestamp",
-                  CAST("champion_gate.promoted" AS BOOLEAN) AS promoted,
-                  "champion_gate.metric_source" AS metric_source,
-                  "champion_alias.model_name" AS alias_model_name,
-                  "champion_alias.model_type" AS alias_model_type
+                  run_timestamp,
+                  CAST(champion_gate_promoted AS BOOLEAN) AS promoted,
+                  champion_gate_metric_source AS metric_source,
+                  champion_alias_model_name AS alias_model_name,
+                  champion_alias_model_type AS alias_model_type
                 FROM run_manifests
-                WHERE COALESCE(CAST("champion_gate.promoted" AS BOOLEAN), FALSE)
+                WHERE COALESCE(CAST(champion_gate_promoted AS BOOLEAN), FALSE)
                 """
             )
         if {"model_name", "max_top1_gap", "worst_segment", "worst_bucket", "run_id"}.issubset(set(robustness_summary.columns)):
@@ -292,6 +278,28 @@ def refresh_analytics_database(
                 LEFT JOIN run_manifests rm
                   ON ms.run_id = rm.run_id
                 ORDER BY digital_twin_test_auc DESC NULLS LAST, causal_test_auc_total DESC NULLS LAST
+                """
+            )
+        if {"latest_run_id", "ops_health_status", "operating_rhythm_status"}.issubset(
+            set(warehouse_bundle.gold["mart_ops_overview"].columns)
+        ):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW latest_ops_overview AS
+                SELECT *
+                FROM mart_ops_overview
+                """
+            )
+        if {"artist_name", "priority_now_count", "max_opportunity_score"}.issubset(
+            set(warehouse_bundle.gold["mart_creator_opportunities"].columns)
+        ):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW creator_priority_now AS
+                SELECT *
+                FROM mart_creator_opportunities
+                WHERE COALESCE(priority_now_count, 0) > 0
+                ORDER BY max_opportunity_score DESC NULLS LAST, priority_now_count DESC NULLS LAST
                 """
             )
     except Exception as exc:

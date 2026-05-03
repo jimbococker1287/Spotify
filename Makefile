@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release control-room-guard analytics-db athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence research-platform-lab athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -131,6 +131,21 @@ control-room-guard:
 
 analytics-db:
 	$(RUN_PY) scripts/build_analytics_db.py $(EXTRA_ARGS)
+
+analytics-warehouse:
+	$(RUN_PY) scripts/build_analytics_db.py --warehouse-only $(EXTRA_ARGS)
+
+listener-archetypes:
+	$(RUN_PY) -m spotify.listener_archetypes $(EXTRA_ARGS)
+
+quant-decision-lab:
+	$(RUN_PY) -m spotify.quant_decision_lab $(EXTRA_ARGS)
+
+creator-market-intelligence:
+	$(RUN_PY) -m spotify.creator_market_intelligence $(EXTRA_ARGS)
+
+research-platform-lab:
+	$(RUN_PY) -m spotify.research_platform_lab $(EXTRA_ARGS)
 
 athena-export:
 	PYTHONPATH=. $(RUN_PY) scripts/export_athena_bundle.py $(EXTRA_ARGS)

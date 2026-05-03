@@ -48,3 +48,47 @@ def test_ecs_task_definitions_exist_and_reference_registry_channel() -> None:
     assert "\"SERVICE_MODE\", \"value\": \"predict\"" in predict_task
     assert "/app/outputs/deployments/registry/channels/stable" in taste_os_task
     assert "\"SERVICE_MODE\", \"value\": \"taste-os\"" in taste_os_task
+
+
+def test_terraform_aws_baseline_exists_and_mentions_core_services() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    terraform_root = repo_root / "deploy" / "terraform" / "aws"
+
+    expected_files = [
+        "README.md",
+        "versions.tf",
+        "variables.tf",
+        "main.tf",
+        "outputs.tf",
+        "terraform.tfvars.example",
+        "terraform.tfvars.cheap-balanced.example",
+    ]
+    for filename in expected_files:
+        assert (terraform_root / filename).exists(), filename
+
+    main_tf = (terraform_root / "main.tf").read_text(encoding="utf-8")
+    assert 'resource "aws_ecs_cluster"' in main_tf
+    assert 'resource "aws_db_instance" "taste_os"' in main_tf
+    assert 'resource "aws_elasticache_cluster" "redis"' in main_tf
+    assert 'resource "aws_efs_file_system" "outputs"' in main_tf
+    assert 'resource "aws_lb" "main"' in main_tf
+
+
+def test_local_production_smoke_stack_exists() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    local_root = repo_root / "deploy" / "local"
+
+    expected_files = [
+        "README.md",
+        ".env.example",
+        "production-smoke.compose.yaml",
+    ]
+    for filename in expected_files:
+        assert (local_root / filename).exists(), filename
+
+    compose_text = (local_root / "production-smoke.compose.yaml").read_text(encoding="utf-8")
+    assert "postgres:16" in compose_text
+    assert "redis:7" in compose_text
+    assert "SERVICE_MODE: predict" in compose_text
+    assert "SERVICE_MODE: taste-os" in compose_text
+    assert "../../outputs:/app/outputs" in compose_text

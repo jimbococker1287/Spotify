@@ -491,6 +491,8 @@ Control room:
 - `outputs/analytics/control_room_weekly_summary.md`
 - `outputs/analytics/control_room_triage.json`
 - `outputs/analytics/control_room_triage.md`
+- `outputs/analytics/spotify_analytics.duckdb`
+- `outputs/analytics/warehouse/`
 
 Generate the control-room summary:
 
@@ -499,6 +501,38 @@ make control-room
 ```
 
 The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
+
+Build the local analytics SQL file and warehouse:
+
+```bash
+make analytics-db
+```
+
+Build only the local bronze/silver/gold Parquet warehouse:
+
+```bash
+make analytics-warehouse
+```
+
+The warehouse writes bronze, silver, and gold marts plus a manifest under `outputs/analytics/warehouse/`. See [docs/analytics_db.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/analytics_db.md) for the local analytics-engineering layout and example queries.
+
+Data-science and quant branches now build on top of that local warehouse too:
+
+```bash
+make listener-archetypes
+make quant-decision-lab
+make creator-market-intelligence
+make research-platform-lab
+```
+
+Those commands now write local-first behavioral clustering, decision-frontier, creator-market, and research-platform artifacts under:
+
+- `outputs/analysis/listener_archetypes/`
+- `outputs/analysis/quant_decision_lab/`
+- `outputs/analysis/creator_market_intelligence/`
+- `outputs/analysis/research_platform_lab/`
+
+See [docs/data_science_quant.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/data_science_quant.md), [docs/creator_market_intelligence.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/creator_market_intelligence.md), and [docs/research_platform_lab.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/research_platform_lab.md) for the local-lab workflow.
 
 ## Taste OS Demo
 
@@ -757,6 +791,24 @@ Deployment templates live in:
 
 - `deploy/kubernetes/`
 - `deploy/ecs/`
+- `deploy/terraform/aws/`
+- `deploy/local/`
+
+## Infrastructure Bootstrap
+
+The repo now includes two practical infrastructure paths:
+
+- `deploy/local/` for a local production-smoke stack with Postgres, Redis, and both ASGI services
+- `deploy/terraform/aws/` for an AWS-first production baseline with VPC, ALB, ECS Fargate, EFS, RDS Postgres, ElastiCache Redis, ECR, and Secrets Manager
+
+Recommended order:
+
+1. Validate the service wiring locally with `deploy/local/production-smoke.compose.yaml`
+2. Provision the cloud baseline with `deploy/terraform/aws/`
+3. Publish a promoted run into the deployment registry
+4. Point the deployed services at `outputs/deployments/registry/channels/stable`
+
+The deployment asset map lives in `deploy/README.md`.
 
 ## Public Comparison
 

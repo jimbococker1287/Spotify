@@ -1,0 +1,84 @@
+# Data Science And Quant Lanes
+
+This repository now has two explicit local-first expansion lanes beyond the core product and ops surfaces:
+
+- `listener archetypes`: behavioral clustering and taste-state summaries over time
+- `quant decision lab`: model and policy frontier analysis for multi-objective recommendation decisions
+
+These lanes are intentionally private and research-oriented. They are designed to help you think better, not just ship more code.
+
+## Listener Archetypes
+
+Build listener archetypes from the local analytics warehouse:
+
+```bash
+make listener-archetypes
+```
+
+This writes:
+
+- `outputs/analysis/listener_archetypes/listener_archetype_assignments.csv`
+- `outputs/analysis/listener_archetypes/listener_archetype_summary.csv`
+- `outputs/analysis/listener_archetypes/listener_archetype_summary.json`
+- `outputs/analysis/listener_archetypes/listener_archetype_monthly.csv`
+- `outputs/analysis/listener_archetypes/listener_archetype_transitions.csv`
+- `outputs/analysis/listener_archetypes/taste_state_brief.json`
+- `outputs/analysis/listener_archetypes/taste_state_brief.md`
+
+Use it to answer:
+
+- what kinds of listening states show up repeatedly in local behavior
+- which states are highest-skip or most exploratory
+- how taste states transition across days
+- which archetypes should become explicit Taste OS modes or evaluation slices
+
+## Quant Decision Lab
+
+Build the quant decision surface from the latest completed run:
+
+```bash
+make quant-decision-lab
+```
+
+This writes:
+
+- `outputs/analysis/quant_decision_lab/model_decision_frontier.csv`
+- `outputs/analysis/quant_decision_lab/model_decision_frontier.json`
+- `outputs/analysis/quant_decision_lab/policy_decision_frontier.csv`
+- `outputs/analysis/quant_decision_lab/policy_decision_frontier.json`
+- `outputs/analysis/quant_decision_lab/scenario_sensitivity.csv`
+- `outputs/analysis/quant_decision_lab/scenario_sensitivity.json`
+- `outputs/analysis/quant_decision_lab/quant_decision_brief.json`
+- `outputs/analysis/quant_decision_lab/quant_decision_brief.md`
+
+Use it to answer:
+
+- which models are efficient under quality, utility, uncertainty, and speed together
+- which policies survive stress tradeoffs instead of only looking good on one metric
+- which scenarios create the most decision pressure
+- whether the serving model is still efficient once risk and cost are included
+
+## Recommended Workflow
+
+1. Refresh the analytics warehouse:
+
+```bash
+make analytics-warehouse
+```
+
+2. Build archetypes:
+
+```bash
+make listener-archetypes
+```
+
+3. Build the quant frontier:
+
+```bash
+make quant-decision-lab
+```
+
+4. Use the artifacts together:
+
+- archetypes define the behavioral slices worth studying
+- quant frontier defines the models and policies worth trusting inside those slices

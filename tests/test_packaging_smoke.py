@@ -33,6 +33,10 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-taste-os-showcase"] == "spotify.taste_os_showcase:main"
     assert scripts["spotify-taste-os-serve"] == "spotify.taste_os_service:main"
     assert scripts["spotify-refresh-champion-gate"] == "spotify.champion_gate_refresh:main"
+    assert scripts["spotify-listener-archetypes"] == "spotify.listener_archetypes:main"
+    assert scripts["spotify-quant-decision-lab"] == "spotify.quant_decision_lab:main"
+    assert scripts["spotify-creator-market-intelligence"] == "spotify.creator_market_intelligence:main"
+    assert scripts["spotify-research-platform-lab"] == "spotify.research_platform_lab:main"
 
 
 def test_built_wheel_excludes_backup_modules_and_ds_store(tmp_path: Path) -> None:

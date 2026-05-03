@@ -1,0 +1,11 @@
+project_name     = "spotify-prod"
+environment      = "prod"
+aws_region       = "us-east-1"
+container_image  = "123456789012.dkr.ecr.us-east-1.amazonaws.com/spotify-serving-api:latest"
+predict_host     = "predict.example.com"
+taste_os_host    = "taste.example.com"
+certificate_arn  = "arn:aws:acm:us-east-1:123456789012:certificate/CHANGE_ME"
+
+auth_token = "CHANGE_ME_WITH_A_LONG_RANDOM_VALUE"
+jwt_secret = "CHANGE_ME_WITH_A_LONG_RANDOM_SHARED_SECRET"
+db_password = "CHANGE_ME_WITH_A_LONG_DATABASE_PASSWORD"

@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  predict-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_MODE: predict
+      PORT: "8000"
+      RUN_DIR: /app/outputs/deployments/registry/channels/stable
+      AUTH_TOKEN: ${AUTH_TOKEN}
+      AUTH_MODE: ${AUTH_MODE}
+      AUTH_SCOPE: ${AUTH_SCOPE}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_AUDIENCE: ${PREDICT_JWT_AUDIENCE}
+      JWT_REQUIRED_SCOPES: ${PREDICT_JWT_REQUIRED_SCOPES}
+      RATE_LIMIT_BACKEND: redis
+      REDIS_URL: ${REDIS_URL}
+      OTEL_ENABLED: "0"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../outputs:/app/outputs
+
+  taste-os-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_MODE: taste-os
+      PORT: "8010"
+      RUN_DIR: /app/outputs/deployments/registry/channels/stable
+      TASTE_OS_OUTPUT_DIR: /app/outputs/analysis/taste_os_service
+      TASTE_OS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AUTH_TOKEN: ${AUTH_TOKEN}
+      AUTH_MODE: ${AUTH_MODE}
+      AUTH_SCOPE: ${AUTH_SCOPE}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_AUDIENCE: ${TASTE_OS_JWT_AUDIENCE}
+      JWT_REQUIRED_SCOPES: ${TASTE_OS_JWT_REQUIRED_SCOPES}
+      RATE_LIMIT_BACKEND: redis
+      REDIS_URL: ${REDIS_URL}
+      OTEL_ENABLED: "0"
+    ports:
+      - "8010:8010"
+    volumes:
+      - ../../outputs:/app/outputs
+
+volumes:
+  postgres-data:

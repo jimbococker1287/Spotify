@@ -1,0 +1,24 @@
+project_name     = "spotify-prod"
+environment      = "prod-lite"
+aws_region       = "us-east-1"
+container_image  = "123456789012.dkr.ecr.us-east-1.amazonaws.com/spotify-serving-api:latest"
+predict_host     = "predict.example.com"
+taste_os_host    = "taste.example.com"
+certificate_arn  = "arn:aws:acm:us-east-1:123456789012:certificate/CHANGE_ME"
+
+# Cheap-and-balanced sizing:
+# - 1 task per service to keep the steady-state bill down
+# - 1 vCPU / 2 GB per task to avoid being too aggressive on memory
+# - single-AZ-sized managed data stores
+predict_desired_count  = 1
+taste_os_desired_count = 1
+predict_cpu            = 1024
+predict_memory         = 2048
+taste_os_cpu           = 1024
+taste_os_memory        = 2048
+db_instance_class      = "db.t4g.micro"
+redis_node_type        = "cache.t4g.micro"
+
+auth_token = "CHANGE_ME_WITH_A_LONG_RANDOM_VALUE"
+jwt_secret = "CHANGE_ME_WITH_A_LONG_RANDOM_SHARED_SECRET"
+db_password = "CHANGE_ME_WITH_A_LONG_DATABASE_PASSWORD"
