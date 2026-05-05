@@ -29,6 +29,13 @@ BENCHMARK_RESUME="${BENCHMARK_RESUME:-1}"
 BENCHMARK_ENABLE_RETRIEVAL="${BENCHMARK_ENABLE_RETRIEVAL:-1}"
 BENCHMARK_TF_SAFE_MODE="${BENCHMARK_TF_SAFE_MODE:-1}"
 BENCHMARK_HISTORY_CSV="${BENCHMARK_HISTORY_CSV:-$ROOT_DIR/outputs/history/experiment_history.csv}"
+if [[ -n "${BENCHMARK_LOCK_RESEARCH_GRADE:-}" ]]; then
+  BENCHMARK_LOCK_RESEARCH_GRADE="$BENCHMARK_LOCK_RESEARCH_GRADE"
+elif [[ "$BENCHMARK_CLASSICAL_ONLY" == "1" ]]; then
+  BENCHMARK_LOCK_RESEARCH_GRADE="0"
+else
+  BENCHMARK_LOCK_RESEARCH_GRADE="1"
+fi
 
 export SPOTIFY_FORCE_CPU="${SPOTIFY_FORCE_CPU:-1}"
 if [[ "$BENCHMARK_TF_SAFE_MODE" == "1" ]]; then
@@ -51,6 +58,7 @@ echo "Deep models: $DEEP_MODELS"
 echo "Classical models: $CLASSICAL_MODELS"
 echo "Classical only: $BENCHMARK_CLASSICAL_ONLY"
 echo "Retrieval enabled: $BENCHMARK_ENABLE_RETRIEVAL"
+echo "Research grade: $BENCHMARK_LOCK_RESEARCH_GRADE"
 echo "TensorFlow safe mode: $BENCHMARK_TF_SAFE_MODE"
 
 for seed in $SEEDS; do
@@ -101,5 +109,25 @@ PY
   "${CMD[@]}"
 done
 
-"$PYTHON_CMD" scripts/aggregate_benchmark.py --benchmark-id "$BENCHMARK_ID"
+AGGREGATE_CMD=(
+  "$PYTHON_CMD" scripts/aggregate_benchmark.py
+  --benchmark-id "$BENCHMARK_ID"
+  --declared-deep-models "$DEEP_MODELS"
+  --declared-classical-models "$CLASSICAL_MODELS"
+  --fail-not-comparison-ready
+)
+if [[ "$BENCHMARK_ENABLE_RETRIEVAL" == "1" ]]; then
+  AGGREGATE_CMD+=(--retrieval-enabled)
+else
+  AGGREGATE_CMD+=(--no-retrieval-enabled)
+fi
+if [[ "$BENCHMARK_CLASSICAL_ONLY" == "1" ]]; then
+  AGGREGATE_CMD+=(--classical-only)
+fi
+if [[ "$BENCHMARK_LOCK_RESEARCH_GRADE" == "1" ]]; then
+  AGGREGATE_CMD+=(--research-grade)
+else
+  AGGREGATE_CMD+=(--non-research-grade)
+fi
+"${AGGREGATE_CMD[@]}"
 echo "Benchmark lock complete: outputs/history/benchmark_lock_${BENCHMARK_ID}_summary.csv"

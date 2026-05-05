@@ -37,6 +37,51 @@ def _parse_args() -> argparse.Namespace:
         default="outputs/history",
         help="Directory to write benchmark summary artifacts.",
     )
+    parser.add_argument(
+        "--declared-deep-models",
+        default="",
+        help="Comma-separated deep models expected in the benchmark-lock run.",
+    )
+    parser.add_argument(
+        "--declared-classical-models",
+        default="",
+        help="Comma-separated classical models expected in the benchmark-lock run.",
+    )
+    parser.add_argument(
+        "--retrieval-enabled",
+        dest="retrieval_enabled",
+        action="store_true",
+        help="Record that retrieval or reranking models are expected in the benchmark-lock run.",
+    )
+    parser.add_argument(
+        "--no-retrieval-enabled",
+        dest="retrieval_enabled",
+        action="store_false",
+        help="Record that retrieval or reranking models are not expected in the benchmark-lock run.",
+    )
+    parser.add_argument(
+        "--research-grade",
+        dest="research_grade",
+        action="store_true",
+        help="Require research-grade comparator guards in the benchmark-lock manifest.",
+    )
+    parser.add_argument(
+        "--non-research-grade",
+        dest="research_grade",
+        action="store_false",
+        help="Do not require the research-grade comparator guard in the benchmark-lock manifest.",
+    )
+    parser.add_argument(
+        "--classical-only",
+        action="store_true",
+        help="Record that the benchmark-lock run was executed in classical-only mode.",
+    )
+    parser.add_argument(
+        "--fail-not-comparison-ready",
+        action="store_true",
+        help="Exit non-zero when the written benchmark-lock manifest is not comparison ready.",
+    )
+    parser.set_defaults(retrieval_enabled=None, research_grade=None)
     return parser.parse_args()
 
 
@@ -48,6 +93,21 @@ def _safe_float(value: str | object) -> float | None:
     if np.isnan(numeric):
         return None
     return float(numeric)
+
+
+def _split_declared_models(value: str | object) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = [str(value)]
+    out: list[str] = []
+    for item in raw_items:
+        normalized = str(item).strip()
+        if normalized:
+            out.append(normalized)
+    return out
 
 
 def _matches_run_name_prefix(run_name: str, prefix: str) -> bool:
@@ -301,7 +361,15 @@ def main() -> int:
         summary_rows=summary_rows,
         significance_rows=significance_rows,
         raw_rows=filtered,
+        declared_model_class_mix={
+            "deep_models": _split_declared_models(args.declared_deep_models),
+            "classical_models": _split_declared_models(args.declared_classical_models),
+            "retrieval_enabled": args.retrieval_enabled,
+            "research_grade": args.research_grade,
+            "classical_only": bool(args.classical_only),
+        },
     )
+    manifest_payload = json.loads(manifest_json.read_text(encoding="utf-8"))
 
     history_append_rows = [
         {
@@ -328,6 +396,14 @@ def main() -> int:
     print(f"benchmark_manifest={manifest_json}")
     print(f"benchmark_manifest_md={manifest_md}")
     print(f"benchmark_significance={significance_csv}")
+    if args.fail_not_comparison_ready and not bool(manifest_payload.get("comparison_ready")):
+        blockers = manifest_payload.get("comparison_blockers", [])
+        blocker_text = "; ".join(str(item).strip() for item in blockers if str(item).strip()) or "comparison guard failed"
+        print(
+            f"benchmark_not_comparison_ready={blocker_text}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

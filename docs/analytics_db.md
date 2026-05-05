@@ -5,7 +5,7 @@ This project now has a local-first analytics stack with two aligned layers:
 - DuckDB SQL file: `outputs/analytics/spotify_analytics.duckdb`
 - Local warehouse: `outputs/analytics/warehouse`
 
-The DuckDB file is the interactive query surface. The warehouse is the local data-engineering layer with bronze, silver, and gold Parquet assets plus lineage artifacts.
+The DuckDB file is the interactive query surface. The warehouse is the local data-engineering layer with bronze, silver, and gold Parquet assets plus lineage and verification artifacts.
 
 ## Refresh Commands
 
@@ -28,6 +28,8 @@ python scripts/build_analytics_db.py
 python scripts/build_analytics_db.py --warehouse-only
 ```
 
+Both flows now run a post-build verification step. The warehouse verifies its written Parquet assets against the manifest, and the DuckDB refresh verifies key tables/views against warehouse metadata persisted inside DuckDB.
+
 ## Warehouse Layout
 
 The warehouse writes:
@@ -37,6 +39,10 @@ The warehouse writes:
 - `outputs/analytics/warehouse/gold/*.parquet`
 - `outputs/analytics/warehouse/warehouse_manifest.json`
 - `outputs/analytics/warehouse/warehouse_manifest.md`
+- `outputs/analytics/warehouse/warehouse_verification.json`
+- `outputs/analytics/warehouse/warehouse_verification.md`
+
+The manifest now records per-asset schema metadata alongside row counts and paths so the warehouse and DuckDB layers can compare the same artifact contract.
 
 ### Bronze
 
@@ -97,6 +103,10 @@ Useful base tables:
 - `mart_ops_overview`
 - `mart_creator_opportunities`
 - `mart_creator_scene_pressure`
+- `warehouse_asset_manifest`
+- `warehouse_asset_columns`
+- `warehouse_consistency_checks`
+- `warehouse_consistency_summary`
 
 Useful views:
 
@@ -118,6 +128,14 @@ Current operating snapshot:
 ```sql
 select *
 from mart_ops_overview;
+```
+
+Latest consistency status:
+
+```sql
+select object_name, row_count_match, column_match, logical_type_match, status
+from warehouse_consistency_checks
+order by object_name;
 ```
 
 Best model per run:

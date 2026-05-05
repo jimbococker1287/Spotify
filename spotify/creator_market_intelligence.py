@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from dataclasses import field
 import json
 import logging
 import math
@@ -21,9 +23,16 @@ _ASSET_SUFFIXES = (
     "ranking_comparison",
     "opportunities",
     "migration_watch",
-    "seed_comparison",
     "scene_seed_comparison",
+    "seed_comparison",
 )
+_ASSET_SUFFIXES_BY_LENGTH = tuple(sorted(_ASSET_SUFFIXES, key=len, reverse=True))
+
+
+@dataclass
+class _ReportFamilyRecord:
+    has_manifest: bool = False
+    asset_paths: dict[str, Path] = field(default_factory=dict)
 
 
 def _safe_float(value: object) -> float:
@@ -95,32 +104,83 @@ def _asset_root(output_dir: Path) -> Path:
     return output_dir / "analysis" / "public_spotify" / "creator_label_intelligence"
 
 
-def _family_id_from_path(path: Path, suffix: str) -> str:
-    return path.stem.removesuffix(f"_{suffix}")
+def _parse_asset_path(path: Path) -> tuple[str, str] | None:
+    if path.suffix.casefold() != ".csv":
+        return None
+    for suffix in _ASSET_SUFFIXES_BY_LENGTH:
+        marker = f"_{suffix}"
+        if not path.stem.endswith(marker):
+            continue
+        family_id = path.stem[: -len(marker)]
+        if family_id:
+            return family_id, suffix
+    return None
+
+
+def _collect_report_family_inventory(base_dir: Path) -> dict[str, _ReportFamilyRecord]:
+    inventory: dict[str, _ReportFamilyRecord] = {}
+    if not base_dir.exists():
+        return inventory
+    for path in sorted(base_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if path.name.endswith("_report_family.json"):
+            family_id = path.stem.removesuffix("_report_family")
+            if family_id:
+                inventory.setdefault(family_id, _ReportFamilyRecord()).has_manifest = True
+            continue
+        parsed = _parse_asset_path(path)
+        if parsed is None:
+            continue
+        family_id, suffix = parsed
+        inventory.setdefault(family_id, _ReportFamilyRecord()).asset_paths.setdefault(suffix, path)
+    return inventory
+
+
+def _report_family_manifest_counts(inventory: dict[str, _ReportFamilyRecord]) -> dict[str, object]:
+    report_family_ids = sorted(inventory)
+    manifest_backed_family_ids = sorted(family_id for family_id, record in inventory.items() if record.has_manifest)
+    asset_backed_family_ids = sorted(family_id for family_id, record in inventory.items() if record.asset_paths)
+    complete_family_ids = sorted(
+        family_id
+        for family_id, record in inventory.items()
+        if record.has_manifest and all(suffix in record.asset_paths for suffix in _ASSET_SUFFIXES)
+    )
+    partial_family_ids = sorted(set(report_family_ids) - set(complete_family_ids))
+    return {
+        "report_family_ids": report_family_ids,
+        "report_family_count": len(report_family_ids),
+        "manifest_backed_report_family_count": len(manifest_backed_family_ids),
+        "asset_backed_report_family_count": len(asset_backed_family_ids),
+        "complete_report_family_count": len(complete_family_ids),
+        "partial_report_family_count": len(partial_family_ids),
+        "partial_report_family_ids": partial_family_ids,
+    }
 
 
 def _discover_report_family_ids(base_dir: Path) -> list[str]:
-    family_ids: set[str] = set()
-    for path in sorted(base_dir.glob("*_report_family.json")):
-        family_ids.add(path.stem.removesuffix("_report_family"))
-    for suffix in _ASSET_SUFFIXES:
-        for path in sorted(base_dir.glob(f"*_{suffix}.csv")):
-            family_ids.add(_family_id_from_path(path, suffix))
-    return sorted(family_ids)
+    return sorted(_collect_report_family_inventory(base_dir))
 
 
-def _load_creator_assets(output_dir: Path) -> dict[str, pd.DataFrame]:
+def _load_creator_assets(
+    output_dir: Path,
+    *,
+    family_inventory: dict[str, _ReportFamilyRecord] | None = None,
+) -> dict[str, pd.DataFrame]:
     base_dir = _asset_root(output_dir)
     frames: dict[str, pd.DataFrame] = {}
     if not base_dir.exists():
         return {suffix: pd.DataFrame() for suffix in _ASSET_SUFFIXES}
+    inventory = family_inventory if family_inventory is not None else _collect_report_family_inventory(base_dir)
     for suffix in _ASSET_SUFFIXES:
         buckets: list[pd.DataFrame] = []
-        for path in sorted(base_dir.glob(f"*_{suffix}.csv")):
+        for family_id in sorted(inventory):
+            path = inventory[family_id].asset_paths.get(suffix)
+            if path is None:
+                continue
             frame = safe_read_csv(path)
             if frame.empty:
                 continue
-            family_id = _family_id_from_path(path, suffix)
             frame.insert(0, "report_family_id", family_id)
             frame.insert(1, "seed_group_slug", family_id.removeprefix("creator_label_intelligence_"))
             buckets.append(frame)
@@ -663,8 +723,10 @@ def _build_market_brief(
 
 def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]:
     base_dir = _asset_root(output_dir)
-    report_family_ids = _discover_report_family_ids(base_dir)
-    assets = _load_creator_assets(output_dir)
+    family_inventory = _collect_report_family_inventory(base_dir)
+    family_counts = _report_family_manifest_counts(family_inventory)
+    report_family_ids = list(family_counts["report_family_ids"])
+    assets = _load_creator_assets(output_dir, family_inventory=family_inventory)
     scene_df = assets.get("scene_comparison", pd.DataFrame()).copy()
     opportunities_df = assets.get("opportunities", pd.DataFrame()).copy()
     migration_df = assets.get("migration_watch", pd.DataFrame()).copy()
@@ -684,7 +746,7 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
     seed_bridge_atlas = _build_seed_scene_bridge_atlas([seed_df, scene_seed_df])
     whitespace_atlas = _build_release_whitespace_atlas(opportunities_df)
     brief_payload, brief_markdown = _build_market_brief(
-        report_family_count=max(len(report_family_ids), int(scene_df.get("report_family_id", pd.Series(dtype="object")).nunique() or 0)),
+        report_family_count=int(family_counts["report_family_count"]),
         scene_market_pulse=scene_market_pulse,
         lane_atlas=lane_atlas,
         migration_network=migration_network,
@@ -793,6 +855,11 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
 
     manifest_payload = {
         "report_family_count": int(brief_payload["report_family_count"]),
+        "manifest_backed_report_family_count": int(family_counts["manifest_backed_report_family_count"]),
+        "asset_backed_report_family_count": int(family_counts["asset_backed_report_family_count"]),
+        "complete_report_family_count": int(family_counts["complete_report_family_count"]),
+        "partial_report_family_count": int(family_counts["partial_report_family_count"]),
+        "partial_report_family_ids": list(family_counts["partial_report_family_ids"]),
         "artifact_root": str(output_root),
         "tables": {},
     }

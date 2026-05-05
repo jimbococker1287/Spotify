@@ -18,6 +18,7 @@ def test_describe_canonical_benchmark_contract_exposes_week10_defaults() -> None
     assert contract["minimum_repeated_runs"] == 3
     assert "benchmark_protocol.json" in contract["required_run_artifacts"]
     assert contract["significance_policy"]["z_threshold"] == 1.96
+    assert contract["comparator_policy"]["required_comparator_class"] == "deep"
 
 
 def test_write_benchmark_lock_manifest_marks_ready_contract(tmp_path: Path) -> None:
@@ -26,16 +27,16 @@ def test_write_benchmark_lock_manifest_marks_ready_contract(tmp_path: Path) -> N
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"benchmark-lock-{benchmark_id}"
     summary_rows = [
-        {"model_name": "retrieval_reranker", "run_count": 3},
-        {"model_name": "gru_artist", "run_count": 3},
+        {"model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "run_count": 3},
+        {"model_name": "gru_artist", "model_type": "deep", "run_count": 3},
     ]
     significance_rows = [
         {"left_model": "retrieval_reranker", "right_model": "gru_artist", "significant_at_95": 1},
     ]
     raw_rows = [
-        {"run_id": "run_a", "profile": "small"},
-        {"run_id": "run_b", "profile": "small"},
-        {"run_id": "run_c", "profile": "small"},
+        {"run_id": "run_a", "profile": "small", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker"},
+        {"run_id": "run_b", "profile": "small", "model_name": "gru_artist", "model_type": "deep"},
+        {"run_id": "run_c", "profile": "small", "model_name": "logreg", "model_type": "classical"},
     ]
 
     rows_path = output_dir / f"benchmark_lock_{benchmark_id}_rows.csv"
@@ -53,11 +54,19 @@ def test_write_benchmark_lock_manifest_marks_ready_contract(tmp_path: Path) -> N
         summary_rows=summary_rows,
         significance_rows=significance_rows,
         raw_rows=raw_rows,
+        declared_model_class_mix={
+            "research_grade": True,
+            "retrieval_enabled": True,
+            "deep_models": ["gru_artist"],
+            "classical_models": ["logreg"],
+        },
     )
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["comparison_ready"] is True
     assert payload["present_artifact_count"] == payload["required_artifact_count"]
+    assert payload["model_class_mix"]["observed"]["model_classes"] == ["candidate", "classical", "deep"]
+    assert payload["comparator_guard"]["deep_comparator_ready"] is True
     assert md_path.exists()
 
     payload = build_benchmark_lock_manifest(
@@ -67,10 +76,17 @@ def test_write_benchmark_lock_manifest_marks_ready_contract(tmp_path: Path) -> N
         summary_rows=summary_rows,
         significance_rows=significance_rows,
         raw_rows=raw_rows,
+        declared_model_class_mix={
+            "research_grade": True,
+            "retrieval_enabled": True,
+            "deep_models": ["gru_artist"],
+            "classical_models": ["logreg"],
+        },
     )
 
     assert payload["comparison_ready"] is True
     assert payload["present_artifact_count"] >= 7
+    assert payload["comparator_guard"]["status"] == "pass"
 
 
 def test_build_benchmark_lock_manifest_requires_repeated_runs_per_model(tmp_path: Path) -> None:
@@ -98,17 +114,72 @@ def test_build_benchmark_lock_manifest_requires_repeated_runs_per_model(tmp_path
         benchmark_id=benchmark_id,
         run_name_prefix="benchmark-lock-demo",
         summary_rows=[
-            {"model_name": "logreg", "run_count": 3},
-            {"model_name": "dense", "run_count": 1},
+            {"model_name": "logreg", "model_type": "classical", "run_count": 3},
+            {"model_name": "dense", "model_type": "deep", "run_count": 1},
         ],
         significance_rows=[{"left_model": "logreg", "right_model": "dense", "significant_at_95": 0}],
         raw_rows=[
-            {"run_id": "run_a", "profile": "small"},
-            {"run_id": "run_b", "profile": "small"},
-            {"run_id": "run_c", "profile": "small"},
+            {"run_id": "run_a", "profile": "small", "model_name": "logreg", "model_type": "classical"},
+            {"run_id": "run_b", "profile": "small", "model_name": "dense", "model_type": "deep"},
+            {"run_id": "run_c", "profile": "small", "model_name": "dense", "model_type": "deep"},
         ],
+        declared_model_class_mix={
+            "research_grade": False,
+            "deep_models": ["dense"],
+            "classical_models": ["logreg"],
+        },
     )
 
     assert payload["comparison_ready"] is False
     per_model_check = next(row for row in payload["stability_checks"] if row["key"] == "minimum_repeated_runs_per_model")
     assert per_model_check["status"] == "fail"
+
+
+def test_build_benchmark_lock_manifest_requires_deep_comparator_for_research_grade(tmp_path: Path) -> None:
+    output_dir = tmp_path / "history"
+    benchmark_id = "demo_research"
+
+    for name in (
+        f"benchmark_lock_{benchmark_id}_rows.csv",
+        f"benchmark_lock_{benchmark_id}_summary.csv",
+        f"benchmark_lock_{benchmark_id}_summary.json",
+        f"benchmark_lock_{benchmark_id}_ci95.png",
+        f"benchmark_lock_{benchmark_id}_significance.csv",
+        f"benchmark_lock_{benchmark_id}_manifest.json",
+        f"benchmark_lock_{benchmark_id}_manifest.md",
+    ):
+        path = output_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix == ".png":
+            path.write_bytes(b"png")
+        else:
+            path.write_text("ok\n", encoding="utf-8")
+
+    payload = build_benchmark_lock_manifest(
+        output_dir=output_dir,
+        benchmark_id=benchmark_id,
+        run_name_prefix="benchmark-lock-demo-research",
+        summary_rows=[
+            {"model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "run_count": 3},
+            {"model_name": "extra_trees", "model_type": "classical", "run_count": 3},
+        ],
+        significance_rows=[],
+        raw_rows=[
+            {"run_id": "run_a", "profile": "small", "model_name": "retrieval_reranker", "model_type": "retrieval_reranker"},
+            {"run_id": "run_b", "profile": "small", "model_name": "extra_trees", "model_type": "classical"},
+            {"run_id": "run_c", "profile": "small", "model_name": "extra_trees", "model_type": "classical"},
+        ],
+        declared_model_class_mix={
+            "research_grade": True,
+            "retrieval_enabled": True,
+            "deep_models": ["gru_artist"],
+            "classical_models": ["extra_trees"],
+        },
+    )
+
+    assert payload["comparison_ready"] is False
+    assert payload["comparator_guard"]["research_grade"] is True
+    assert payload["comparator_guard"]["deep_comparator_ready"] is False
+    comparator_check = next(row for row in payload["stability_checks"] if row["key"] == "repeated_deep_comparator")
+    assert comparator_check["status"] == "fail"
+    assert "deep comparator" in comparator_check["detail"].lower()

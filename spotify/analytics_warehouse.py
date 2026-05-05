@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from pandas.api.types import is_bool_dtype
+from pandas.api.types import is_datetime64_any_dtype
+from pandas.api.types import is_float_dtype
+from pandas.api.types import is_integer_dtype
 from pandas.api.types import is_object_dtype
 
 from .aws_athena_export import _prepare_raw_streaming_history
@@ -115,6 +119,7 @@ def _normalize_frame_for_storage(df: pd.DataFrame) -> pd.DataFrame:
             continue
         non_null = series.dropna()
         if non_null.empty:
+            frame[column] = series.map(lambda value: None if pd.isna(value) else str(value)).astype("string")
             continue
         numeric_candidate = pd.to_numeric(non_null.replace("", None), errors="coerce")
         if numeric_candidate.notna().sum() == len(non_null):
@@ -132,8 +137,35 @@ def _normalize_frame_for_storage(df: pd.DataFrame) -> pd.DataFrame:
                 if isinstance(value, (dict, list, tuple, set))
                 else (None if pd.isna(value) else str(value))
             )
-        )
+        ).astype("string")
     return frame
+
+
+def _logical_type_from_dtype(dtype: object) -> str:
+    if is_bool_dtype(dtype):
+        return "boolean"
+    if is_integer_dtype(dtype):
+        return "integer"
+    if is_float_dtype(dtype):
+        return "float"
+    if is_datetime64_any_dtype(dtype):
+        return "timestamp"
+    return "string"
+
+
+def _schema_records(df: pd.DataFrame) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for position, column in enumerate(df.columns, start=1):
+        dtype = df[column].dtype
+        records.append(
+            {
+                "name": str(column),
+                "position": position,
+                "dtype": str(dtype),
+                "logical_type": _logical_type_from_dtype(dtype),
+            }
+        )
+    return records
 
 
 def _reindex_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -1136,6 +1168,185 @@ def build_analytics_warehouse_bundle(
     )
 
 
+def load_analytics_warehouse_manifest(warehouse_root: Path) -> dict[str, Any]:
+    manifest = safe_read_json(warehouse_root / "warehouse_manifest.json", default={})
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def warehouse_manifest_frames(warehouse_root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    asset_columns = [
+        "manifest_generated_at",
+        "layer",
+        "asset_name",
+        "object_name",
+        "parquet_path",
+        "expected_rows",
+        "expected_column_count",
+        "expected_columns_json",
+        "schema_json",
+    ]
+    column_columns = [
+        "manifest_generated_at",
+        "layer",
+        "asset_name",
+        "object_name",
+        "column_position",
+        "column_name",
+        "dtype",
+        "logical_type",
+    ]
+    manifest = load_analytics_warehouse_manifest(warehouse_root)
+    generated_at = str(manifest.get("generated_at", "") or "")
+    layers = manifest.get("layers", {})
+    asset_rows: list[dict[str, object]] = []
+    column_rows: list[dict[str, object]] = []
+
+    if not isinstance(layers, dict):
+        return pd.DataFrame(columns=asset_columns), pd.DataFrame(columns=column_columns)
+
+    for layer_name, assets in layers.items():
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            asset_name = str(asset.get("name", "") or "")
+            schema = asset.get("schema", [])
+            schema_records = [record for record in schema if isinstance(record, dict)] if isinstance(schema, list) else []
+            expected_columns = [str(record.get("name", "") or "") for record in schema_records]
+            asset_rows.append(
+                {
+                    "manifest_generated_at": generated_at,
+                    "layer": str(layer_name),
+                    "asset_name": asset_name,
+                    "object_name": asset_name,
+                    "parquet_path": str(asset.get("path", "") or ""),
+                    "expected_rows": int(asset.get("rows", 0) or 0),
+                    "expected_column_count": int(asset.get("column_count", 0) or 0),
+                    "expected_columns_json": json.dumps(expected_columns),
+                    "schema_json": json.dumps(schema_records),
+                }
+            )
+            for record in schema_records:
+                column_rows.append(
+                    {
+                        "manifest_generated_at": generated_at,
+                        "layer": str(layer_name),
+                        "asset_name": asset_name,
+                        "object_name": asset_name,
+                        "column_position": int(record.get("position", 0) or 0),
+                        "column_name": str(record.get("name", "") or ""),
+                        "dtype": str(record.get("dtype", "") or ""),
+                        "logical_type": str(record.get("logical_type", "") or ""),
+                    }
+                )
+
+    return pd.DataFrame(asset_rows, columns=asset_columns), pd.DataFrame(column_rows, columns=column_columns)
+
+
+def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dict[str, Any]:
+    asset_manifest, _ = warehouse_manifest_frames(warehouse_root)
+    results: list[dict[str, object]] = []
+    failures: list[str] = []
+
+    for asset in asset_manifest.to_dict(orient="records"):
+        asset_name = str(asset.get("asset_name", "") or "")
+        parquet_path = Path(str(asset.get("parquet_path", "") or ""))
+        expected_rows = int(asset.get("expected_rows", 0) or 0)
+        expected_columns = json.loads(str(asset.get("expected_columns_json", "[]") or "[]"))
+        expected_schema = json.loads(str(asset.get("schema_json", "[]") or "[]"))
+        expected_logical_types = [str(record.get("logical_type", "") or "") for record in expected_schema]
+        actual_rows: int | None = None
+        actual_columns: list[str] = []
+        actual_logical_types: list[str] = []
+        error_message = ""
+        row_count_match = False
+        column_match = False
+        logical_type_match = False
+
+        try:
+            frame = pd.read_parquet(parquet_path)
+            actual_rows = int(len(frame.index))
+            actual_columns = [str(column) for column in frame.columns]
+            actual_logical_types = [str(record["logical_type"]) for record in _schema_records(frame)]
+            row_count_match = actual_rows == expected_rows
+            column_match = actual_columns == expected_columns
+            logical_type_match = actual_logical_types == expected_logical_types
+        except Exception as exc:
+            error_message = str(exc)
+
+        status = "pass" if row_count_match and column_match and logical_type_match and not error_message else "fail"
+        results.append(
+            {
+                "layer": str(asset.get("layer", "") or ""),
+                "asset_name": asset_name,
+                "parquet_path": str(parquet_path),
+                "expected_rows": expected_rows,
+                "actual_rows": actual_rows,
+                "row_count_match": row_count_match,
+                "expected_columns": expected_columns,
+                "actual_columns": actual_columns,
+                "column_match": column_match,
+                "expected_logical_types": expected_logical_types,
+                "actual_logical_types": actual_logical_types,
+                "logical_type_match": logical_type_match,
+                "status": status,
+                "error": error_message,
+            }
+        )
+        if status != "pass":
+            failures.append(asset_name)
+
+    verification_payload = {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "warehouse_root": str(warehouse_root.resolve()),
+        "status": "pass" if not failures else "fail",
+        "summary": {
+            "checked_assets": int(len(results)),
+            "passed_assets": int(sum(1 for row in results if row["status"] == "pass")),
+            "failed_assets": int(sum(1 for row in results if row["status"] != "pass")),
+        },
+        "results": results,
+    }
+    write_json(warehouse_root / "warehouse_verification.json", verification_payload, sort_keys=False)
+
+    markdown_lines = [
+        "# Analytics Warehouse Verification",
+        "",
+        f"- Generated at: `{verification_payload['generated_at']}`",
+        f"- Warehouse root: `{verification_payload['warehouse_root']}`",
+        f"- Status: `{verification_payload['status']}`",
+        "",
+        "| Asset | Rows | Columns | Logical types | Status |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in results:
+        markdown_lines.append(
+            "| `{asset_name}` | {row_count_match} | {column_match} | {logical_type_match} | `{status}` |".format(
+                asset_name=row["asset_name"],
+                row_count_match="pass" if row["row_count_match"] else "fail",
+                column_match="pass" if row["column_match"] else "fail",
+                logical_type_match="pass" if row["logical_type_match"] else "fail",
+                status=row["status"],
+            )
+        )
+        if row["error"]:
+            markdown_lines.append(f"| `{row['asset_name']}` error | `{row['error']}` |  |  |  |")
+    write_markdown(warehouse_root / "warehouse_verification.md", markdown_lines)
+
+    if failures:
+        raise ValueError(
+            "Analytics warehouse verification failed for assets: " + ", ".join(sorted(set(failures)))
+        )
+
+    logger.info(
+        "Analytics warehouse artifacts verified: %s (%d assets)",
+        warehouse_root,
+        len(results),
+    )
+    return verification_payload
+
+
 def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Path:
     bundle.root.mkdir(parents=True, exist_ok=True)
     layer_payloads: dict[str, list[dict[str, object]]] = {}
@@ -1151,6 +1362,7 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
             asset_path = layer_dir / f"{asset_name}.parquet"
             storage_df = _normalize_frame_for_storage(df)
             storage_df.to_parquet(asset_path, index=False)
+            schema = _schema_records(storage_df)
             layer_entries.append(
                 {
                     "name": asset_name,
@@ -1158,6 +1370,7 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
                     "rows": int(len(storage_df.index)),
                     "column_count": int(len(storage_df.columns)),
                     "columns": [str(column) for column in storage_df.columns],
+                    "schema": schema,
                 }
             )
         layer_payloads[layer_name] = layer_entries
@@ -1193,6 +1406,7 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
                 f"| `{asset['name']}` | {asset['rows']} | {asset['column_count']} | `{Path(str(asset['path'])).name}` |"
             )
     write_markdown(bundle.root / "warehouse_manifest.md", markdown_lines)
+    verify_analytics_warehouse_artifacts(bundle.root, logger=logger)
     logger.info("Analytics warehouse refreshed: %s", bundle.root)
     return bundle.root
 

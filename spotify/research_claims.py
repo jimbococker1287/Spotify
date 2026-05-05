@@ -271,6 +271,11 @@ def _best_benchmark_row(rows: list[dict[str, object]], *, predicate) -> dict[str
     )
 
 
+def _benchmark_comparator_guard(benchmark_manifest: dict[str, object]) -> dict[str, object]:
+    payload = benchmark_manifest.get("comparator_guard", {})
+    return payload if isinstance(payload, dict) else {}
+
+
 def _claim_candidate_ranking(
     *,
     run_dir: Path,
@@ -300,6 +305,7 @@ def _claim_candidate_ranking(
     significance_rows = significance_rows if isinstance(significance_rows, list) else []
     benchmark_manifest = benchmark_bundle.get("manifest", {})
     benchmark_manifest = benchmark_manifest if isinstance(benchmark_manifest, dict) else {}
+    comparator_guard = _benchmark_comparator_guard(benchmark_manifest)
     lock_retrieval = next(
         (
             row
@@ -326,7 +332,14 @@ def _claim_candidate_ranking(
         else float("nan")
     )
     benchmark_ready = bool(benchmark_manifest.get("comparison_ready"))
-    retrieval_benchmark_ready = benchmark_ready and int(float(lock_retrieval.get("run_count", 0) or 0)) >= 3
+    requires_deep_comparator = bool(comparator_guard.get("requires_deep_comparator"))
+    deep_comparator_ready = bool(comparator_guard.get("deep_comparator_ready"))
+    deep_comparator_detail = str(comparator_guard.get("detail", "")).strip()
+    retrieval_benchmark_ready = (
+        benchmark_ready
+        and int(float(lock_retrieval.get("run_count", 0) or 0)) >= 3
+        and (not requires_deep_comparator or deep_comparator_ready)
+    )
     retrieval_vs_deep_significance = next(
         (
             row
@@ -384,9 +397,15 @@ def _claim_candidate_ranking(
             f"Repeated-seed significance vs `{lock_deep.get('model_name', '')}` is `{int(float(retrieval_vs_deep_significance.get('significant_at_95', 0) or 0))}` "
             f"with mean val_top1 diff `{_format_metric(retrieval_vs_deep_significance.get('mean_diff_val_top1'))}`."
         )
+    if requires_deep_comparator and not deep_comparator_ready and deep_comparator_detail:
+        evidence.append(f"Benchmark comparator guard: {deep_comparator_detail}")
 
     missing_checks = []
-    if not benchmark_ready:
+    if requires_deep_comparator and not deep_comparator_ready:
+        missing_checks.append(
+            "Benchmark lock is not comparison-ready because the research-grade comparator guard did not observe a repeated deep comparator."
+        )
+    elif not benchmark_ready:
         missing_checks.append("Finish the repeated-seed benchmark lock with at least 3 runs and a complete manifest artifact pack.")
     if not lock_retrieval:
         missing_checks.append("Add retrieval and reranker models to the benchmark-lock script so the main claim is repeated-seed, not single-run only.")
@@ -405,7 +424,8 @@ def _claim_candidate_ranking(
         "status": status,
         "summary": (
             f"Retrieval/reranking or ensemble-style candidate surfaces show a live test-top1 lift of `{_format_metric(live_delta)}` "
-            f"over the best deep baseline, but the benchmark-lock evidence is `{('ready' if benchmark_ready else 'not ready')}`."
+            f"over the best deep baseline, but the benchmark-lock evidence is "
+            f"`{('missing repeated deep comparator evidence' if requires_deep_comparator and not deep_comparator_ready else ('ready' if benchmark_ready else 'not ready'))}`."
         ),
         "evidence": evidence,
         "metrics": {
@@ -421,6 +441,10 @@ def _claim_candidate_ranking(
             "benchmark_comparison_ready": benchmark_ready,
             "benchmark_retrieval_ready": retrieval_benchmark_ready,
             "benchmark_significant_lift": significant_retrieval_lift,
+            "benchmark_requires_deep_comparator": requires_deep_comparator,
+            "benchmark_deep_comparator_ready": deep_comparator_ready,
+            "benchmark_deep_comparator_detail": deep_comparator_detail,
+            "benchmark_model_class_mix": benchmark_manifest.get("model_class_mix", {}),
         },
         "missing_checks": missing_checks,
         "supporting_artifacts": [
@@ -969,6 +993,12 @@ def build_research_claims_report(
             "manifest_path": str(benchmark_bundle.get("manifest_path", "")),
             "benchmark_id": str((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("benchmark_id", "")),
             "comparison_ready": bool((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparison_ready")),
+            "model_class_mix": dict((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("model_class_mix", {}))
+            if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("model_class_mix", {}), dict)
+            else {},
+            "comparator_guard": dict((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparator_guard", {}))
+            if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparator_guard", {}), dict)
+            else {},
             "summary": list((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("summary", []))
             if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("summary", []), list)
             else [],

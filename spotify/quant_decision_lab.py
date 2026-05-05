@@ -38,6 +38,30 @@ def _safe_float(value: object) -> float:
     return out
 
 
+def _native_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _native_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_native_value(item) for item in value]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
 def _normalize_series(series: pd.Series, *, higher_is_better: bool) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.notna().sum() <= 1:
@@ -383,6 +407,366 @@ def _build_policy_frontier(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     return policy_frontier, scenario_sensitivity
 
 
+def _listener_archetype_context(output_dir: Path) -> dict[str, Any]:
+    output_root = output_dir / "analysis" / "listener_archetypes"
+    brief = safe_read_json(output_root / "taste_state_brief.json", default={})
+    summary = safe_read_json(output_root / "listener_archetype_summary.json", default={})
+    brief_payload = brief if isinstance(brief, dict) else {}
+    summary_payload = summary if isinstance(summary, dict) else {}
+    archetype_rows = summary_payload.get("archetypes", [])
+    archetype_lookup: dict[str, dict[str, object]] = {}
+    if isinstance(archetype_rows, list):
+        for row in archetype_rows:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("archetype_label", "")).strip()
+            if label:
+                archetype_lookup[label] = _native_value(row)
+
+    dominant_label = str(brief_payload.get("dominant_archetype", "")).strip()
+    highest_skip_label = str(brief_payload.get("highest_skip_archetype", "")).strip()
+    exploratory_label = str(brief_payload.get("highest_exploration_archetype", "")).strip()
+    available = bool(dominant_label or highest_skip_label or exploratory_label)
+    return {
+        "status": "ok" if available else "missing",
+        "available": available,
+        "brief": brief_payload,
+        "summary": summary_payload,
+        "archetype_lookup": archetype_lookup,
+        "dominant_archetype": dominant_label,
+        "highest_skip_archetype": highest_skip_label,
+        "highest_exploration_archetype": exploratory_label,
+    }
+
+
+def _prefer_efficient_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "is_pareto_efficient" not in frame.columns:
+        return frame.copy()
+    efficient_mask = frame["is_pareto_efficient"].fillna(False).astype(bool)
+    if bool(efficient_mask.any()):
+        return frame.loc[efficient_mask].copy()
+    return frame.copy()
+
+
+def _compact_record(row: dict[str, object], columns: list[str], *, selection_basis: str) -> dict[str, object]:
+    payload = {column: _native_value(row.get(column)) for column in columns}
+    payload["selection_basis"] = selection_basis
+    return payload
+
+
+def _select_model_recommendation(model_frontier: pd.DataFrame, role: str) -> dict[str, object]:
+    if model_frontier.empty:
+        return {}
+    ranked = _prefer_efficient_rows(model_frontier)
+    for column in [
+        "utility_score",
+        "test_top1",
+        "test_discounted_reward",
+        "test_hit_at_k",
+        "test_expected_utility_mass",
+        "test_selective_risk",
+        "test_accepted_rate",
+    ]:
+        ranked[column] = pd.to_numeric(ranked.get(column), errors="coerce")
+    if role == "high_skip":
+        risk_complete = ranked.loc[ranked.get("risk_complete", False).fillna(False).astype(bool)].copy()
+        if not risk_complete.empty:
+            ranked = risk_complete
+        selected = ranked.sort_values(
+            ["test_selective_risk", "test_accepted_rate", "utility_score"],
+            ascending=[True, False, False],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Lowest selective risk with complete uncertainty metrics."
+    elif role == "exploratory":
+        selected = ranked.sort_values(
+            ["test_expected_utility_mass", "test_hit_at_k", "utility_score", "test_top1"],
+            ascending=[False, False, False, False],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Highest expected utility mass and hit-rate proxy for discovery breadth."
+    else:
+        selected = ranked.sort_values(
+            ["utility_score", "test_top1", "test_discounted_reward"],
+            ascending=[False, False, False],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Highest utility score on the efficient model frontier."
+    return _compact_record(
+        selected,
+        [
+            "model_name",
+            "model_type",
+            "model_family",
+            "frontier_status",
+            "is_pareto_efficient",
+            "utility_score",
+            "test_top1",
+            "test_hit_at_k",
+            "test_discounted_reward",
+            "test_expected_utility_mass",
+            "test_selective_risk",
+            "test_accepted_rate",
+        ],
+        selection_basis=basis,
+    )
+
+
+def _select_policy_recommendation(policy_frontier: pd.DataFrame, role: str) -> dict[str, object]:
+    if policy_frontier.empty:
+        return {}
+    ranked = _prefer_efficient_rows(policy_frontier)
+    for column in ["utility_score", "mean_session_length", "mean_skip_risk", "worst_skip_risk", "mean_end_risk"]:
+        ranked[column] = pd.to_numeric(ranked.get(column), errors="coerce")
+    safe_ranked = ranked.loc[ranked["policy_family"].astype(str) == "safe"].copy()
+    if role == "high_skip":
+        if not safe_ranked.empty:
+            ranked = safe_ranked
+        selected = ranked.sort_values(
+            ["mean_skip_risk", "worst_skip_risk", "mean_end_risk", "utility_score"],
+            ascending=[True, True, True, False],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Lowest skip-risk safe policy on the stress-tested frontier."
+    elif role == "exploratory":
+        if not safe_ranked.empty:
+            ranked = safe_ranked
+        selected = ranked.sort_values(
+            ["mean_session_length", "utility_score", "mean_skip_risk"],
+            ascending=[False, False, True],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Longest safe-policy session length while preserving frontier utility."
+    else:
+        selected = ranked.sort_values(
+            ["utility_score", "mean_skip_risk", "mean_end_risk"],
+            ascending=[False, True, True],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Highest utility score on the policy frontier."
+    return _compact_record(
+        selected,
+        [
+            "policy_name",
+            "policy_family",
+            "frontier_status",
+            "is_pareto_efficient",
+            "utility_score",
+            "mean_session_length",
+            "mean_skip_risk",
+            "worst_skip_risk",
+            "mean_end_risk",
+            "scenario_count",
+        ],
+        selection_basis=basis,
+    )
+
+
+def _select_scenario_focus(scenario_sensitivity: pd.DataFrame, role: str) -> dict[str, object]:
+    if scenario_sensitivity.empty:
+        return {}
+    ranked = scenario_sensitivity.copy()
+    for column in [
+        "baseline_skip_risk",
+        "baseline_end_risk",
+        "best_safe_skip_risk",
+        "best_safe_end_risk",
+        "safe_skip_improvement_vs_baseline",
+        "pressure_score",
+    ]:
+        ranked[column] = pd.to_numeric(ranked.get(column), errors="coerce")
+    if role == "dominant":
+        baseline = ranked.loc[ranked["scenario"].astype(str) == "baseline"].copy()
+        if not baseline.empty:
+            selected = baseline.iloc[0].to_dict()
+        else:
+            selected = ranked.sort_values(
+                ["pressure_score", "baseline_skip_risk"],
+                ascending=[True, True],
+                na_position="last",
+            ).iloc[0].to_dict()
+        basis = "Default operating slice anchored on the baseline scenario."
+    elif role == "high_skip":
+        selected = ranked.sort_values(
+            ["pressure_score", "baseline_skip_risk", "safe_skip_improvement_vs_baseline"],
+            ascending=[False, False, False],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Highest pressure scenario where skip-risk control matters most."
+    else:
+        selected = ranked.sort_values(
+            ["safe_skip_improvement_vs_baseline", "pressure_score", "best_safe_skip_risk"],
+            ascending=[False, False, True],
+            na_position="last",
+        ).iloc[0].to_dict()
+        basis = "Largest safe skip-improvement window for discovery-style routing experiments."
+    return _compact_record(
+        selected,
+        [
+            "scenario",
+            "baseline_skip_risk",
+            "baseline_end_risk",
+            "best_safe_policy_name",
+            "best_safe_skip_risk",
+            "best_safe_end_risk",
+            "safe_skip_improvement_vs_baseline",
+            "pressure_score",
+        ],
+        selection_basis=basis,
+    )
+
+
+def _build_archetype_decision_bridge(
+    *,
+    output_dir: Path,
+    run_dir: Path,
+    model_frontier: pd.DataFrame,
+    policy_frontier: pd.DataFrame,
+    scenario_sensitivity: pd.DataFrame,
+) -> tuple[dict[str, Any], list[str]]:
+    listener_context = _listener_archetype_context(output_dir)
+    summary = [f"Latest quant decision anchor is `{run_dir.name}`."]
+    if not listener_context["available"]:
+        summary.append("Listener archetype outputs were not available, so archetype-specific bridge recommendations were skipped.")
+        actions = [
+            "Build `make listener-archetypes` before relying on archetype-specific model and policy slices.",
+            "Use the existing quant frontier artifacts directly until archetype summaries are present.",
+        ]
+        payload = {
+            "status": "listener_archetypes_missing",
+            "run_id": run_dir.name,
+            "listener_archetypes_available": False,
+            "listener_archetype_source": {
+                "status": listener_context["status"],
+                "dominant_archetype": listener_context["dominant_archetype"],
+                "highest_skip_archetype": listener_context["highest_skip_archetype"],
+                "highest_exploration_archetype": listener_context["highest_exploration_archetype"],
+            },
+            "archetype_recommendations": [],
+            "summary": summary,
+            "actions": actions,
+        }
+        markdown = [
+            "# Archetype Decision Bridge",
+            "",
+            *[f"- {line}" for line in summary],
+            "",
+            "## Suggested Uses",
+            "",
+            *[f"- {line}" for line in actions],
+        ]
+        return payload, markdown
+
+    brief = listener_context["brief"]
+    lookup = listener_context["archetype_lookup"]
+    roles = [
+        {
+            "role": "dominant",
+            "title": "Dominant Archetype",
+            "archetype_label": listener_context["dominant_archetype"],
+            "metric_name": "days",
+            "metric_value": brief.get("dominant_archetype_days"),
+            "archetype_basis": "Most common listener state across observed days.",
+        },
+        {
+            "role": "high_skip",
+            "title": "High-Skip Archetype",
+            "archetype_label": listener_context["highest_skip_archetype"],
+            "metric_name": "skip_rate",
+            "metric_value": brief.get("highest_skip_rate"),
+            "archetype_basis": "Highest skip-rate listener state from listener archetypes.",
+        },
+        {
+            "role": "exploratory",
+            "title": "Exploratory Archetype",
+            "archetype_label": listener_context["highest_exploration_archetype"],
+            "metric_name": "exploration_ratio",
+            "metric_value": brief.get("highest_exploration_ratio"),
+            "archetype_basis": "Most exploratory listener state from archetype summaries.",
+        },
+    ]
+
+    recommendations: list[dict[str, object]] = []
+    for role in roles:
+        label = str(role["archetype_label"]).strip()
+        if not label:
+            continue
+        model = _select_model_recommendation(model_frontier, str(role["role"]))
+        policy = _select_policy_recommendation(policy_frontier, str(role["role"]))
+        scenario = _select_scenario_focus(scenario_sensitivity, str(role["role"]))
+        recommendation = {
+            "role": role["role"],
+            "title": role["title"],
+            "archetype_label": label,
+            "archetype_basis": role["archetype_basis"],
+            "archetype_metric_name": role["metric_name"],
+            "archetype_metric_value": _native_value(role["metric_value"]),
+            "archetype_details": lookup.get(label, {}),
+            "recommended_model": model,
+            "recommended_policy": policy,
+            "scenario_focus": scenario,
+        }
+        recommendations.append(recommendation)
+        summary.append(
+            f"{role['title']} `{label}` maps to model `{model.get('model_name', '')}`, policy `{policy.get('policy_name', '')}`, and scenario `{scenario.get('scenario', '')}`."
+        )
+
+    actions = [
+        "Use the dominant archetype bridge as the default evaluation slice for everyday Taste OS demos and benchmark checks.",
+        "Start calibration and recovery experiments with the high-skip bridge because it couples the safest model with the lowest skip-risk policy.",
+        "Use the exploratory bridge when pressure-testing discovery routing so scenario focus and model breadth stay aligned.",
+    ]
+    payload = {
+        "status": "ok",
+        "run_id": run_dir.name,
+        "listener_archetypes_available": True,
+        "listener_archetype_source": {
+            "status": listener_context["status"],
+            "dominant_archetype": listener_context["dominant_archetype"],
+            "highest_skip_archetype": listener_context["highest_skip_archetype"],
+            "highest_exploration_archetype": listener_context["highest_exploration_archetype"],
+            "summary": _native_value(brief.get("summary", [])),
+            "actions": _native_value(brief.get("actions", [])),
+            "archetype_count": len(lookup),
+        },
+        "archetype_recommendations": recommendations,
+        "summary": summary,
+        "actions": actions,
+    }
+
+    markdown = [
+        "# Archetype Decision Bridge",
+        "",
+        *[f"- {line}" for line in summary],
+        "",
+        "## Recommended Lanes",
+        "",
+    ]
+    for recommendation in recommendations:
+        model = recommendation.get("recommended_model", {})
+        policy = recommendation.get("recommended_policy", {})
+        scenario = recommendation.get("scenario_focus", {})
+        markdown.extend(
+            [
+                f"### {recommendation.get('title', '')}",
+                "",
+                f"- Archetype: `{recommendation.get('archetype_label', '')}` ({recommendation.get('archetype_metric_name', '')}: `{recommendation.get('archetype_metric_value', '')}`)",
+                f"- Model: `{model.get('model_name', '')}`. {model.get('selection_basis', '')}",
+                f"- Policy: `{policy.get('policy_name', '')}`. {policy.get('selection_basis', '')}",
+                f"- Scenario focus: `{scenario.get('scenario', '')}`. {scenario.get('selection_basis', '')}",
+                "",
+            ]
+        )
+    markdown.extend(
+        [
+            "## Suggested Uses",
+            "",
+            *[f"- {line}" for line in actions],
+        ]
+    )
+    return payload, markdown
+
+
 def _brief_lines(
     *,
     run_dir: Path,
@@ -533,6 +917,16 @@ def build_quant_decision_lab(
         )
         paths.append(path)
         paths.append(write_json(output_root / "scenario_sensitivity.json", scenario_sensitivity.to_dict(orient="records")))
+
+    bridge_payload, bridge_markdown = _build_archetype_decision_bridge(
+        output_dir=output_dir,
+        run_dir=resolved_run_dir,
+        model_frontier=model_frontier,
+        policy_frontier=policy_frontier,
+        scenario_sensitivity=scenario_sensitivity,
+    )
+    paths.append(write_json(output_root / "archetype_decision_bridge.json", bridge_payload))
+    paths.append(write_markdown(output_root / "archetype_decision_bridge.md", bridge_markdown))
 
     brief_payload, brief_markdown = _brief_lines(
         run_dir=resolved_run_dir,

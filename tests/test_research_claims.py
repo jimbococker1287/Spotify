@@ -240,6 +240,17 @@ def test_candidate_ranking_claim_uses_retrieval_benchmark_lock_when_available(tm
         {
             "benchmark_id": "demo_ready",
             "comparison_ready": True,
+            "model_class_mix": {
+                "declared": {"expected_model_classes": ["candidate", "deep"], "research_grade": True},
+                "observed": {"model_classes": ["candidate", "deep"], "model_types": ["deep", "retrieval_reranker"]},
+            },
+            "comparator_guard": {
+                "research_grade": True,
+                "requires_deep_comparator": True,
+                "deep_comparator_ready": True,
+                "deep_comparator_models": ["gru_artist"],
+                "detail": "Research-grade comparator guard observed repeated deep comparator(s): `gru_artist`.",
+            },
             "summary": ["Benchmark lock is comparison ready."],
         },
     )
@@ -253,4 +264,73 @@ def test_candidate_ranking_claim_uses_retrieval_benchmark_lock_when_available(tm
     candidate_claim = next(claim for claim in report["claims"] if claim["key"] == "candidate_ranking")
     assert candidate_claim["metrics"]["benchmark_retrieval_model_name"] == "retrieval_reranker"
     assert candidate_claim["metrics"]["benchmark_significant_lift"] is True
+    assert candidate_claim["metrics"]["benchmark_deep_comparator_ready"] is True
     assert not any("Add retrieval and reranker models" in item for item in candidate_claim["missing_checks"])
+
+
+def test_candidate_ranking_claim_calls_out_missing_deep_comparator_evidence(tmp_path: Path) -> None:
+    outputs, _ = _fixture_outputs(tmp_path)
+    run_dir = outputs / "runs" / "run_full"
+    history_dir = outputs / "history"
+    benchmark_manifest = history_dir / "benchmark_lock_demo_missing_deep_manifest.json"
+    _write_csv(
+        history_dir / "benchmark_lock_demo_missing_deep_summary.csv",
+        [
+            {"model_name": "retrieval_reranker", "model_type": "retrieval_reranker", "run_count": 3, "val_top1_mean": 0.24, "test_top1_mean": 0.29, "val_top1_ci95": 0.01},
+            {"model_name": "extra_trees", "model_type": "classical", "run_count": 3, "val_top1_mean": 0.19, "test_top1_mean": 0.17, "val_top1_ci95": 0.01},
+        ],
+    )
+    _write_csv(
+        history_dir / "benchmark_lock_demo_missing_deep_significance.csv",
+        [
+            {
+                "left_model": "retrieval_reranker",
+                "right_model": "extra_trees",
+                "shared_runs": 3,
+                "mean_diff_val_top1": 0.05,
+                "ci95_diff_val_top1": 0.02,
+                "z_score": 2.8,
+                "significant_at_95": 1,
+            }
+        ],
+    )
+    _write_json(
+        benchmark_manifest,
+        {
+            "benchmark_id": "demo_missing_deep",
+            "comparison_ready": False,
+            "model_class_mix": {
+                "declared": {"expected_model_classes": ["candidate", "classical", "deep"], "research_grade": True},
+                "observed": {
+                    "model_classes": ["candidate", "classical"],
+                    "model_types": ["classical", "retrieval_reranker"],
+                    "model_names_by_type": {
+                        "classical": ["extra_trees"],
+                        "retrieval_reranker": ["retrieval_reranker"],
+                    },
+                },
+            },
+            "comparator_guard": {
+                "research_grade": True,
+                "requires_deep_comparator": True,
+                "deep_comparator_ready": False,
+                "deep_comparator_models": [],
+                "detail": "Research-grade comparator guard failed: no deep model appears in the repeated benchmark summary with at least `3` run(s).",
+            },
+            "summary": ["Benchmark lock is not comparison-ready because it lacks repeated deep comparator evidence."],
+        },
+    )
+
+    report = build_research_claims_report(
+        outputs,
+        run_dir=run_dir,
+        benchmark_manifest_path=benchmark_manifest,
+    )
+
+    candidate_claim = next(claim for claim in report["claims"] if claim["key"] == "candidate_ranking")
+    assert candidate_claim["status"] == "promising_but_unlocked"
+    assert "missing repeated deep comparator evidence" in candidate_claim["summary"]
+    assert candidate_claim["metrics"]["benchmark_requires_deep_comparator"] is True
+    assert candidate_claim["metrics"]["benchmark_deep_comparator_ready"] is False
+    assert any("research-grade comparator guard" in item for item in candidate_claim["missing_checks"])
+    assert any("comparator guard failed" in item.lower() for item in candidate_claim["evidence"])

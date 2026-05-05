@@ -24,6 +24,7 @@ Main outputs:
 - `seed_scene_bridge_atlas.csv/json`: best seed-to-scene bridge combinations.
 - `release_whitespace_atlas.csv/json`: whitespace and release-timing watchlist when public release metadata is available.
 - `creator_market_brief.json/md`: short brief summarizing the strongest market signals and next uses.
+- `creator_market_manifest.json`: artifact index plus truthful report-family counts, including how many discovered families are still partial.
 
 Suggested use:
 

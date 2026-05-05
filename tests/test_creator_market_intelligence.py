@@ -19,11 +19,15 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Path) -> None:
+def _logger() -> logging.Logger:
     logger = logging.getLogger("spotify.test.creator_market_intelligence")
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
+    return logger
 
+
+def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Path) -> None:
+    logger = _logger()
     root = tmp_path / "outputs" / "analysis" / "public_spotify" / "creator_label_intelligence"
     family_a = "creator_label_intelligence_seed-a-seed-b"
     family_b = "creator_label_intelligence_seed-c-seed-d"
@@ -219,9 +223,140 @@ def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Pa
     scene_pulse = pd.read_csv(output_root / "scene_market_pulse.csv")
     migration_network = pd.read_csv(output_root / "market_migration_network.csv")
     whitespace_atlas = pd.read_csv(output_root / "release_whitespace_atlas.csv")
+    manifest_payload = json.loads((output_root / "creator_market_manifest.json").read_text(encoding="utf-8"))
+    brief_payload = json.loads((output_root / "creator_market_brief.json").read_text(encoding="utf-8"))
     brief_text = (output_root / "creator_market_brief.md").read_text(encoding="utf-8")
 
     assert scene_pulse.iloc[0]["scene_name"] == "scene-2"
     assert migration_network.iloc[0]["target_artist"] in {"Artist 4", "Artist 2"}
     assert not whitespace_atlas.empty
+    assert manifest_payload["report_family_count"] == 2
+    assert manifest_payload["manifest_backed_report_family_count"] == 2
+    assert manifest_payload["asset_backed_report_family_count"] == 2
+    assert manifest_payload["complete_report_family_count"] == 0
+    assert manifest_payload["partial_report_family_count"] == 2
+    assert manifest_payload["partial_report_family_ids"] == [family_a, family_b]
+    assert brief_payload["report_family_count"] == 2
     assert "Creator Market Brief" in brief_text
+    assert "aggregating `2` creator report families" in brief_text
+
+
+def test_build_creator_market_intelligence_counts_complete_and_partial_families(tmp_path: Path) -> None:
+    logger = _logger()
+    root = tmp_path / "outputs" / "analysis" / "public_spotify" / "creator_label_intelligence"
+    complete_family = "creator_label_intelligence_complete-family"
+    partial_family = "creator_label_intelligence_partial-family"
+
+    _write_json(root / f"{complete_family}_report_family.json", {"primary_report": "complete.md"})
+    _write_csv(
+        root / f"{complete_family}_ranking_comparison.csv",
+        [
+            {
+                "artist_name": "Artist Complete",
+                "scene_name": "scene-complete",
+                "primary_driver": "seed_adjacency",
+                "opportunity_score": 0.51,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{complete_family}_scene_comparison.csv",
+        [
+            {
+                "scene_id": 1,
+                "scene_name": "scene-complete",
+                "scene_local_play_share": 0.61,
+                "avg_opportunity_score": 0.52,
+                "priority_now_count": 2,
+                "watchlist_count": 0,
+                "scene_release_pressure": 0.18,
+                "scene_label_concentration": 0.09,
+                "top_opportunity_artist": "Artist Complete",
+                "top_opportunity_score": 0.53,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{complete_family}_opportunities.csv",
+        [
+            {
+                "artist_name": "Artist Complete",
+                "scene_name": "scene-complete",
+                "primary_driver": "seed_adjacency",
+                "opportunity_band": "priority_now",
+                "opportunity_score": 0.53,
+                "scene_local_play_share": 0.61,
+                "scene_release_pressure": 0.18,
+                "scene_label_concentration": 0.09,
+                "fan_migration_score": 0.48,
+                "release_whitespace_score": 0.42,
+                "local_gap_score": 0.37,
+                "scene_momentum_score": 0.58,
+                "connected_seed_artists": json.dumps(["Seed Complete"]),
+                "dominant_release_labels": json.dumps(["Indie"]),
+                "days_since_latest_release": 90,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{complete_family}_migration_watch.csv",
+        [
+            {
+                "source_artist": "Artist Source",
+                "target_artist": "Artist Complete",
+                "source_scene_id": 1,
+                "target_scene_id": 1,
+                "source_out_share": 0.26,
+                "target_in_share": 0.31,
+                "transition_count": 28,
+            }
+        ],
+    )
+    seed_bridge_rows = [
+        {
+            "scene_name": "scene-complete",
+            "seed_artist": "Seed Complete",
+            "avg_opportunity_score": 0.52,
+            "bridge_artist_count": 2,
+            "opportunity_count": 1,
+            "scene_local_play_share": 0.61,
+            "scene_release_pressure": 0.18,
+            "scene_label_concentration": 0.09,
+            "top_driver": "seed_adjacency",
+            "top_opportunity_artist": "Artist Complete",
+        }
+    ]
+    _write_csv(root / f"{complete_family}_seed_comparison.csv", seed_bridge_rows)
+    _write_csv(root / f"{complete_family}_scene_seed_comparison.csv", seed_bridge_rows)
+    _write_csv(
+        root / f"{partial_family}_scene_seed_comparison.csv",
+        [
+            {
+                "scene_name": "scene-partial",
+                "seed_artist": "Seed Partial",
+                "avg_opportunity_score": 0.27,
+                "bridge_artist_count": 1,
+                "opportunity_count": 1,
+                "scene_local_play_share": 0.22,
+                "scene_release_pressure": 0.12,
+                "scene_label_concentration": 0.16,
+                "top_driver": "migration_capture",
+                "top_opportunity_artist": "Artist Partial",
+            }
+        ],
+    )
+
+    paths = build_creator_market_intelligence(output_dir=tmp_path / "outputs", logger=logger)
+
+    assert paths
+    output_root = tmp_path / "outputs" / "analysis" / "creator_market_intelligence"
+    manifest_payload = json.loads((output_root / "creator_market_manifest.json").read_text(encoding="utf-8"))
+    brief_payload = json.loads((output_root / "creator_market_brief.json").read_text(encoding="utf-8"))
+
+    assert manifest_payload["report_family_count"] == 2
+    assert manifest_payload["manifest_backed_report_family_count"] == 1
+    assert manifest_payload["asset_backed_report_family_count"] == 2
+    assert manifest_payload["complete_report_family_count"] == 1
+    assert manifest_payload["partial_report_family_count"] == 1
+    assert manifest_payload["partial_report_family_ids"] == [partial_family]
+    assert brief_payload["report_family_count"] == 2

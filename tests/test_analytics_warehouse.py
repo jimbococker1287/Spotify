@@ -183,7 +183,12 @@ def _write_minimal_control_room(output_dir: Path) -> None:
                     "promoted": True,
                 },
                 "run_selection": {
-                    "selected_run": "run_a",
+                    "selected_run": {
+                        "run_id": "run_a",
+                        "profile": "full",
+                        "best_model_name": "mlp",
+                        "best_model_type": "classical",
+                    },
                     "selection_reason": "latest full run",
                 },
                 "ops_health": {
@@ -362,9 +367,13 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
 
     assert warehouse_root.exists()
     assert (warehouse_root / "warehouse_manifest.json").exists()
+    assert (warehouse_root / "warehouse_verification.json").exists()
     assert (warehouse_root / "bronze" / "control_room_snapshot.parquet").exists()
     assert (warehouse_root / "silver" / "model_run_summary.parquet").exists()
     assert (warehouse_root / "gold" / "mart_creator_opportunities.parquet").exists()
+
+    control_room_snapshot = pd.read_parquet(warehouse_root / "bronze" / "control_room_snapshot.parquet")
+    assert control_room_snapshot.loc[0, "selected_run_id"] == "run_a"
 
     model_run_summary = pd.read_parquet(warehouse_root / "silver" / "model_run_summary.parquet")
     assert model_run_summary.loc[0, "is_serving_alias"]
@@ -374,6 +383,10 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
 
     creator_opportunities = pd.read_parquet(warehouse_root / "gold" / "mart_creator_opportunities.parquet")
     assert creator_opportunities.loc[0, "artist_name"] == "Artist X"
+
+    verification = json.loads((warehouse_root / "warehouse_verification.json").read_text(encoding="utf-8"))
+    assert verification["status"] == "pass"
+    assert verification["summary"]["failed_assets"] == 0
 
 
 def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) -> None:
@@ -399,6 +412,36 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
         creator_row = con.execute(
             "SELECT artist_name, priority_now_count FROM creator_priority_now ORDER BY max_opportunity_score DESC"
         ).fetchone()
+        consistency_rows = con.execute(
+            """
+            SELECT object_name, row_count_match, column_match, logical_type_match
+            FROM warehouse_consistency_checks
+            WHERE object_name IN ('control_room_snapshot', 'mart_ops_overview', 'latest_ops_overview')
+            ORDER BY object_name
+            """
+        ).fetchall()
+        metadata_row = con.execute(
+            """
+            SELECT expected_rows, expected_column_count
+            FROM warehouse_asset_manifest
+            WHERE asset_name = 'control_room_snapshot'
+            """
+        ).fetchone()
+        selected_run_row = con.execute(
+            """
+            SELECT selected_run_id
+            FROM control_room_snapshot
+            """
+        ).fetchone()
 
     assert ops_row == ("run_a", "attention", "stale")
     assert creator_row == ("Artist X", 1)
+    assert consistency_rows == [
+        ("control_room_snapshot", True, True, True),
+        ("latest_ops_overview", True, True, True),
+        ("mart_ops_overview", True, True, True),
+    ]
+    assert metadata_row is not None
+    assert metadata_row[0] == 1
+    assert metadata_row[1] >= 1
+    assert selected_run_row == ("run_a",)

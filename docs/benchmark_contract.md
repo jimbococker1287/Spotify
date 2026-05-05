@@ -9,6 +9,7 @@ Week 10 freezes the comparison protocol so future experiments can be evaluated w
 - Comparison mode: `repeated_seed_lock`
 - Minimum repeated runs: `3`
 - Significance rule: paired by `run_id` on `val_top1` with 95% confidence and `z >= 1.96`
+- Comparator guard: research-grade locks must include a repeated deep comparator before they are comparison-ready
 
 ## Locked Artifact Set
 
@@ -37,7 +38,9 @@ Every aggregated benchmark-lock should preserve:
 - Treat changes to sequence length, max artists, random seed policy, or data fingerprint as a new benchmark version.
 - Require the full artifact pack before calling a result publication-grade.
 - Require every published model in the summary table to appear in all repeated runs, not just the benchmark aggregate overall.
+- Record the declared and observed model-class mix in the lock manifest so comparator coverage is auditable after the run.
+- Treat retrieval, reranking, and ensemble candidate surfaces as research-grade evidence that needs a repeated deep comparator in the same lock.
 
 ## Working Rule
 
-Use `make benchmark-lock` when you want a benchmark-grade comparison and treat its manifest as the source of truth for whether the comparison is actually ready. The benchmark runner now resumes missing seeds by default, so rerunning the same benchmark id is safe when a prior pass stopped early.
+Use `make benchmark-lock` when you want a benchmark-grade comparison and treat its manifest as the source of truth for whether the comparison is actually ready. The manifest now records both declared and observed model-class mix, and the benchmark command fails if a research-grade lock is missing its repeated deep comparator. The benchmark runner still resumes missing seeds by default, so rerunning the same benchmark id is safe when a prior pass stopped early.

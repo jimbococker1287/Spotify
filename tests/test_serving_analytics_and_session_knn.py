@@ -198,7 +198,23 @@ def test_analytics_db_refresh_builds_duckdb(tmp_path: Path) -> None:
         rows = con.execute(
             "SELECT run_id, multimodal_embedding_dim, stress_worst_skip_scenario FROM moonshot_run_summary"
         ).fetchall()
+        consistency_row = con.execute(
+            """
+            SELECT row_count_match, column_match, logical_type_match
+            FROM warehouse_consistency_checks
+            WHERE object_name = 'run_manifests'
+            """
+        ).fetchone()
+        metadata_row = con.execute(
+            """
+            SELECT expected_rows, expected_column_count
+            FROM warehouse_asset_manifest
+            WHERE asset_name = 'moonshot_summary'
+            """
+        ).fetchone()
     assert rows == [("run_a", 8, "high_friction_spike")]
+    assert consistency_row == (True, True, True)
+    assert metadata_row == (1, 10)
 
 
 def test_analytics_db_refresh_can_reuse_preloaded_raw_df(tmp_path: Path) -> None:
