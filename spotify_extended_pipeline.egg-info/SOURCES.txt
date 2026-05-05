@@ -4,6 +4,7 @@ setup.py
 spotify/__init__.py
 spotify/__main__.py
 spotify/analytics_db.py
+spotify/analytics_warehouse.py
 spotify/artifact_cleanup.py
 spotify/aws_athena.py
 spotify/aws_athena_export.py
@@ -30,10 +31,12 @@ spotify/control_room_selection.py
 spotify/control_room_triage.py
 spotify/creator_label_intelligence.py
 spotify/creator_label_intelligence_core.py
+spotify/creator_market_intelligence.py
 spotify/data.py
 spotify/data_preparation.py
 spotify/data_quality.py
 spotify/day_90_launch.py
+spotify/deployment_registry.py
 spotify/digital_twin.py
 spotify/drift.py
 spotify/ensemble.py
@@ -46,6 +49,7 @@ spotify/governance.py
 spotify/group_auto_dj.py
 spotify/journey_planner.py
 spotify/lastfm.py
+spotify/listener_archetypes.py
 spotify/model_types.py
 spotify/modeling.py
 spotify/monitoring.py
@@ -130,11 +134,13 @@ spotify/public_insights_creator_brief.py
 spotify/public_insights_graph.py
 spotify/public_insights_handlers.py
 spotify/public_insights_index.py
+spotify/quant_decision_lab.py
 spotify/ranking.py
 spotify/recommender_safety.py
 spotify/reporting.py
 spotify/research_artifacts.py
 spotify/research_claims.py
+spotify/research_platform_lab.py
 spotify/retrieval.py
 spotify/retrieval_ann_metrics.py
 spotify/retrieval_artifact_payloads.py
@@ -159,7 +165,10 @@ spotify/run_timing.py
 spotify/runtime.py
 spotify/safe_policy.py
 spotify/safety_platform.py
+spotify/service_api.py
+spotify/service_auth.py
 spotify/serving.py
+spotify/serving_bundle.py
 spotify/session_knn.py
 spotify/show_ready_backfill.py
 spotify/show_ready_maintenance.py
@@ -171,6 +180,7 @@ spotify/taste_os_http.py
 spotify/taste_os_page.py
 spotify/taste_os_service.py
 spotify/taste_os_showcase.py
+spotify/taste_os_state.py
 spotify/tracking.py
 spotify/training.py
 spotify/training_preflight.py
@@ -183,6 +193,7 @@ spotify_extended_pipeline.egg-info/entry_points.txt
 spotify_extended_pipeline.egg-info/requires.txt
 spotify_extended_pipeline.egg-info/top_level.txt
 tests/test_aggregate_benchmark.py
+tests/test_analytics_warehouse.py
 tests/test_artifact_cleanup.py
 tests/test_athena_export.py
 tests/test_audio_features.py
@@ -204,9 +215,12 @@ tests/test_control_room.py
 tests/test_control_room_cli_smoke.py
 tests/test_control_room_guard.py
 tests/test_creator_label_intelligence.py
+tests/test_creator_market_intelligence.py
 tests/test_data_discovery.py
 tests/test_data_quality_gate.py
 tests/test_day_90_launch.py
+tests/test_deploy_manifests.py
+tests/test_deployment_registry.py
 tests/test_digital_twin.py
 tests/test_drift_and_backtesting.py
 tests/test_env_loader.py
@@ -216,6 +230,7 @@ tests/test_front_door.py
 tests/test_front_door_cli_smoke.py
 tests/test_governance_gate.py
 tests/test_lastfm.py
+tests/test_listener_archetypes.py
 tests/test_moonshot_lab.py
 tests/test_outward_package.py
 tests/test_outward_package_cli_smoke.py
@@ -235,6 +250,7 @@ tests/test_public_catalog.py
 tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
 tests/test_public_insights_creator_brief.py
+tests/test_quant_decision_lab.py
 tests/test_ranking_metrics.py
 tests/test_recommender_safety_platform.py
 tests/test_regression_alert.py
@@ -242,6 +258,7 @@ tests/test_reporting_and_evaluation.py
 tests/test_research_claims.py
 tests/test_research_claims_cli_smoke.py
 tests/test_research_platform.py
+tests/test_research_platform_lab.py
 tests/test_retrieval_and_friction.py
 tests/test_retrieval_reranking.py
 tests/test_run_artifact_writes.py
@@ -250,6 +267,8 @@ tests/test_run_timing.py
 tests/test_runtime_acceleration.py
 tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
+tests/test_service_api.py
+tests/test_service_api_cli_smoke.py
 tests/test_serving_analytics_and_session_knn.py
 tests/test_shared_helpers.py
 tests/test_show_ready_backfill.py
@@ -262,6 +281,7 @@ tests/test_taste_os_service.py
 tests/test_taste_os_service_cli_smoke.py
 tests/test_taste_os_showcase.py
 tests/test_taste_os_showcase_cli_smoke.py
+tests/test_taste_os_state.py
 tests/test_tracking.py
 tests/test_training_cache.py
 tests/test_training_helpers.py

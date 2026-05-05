@@ -8,7 +8,7 @@ import secrets
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, TypedDict
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from .taste_os_demo import MODE_CONFIGS, SCENARIOS
 
@@ -69,12 +69,29 @@ def parse_taste_os_args() -> argparse.Namespace:
         help="Path to outputs/runs/<run_id> or outputs/models/champion. Defaults to champion alias.",
     )
     parser.add_argument("--model-name", type=str, default=None, help="Optional serveable model name override.")
-    parser.add_argument("--data-dir", type=str, default="data/raw", help="Path to raw Streaming_History JSON files.")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data/raw",
+        help="Optional raw Streaming_History JSON directory used only when a serving bundle is missing.",
+    )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="outputs/analysis/taste_os_service",
         help="Directory for optional persisted session artifacts.",
+    )
+    parser.add_argument(
+        "--state-db",
+        type=str,
+        default="",
+        help="Optional SQLite path for durable Taste OS feedback/session state. Defaults under the output dir.",
+    )
+    parser.add_argument(
+        "--state-db-url",
+        type=str,
+        default=os.getenv("TASTE_OS_DATABASE_URL", ""),
+        help="Optional SQLAlchemy database URL for durable Taste OS feedback/session state. Overrides --state-db when set.",
     )
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8010, help="HTTP port.")
@@ -89,6 +106,11 @@ def parse_taste_os_args() -> argparse.Namespace:
         "--include-video",
         action="store_true",
         help="Include video history files by default when rebuilding request context.",
+    )
+    parser.add_argument(
+        "--require-serving-bundle",
+        action="store_true",
+        help="Fail fast unless the run already has a materialized prediction serving bundle.",
     )
     return parser.parse_args()
 
@@ -516,17 +538,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                     self._send_error(404, code="artifact_not_found", message=str(exc))
                 return
             if path == "/health":
-                self._send_json(
-                    200,
-                    {
-                        "status": "ok",
-                        "model_name": service.model_name,
-                        "model_type": service.model_type,
-                        "run_dir": str(service.run_dir),
-                        "max_top_k": service.max_top_k,
-                        "requires_auth": bool(service.auth_token),
-                    },
-                )
+                self._send_json(200, service.health_payload())
                 return
             if path == "/taste-os/catalog":
                 self._send_json(

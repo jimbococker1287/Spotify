@@ -62,6 +62,15 @@ def _latest_run_dir(outputs_root: Path) -> Path | None:
     return max(ranked, key=lambda path: path.stat().st_mtime)
 
 
+def _run_anchor_timestamp(run_dir: Path | None) -> datetime | None:
+    if run_dir is None:
+        return None
+    manifest_path = run_dir / "run_manifest.json"
+    if manifest_path.exists():
+        return _timestamp(manifest_path)
+    return _timestamp(run_dir)
+
+
 def _anchor_alignment_status(
     *,
     outputs_root: Path,
@@ -196,7 +205,8 @@ def _canonical_artifact_freshness_status(
     day_90_launch_json = outputs_root / "analysis" / "day_90_launch" / "day_90_launch.json"
     launch_payload = _coerce_dict(safe_read_json(day_90_launch_json, default={}))
     canonical_rows = [row for row in _coerce_list(launch_payload.get("canonical_artifacts")) if isinstance(row, dict)]
-    latest_run_ts = _timestamp(latest_run)
+    latest_run_ts = _run_anchor_timestamp(latest_run)
+    package_refresh_ts = _timestamp(day_90_launch_json)
     rows = []
     ready_count = 0
     stale_count = 0
@@ -206,7 +216,7 @@ def _canonical_artifact_freshness_status(
         path = Path(source_path_text).expanduser() if source_path_text else None
         exists = bool(path and path.exists())
         modified_at = _timestamp(path)
-        stale = bool(exists and latest_run_ts and modified_at and modified_at < latest_run_ts)
+        stale = bool(exists and latest_run_ts and package_refresh_ts and package_refresh_ts < latest_run_ts)
         status = "ready" if exists and not stale else "attention" if exists else "missing"
         if status == "ready":
             ready_count += 1
@@ -231,6 +241,7 @@ def _canonical_artifact_freshness_status(
         "status": status,
         "release_status": str(launch_payload.get("release_status", "")).strip(),
         "latest_run_timestamp": _isoformat(latest_run_ts),
+        "package_refresh_timestamp": _isoformat(package_refresh_ts),
         "canonical_artifact_count": len(canonical_rows),
         "ready_count": ready_count,
         "stale_count": stale_count,
@@ -329,7 +340,7 @@ def build_show_ready_maintenance_report(output_dir: Path | str = "outputs") -> d
         "output_dir": str(output_root),
         "workspace_root": str(workspace_root),
         "latest_run_dir": str(latest_run.resolve()) if latest_run is not None else "",
-        "latest_run_timestamp": _isoformat(_timestamp(latest_run)),
+        "latest_run_timestamp": _isoformat(_run_anchor_timestamp(latest_run)),
         "overall_status": overall_status,
         "summary": summary,
         "anchor_alignment": anchor_alignment,
@@ -395,6 +406,7 @@ def write_show_ready_maintenance_report(
         "",
         f"- Status: `{freshness.get('status', '')}`",
         f"- Release status: `{freshness.get('release_status', '')}`",
+        f"- Package refreshed at: `{freshness.get('package_refresh_timestamp', '')}`",
         f"- Ready copies: `{freshness.get('ready_count', 0)}`",
         f"- Stale copies: `{freshness.get('stale_count', 0)}`",
         f"- Missing copies: `{freshness.get('missing_count', 0)}`",

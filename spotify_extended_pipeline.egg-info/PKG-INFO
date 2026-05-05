@@ -5,22 +5,33 @@ Summary: Personal Taste OS for Spotify streaming history: experimentation, sessi
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: catboost>=1.2
+Requires-Dist: boto3>=1.35
 Requires-Dist: duckdb>=1.1
+Requires-Dist: fastapi>=0.115
+Requires-Dist: google-cloud-storage>=2.18
 Requires-Dist: joblib>=1.4
 Requires-Dist: matplotlib>=3.9
 Requires-Dist: numpy>=1.26
+Requires-Dist: opentelemetry-api>=1.36
+Requires-Dist: opentelemetry-sdk>=1.36
 Requires-Dist: pandas>=2.2
 Requires-Dist: orjson>=3.10
+Requires-Dist: psycopg[binary]>=3.2
 Requires-Dist: psutil>=5.9
+Requires-Dist: PyJWT>=2.9
+Requires-Dist: redis>=5.2
 Requires-Dist: scikit-learn>=1.5
+Requires-Dist: SQLAlchemy>=2.0
 Requires-Dist: tensorflow>=2.16
 Requires-Dist: mlflow>=2.17
 Requires-Dist: optuna>=3.6
+Requires-Dist: uvicorn>=0.30
 Provides-Extra: extras
 Requires-Dist: spotipy>=2.24; extra == "extras"
 Requires-Dist: shap>=0.46; extra == "extras"
 Requires-Dist: gputil>=1.4; extra == "extras"
 Provides-Extra: dev
+Requires-Dist: httpx>=0.28; extra == "dev"
 Requires-Dist: pytest>=8.3; extra == "dev"
 Requires-Dist: ruff>=0.6; extra == "dev"
 Requires-Dist: mypy>=1.11; extra == "dev"
@@ -64,6 +75,10 @@ The current system already includes:
 - Benchmark lock runs with seed-based confidence intervals
 - Prediction CLI for serving top-k next-artist recommendations
 - Conformal uncertainty diagnostics with abstaining prediction support
+- Materialized serving bundles for bundle-only online inference
+- Production-style ASGI APIs with versioned routes, request IDs, readiness probes, Prometheus-style metrics, and OpenTelemetry-friendly trace IDs
+- Durable SQL-backed Taste OS feedback and session state with local SQLite and SQLAlchemy database URL support
+- Deployment registry channels for stable/canary rollout metadata and release packaging
 
 ## Product Direction
 
@@ -149,6 +164,8 @@ source .venv/bin/activate
 spotify-lab --help
 spotify-predict --help
 spotify-serve --help
+spotify-build-serving-bundle --help
+spotify-serve-api --help
 spotify-public-insights --help
 spotify-compare-public --help
 spotify-control-room --help
@@ -513,6 +530,8 @@ Control room:
 - `outputs/analytics/control_room_weekly_summary.md`
 - `outputs/analytics/control_room_triage.json`
 - `outputs/analytics/control_room_triage.md`
+- `outputs/analytics/spotify_analytics.duckdb`
+- `outputs/analytics/warehouse/`
 
 Generate the control-room summary:
 
@@ -521,6 +540,38 @@ make control-room
 ```
 
 The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
+
+Build the local analytics SQL file and warehouse:
+
+```bash
+make analytics-db
+```
+
+Build only the local bronze/silver/gold Parquet warehouse:
+
+```bash
+make analytics-warehouse
+```
+
+The warehouse writes bronze, silver, and gold marts plus a manifest under `outputs/analytics/warehouse/`. See [docs/analytics_db.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/analytics_db.md) for the local analytics-engineering layout and example queries.
+
+Data-science and quant branches now build on top of that local warehouse too:
+
+```bash
+make listener-archetypes
+make quant-decision-lab
+make creator-market-intelligence
+make research-platform-lab
+```
+
+Those commands now write local-first behavioral clustering, decision-frontier, creator-market, and research-platform artifacts under:
+
+- `outputs/analysis/listener_archetypes/`
+- `outputs/analysis/quant_decision_lab/`
+- `outputs/analysis/creator_market_intelligence/`
+- `outputs/analysis/research_platform_lab/`
+
+See [docs/data_science_quant.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/data_science_quant.md), [docs/creator_market_intelligence.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/creator_market_intelligence.md), and [docs/research_platform_lab.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/research_platform_lab.md) for the local-lab workflow.
 
 ## Taste OS Demo
 
@@ -556,6 +607,15 @@ Or via Make:
 make taste-os-showcase EXTRA_ARGS='--top-k 5'
 ```
 
+Build a serving bundle once so online services can run without rebuilding request context from raw history files:
+
+```bash
+python -m spotify.serving_bundle \
+  --run-dir outputs/runs/<run_id> \
+  --data-dir data/raw \
+  --all-contexts
+```
+
 Serve Taste OS session plans over HTTP:
 
 ```bash
@@ -580,7 +640,36 @@ That service exposes a browser UI at `GET /taste-os`, plus:
 - `POST /taste-os/session`
 - `POST /taste-os/feedback`
 
-It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now keeps a lightweight feedback-memory store that can seed future sessions when `use_feedback_memory` is enabled.
+It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now stores feedback/session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
+
+For the production-style ASGI surface with versioned endpoints, request IDs, rate limiting, and metrics:
+
+```bash
+python -m spotify.service_api \
+  --app taste-os \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8010
+```
+
+The ASGI surface adds:
+
+- `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
+- `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
+- `GET /v1/taste-os/catalog`
+- `GET /v1/taste-os/history`
+- `POST /v1/taste-os/session`
+- `POST /v1/taste-os/feedback`
+
+Useful production flags:
+
+- `--state-db-url postgresql+psycopg://...` to move Taste OS state onto a shared SQL backend
+- `--rate-limit-backend redis --redis-url redis://...` for multi-instance request limiting
+- `--disable-otel` to turn off request spans / trace IDs when needed
 
 The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
 
@@ -660,12 +749,105 @@ curl -s -X POST http://127.0.0.1:8000/predict \
   -d '{"top_k":5,"recent_artists":["Artist A","Artist B","Artist C"]}'
 ```
 
-Optional token auth + request limits:
+For the production-style ASGI surface that prefers materialized serving bundles, exposes `/v1` routes, and adds request telemetry:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+That API exposes:
+
+- `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
+- `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
+- `POST /v1/predict`
+- OpenAPI at `GET /openapi.json`
+
+Optional auth + request limits:
 
 - Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
+- Set `--auth-mode jwt` with `--jwks-url https://...` or `--jwt-secret ...` for JWT validation.
+- Use `--jwt-issuer`, `--jwt-audience`, and `--jwt-required-scopes` to make the API OAuth-provider-ready when your gateway or IdP issues JWT bearer tokens.
+- Use `--auth-scope all` to protect reads as well as mutations.
 - Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
 - Errors return structured payloads: `{"error":{"code","message","details"}}`.
 - When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
+- The ASGI surface adds `X-Request-ID` and `X-Trace-ID` headers, route-level telemetry at `/metrics`, Prometheus exposition at `/metrics/prometheus`, and shared Redis-backed rate limiting when configured.
+
+## Deployment Registry
+
+Publish a promoted run into the deployment registry and activate the `stable` channel:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable
+```
+
+That writes:
+
+- `outputs/deployments/registry/releases/<run_id>/deployment_release.json`
+- `outputs/deployments/registry/channels/<channel>/deployment_channel.json`
+- `outputs/deployments/registry/channels/<channel>/alias.json`
+
+Because the channel directory exports a normal `alias.json`, the serving APIs can point directly at it:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --require-serving-bundle
+```
+
+If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
+
+To publish the copied release artifacts directly to a remote target, add `--publish-artifacts`. Supported targets are:
+
+- `file:///shared/releases`
+- `s3://bucket/prefix`
+- `gs://bucket/prefix`
+
+Example:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable \
+  --artifact-base-uri s3://spotify-prod-releases/runs \
+  --publish-artifacts
+```
+
+Deployment templates live in:
+
+- `deploy/kubernetes/`
+- `deploy/ecs/`
+- `deploy/terraform/aws/`
+- `deploy/local/`
+
+## Infrastructure Bootstrap
+
+The repo now includes two practical infrastructure paths:
+
+- `deploy/local/` for a local production-smoke stack with Postgres, Redis, and both ASGI services
+- `deploy/terraform/aws/` for an AWS-first production baseline with VPC, ALB, ECS Fargate, EFS, RDS Postgres, ElastiCache Redis, ECR, and Secrets Manager
+
+Recommended order:
+
+1. Validate the service wiring locally with `deploy/local/production-smoke.compose.yaml`
+2. Provision the cloud baseline with `deploy/terraform/aws/`
+3. Publish a promoted run into the deployment registry
+4. Point the deployed services at `outputs/deployments/registry/channels/stable`
+
+The deployment asset map lives in `deploy/README.md`.
 
 ## Public Comparison
 
@@ -872,26 +1054,47 @@ Artifacts are written under `outputs/analysis/public_spotify/`. Full pipeline ru
 
 See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the demo contract, `docs/taste_os_demo_walkthrough.md` for a guided demo flow, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
 
-## Docker (Prediction Service)
+## Docker (Serving APIs)
 
 Build:
 
 ```bash
-docker build -t spotify-predict-service .
+docker build -t spotify-serving-api .
 ```
 
-Run (mount project outputs and raw data):
+Run the prediction API:
 
 ```bash
 docker run --rm -p 8000:8000 \
+  -e SERVICE_MODE=predict \
   -e RUN_DIR=/app/outputs/models/champion \
-  -e DATA_DIR=/app/data/raw \
   -v "$(pwd)/outputs:/app/outputs" \
-  -v "$(pwd)/data/raw:/app/data/raw:ro" \
-  spotify-predict-service
+  spotify-serving-api
 ```
 
-The container includes a `/health` Docker healthcheck.
+Run the Taste OS API:
+
+```bash
+docker run --rm -p 8010:8010 \
+  -e SERVICE_MODE=taste-os \
+  -e PORT=8010 \
+  -e RUN_DIR=/app/outputs/models/champion \
+  -e TASTE_OS_OUTPUT_DIR=/app/outputs/analysis/taste_os_service \
+  -v "$(pwd)/outputs:/app/outputs" \
+  spotify-serving-api
+```
+
+The container includes a `/readyz` Docker healthcheck.
+
+New container envs:
+
+- `TASTE_OS_DATABASE_URL` to use a shared SQL backend for Taste OS state
+- `RATE_LIMIT_BACKEND=redis` plus `REDIS_URL=redis://...` for shared rate limiting
+- `AUTH_MODE=token|jwt|token_or_jwt|off`
+- `AUTH_SCOPE=mutations|all`
+- `JWT_SECRET=...` or `JWKS_URL=https://...`
+- `JWT_ISSUER=...`, `JWT_AUDIENCE=...`, `JWT_REQUIRED_SCOPES=...`
+- `OTEL_ENABLED=0` to disable request spans / trace IDs
 
 ## CI
 
@@ -900,6 +1103,8 @@ GitHub Actions CI is defined in `.github/workflows/ci.yml` and runs on push/PR:
 - `ruff`
 - `mypy`
 - `pytest`
+- wheel build smoke
+- Docker image build smoke
 
 ## Scheduling + Alerts
 
@@ -925,6 +1130,12 @@ Or via Make:
 
 ```bash
 make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
+```
+
+Publish a promoted run into the deployment registry:
+
+```bash
+make deploy-release EXTRA_ARGS='--run-dir outputs/runs/<run_id> --registry-root outputs/deployments/registry --channel stable'
 ```
 
 Keep the outward-facing package current after Day 90:

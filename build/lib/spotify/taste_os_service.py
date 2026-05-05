@@ -5,9 +5,8 @@ import json
 import logging
 import secrets
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
 from urllib.parse import quote
 
 import numpy as np
@@ -18,29 +17,34 @@ from .env import load_local_env
 from .multimodal import MultimodalArtistSpace
 from .predict_next import (
     PredictionInputContext,
+    _prediction_serving_bundle_path,
     _prepare_inputs,
     load_prediction_input_context,
     prediction_source_signature,
 )
 from .safe_policy import SafeBanditPolicyArtifact
 from .serving import load_predictor, resolve_model_row
+from .taste_os_state import TasteOSStateStore
 from .taste_os_demo import MODE_CONFIGS, SCENARIOS, _load_artifact, build_taste_os_demo_payload, write_taste_os_demo_artifacts
 from .taste_os_http import (
     DEFAULT_HISTORY_LIMIT,
-    DEFAULT_MAX_TOP_K,
     RequestValidationError,
-    append_jsonl as _append_jsonl,
     artist_key as _artist_key,
     build_taste_os_handler,
-    is_authorized_request,
-    load_json_document as _load_json_document,
     normalize_taste_os_feedback_payload,
     normalize_taste_os_payload,
     parse_taste_os_args,
-    read_jsonl_tail as _read_jsonl_tail,
     utc_now_iso as _utc_now_iso,
 )
 from .taste_os_page import render_taste_os_page_html
+
+__all__ = [
+    "RequestValidationError",
+    "TasteOSService",
+    "normalize_taste_os_feedback_payload",
+    "normalize_taste_os_payload",
+    "_taste_os_page_html",
+]
 
 @dataclass(frozen=True)
 class _TasteOSContextCacheEntry:
@@ -52,24 +56,59 @@ def _taste_os_page_html(service: "TasteOSService") -> str:
     return render_taste_os_page_html(service)
 
 
+def _coerce_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _coerce_float(value: object) -> float:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _mapping(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
 class TasteOSService:
     def __init__(
         self,
         *,
         run_dir: Path,
-        data_dir: Path,
+        data_dir: Path | None,
         output_dir: Path,
         model_name: str,
         include_video: bool,
         max_top_k: int,
         auth_token: str | None,
         logger: logging.Logger,
+        state_db_path: Path | None = None,
+        state_database_url: str | None = None,
+        require_serving_bundle: bool = False,
         digital_twin: ListenerDigitalTwinArtifact | None = None,
         multimodal_space: MultimodalArtistSpace | None = None,
         safe_policy: SafeBanditPolicyArtifact | None = None,
     ) -> None:
         self.run_dir = run_dir
-        self.data_dir = data_dir
+        self.data_dir = data_dir.expanduser().resolve() if isinstance(data_dir, Path) else None
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.include_video = include_video
@@ -83,6 +122,17 @@ class TasteOSService:
         self.feedback_memory_path = self.output_dir / "feedback_memory.json"
         self.feedback_event_log_path = self.output_dir / "feedback_events.jsonl"
         self.session_history_path = self.output_dir / "session_history.jsonl"
+        self.state_db_path = (state_db_path or (self.output_dir / "taste_os_state.sqlite3")).expanduser().resolve()
+        self.state_database_url = str(state_database_url or "").strip() or None
+        self.require_serving_bundle = bool(require_serving_bundle)
+        self.state_store = TasteOSStateStore(
+            db_path=(None if self.state_database_url else self.state_db_path),
+            logger=logger,
+            database_url=self.state_database_url,
+            legacy_feedback_memory_path=self.feedback_memory_path,
+            legacy_feedback_event_log_path=self.feedback_event_log_path,
+            legacy_session_history_path=self.session_history_path,
+        )
 
         metadata = json.loads((run_dir / "feature_metadata.json").read_text(encoding="utf-8"))
         self.artist_labels = list(metadata.get("artist_labels", []))
@@ -124,11 +174,13 @@ class TasteOSService:
         except Exception as exc:
             logger.info("Taste OS context warm-up skipped: %s", exc)
         logger.info(
-            "Loaded Taste OS service: model=%s type=%s modes=%d scenarios=%d",
+            "Loaded Taste OS service: model=%s type=%s modes=%d scenarios=%d state_db=%s bundle_required=%s",
             self.model_name,
             self.model_type,
             len(MODE_CONFIGS),
             len(SCENARIOS),
+            self.state_db_path,
+            self.require_serving_bundle,
         )
 
     def _empty_feedback_store(self) -> dict[str, object]:
@@ -139,8 +191,7 @@ class TasteOSService:
         }
 
     def _load_feedback_store(self) -> dict[str, object]:
-        default_store = self._empty_feedback_store()
-        store = _load_json_document(self.feedback_memory_path, default=default_store)
+        store = self.state_store.feedback_store()
         artists = store.get("artists")
         if not isinstance(artists, dict):
             store["artists"] = {}
@@ -151,14 +202,14 @@ class TasteOSService:
         return store
 
     def _write_feedback_store(self, store: dict[str, object]) -> None:
-        self.feedback_memory_path.parent.mkdir(parents=True, exist_ok=True)
-        self.feedback_memory_path.write_text(json.dumps(store, indent=2, sort_keys=True), encoding="utf-8")
+        _ = store
+        self.state_store.sync_legacy_snapshots()
 
     def _feedback_artist_summary(self, artist_name: str, stats: dict[str, object]) -> dict[str, object]:
-        like_count = int(stats.get("like_count", 0))
-        repeat_count = int(stats.get("repeat_count", 0))
-        skip_count = int(stats.get("skip_count", 0))
-        dislike_count = int(stats.get("dislike_count", 0))
+        like_count = _coerce_int(stats.get("like_count", 0))
+        repeat_count = _coerce_int(stats.get("repeat_count", 0))
+        skip_count = _coerce_int(stats.get("skip_count", 0))
+        dislike_count = _coerce_int(stats.get("dislike_count", 0))
         positive_score = float(like_count) + float(repeat_count) * 1.25
         negative_score = float(dislike_count) * 1.3 + float(skip_count) * 0.7
         net_score = round(positive_score - negative_score, 3)
@@ -197,9 +248,9 @@ class TasteOSService:
             summary = self._feedback_artist_summary(artist_name, raw_stats)
             if str(summary["memory_state"]) == "avoid":
                 continue
-            if float(summary["net_score"]) <= 0.0:
+            if _coerce_float(summary["net_score"]) <= 0.0:
                 continue
-            candidates.append((float(summary["net_score"]), str(summary["updated_at"]), artist_name))
+            candidates.append((_coerce_float(summary["net_score"]), str(summary["updated_at"]), artist_name))
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [artist_name for _, _, artist_name in candidates[: max(0, int(limit))]]
 
@@ -221,19 +272,23 @@ class TasteOSService:
                 if not artist_name:
                     continue
                 summaries.append(self._feedback_artist_summary(artist_name, raw_stats))
-        summaries.sort(key=lambda item: (float(item["net_score"]), str(item["updated_at"])), reverse=True)
-        top_affinities = [item for item in summaries if float(item["net_score"]) > 0][:limit]
-        avoid_artists = [item for item in sorted(summaries, key=lambda item: (float(item["net_score"]), str(item["updated_at"]))) if float(item["net_score"]) < 0][:limit]
+        summaries.sort(key=lambda item: (_coerce_float(item.get("net_score")), str(item["updated_at"])), reverse=True)
+        top_affinities = [item for item in summaries if _coerce_float(item.get("net_score")) > 0][:limit]
+        avoid_artists = [
+            item
+            for item in sorted(summaries, key=lambda item: (_coerce_float(item.get("net_score")), str(item["updated_at"])))
+            if _coerce_float(item.get("net_score")) < 0
+        ][:limit]
         seed_artists = self._feedback_seed_artists(store=active_store, limit=max(limit, len(effective_recent_artists or [])))
         return {
-            "event_count": int(active_store.get("event_count", 0)),
+            "event_count": _coerce_int(active_store.get("event_count", 0)),
             "artist_count": len(summaries),
             "updated_at": str(active_store.get("updated_at", "")),
             "seed_artists": seed_artists,
             "effective_recent_artists": list(effective_recent_artists or []),
             "top_affinities": top_affinities,
             "avoid_artists": avoid_artists,
-            "recent_feedback": _read_jsonl_tail(self.feedback_event_log_path, limit=limit),
+            "recent_feedback": self.state_store.recent_feedback(limit=limit),
         }
 
     def _annotate_feedback_rows(self, rows: object, *, store: dict[str, object]) -> None:
@@ -266,17 +321,17 @@ class TasteOSService:
         effective_recent_artists: list[str],
         used_feedback_memory: bool,
     ) -> dict[str, object]:
-        request = result.get("request", {}) if isinstance(result, dict) else {}
-        summary = result.get("demo_summary", {}) if isinstance(result, dict) else {}
-        service = result.get("service", {}) if isinstance(result, dict) else {}
+        request = _mapping(result.get("request", {}) if isinstance(result, dict) else {})
+        summary = _mapping(result.get("demo_summary", {}) if isinstance(result, dict) else {})
+        service = _mapping(result.get("service", {}) if isinstance(result, dict) else {})
         return {
             "session_id": session_id,
             "created_at": created_at,
             "mode": str(request.get("mode", "")),
             "scenario": str(request.get("scenario", "")),
             "top_artist": str(summary.get("top_artist", "")),
-            "adaptive_replans": int(summary.get("adaptive_replans", 0)),
-            "safe_route_steps": int(summary.get("adaptive_safe_route_steps", 0)),
+            "adaptive_replans": _coerce_int(summary.get("adaptive_replans", 0)),
+            "safe_route_steps": _coerce_int(summary.get("adaptive_safe_route_steps", 0)),
             "effective_recent_artists": list(effective_recent_artists),
             "used_feedback_memory": bool(used_feedback_memory),
             "persisted": bool(service.get("persisted", False)),
@@ -291,20 +346,19 @@ class TasteOSService:
         effective_recent_artists: list[str],
         used_feedback_memory: bool,
     ) -> None:
-        _append_jsonl(
-            self.session_history_path,
+        self.state_store.record_session_history(
             self._session_history_row(
                 result=result,
                 session_id=session_id,
                 created_at=created_at,
                 effective_recent_artists=effective_recent_artists,
                 used_feedback_memory=used_feedback_memory,
-            ),
+            )
         )
 
     def history_snapshot(self, *, limit: int = DEFAULT_HISTORY_LIMIT) -> dict[str, object]:
         return {
-            "recent_sessions": _read_jsonl_tail(self.session_history_path, limit=limit),
+            "recent_sessions": self.state_store.recent_sessions(limit=limit),
             "feedback_memory": self._feedback_summary(limit=limit),
         }
 
@@ -320,42 +374,14 @@ class TasteOSService:
         normalized_artist_name = str(artist_name).strip()
         normalized_signal = str(signal).strip().lower()
         with self._memory_lock:
-            store = self._load_feedback_store()
-            artists = store.setdefault("artists", {})
-            if not isinstance(artists, dict):
-                artists = {}
-                store["artists"] = artists
-            key = _artist_key(normalized_artist_name)
-            row = artists.get(key)
-            if not isinstance(row, dict):
-                row = {
-                    "artist_name": normalized_artist_name,
-                    "like_count": 0,
-                    "repeat_count": 0,
-                    "skip_count": 0,
-                    "dislike_count": 0,
-                    "last_signal": "",
-                    "last_session_id": "",
-                    "updated_at": "",
-                }
-            row["artist_name"] = normalized_artist_name
-            counter_name = f"{normalized_signal}_count"
-            row[counter_name] = int(row.get(counter_name, 0)) + 1
-            row["last_signal"] = normalized_signal
-            row["last_session_id"] = session_id
-            row["updated_at"] = timestamp
-            artists[key] = row
-            store["event_count"] = int(store.get("event_count", 0)) + 1
-            store["updated_at"] = timestamp
-            self._write_feedback_store(store)
-            event = {
-                "timestamp": timestamp,
-                "session_id": session_id,
-                "artist_name": normalized_artist_name,
-                "signal": normalized_signal,
-                "notes": notes or "",
-            }
-            _append_jsonl(self.feedback_event_log_path, event)
+            event = self.state_store.record_feedback(
+                timestamp=timestamp,
+                session_id=session_id,
+                artist_name=normalized_artist_name,
+                signal=normalized_signal,
+                notes=notes,
+            )
+            store = self.state_store.feedback_store()
             summary = self._feedback_summary(store=store)
         return {
             "recorded": True,
@@ -381,11 +407,40 @@ class TasteOSService:
             raise FileNotFoundError(f"Artifact not found: {relative_path}")
         return candidate
 
+    def health_payload(self) -> dict[str, object]:
+        bundle_path = _prediction_serving_bundle_path(self.run_dir, include_video=self.include_video)
+        state_health = self.state_store.health_payload()
+        return {
+            "status": "ok",
+            "model_name": self.model_name,
+            "model_type": self.model_type,
+            "run_dir": str(self.run_dir),
+            "output_dir": str(self.output_dir),
+            "state_db_path": str(self.state_db_path),
+            "state_database_url": str(state_health.get("database_url", "")),
+            "state_backend": str(state_health.get("backend", "")),
+            "state_reachable": bool(state_health.get("reachable", False)),
+            "max_top_k": self.max_top_k,
+            "requires_auth": bool(self.auth_token),
+            "data_dir_configured": bool(self.data_dir),
+            "require_serving_bundle": self.require_serving_bundle,
+            "serving_bundle_path": str(bundle_path),
+            "serving_bundle_present": bundle_path.exists(),
+            "input_source_mode": (
+                "serving_bundle"
+                if bundle_path.exists()
+                else ("raw_history_fallback" if self.data_dir is not None else "bundle_required")
+            ),
+            "mode_count": len(MODE_CONFIGS),
+            "scenario_count": len(SCENARIOS),
+        }
+
     def _prediction_source_signature(self, *, include_video: bool) -> tuple[tuple[str, int, int], ...]:
         return prediction_source_signature(
             run_dir=self.run_dir,
             data_dir=self.data_dir,
             include_video=include_video,
+            prefer_serving_bundle=True,
         )
 
     def _get_prediction_context(self, *, include_video: bool) -> PredictionInputContext:
@@ -404,6 +459,8 @@ class TasteOSService:
                 data_dir=self.data_dir,
                 include_video=include_video,
                 logger=self.logger,
+                prefer_serving_bundle=True,
+                require_serving_bundle=self.require_serving_bundle,
             )
             self._context_cache[include_video] = _TasteOSContextCacheEntry(
                 signature=signature,
@@ -519,8 +576,10 @@ def main() -> int:
     logger = logging.getLogger("spotify.taste_os_service")
 
     run_dir, champion_alias_model_name = resolve_prediction_run_dir(args.run_dir)
-    data_dir = Path(args.data_dir).expanduser().resolve()
+    data_dir = Path(args.data_dir).expanduser().resolve() if str(args.data_dir).strip() else None
     output_dir = Path(args.output_dir).expanduser().resolve()
+    state_db_path = Path(args.state_db).expanduser().resolve() if str(args.state_db).strip() else None
+    state_database_url = str(getattr(args, "state_db_url", "") or "").strip() or None
     model_row = resolve_model_row(
         run_dir,
         explicit_model_name=args.model_name,
@@ -537,6 +596,9 @@ def main() -> int:
         max_top_k=max(1, int(args.max_top_k)),
         auth_token=(str(args.auth_token).strip() if args.auth_token else None),
         logger=logger,
+        state_db_path=state_db_path,
+        state_database_url=state_database_url,
+        require_serving_bundle=bool(args.require_serving_bundle),
     )
     server = ThreadingHTTPServer((str(args.host), int(args.port)), _build_handler(service))
     logger.info("Taste OS service listening on http://%s:%d", args.host, int(args.port))

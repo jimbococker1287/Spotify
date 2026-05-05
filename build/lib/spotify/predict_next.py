@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -35,6 +36,7 @@ class PredictionInputContext:
 
 
 _PREDICTION_CONTEXT_CACHE_VERSION = 4
+_PREDICTION_SERVING_BUNDLE_VERSION = 1
 
 
 def _parse_args() -> argparse.Namespace:
@@ -115,9 +117,21 @@ def _signature_for_paths(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
 def prediction_source_signature(
     *,
     run_dir: Path,
-    data_dir: Path,
+    data_dir: Path | None,
     include_video: bool,
+    prefer_serving_bundle: bool = False,
 ) -> tuple[tuple[str, int, int], ...]:
+    bundle_path = _prediction_serving_bundle_path(run_dir, include_video=include_video)
+    if prefer_serving_bundle and bundle_path.exists():
+        return _signature_for_paths([bundle_path])
+    if data_dir is None:
+        return _signature_for_paths(
+            [
+                bundle_path,
+                run_dir / "feature_metadata.json",
+                run_dir / "context_scaler.joblib",
+            ]
+        )
     root = data_dir.expanduser().resolve()
     json_paths = sorted(path for path in root.rglob("*.json") if path.is_file())
     if not include_video:
@@ -143,6 +157,20 @@ def _prediction_context_cache_path(run_dir: Path, *, include_video: bool) -> Pat
     cache_dir.mkdir(parents=True, exist_ok=True)
     suffix = "audio_video" if include_video else "audio"
     return cache_dir / f"prediction_input_context_{suffix}.joblib"
+
+
+def _prediction_serving_bundle_path(run_dir: Path, *, include_video: bool) -> Path:
+    bundle_dir = run_dir / "analysis" / "serving"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "audio_video" if include_video else "audio"
+    return bundle_dir / f"prediction_input_context_{suffix}.joblib"
+
+
+def _prediction_serving_bundle_manifest_path(run_dir: Path, *, include_video: bool) -> Path:
+    bundle_dir = run_dir / "analysis" / "serving"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "audio_video" if include_video else "audio"
+    return bundle_dir / f"prediction_input_context_{suffix}.manifest.json"
 
 
 def _load_cached_prediction_input_context(
@@ -189,6 +217,64 @@ def _store_prediction_input_context_cache(
         logger.warning("Prediction context cache write failed for %s: %s", cache_path, exc)
 
 
+def _load_prediction_input_context_bundle(
+    *,
+    bundle_path: Path,
+    logger: logging.Logger,
+) -> PredictionInputContext | None:
+    if not bundle_path.exists():
+        return None
+    try:
+        payload = joblib.load(bundle_path)
+    except Exception as exc:
+        logger.warning("Prediction serving bundle load failed for %s: %s", bundle_path, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("version", -1)) != _PREDICTION_SERVING_BUNDLE_VERSION:
+        return None
+    context = payload.get("context")
+    if not isinstance(context, PredictionInputContext):
+        return None
+    logger.info("Loaded prediction serving bundle: %s", bundle_path)
+    return context
+
+
+def _store_prediction_input_context_bundle(
+    *,
+    run_dir: Path,
+    include_video: bool,
+    signature: tuple[tuple[str, int, int], ...],
+    context: PredictionInputContext,
+    logger: logging.Logger,
+) -> Path:
+    bundle_path = _prediction_serving_bundle_path(run_dir, include_video=include_video)
+    manifest_path = _prediction_serving_bundle_manifest_path(run_dir, include_video=include_video)
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    payload = {
+        "version": _PREDICTION_SERVING_BUNDLE_VERSION,
+        "created_at": created_at,
+        "include_video": bool(include_video),
+        "source_signature": signature,
+        "context": context,
+    }
+    manifest = {
+        "version": _PREDICTION_SERVING_BUNDLE_VERSION,
+        "created_at": created_at,
+        "include_video": bool(include_video),
+        "bundle_path": str(bundle_path),
+        "signature_fingerprint": prediction_signature_fingerprint(signature),
+        "source_count": int(len(signature)),
+        "artist_count": int(len(context.artist_labels)),
+        "sequence_length": int(context.sequence_length),
+        "context_feature_count": int(len(context.context_features or [])),
+    }
+    joblib.dump(payload, bundle_path, compress=3)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Wrote prediction serving bundle: %s", bundle_path)
+    return bundle_path
+
+
 def _is_friction_feature_name(feature_name: str) -> bool:
     name = str(feature_name).lower()
     if name == "offline":
@@ -220,14 +306,37 @@ def _friction_feature_indices(context_features: list[str]) -> list[int]:
 
 def load_prediction_input_context(
     run_dir: Path,
-    data_dir: Path,
+    data_dir: Path | None,
     include_video: bool,
     logger: logging.Logger,
+    *,
+    prefer_serving_bundle: bool = False,
+    require_serving_bundle: bool = False,
 ) -> PredictionInputContext:
+    bundle_path = _prediction_serving_bundle_path(run_dir, include_video=include_video)
+    if prefer_serving_bundle or require_serving_bundle:
+        bundled = _load_prediction_input_context_bundle(
+            bundle_path=bundle_path,
+            logger=logger,
+        )
+        if bundled is not None:
+            return bundled
+        if require_serving_bundle:
+            raise FileNotFoundError(
+                f"Missing prediction serving bundle: {bundle_path}. "
+                "Build it with `python -m spotify.serving_bundle --run-dir ... --data-dir ...`."
+            )
+
+    if data_dir is None:
+        raise FileNotFoundError(
+            f"Prediction input context requires raw data or a serving bundle. Missing bundle: {bundle_path}"
+        )
+
     signature = prediction_source_signature(
         run_dir=run_dir,
         data_dir=data_dir,
         include_video=include_video,
+        prefer_serving_bundle=False,
     )
     cache_path = _prediction_context_cache_path(run_dir, include_video=include_video)
     cached = _load_cached_prediction_input_context(
@@ -332,12 +441,49 @@ def load_prediction_input_context(
         context=context,
         logger=logger,
     )
+    _store_prediction_input_context_bundle(
+        run_dir=run_dir,
+        include_video=include_video,
+        signature=signature,
+        context=context,
+        logger=logger,
+    )
     return context
+
+
+def build_prediction_serving_bundle(
+    *,
+    run_dir: Path,
+    data_dir: Path,
+    include_video: bool,
+    logger: logging.Logger,
+) -> Path:
+    context = load_prediction_input_context(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        include_video=include_video,
+        logger=logger,
+        prefer_serving_bundle=False,
+        require_serving_bundle=False,
+    )
+    signature = prediction_source_signature(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        include_video=include_video,
+        prefer_serving_bundle=False,
+    )
+    return _store_prediction_input_context_bundle(
+        run_dir=run_dir,
+        include_video=include_video,
+        signature=signature,
+        context=context,
+        logger=logger,
+    )
 
 
 def _prepare_inputs(
     run_dir: Path,
-    data_dir: Path,
+    data_dir: Path | None,
     recent_artists: list[str] | None,
     include_video: bool,
     logger: logging.Logger,

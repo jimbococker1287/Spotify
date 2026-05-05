@@ -68,9 +68,11 @@ def _map_platform_gate(
         "challenger_selection_reason": str(gate.get("challenger_selection_reason", "")).strip(),
         "top_candidate_model_name": str(gate.get("top_candidate_model_name", "")).strip(),
         "top_candidate_score": _to_float(gate.get("top_candidate_score")),
-        "top_candidate_risk_blockers": list(gate.get("top_candidate_risk_blockers", []))
-        if isinstance(gate.get("top_candidate_risk_blockers", []), list)
-        else [],
+        "top_candidate_risk_blockers": (
+            list(top_candidate_risk_blockers)
+            if isinstance((top_candidate_risk_blockers := gate.get("top_candidate_risk_blockers", [])), list)
+            else []
+        ),
     }
 
 
