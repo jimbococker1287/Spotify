@@ -17,8 +17,143 @@ def test_build_athena_sql_includes_expected_locations() -> None:
 
     assert "CREATE DATABASE IF NOT EXISTS spotify_taste_os;" in sql
     assert "LOCATION 's3://demo-bucket/spotify-athena/curated/raw_streaming_history/'" in sql
+    assert "LOCATION 's3://demo-bucket/spotify-athena/curated/mart_run_quality/'" in sql
     assert "CREATE OR REPLACE VIEW latest_run_results AS" in sql
+    assert "CREATE OR REPLACE VIEW latest_ops_overview AS" in sql
     assert "MSCK REPAIR TABLE raw_streaming_history;" in sql
+
+
+def _write_minimal_control_room(output_dir: Path, *, run_id: str) -> None:
+    analytics_dir = output_dir / "analytics"
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    (analytics_dir / "control_room.json").write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-03-25T01:00:00+00:00",
+                "latest_run": {
+                    "run_id": run_id,
+                    "profile": "full",
+                    "best_model_name": "mlp",
+                    "best_model_type": "classical",
+                    "best_model_test_top1": 0.2884,
+                    "serving_model_name": "mlp",
+                    "serving_model_type": "classical",
+                    "promoted": False,
+                },
+                "run_selection": {
+                    "selected_run": {
+                        "run_id": run_id,
+                        "profile": "full",
+                        "best_model_name": "mlp",
+                        "best_model_type": "classical",
+                    },
+                    "selection_reason": "latest full run",
+                },
+                "ops_health": {
+                    "status": "attention",
+                    "headline": "Review cadence and drift.",
+                },
+                "operating_rhythm": {
+                    "overall_status": "stale",
+                    "recommended_run_command": "make schedule-run MODE=fast",
+                    "recommended_run_reason": "Restore cadence.",
+                },
+                "safety": {
+                    "test_jsd_target_drift": 0.218,
+                    "test_selective_risk": 0.372,
+                    "test_abstention_rate": 0.241,
+                    "test_accepted_rate": 0.759,
+                    "repeat_from_prev_new_gap": 0.096,
+                },
+                "qoe": {
+                    "stress_benchmark_skip_risk": 0.591,
+                    "stress_benchmark_scenario": "evening_drift",
+                    "stress_benchmark_policy_name": "safe_global",
+                },
+                "review_actions": [
+                    {
+                        "priority": "medium",
+                        "area": "cadence",
+                        "title": "Restore cadence",
+                        "detail": "Run the fast lane.",
+                        "inspect": ["outputs/analytics/control_room_history.csv"],
+                    }
+                ],
+                "next_bets": [{"title": "Investigate drift"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (analytics_dir / "control_room_history.csv").write_text(
+        "\n".join(
+            [
+                "generated_at,run_id,run_timestamp,profile,promoted,promotion_status,best_model_name,best_model_type,best_model_val_top1,best_model_test_top1,champion_gate_regression,target_drift_jsd,test_ece,test_selective_risk,test_abstention_rate,robustness_gap,stress_skip_risk,review_action_count,high_priority_review_actions,medium_priority_review_actions,review_action_areas,baseline_run_id,next_bet_count,ops_coverage_ratio,available_summary_count,expected_summary_count,operating_status,fast_cadence_status,full_cadence_status,async_handoff_status,recommended_run_command,ops_health_status,operational_high_priority_review_actions,strategic_high_priority_review_actions,test_accepted_rate,conformal_operating_threshold,repeat_from_prev_new_gap,stress_benchmark_skip_risk",
+                f"2026-03-25T01:00:00+00:00,{run_id},2026-03-25T00:45:06,full,0,fail,mlp,classical,0.3741,0.2884,0.019,0.218,0.08,0.372,0.241,0.096,0.593,1,0,1,cadence,old_run,1,1.0,6,6,stale,stale,healthy,attention,make schedule-run MODE=fast,attention,0,0,0.759,0.24,0.096,0.591",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_minimal_creator_family(output_dir: Path) -> None:
+    base_dir = output_dir / "analysis" / "public_spotify" / "creator_label_intelligence"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    family_id = "creator_label_intelligence_seed-a-seed-b"
+    (base_dir / f"{family_id}.md").write_text("# Primary report\n", encoding="utf-8")
+    (base_dir / f"{family_id}_report_family.md").write_text("# Report family\n", encoding="utf-8")
+    (base_dir / f"{family_id}_report_family.json").write_text(
+        json.dumps(
+            {
+                "primary_report": str((base_dir / f"{family_id}.md").resolve()),
+                "artifact_index_markdown": str((base_dir / f"{family_id}_report_family.md").resolve()),
+                "backfilled_artifact_index_at": "2026-03-25T01:05:00+00:00",
+                "comparison_view_markdown": {
+                    "ranking_comparison": str((base_dir / f"{family_id}_ranking_comparison.md").resolve()),
+                    "scene_comparison": str((base_dir / f"{family_id}_scene_comparison.md").resolve()),
+                    "scene_seed_comparison": str((base_dir / f"{family_id}_scene_seed_comparison.md").resolve()),
+                    "seed_comparison": str((base_dir / f"{family_id}_seed_comparison.md").resolve()),
+                },
+                "comparison_view_csv": {
+                    "ranking_comparison": str((base_dir / f"{family_id}_ranking_comparison.csv").resolve()),
+                    "scene_comparison": str((base_dir / f"{family_id}_scene_comparison.csv").resolve()),
+                    "scene_seed_comparison": str((base_dir / f"{family_id}_scene_seed_comparison.csv").resolve()),
+                    "seed_comparison": str((base_dir / f"{family_id}_seed_comparison.csv").resolve()),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (base_dir / f"{family_id}_ranking_comparison.csv").write_text(
+        "\n".join(
+            [
+                "artist_name,opportunity_score,opportunity_rank,opportunity_band,scene_name,primary_driver,seed_bridges,why_now",
+                'Artist X,0.41,1,priority_now,scene-1,seed_adjacency,"[""Seed A""]",Strong adjacency.',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (base_dir / f"{family_id}_scene_comparison.csv").write_text(
+        "\n".join(
+            [
+                "scene_name,avg_opportunity_score,priority_now_count,scene_local_play_share,scene_label_concentration,scene_release_pressure,top_opportunity_artist,top_opportunity_score,top_seed_artists",
+                'scene-1,0.41,1,0.33,0.10,0.20,Artist X,0.41,"[""Seed A""]"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (base_dir / f"{family_id}_scene_seed_comparison.csv").write_text(
+        "\n".join(
+            [
+                "scene_name,seed_artist,avg_opportunity_score,top_opportunity_artist,top_opportunity_score",
+                "scene-1,Seed A,0.41,Artist X,0.41",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_export_athena_bundle_writes_expected_bundle(tmp_path: Path) -> None:
@@ -127,7 +262,7 @@ def test_export_athena_bundle_writes_expected_bundle(tmp_path: Path) -> None:
             "challenger_model_name": "extra_trees",
             "challenger_score": 0.26,
         },
-        "champion_alias": {"updated": False, "model_name": "", "model_type": ""},
+        "champion_alias": {"updated": True, "model_name": "mlp", "model_type": "classical"},
         "artifact_cleanup": {
             "mode": "light",
             "status": "completed",
@@ -161,6 +296,8 @@ def test_export_athena_bundle_writes_expected_bundle(tmp_path: Path) -> None:
     ]
     (run_dir / "run_manifest.json").write_text(json.dumps(run_manifest), encoding="utf-8")
     (run_dir / "run_results.json").write_text(json.dumps(run_results), encoding="utf-8")
+    _write_minimal_control_room(output_dir, run_id=run_manifest["run_id"])
+    _write_minimal_creator_family(output_dir)
 
     report = export_athena_bundle(
         data_dir=data_dir,
@@ -178,15 +315,40 @@ def test_export_athena_bundle_writes_expected_bundle(tmp_path: Path) -> None:
     assert (export_dir / "raw" / "spotify_streaming_history" / "Streaming_History_Audio_2024_0.json").exists()
     assert (export_dir / "curated" / "experiment_history" / "data.parquet").exists()
     assert (export_dir / "curated" / "run_manifests" / "data.parquet").exists()
+    assert (export_dir / "curated" / "listener_daily_activity" / "data.parquet").exists()
+    assert (export_dir / "curated" / "model_run_summary" / "data.parquet").exists()
+    assert (export_dir / "curated" / "mart_run_quality" / "data.parquet").exists()
+    assert (export_dir / "curated" / "mart_ops_overview" / "data.parquet").exists()
+    assert (export_dir / "curated" / "mart_creator_opportunities" / "data.parquet").exists()
 
     raw_partition_path = export_dir / "curated" / "raw_streaming_history" / "year=2024" / "month=7" / "data.parquet"
     assert raw_partition_path.exists()
+
+    exported_table_lookup = {table["name"]: table for table in report["tables"]}
+    assert exported_table_lookup["listener_daily_activity"]["warehouse_layer"] == "silver"
+    assert exported_table_lookup["mart_run_quality"]["warehouse_layer"] == "gold"
+    assert exported_table_lookup["mart_creator_opportunities"]["warehouse_layer"] == "gold"
 
     with duckdb.connect() as con:
         raw_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{raw_partition_path.as_posix()}')").fetchone()[0]
         manifest_rows = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{(export_dir / 'curated' / 'run_manifests' / 'data.parquet').as_posix()}')"
         ).fetchone()[0]
+        daily_row = con.execute(
+            f"SELECT played_date, total_streams, unique_artists FROM read_parquet('{(export_dir / 'curated' / 'listener_daily_activity' / 'data.parquet').as_posix()}')"
+        ).fetchone()
+        model_summary_row = con.execute(
+            f"SELECT run_id, model_name, promoted, is_serving_alias FROM read_parquet('{(export_dir / 'curated' / 'model_run_summary' / 'data.parquet').as_posix()}')"
+        ).fetchone()
+        run_quality_row = con.execute(
+            f"SELECT run_id, best_model_name, serving_model_name FROM read_parquet('{(export_dir / 'curated' / 'mart_run_quality' / 'data.parquet').as_posix()}')"
+        ).fetchone()
+        ops_row = con.execute(
+            f"SELECT latest_run_id, ops_health_status, operating_rhythm_status FROM read_parquet('{(export_dir / 'curated' / 'mart_ops_overview' / 'data.parquet').as_posix()}')"
+        ).fetchone()
+        creator_row = con.execute(
+            f"SELECT artist_name, priority_now_count, top_scene_name FROM read_parquet('{(export_dir / 'curated' / 'mart_creator_opportunities' / 'data.parquet').as_posix()}')"
+        ).fetchone()
         raw_columns = {
             row[0]
             for row in con.execute(
@@ -196,5 +358,10 @@ def test_export_athena_bundle_writes_expected_bundle(tmp_path: Path) -> None:
 
     assert raw_rows == 1
     assert manifest_rows == 1
+    assert daily_row == ("2024-07-01", 1, 1)
+    assert model_summary_row == ("20260324_222814_taste-os-full", "mlp", False, True)
+    assert run_quality_row == ("20260324_222814_taste-os-full", "mlp", "mlp")
+    assert ops_row == ("20260324_222814_taste-os-full", "attention", "stale")
+    assert creator_row == ("Artist X", 1, "scene-1")
     assert "ip_addr" not in raw_columns
     assert "played_at" in raw_columns

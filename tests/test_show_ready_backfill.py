@@ -25,8 +25,12 @@ def _create_legacy_creator_manifest(root: Path, stem: str) -> Path:
     scene_seed_md = base_dir / f"{stem}_scene_seed_comparison.md"
     lane_md = base_dir / f"{stem}_opportunity_lane_comparison.md"
     strategy_md = base_dir / f"{stem}_scene_strategy_watch.md"
+    lane_csv = base_dir / f"{stem}_opportunity_lane_comparison.csv"
+    strategy_csv = base_dir / f"{stem}_scene_strategy_watch.csv"
     for path in (primary_report, ranking_md, scene_md, seed_md, scene_seed_md, lane_md, strategy_md):
         _touch(path, f"# {path.stem}\n")
+    _touch(lane_csv, "scene_name,primary_driver\nscene-1,seed_adjacency\n")
+    _touch(strategy_csv, "scene_name,strategy_posture\nscene-1,accelerate_capture\n")
     manifest_path = base_dir / f"{stem}_report_family.json"
     _write_json(
         manifest_path,
@@ -37,12 +41,9 @@ def _create_legacy_creator_manifest(root: Path, stem: str) -> Path:
                 "scene_comparison": str(scene_md.resolve()),
                 "seed_comparison": str(seed_md.resolve()),
                 "scene_seed_comparison": str(scene_seed_md.resolve()),
-                "opportunity_lane_comparison": str(lane_md.resolve()),
             },
             "comparison_view_csv": {},
-            "brief_view_markdown": {
-                "scene_strategy_watch": str(strategy_md.resolve()),
-            },
+            "brief_view_markdown": {},
             "brief_view_csv": {},
         },
     )
@@ -64,12 +65,21 @@ def test_show_ready_backfill_restores_legacy_indexes_and_safety_contract(tmp_pat
     creator_report = report["creator_report_family_indexes"]
     assert creator_report["manifest_count"] == 2
     assert creator_report["backfilled_count"] == 2
+    assert creator_report["normalized_count"] == 2
+    assert creator_report["refresh_anchor_ready_count"] == 2
     assert report["safety_platform_contract"]["status"] == "backfilled"
 
     for manifest_path in manifest_paths:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         index_path = Path(str(payload["artifact_index_markdown"]))
         assert index_path.exists()
+        assert payload["comparison_view_markdown"]["opportunity_lane_comparison"].endswith("_opportunity_lane_comparison.md")
+        assert payload["comparison_view_csv"]["opportunity_lane_comparison"].endswith("_opportunity_lane_comparison.csv")
+        assert payload["brief_view_markdown"]["scene_strategy_watch"].endswith("_scene_strategy_watch.md")
+        assert payload["brief_view_csv"]["scene_strategy_watch"].endswith("_scene_strategy_watch.csv")
+        assert payload["packaging_metadata"]["refresh_anchor_ready"] is True
+        assert payload["packaging_metadata"]["anchor_views"]["opportunity_lane"]["ready"] is True
+        assert payload["packaging_metadata"]["anchor_views"]["scene_strategy"]["ready"] is True
 
     assert (tmp_path / "outputs/runs/run_demo/safety_platform_contract.json").exists()
     assert (tmp_path / "outputs/runs/run_demo/safety_platform_contract.md").exists()

@@ -2,7 +2,90 @@ from __future__ import annotations
 
 from datetime import datetime
 import math
+from pathlib import Path
 from typing import Callable
+
+from .run_artifacts import safe_read_json
+
+
+def _coerce_dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def build_ds_quant_review_block(
+    *,
+    output_dir: object,
+    latest_run: dict[str, object],
+) -> dict[str, object]:
+    output_root_text = str(output_dir or "").strip()
+    if not output_root_text:
+        return {"status": "missing", "summary": [], "recommendations": []}
+
+    bridge_path = Path(output_root_text).expanduser() / "analysis" / "quant_decision_lab" / "archetype_decision_bridge.json"
+    bridge_payload = safe_read_json(bridge_path, default={})
+    bridge = bridge_payload if isinstance(bridge_payload, dict) else {}
+    if str(bridge.get("status", "")).strip().lower() != "ok":
+        return {"status": "missing", "summary": [], "recommendations": []}
+
+    raw_recommendations = bridge.get("archetype_recommendations", [])
+    raw_recommendations = raw_recommendations if isinstance(raw_recommendations, list) else []
+    role_order = ("dominant", "high_skip", "exploratory")
+    recommendations: list[dict[str, object]] = []
+    for role in role_order:
+        row = next(
+            (
+                item
+                for item in raw_recommendations
+                if isinstance(item, dict) and str(item.get("role", "")).strip() == role
+            ),
+            {},
+        )
+        if not row:
+            continue
+        model = _coerce_dict(row.get("recommended_model", {}))
+        policy = _coerce_dict(row.get("recommended_policy", {}))
+        scenario = _coerce_dict(row.get("scenario_focus", {}))
+        title = str(row.get("title", "")).strip()
+        archetype_label = str(row.get("archetype_label", "")).strip()
+        model_name = str(model.get("model_name", "")).strip()
+        policy_name = str(policy.get("policy_name", "")).strip()
+        scenario_name = str(scenario.get("scenario", "")).strip()
+        if not title and not archetype_label and not model_name and not policy_name and not scenario_name:
+            continue
+        recommendations.append(
+            {
+                "role": role,
+                "title": title or role.replace("_", " ").title(),
+                "archetype_label": archetype_label,
+                "model_name": model_name,
+                "policy_name": policy_name,
+                "scenario": scenario_name,
+            }
+        )
+
+    if not recommendations:
+        return {"status": "missing", "summary": [], "recommendations": []}
+
+    bridge_run_id = str(bridge.get("run_id", "")).strip()
+    current_run_id = str(latest_run.get("run_id", "")).strip()
+    summary: list[str] = []
+    if bridge_run_id and current_run_id:
+        if bridge_run_id == current_run_id:
+            summary.append(f"Quant bridge is aligned with the current review anchor `{current_run_id}`.")
+        else:
+            summary.append(
+                f"Quant bridge is anchored on `{bridge_run_id}` while the control-room review anchor is `{current_run_id}`."
+            )
+    elif bridge_run_id:
+        summary.append(f"Quant bridge is anchored on `{bridge_run_id}`.")
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "recommendations": recommendations,
+        "bridge_run_id": bridge_run_id,
+        "current_run_id": current_run_id,
+    }
 
 
 def build_next_bets(

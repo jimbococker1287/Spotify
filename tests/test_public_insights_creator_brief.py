@@ -12,6 +12,7 @@ from spotify.public_insights import (
     _creator_brief_scene_seed_comparison,
     _creator_brief_seed_comparison,
 )
+from spotify.public_insights_creator_brief import normalize_creator_report_family_manifest
 
 
 def _payload() -> dict[str, object]:
@@ -224,3 +225,54 @@ def test_creator_brief_executive_summary_calls_out_scene_opportunity_and_migrati
     assert any("Emerging E" in line for line in lines)
     assert any("Artist A -> Artist B" in line for line in lines)
     assert any("strongest opportunity lane" in line for line in lines)
+
+
+def test_normalize_creator_report_family_manifest_recovers_refreshable_anchor_views(tmp_path) -> None:
+    report_dir = tmp_path / "creator_label_intelligence"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stem = "creator_label_intelligence_demo"
+
+    (report_dir / f"{stem}.md").write_text("# Brief\n", encoding="utf-8")
+    (report_dir / f"{stem}.json").write_text("{}", encoding="utf-8")
+    lane_md = report_dir / f"{stem}_opportunity_lane_comparison.md"
+    lane_csv = report_dir / f"{stem}_opportunity_lane_comparison.csv"
+    strategy_md = report_dir / f"{stem}_scene_strategy_watch.md"
+    strategy_csv = report_dir / f"{stem}_scene_strategy_watch.csv"
+    lane_md.write_text("# Lane\n", encoding="utf-8")
+    lane_csv.write_text("scene_name,primary_driver\nscene-1,seed_adjacency\n", encoding="utf-8")
+    strategy_md.write_text("# Strategy\n", encoding="utf-8")
+    strategy_csv.write_text("scene_name,strategy_posture\nscene-1,accelerate_capture\n", encoding="utf-8")
+
+    manifest = {
+        "comparison_view_markdown": {},
+        "comparison_view_csv": {},
+        "brief_view_markdown": {},
+        "brief_view_csv": {},
+        "reading_order": ["primary_report"],
+    }
+
+    normalized = normalize_creator_report_family_manifest(
+        manifest,
+        report_dir=report_dir,
+        stem=stem,
+        refreshed_at="2026-05-05T00:00:00+00:00",
+        refresh_source="unit_test",
+    )
+
+    assert normalized["primary_report"] == str((report_dir / f"{stem}.md").resolve())
+    assert normalized["primary_report_json"] == str((report_dir / f"{stem}.json").resolve())
+    assert normalized["comparison_view_markdown"]["opportunity_lane_comparison"] == str(lane_md.resolve())
+    assert normalized["comparison_view_csv"]["opportunity_lane_comparison"] == str(lane_csv.resolve())
+    assert normalized["brief_view_markdown"]["scene_strategy_watch"] == str(strategy_md.resolve())
+    assert normalized["brief_view_csv"]["scene_strategy_watch"] == str(strategy_csv.resolve())
+    assert normalized["reading_order"] == ["primary_report", "opportunity_lane_comparison", "scene_strategy_watch"]
+
+    packaging = normalized["packaging_metadata"]
+    assert packaging["normalized_at"] == "2026-05-05T00:00:00+00:00"
+    assert packaging["refresh_source"] == "unit_test"
+    assert packaging["refresh_anchor_ready"] is True
+    assert packaging["anchor_views"]["opportunity_lane"]["ready"] is True
+    assert packaging["anchor_views"]["scene_strategy"]["ready"] is True
+    assert packaging["view_inventory"]["opportunity_lane_comparison"]["legacy_markdown_filenames"] == [
+        f"{stem}_opportunity_lane_comparison.md"
+    ]

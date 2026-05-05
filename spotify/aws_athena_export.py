@@ -7,7 +7,7 @@ import shutil
 
 import pandas as pd
 
-from .aws_athena_sql import build_athena_queries, build_athena_sql, normalize_s3_prefix
+from .aws_athena_sql import ATHENA_TABLE_SPEC_LOOKUP, build_athena_queries, build_athena_sql, normalize_s3_prefix
 from .data import discover_streaming_files, discover_technical_log_files, load_streaming_history
 
 
@@ -17,6 +17,7 @@ class AthenaTableExport:
     local_path: str
     row_count: int
     partitioned: bool = False
+    warehouse_layer: str | None = None
 
 
 def _safe_read_csv(path: Path) -> pd.DataFrame:
@@ -524,6 +525,55 @@ def _write_partitioned_parquet_table(
         )
 
 
+def _coerce_boolean_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype("boolean")
+    normalized = series.map(
+        lambda value: (
+            True
+            if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes", "y"}
+            else (
+                False
+                if isinstance(value, str) and value.strip().lower() in {"false", "0", "no", "n"}
+                else (None if pd.isna(value) else bool(value))
+            )
+        )
+    )
+    return normalized.astype("boolean")
+
+
+def _coerce_series_for_athena(series: pd.Series, athena_type: str) -> pd.Series:
+    if athena_type == "timestamp":
+        return pd.to_datetime(series, errors="coerce")
+    if athena_type == "double":
+        return pd.to_numeric(series, errors="coerce")
+    if athena_type in {"bigint", "int"}:
+        return pd.to_numeric(series, errors="coerce").astype("Int64")
+    if athena_type == "boolean":
+        return _coerce_boolean_series(series)
+    return series.map(
+        lambda value: (
+            _json_string(value)
+            if isinstance(value, (dict, list, tuple, set))
+            else (None if pd.isna(value) else str(value))
+        )
+    ).astype("string")
+
+
+def _align_frame_to_athena_spec(df: pd.DataFrame, *, table_name: str) -> pd.DataFrame:
+    spec = ATHENA_TABLE_SPEC_LOOKUP[table_name]
+    frame = df.copy()
+    ordered_columns = [column_name for column_name, _ in spec.columns] + [
+        column_name for column_name, _ in spec.partition_columns
+    ]
+    for column_name in ordered_columns:
+        if column_name not in frame.columns:
+            frame[column_name] = None
+    for column_name, athena_type in (*spec.columns, *spec.partition_columns):
+        frame[column_name] = _coerce_series_for_athena(frame[column_name], athena_type)
+    return frame[ordered_columns]
+
+
 def export_athena_bundle(
     *,
     data_dir: Path,
@@ -538,6 +588,8 @@ def export_athena_bundle(
         import duckdb
     except Exception as exc:
         raise RuntimeError(f"DuckDB is required for Athena export: {exc}") from exc
+
+    from .analytics_warehouse import build_analytics_warehouse_bundle
 
     normalized_prefix = normalize_s3_prefix(s3_prefix)
     data_dir = data_dir.expanduser().resolve()
@@ -574,56 +626,61 @@ def export_athena_bundle(
         ),
     }
 
-    raw_streaming_history = _prepare_raw_streaming_history(
-        load_streaming_history(data_dir, include_video=include_video, logger=logger)
+    raw_df = load_streaming_history(data_dir, include_video=include_video, logger=logger)
+    warehouse_bundle = build_analytics_warehouse_bundle(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=include_video,
+        logger=logger,
+        raw_df=raw_df,
     )
-    experiment_history = _prepare_experiment_history(output_dir / "history" / "experiment_history.csv")
-    backtest_history = _prepare_backtest_history(output_dir / "history" / "backtest_history.csv")
-    optuna_history = _prepare_optuna_history(output_dir / "history" / "optuna_history.csv")
-    benchmark_history = _prepare_benchmark_history(output_dir / "history" / "benchmark_history.csv")
-    run_manifests = _prepare_run_manifests(output_dir)
-    run_results = _prepare_run_results(output_dir)
 
     exported_tables: list[AthenaTableExport] = []
+    export_frames: list[tuple[str, str, pd.DataFrame]] = [
+        ("bronze", "raw_streaming_history", warehouse_bundle.bronze["raw_streaming_history"]),
+        ("bronze", "experiment_history", warehouse_bundle.bronze["experiment_history"]),
+        ("bronze", "backtest_history", warehouse_bundle.bronze["backtest_history"]),
+        ("bronze", "optuna_history", warehouse_bundle.bronze["optuna_history"]),
+        ("bronze", "benchmark_history", warehouse_bundle.bronze["benchmark_history"]),
+        ("bronze", "run_manifests", warehouse_bundle.bronze["run_manifests"]),
+        ("bronze", "run_results", warehouse_bundle.bronze["run_results"]),
+        ("silver", "listener_daily_activity", warehouse_bundle.silver["listener_daily_activity"]),
+        ("silver", "model_run_summary", warehouse_bundle.silver["model_run_summary"]),
+        ("silver", "ops_review_snapshot", warehouse_bundle.silver["ops_review_snapshot"]),
+        ("silver", "creator_report_family_summary", warehouse_bundle.silver["creator_report_family_summary"]),
+        ("gold", "mart_run_quality", warehouse_bundle.gold["mart_run_quality"]),
+        ("gold", "mart_model_registry", warehouse_bundle.gold["mart_model_registry"]),
+        ("gold", "mart_ops_overview", warehouse_bundle.gold["mart_ops_overview"]),
+        ("gold", "mart_creator_opportunities", warehouse_bundle.gold["mart_creator_opportunities"]),
+        ("gold", "mart_creator_scene_pressure", warehouse_bundle.gold["mart_creator_scene_pressure"]),
+    ]
     with duckdb.connect() as con:
-        _write_partitioned_parquet_table(
-            con,
-            raw_streaming_history,
-            base_dir=curated_export_dir / "raw_streaming_history",
-            relation_name_prefix="raw_streaming_history",
-            partition_columns=("year", "month"),
-        )
-        exported_tables.append(
-            AthenaTableExport(
-                name="raw_streaming_history",
-                local_path=str((curated_export_dir / "raw_streaming_history").resolve()),
-                row_count=int(len(raw_streaming_history)),
-                partitioned=True,
-            )
-        )
-
-        non_partitioned_tables = [
-            ("experiment_history", experiment_history),
-            ("backtest_history", backtest_history),
-            ("optuna_history", optuna_history),
-            ("benchmark_history", benchmark_history),
-            ("run_manifests", run_manifests),
-            ("run_results", run_results),
-        ]
-        for relation_name, frame in non_partitioned_tables:
-            table_dir = curated_export_dir / relation_name
-            _write_parquet_file(
-                con,
-                frame,
-                table_dir / "data.parquet",
-                relation_name=f"{relation_name}_df",
-            )
+        for warehouse_layer, table_name, frame in export_frames:
+            aligned_frame = _align_frame_to_athena_spec(frame, table_name=table_name)
+            spec = ATHENA_TABLE_SPEC_LOOKUP[table_name]
+            table_dir = curated_export_dir / table_name
+            if spec.partition_columns:
+                _write_partitioned_parquet_table(
+                    con,
+                    aligned_frame,
+                    base_dir=table_dir,
+                    relation_name_prefix=table_name,
+                    partition_columns=tuple(column_name for column_name, _ in spec.partition_columns),
+                )
+            else:
+                _write_parquet_file(
+                    con,
+                    aligned_frame,
+                    table_dir / "data.parquet",
+                    relation_name=f"{table_name}_df",
+                )
             exported_tables.append(
                 AthenaTableExport(
-                    name=relation_name,
+                    name=table_name,
                     local_path=str(table_dir.resolve()),
-                    row_count=int(len(frame)),
-                    partitioned=False,
+                    row_count=int(len(aligned_frame)),
+                    partitioned=bool(spec.partition_columns),
+                    warehouse_layer=warehouse_layer,
                 )
             )
 

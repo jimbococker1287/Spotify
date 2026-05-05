@@ -564,6 +564,45 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
         json.dumps([{"model_name": "mlp", "model_type": "classical", "val_top1": 0.33, "test_top1": 0.31}]),
         encoding="utf-8",
     )
+    quant_dir = output_dir / "analysis" / "quant_decision_lab"
+    quant_dir.mkdir(parents=True, exist_ok=True)
+    (quant_dir / "archetype_decision_bridge.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "run_id": "run_a",
+                "listener_archetypes_available": True,
+                "archetype_recommendations": [
+                    {
+                        "role": "dominant",
+                        "title": "Dominant Archetype",
+                        "archetype_label": "steady_replay",
+                        "recommended_model": {"model_name": "retrieval_reranker"},
+                        "recommended_policy": {"policy_name": "safe_routed_default"},
+                        "scenario_focus": {"scenario": "baseline"},
+                    },
+                    {
+                        "role": "high_skip",
+                        "title": "High-Skip Archetype",
+                        "archetype_label": "skip_surfing",
+                        "recommended_model": {"model_name": "retrieval_reranker"},
+                        "recommended_policy": {"policy_name": "safe_routed_evening"},
+                        "scenario_focus": {"scenario": "evening_drift"},
+                    },
+                    {
+                        "role": "exploratory",
+                        "title": "Exploratory Archetype",
+                        "archetype_label": "exploratory_shuffle",
+                        "recommended_model": {"model_name": "blended_ensemble"},
+                        "recommended_policy": {"policy_name": "safe_routed_restart"},
+                        "scenario_focus": {"scenario": "session_restart"},
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     json_path, md_path = write_control_room_report(output_dir, top_n=2)
 
@@ -597,6 +636,9 @@ def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> 
     assert "Weekly Window" in markdown
     assert "Review Actions" in markdown
     assert "Async Handoff" in markdown
+    assert "DS / Quant Insight" in markdown
+    assert "Quant bridge is aligned with the current review anchor `run_a`." in markdown
+    assert "Dominant Archetype: `steady_replay` -> model=`retrieval_reranker` policy=`safe_routed_default` scenario=`baseline`" in markdown
 
 
 def test_control_room_adds_review_action_when_raw_winner_is_blocked_by_abstention(tmp_path: Path) -> None:

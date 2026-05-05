@@ -7,6 +7,7 @@ This project can be imported into AWS as a very small analytics lakehouse:
 - `Amazon Athena` queries the curated tables with SQL.
 
 This is the lowest-friction AWS-native replacement for the local DuckDB analytics database in `outputs/analytics/spotify_analytics.duckdb`.
+The export flow is still local-first: it builds from local branch artifacts and warehouse semantics without requiring AWS credentials just to generate the bundle.
 
 ## What This Repo Now Generates
 
@@ -34,6 +35,15 @@ The bundle contains:
 - `curated/benchmark_history/`: Parquet table built from `outputs/history/benchmark_history.csv`
 - `curated/run_manifests/`: flattened Parquet table built from `outputs/runs/*/run_manifest.json`
 - `curated/run_results/`: flattened Parquet table built from `outputs/runs/*/run_results.json`
+- `curated/listener_daily_activity/`: warehouse silver table for daily listener behavior
+- `curated/model_run_summary/`: warehouse silver table for run-by-model evaluation detail
+- `curated/ops_review_snapshot/`: warehouse silver table for the latest control-room operating snapshot
+- `curated/creator_report_family_summary/`: warehouse silver table summarizing creator report families
+- `curated/mart_run_quality/`: warehouse gold mart for run-level model quality
+- `curated/mart_model_registry/`: warehouse gold mart for reusable model registry analysis
+- `curated/mart_ops_overview/`: warehouse gold mart for current operating health and cadence
+- `curated/mart_creator_opportunities/`: warehouse gold mart for creator whitespace ranking
+- `curated/mart_creator_scene_pressure/`: warehouse gold mart for scene-level creator pressure
 - `ddl/athena.sql`: ready-to-run Athena DDL
 - `ddl/sample_queries.sql`: validation/sample queries
 - `notes/aws_cli_commands.txt`: copy-paste sync commands
@@ -42,6 +52,7 @@ The bundle contains:
 Notes:
 
 - The curated raw-history table intentionally omits `ip_addr`.
+- The semantic tables are exported from the same local analytics-warehouse bundle used by the DuckDB analytics branch, so Athena sees the silver/gold layer rather than only the older raw/history/run slices.
 - The `raw/` area still contains original Spotify JSON and should stay private in S3.
 
 ## Recommended S3 Layout
@@ -75,6 +86,24 @@ s3://spotify-taste-os-data/spotify-athena/
     run_manifests/
       data.parquet
     run_results/
+      data.parquet
+    listener_daily_activity/
+      data.parquet
+    model_run_summary/
+      data.parquet
+    ops_review_snapshot/
+      data.parquet
+    creator_report_family_summary/
+      data.parquet
+    mart_run_quality/
+      data.parquet
+    mart_model_registry/
+      data.parquet
+    mart_ops_overview/
+      data.parquet
+    mart_creator_opportunities/
+      data.parquet
+    mart_creator_scene_pressure/
       data.parquet
   athena-results/
 ```
@@ -237,6 +266,7 @@ That file will:
 
 - create the Athena database
 - create the curated external tables
+- register the warehouse semantic-layer tables
 - repair partitions for `raw_streaming_history`
 - create helper views
 
@@ -255,6 +285,22 @@ SELECT master_metadata_album_artist_name, COUNT(*) AS plays
 FROM raw_streaming_history
 GROUP BY 1
 ORDER BY plays DESC
+LIMIT 25;
+```
+
+Additional semantic-layer examples from the generated sample SQL:
+
+```sql
+SELECT run_id, best_model_name, best_test_top1, serving_model_name, promoted
+FROM mart_run_quality
+ORDER BY run_timestamp DESC;
+
+SELECT selected_run_id, latest_run_id, ops_health_status, operating_rhythm_status
+FROM latest_ops_overview;
+
+SELECT artist_name, max_opportunity_score, priority_now_count, top_scene_name
+FROM creator_priority_now
+ORDER BY max_opportunity_score DESC
 LIMIT 25;
 ```
 

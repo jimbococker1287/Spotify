@@ -86,3 +86,11 @@ make quant-decision-lab
 - archetypes define the behavioral slices worth studying
 - quant frontier defines the models and policies worth trusting inside those slices
 - archetype decision bridge turns those two views into concrete evaluation lanes without changing downstream consumers yet
+
+5. Review the current recommendation set in the control room:
+
+```bash
+make control-room
+```
+
+- when `outputs/analysis/quant_decision_lab/archetype_decision_bridge.json` exists, the control-room markdown surfaces a concise DS/quant bridge block tied to the current review anchor
