@@ -125,6 +125,88 @@ def _load_benchmark_bundle(manifest_path: Path | None) -> dict[str, object]:
     }
 
 
+def _portable_path(path: Path, *, output_root: Path) -> tuple[str, bool, str]:
+    resolved = path.expanduser().resolve()
+    try:
+        return str(resolved.relative_to(output_root)), True, "output_relative"
+    except ValueError:
+        return str(resolved), False, "absolute_external"
+
+
+def _artifact_records(paths: list[object], *, output_root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for raw in paths:
+        raw_text = str(raw).strip()
+        if not raw_text:
+            continue
+        candidate = Path(raw_text).expanduser()
+        resolved = candidate.resolve()
+        portable_path, portable, scope = _portable_path(candidate, output_root=output_root)
+        records.append(
+            {
+                "absolute_path": str(resolved),
+                "portable_path": portable_path,
+                "portable": portable,
+                "path_scope": scope,
+                "exists": resolved.exists(),
+            }
+        )
+    return records
+
+
+def _artifact_portability_summary(claims: list[dict[str, object]]) -> dict[str, object]:
+    records = [
+        record
+        for claim in claims
+        if isinstance(claim, dict)
+        for record in claim.get("supporting_artifact_records", [])
+        if isinstance(record, dict)
+    ]
+    total = len(records)
+    portable = sum(1 for record in records if bool(record.get("portable")))
+    existing = sum(1 for record in records if bool(record.get("exists")))
+    non_portable_examples = [
+        str(record.get("absolute_path", "")).strip()
+        for record in records
+        if not bool(record.get("portable")) and str(record.get("absolute_path", "")).strip()
+    ]
+    return {
+        "path_mode": "relative_to_output_dir_when_possible",
+        "total_supporting_artifact_count": int(total),
+        "portable_supporting_artifact_count": int(portable),
+        "existing_supporting_artifact_count": int(existing),
+        "non_portable_supporting_artifact_count": int(total - portable),
+        "missing_supporting_artifact_count": int(total - existing),
+        "all_supporting_artifacts_portable": bool(total > 0 and portable == total),
+        "all_supporting_artifacts_present": bool(total > 0 and existing == total),
+        "non_portable_examples": non_portable_examples[:5],
+    }
+
+
+def _enrich_claim_artifacts(
+    claim: dict[str, object],
+    *,
+    output_root: Path,
+) -> dict[str, object]:
+    enriched = dict(claim)
+    raw_paths = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    records = _artifact_records(raw_paths, output_root=output_root)
+    portability_ready = bool(records) and all(bool(record.get("portable")) for record in records)
+    artifact_pack_ready = bool(records) and all(bool(record.get("exists")) for record in records)
+    enriched["supporting_artifacts"] = [str(record.get("absolute_path", "")).strip() for record in records]
+    enriched["supporting_artifacts_portable"] = [str(record.get("portable_path", "")).strip() for record in records]
+    enriched["supporting_artifact_records"] = records
+    enriched["supporting_artifact_summary"] = {
+        "path_mode": "relative_to_output_dir_when_possible",
+        "artifact_count": int(len(records)),
+        "portable_artifact_count": int(sum(1 for record in records if bool(record.get("portable")))),
+        "existing_artifact_count": int(sum(1 for record in records if bool(record.get("exists")))),
+        "portability_status": "ready" if portability_ready else "attention" if records else "missing",
+        "artifact_pack_status": "ready" if artifact_pack_ready else "attention" if records else "missing",
+    }
+    return enriched
+
+
 def _median_metric(values: list[float]) -> float:
     finite = [value for value in values if math.isfinite(value)]
     if not finite:
@@ -728,6 +810,7 @@ def _publication_outline(primary_claim: dict[str, object], backup_claim: dict[st
             "notes": [
                 "Call out any benchmark-contract failures directly instead of burying them.",
                 "Explain which claims are single-run, which are repeated-seed, and which still depend on operator-facing diagnostics.",
+                "Keep supporting artifact references portable by preferring paths relative to the output bundle over workspace-absolute paths.",
             ],
         },
     ]
@@ -752,6 +835,11 @@ def _claim_support_row(
     metrics = claim.get("metrics", {})
     metrics = metrics if isinstance(metrics, dict) else {}
     supporting_artifacts = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    supporting_artifact_records = [
+        dict(item)
+        for item in claim.get("supporting_artifact_records", [])
+        if isinstance(item, dict)
+    ]
     missing_checks = [str(item).strip() for item in claim.get("missing_checks", []) if str(item).strip()]
     claim_key = str(claim.get("key", "")).strip()
 
@@ -785,9 +873,19 @@ def _claim_support_row(
         risk_ready = math.isfinite(_safe_float(metrics.get("test_mean_delta")))
         benchmark_status = _evidence_status(None)
 
-    artifact_count = len(supporting_artifacts)
-    existing_artifacts = _existing_artifact_count(supporting_artifacts)
+    artifact_count = len(supporting_artifact_records) if supporting_artifact_records else len(supporting_artifacts)
+    existing_artifacts = (
+        sum(1 for item in supporting_artifact_records if bool(item.get("exists")))
+        if supporting_artifact_records
+        else _existing_artifact_count(supporting_artifacts)
+    )
+    portable_artifacts = (
+        sum(1 for item in supporting_artifact_records if bool(item.get("portable")))
+        if supporting_artifact_records
+        else 0
+    )
     artifact_pack_ready = artifact_count > 0 and existing_artifacts == artifact_count
+    artifact_portability_ready = artifact_count > 0 and portable_artifacts == artifact_count
     live_signal_ready = _STATUS_RANK.get(str(claim.get("status", "")), 0) >= 1
 
     return {
@@ -800,8 +898,10 @@ def _claim_support_row(
         "slice_evidence_status": _evidence_status(slice_ready),
         "risk_evidence_status": _evidence_status(risk_ready),
         "artifact_pack_status": _evidence_status(artifact_pack_ready),
+        "artifact_portability_status": _evidence_status(artifact_portability_ready),
         "supporting_artifact_count": artifact_count,
         "existing_artifact_count": existing_artifacts,
+        "portable_artifact_count": portable_artifacts,
         "missing_check_count": len(missing_checks),
         "next_gate": missing_checks[0] if missing_checks else "ready_to_package",
     }
@@ -825,6 +925,16 @@ def _build_submission_readiness(
     benchmark_table = evaluation_tables.get("benchmark_lock", [])
     run_leaderboard = run_leaderboard if isinstance(run_leaderboard, list) else []
     benchmark_table = benchmark_table if isinstance(benchmark_table, list) else []
+    primary_missing_checks = [
+        str(item).strip()
+        for item in primary_claim.get("missing_checks", [])
+        if str(item).strip()
+    ]
+    backup_missing_checks = [
+        str(item).strip()
+        for item in backup_claim.get("missing_checks", [])
+        if str(item).strip()
+    ]
 
     checks = [
         {
@@ -849,6 +959,22 @@ def _build_submission_readiness(
             ),
         },
         {
+            "key": "primary_claim_blockers",
+            "status": "pass" if not primary_missing_checks else "attention",
+            "detail": (
+                "Primary claim blockers: "
+                f"`{primary_missing_checks[0] if primary_missing_checks else 'none'}`."
+            ),
+        },
+        {
+            "key": "backup_claim_blockers",
+            "status": "pass" if not backup_missing_checks else "attention",
+            "detail": (
+                "Backup claim blockers: "
+                f"`{backup_missing_checks[0] if backup_missing_checks else 'none'}`."
+            ),
+        },
+        {
             "key": "evaluation_tables",
             "status": "pass" if bool(run_leaderboard) and bool(benchmark_table) and bool(claim_support_matrix) else "fail",
             "detail": (
@@ -870,15 +996,29 @@ def _build_submission_readiness(
             ),
         },
         {
+            "key": "artifact_portability",
+            "status": (
+                "pass"
+                if str(primary_row.get("artifact_portability_status", "")) == "ready"
+                and str(backup_row.get("artifact_portability_status", "")) in {"ready", "n/a", ""}
+                else "attention"
+            ),
+            "detail": (
+                f"Primary artifact portability is `{primary_row.get('artifact_portability_status', 'gap')}` and backup portability is "
+                f"`{backup_row.get('artifact_portability_status', 'gap')}`."
+            ),
+        },
+        {
             "key": "open_gaps",
-            "status": "pass" if len(claim_gaps) <= 2 else "attention",
+            "status": "pass" if len(claim_gaps) == 0 else "attention" if len(claim_gaps) <= 2 else "fail",
             "detail": f"Open claim gaps: `{len(claim_gaps)}`.",
         },
     ]
 
-    if primary_rank >= 4 and benchmark_ready and all(check["status"] == "pass" for check in checks):
+    has_open_checks = any(str(check.get("status", "")) != "pass" for check in checks)
+    if primary_rank >= 4 and benchmark_ready and not has_open_checks:
         status = "submission_candidate"
-    elif primary_rank >= 3 and backup_rank >= 1:
+    elif primary_rank >= 3 and backup_rank >= 1 and benchmark_ready and not has_open_checks:
         status = "analysis_ready"
     elif primary_rank >= 2:
         status = "promising_but_unlocked"
@@ -897,12 +1037,17 @@ def _build_submission_readiness(
     summary = [
         f"Primary claim is `{primary_claim.get('status', 'unknown')}` and backup claim is `{backup_claim.get('status', 'unknown')}`.",
         f"Benchmark lock is `{('ready' if benchmark_ready else 'not ready')}` with `{len(claim_gaps)}` open claim gaps.",
+        (
+            "Supporting artifacts are portable enough for packaging."
+            if str(primary_row.get("artifact_portability_status", "")) == "ready"
+            else "Supporting artifact paths still depend on workspace-specific references or missing files."
+        ),
         f"Submission-readiness state is `{status}`.",
     ]
 
     return {
         "status": status,
-        "ready_for_external_review": status in {"analysis_ready", "submission_candidate", "promising_but_unlocked"},
+        "ready_for_external_review": status in {"analysis_ready", "submission_candidate"} and not has_open_checks and benchmark_ready,
         "checks": checks,
         "blockers": blockers[:6],
         "summary": summary,
@@ -944,6 +1089,7 @@ def build_research_claims_report(
         _claim_friction_counterfactual(run_dir=resolved_run_dir),
         _claim_risk_aware_abstention(run_dir=resolved_run_dir, run_results=run_results),
     ]
+    claims = [_enrich_claim_artifacts(claim, output_root=output_root) for claim in claims if isinstance(claim, dict)]
     claims.sort(key=_claim_sort_key, reverse=True)
     primary_claim = claims[0] if claims else {}
     backup_claim = claims[1] if len(claims) > 1 else {}
@@ -988,9 +1134,15 @@ def build_research_claims_report(
             "profile": str(run_manifest.get("profile", "")),
             "timestamp": str(run_manifest.get("timestamp", "")),
             "run_dir": str(resolved_run_dir),
+            "run_dir_portable": _portable_path(resolved_run_dir, output_root=output_root)[0],
         },
         "benchmark_lock": {
             "manifest_path": str(benchmark_bundle.get("manifest_path", "")),
+            "manifest_path_portable": (
+                _portable_path(Path(str(benchmark_bundle.get("manifest_path", ""))), output_root=output_root)[0]
+                if str(benchmark_bundle.get("manifest_path", "")).strip()
+                else ""
+            ),
             "benchmark_id": str((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("benchmark_id", "")),
             "comparison_ready": bool((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparison_ready")),
             "model_class_mix": dict((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("model_class_mix", {}))
@@ -1008,6 +1160,7 @@ def build_research_claims_report(
         "backup_claim": backup_claim,
         "believable_submission_path": _STATUS_RANK.get(str(primary_claim.get("status", "")), 0) >= 2
         and _STATUS_RANK.get(str(backup_claim.get("status", "")), 0) >= 1,
+        "artifact_portability": _artifact_portability_summary(claims),
         "evaluation_tables": {
             "run_leaderboard": top_model_rows,
             "benchmark_lock": benchmark_table,
@@ -1076,6 +1229,8 @@ def write_research_claims_report(
         artifact_dir / "claim_support_matrix.csv",
         [row for row in claim_support_matrix if isinstance(row, dict)],
     )
+    artifact_portability = report.get("artifact_portability", {})
+    artifact_portability = artifact_portability if isinstance(artifact_portability, dict) else {}
 
     lines = [
         "# Research Claims",
@@ -1084,6 +1239,7 @@ def write_research_claims_report(
         f"- Profile: `{(report.get('run', {}) if isinstance(report.get('run', {}), dict) else {}).get('profile', '')}`",
         f"- Benchmark lock ready: `{benchmark_lock.get('comparison_ready', False)}`",
         f"- Believable submission path: `{report.get('believable_submission_path', False)}`",
+        f"- Artifact path mode: `{artifact_portability.get('path_mode', '')}`",
         "",
         "## Primary Claim",
         "",
@@ -1109,11 +1265,26 @@ def write_research_claims_report(
     for item in backup_claim.get("evidence", []):
         lines.append(f"- {item}")
 
+    lines.extend(["", "## Artifact Portability", ""])
+    lines.append(
+        f"- Portable supporting artifacts: `{artifact_portability.get('portable_supporting_artifact_count', 0)}` / `{artifact_portability.get('total_supporting_artifact_count', 0)}`"
+    )
+    lines.append(
+        f"- Existing supporting artifacts: `{artifact_portability.get('existing_supporting_artifact_count', 0)}` / `{artifact_portability.get('total_supporting_artifact_count', 0)}`"
+    )
+    if artifact_portability.get("non_portable_examples"):
+        lines.append(
+            f"- Non-portable examples: `{', '.join(str(item) for item in artifact_portability.get('non_portable_examples', []))}`"
+        )
+
     lines.extend(["", "## Claim Matrix", ""])
     for claim in report.get("claims", []):
         if not isinstance(claim, dict):
             continue
-        lines.append(f"- `{claim.get('status', '')}` {claim.get('title', '')}")
+        lines.append(
+            f"- `{claim.get('status', '')}` {claim.get('title', '')} "
+            f"(artifacts `{(claim.get('supporting_artifact_summary', {}) if isinstance(claim.get('supporting_artifact_summary', {}), dict) else {}).get('portability_status', 'missing')}`)"
+        )
 
     lines.extend(["", "## Evaluation Tables", "", "### Run Leaderboard", ""])
     for row in (report.get("evaluation_tables", {}) if isinstance(report.get("evaluation_tables", {}), dict) else {}).get("run_leaderboard", []):
@@ -1141,7 +1312,8 @@ def write_research_claims_report(
             f"- `{row.get('role', '')}` `{row.get('claim_key', '')}` [{row.get('status', '')}] "
             f"live=`{row.get('live_signal_status', '')}` benchmark=`{row.get('benchmark_evidence_status', '')}` "
             f"repeated=`{row.get('repeated_evidence_status', '')}` slice=`{row.get('slice_evidence_status', '')}` "
-            f"risk=`{row.get('risk_evidence_status', '')}` artifacts=`{row.get('artifact_pack_status', '')}`"
+            f"risk=`{row.get('risk_evidence_status', '')}` artifacts=`{row.get('artifact_pack_status', '')}` "
+            f"portability=`{row.get('artifact_portability_status', '')}`"
         )
 
     lines.extend(["", "## Submission Readiness", ""])
@@ -1193,7 +1365,8 @@ def write_research_claims_report(
         claim_support_md_lines.append(
             f"- `{row.get('role', '')}` `{row.get('claim_key', '')}`: benchmark `{row.get('benchmark_evidence_status', '')}`, "
             f"repeated `{row.get('repeated_evidence_status', '')}`, slice `{row.get('slice_evidence_status', '')}`, "
-            f"risk `{row.get('risk_evidence_status', '')}`, artifacts `{row.get('artifact_pack_status', '')}`."
+            f"risk `{row.get('risk_evidence_status', '')}`, artifacts `{row.get('artifact_pack_status', '')}`, "
+            f"portability `{row.get('artifact_portability_status', '')}`."
         )
         claim_support_md_lines.append(f"Next gate: {row.get('next_gate', '')}")
     claim_support_md = artifact_dir / "claim_support_matrix.md"

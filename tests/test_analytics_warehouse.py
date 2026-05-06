@@ -342,6 +342,335 @@ def _write_minimal_creator_family(output_dir: Path) -> None:
     ).to_csv(base_dir / f"{family_id}_scene_seed_comparison.csv", index=False)
 
 
+def _write_minimal_creator_market_branch(output_dir: Path) -> None:
+    base_dir = output_dir / "analysis" / "creator_market_intelligence"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        [
+            {
+                "scene_name": "scene-1",
+                "family_count": 1,
+                "avg_scene_local_play_share": 0.44,
+                "avg_opportunity_score": 0.56,
+                "total_priority_now": 2,
+                "total_watchlist": 1,
+                "avg_release_pressure": 0.31,
+                "avg_label_concentration": 0.12,
+                "avg_inbound_target_share": 0.27,
+                "avg_outbound_source_share": 0.19,
+                "avg_seed_bridge_count": 1.5,
+                "dominant_driver": "seed_adjacency",
+                "top_opportunity_artist": "Artist X",
+                "top_migration_route": "Seed Artist -> Artist X",
+                "strategy_posture": "accelerate",
+                "momentum_score": 0.88,
+            }
+        ]
+    ).to_csv(base_dir / "scene_market_pulse.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "scene_name": "scene-1",
+                "primary_driver": "seed_adjacency",
+                "family_count": 1,
+                "artist_count": 1,
+                "opportunity_count": 1,
+                "priority_now_count": 1,
+                "watchlist_count": 0,
+                "avg_opportunity_score": 0.58,
+                "avg_scene_local_play_share": 0.44,
+                "avg_scene_release_pressure": 0.31,
+                "avg_scene_label_concentration": 0.12,
+                "avg_seed_bridge_count": 2.0,
+                "avg_fan_migration_score": 0.35,
+                "avg_release_whitespace_score": 0.61,
+                "avg_local_gap_score": 0.4,
+                "avg_scene_momentum_score": 0.88,
+                "representative_artist": "Artist X",
+                "lane_posture": "expand",
+                "lane_attractiveness_score": 0.91,
+            }
+        ]
+    ).to_csv(base_dir / "opportunity_lane_atlas.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "source_artist": "Seed Artist",
+                "target_artist": "Artist X",
+                "family_count": 1,
+                "route_mentions": 1,
+                "total_transition_count": 14,
+                "avg_source_out_share": 0.29,
+                "avg_target_in_share": 0.34,
+                "source_scene_name": "scene-seed",
+                "target_scene_name": "scene-1",
+                "route_strength_score": 0.79,
+            }
+        ]
+    ).to_csv(base_dir / "market_migration_network.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "scene_name": "scene-1",
+                "seed_artist": "Seed A",
+                "family_count": 1,
+                "opportunity_count": 2,
+                "avg_opportunity_score": 0.55,
+                "avg_bridge_artist_count": 3.0,
+                "avg_scene_local_play_share": 0.44,
+                "avg_scene_release_pressure": 0.31,
+                "avg_scene_label_concentration": 0.12,
+                "top_opportunity_artist": "Artist X",
+                "dominant_driver": "seed_adjacency",
+                "bridge_score": 0.83,
+            }
+        ]
+    ).to_csv(base_dir / "seed_scene_bridge_atlas.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "artist_name": "Artist X",
+                "scene_name": "scene-1",
+                "family_count": 1,
+                "avg_opportunity_score": 0.58,
+                "avg_release_whitespace_score": 0.67,
+                "max_days_since_latest_release": 42,
+                "avg_seed_bridge_count": 2.0,
+                "dominant_labels": "Label A|Label B",
+                "primary_driver": "seed_adjacency",
+                "whitespace_signal_score": 0.94,
+            }
+        ]
+    ).to_csv(base_dir / "release_whitespace_atlas.csv", index=False)
+    (base_dir / "creator_market_brief.json").write_text(
+        json.dumps(
+            {
+                "report_family_count": 1,
+                "top_scene": {"scene_name": "scene-1", "momentum_score": 0.88},
+                "top_lane": {"scene_name": "scene-1", "primary_driver": "seed_adjacency"},
+                "top_route": {"source_artist": "Seed Artist", "target_artist": "Artist X"},
+                "top_bridge": {"scene_name": "scene-1", "seed_artist": "Seed A"},
+                "top_whitespace": {"artist_name": "Artist X", "scene_name": "scene-1"},
+                "summary": ["Creator market branch is ready for warehouse ingestion."],
+                "actions": ["Prioritize the whitespace watchlist in the semantic layer."],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (base_dir / "creator_market_manifest.json").write_text(
+        json.dumps(
+            {
+                "report_family_count": 1,
+                "manifest_backed_report_family_count": 1,
+                "asset_backed_report_family_count": 1,
+                "complete_report_family_count": 1,
+                "partial_report_family_count": 0,
+                "partial_report_family_ids": [],
+                "artifact_root": str(base_dir.resolve()),
+                "tables": {
+                    "scene_market_pulse": {"row_count": 1},
+                    "opportunity_lane_atlas": {"row_count": 1},
+                    "market_migration_network": {"row_count": 1},
+                    "seed_scene_bridge_atlas": {"row_count": 1},
+                    "release_whitespace_atlas": {"row_count": 1},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_minimal_research_platform_branch(output_dir: Path) -> None:
+    base_dir = output_dir / "analysis" / "research_platform_lab"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        [
+            {
+                "run_id": "run_a",
+                "profile": "full",
+                "timestamp": "2026-01-01T00:04:00+00:00",
+                "promoted": True,
+                "champion_gate_status": "pass",
+                "benchmark_protocol_present": True,
+                "safety_platform_contract_present": True,
+                "conformal_summary_count": 1,
+                "backtest_model_count": 1,
+                "benchmark_contract_version": "v1",
+                "benchmark_comparison_mode": "temporal",
+                "safety_api_group_count": 2,
+                "spotify_wrapper_count": 1,
+                "portability_note_count": 1,
+                "portability_signal_status": "ready",
+                "research_artifact_ratio": 1.0,
+                "research_stage": "review_ready",
+                "claim_pack_attached": True,
+                "claim_pack_path": str((output_dir / "analysis" / "research_claims" / "research_claims.json").resolve()),
+                "claim_pack_freshness_status": "fresh",
+                "claim_pack_stale_source_path": "",
+                "claim_pack_stale_source_count": 0,
+                "run_manifest_path": str((output_dir / "runs" / "run_a" / "run_manifest.json").resolve()),
+                "run_manifest_timestamp": "2026-01-01T00:04:00+00:00",
+                "run_manifest_age_hours": 1.0,
+                "benchmark_protocol_path": str((output_dir / "runs" / "run_a" / "benchmark_protocol.json").resolve()),
+                "safety_platform_contract_path": str((output_dir / "runs" / "run_a" / "safety_platform_contract.json").resolve()),
+                "target_drift_jsd": 0.218,
+                "test_selective_risk": 0.372,
+                "test_abstention_rate": 0.241,
+                "robustness_gap": 0.096,
+                "stress_skip_risk": 0.591,
+                "ops_coverage_ratio": 1.0,
+            }
+        ]
+    ).to_csv(base_dir / "run_research_registry.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "benchmark_id": "smokebench",
+                "canonical_profile": "full",
+                "comparison_mode": "temporal",
+                "comparison_ready": False,
+                "comparison_status": "incomplete",
+                "run_count": 3,
+                "model_count": 2,
+                "present_artifact_count": 3,
+                "required_artifact_count": 4,
+                "required_artifact_ratio": 0.75,
+                "significant_pair_count": 1,
+                "comparison_blocker_count": 1,
+                "top_comparison_blocker": "Need repeated benchmark",
+                "comparison_blockers_json": json.dumps(["Need repeated benchmark"]),
+                "comparator_guard_status": "attention",
+                "deep_comparator_ready": False,
+                "observed_model_classes_json": json.dumps(["classical"]),
+                "best_model_name": "mlp",
+                "best_model_type": "classical",
+                "best_val_top1_mean": 0.35,
+                "best_test_top1_mean": 0.28,
+                "top_significant_pair": "mlp vs deep",
+                "top_significant_margin": 0.02,
+                "manifest_freshness_status": "fresh",
+                "manifest_stale_source_path": "",
+                "manifest_stale_source_count": 0,
+                "manifest_age_hours": 2.0,
+                "summary_path": str((output_dir / "history" / "benchmark_lock_smokebench_summary.csv").resolve()),
+                "significance_path": str((output_dir / "history" / "benchmark_lock_smokebench_significance.csv").resolve()),
+                "benchmark_strength_score": 0.73,
+                "manifest_path": str((output_dir / "history" / "benchmark_lock_smokebench_manifest.json").resolve()),
+            }
+        ]
+    ).to_csv(base_dir / "benchmark_lock_atlas.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "claim_key": "claim_ready",
+                "title": "Model is ready",
+                "role": "primary",
+                "status": "analysis_ready",
+                "claim_readiness_status": "ready",
+                "summary": "Primary claim is ready.",
+                "live_signal_status": "ready",
+                "benchmark_evidence_status": "ready",
+                "repeated_evidence_status": "ready",
+                "slice_evidence_status": "ready",
+                "risk_evidence_status": "ready",
+                "artifact_pack_status": "fresh",
+                "supporting_artifact_count": 3,
+                "existing_supporting_artifact_count": 3,
+                "missing_supporting_artifact_count": 0,
+                "stale_supporting_artifact_count": 0,
+                "supporting_artifact_path_status": "ready",
+                "supporting_artifact_freshness_status": "fresh",
+                "missing_supporting_artifact_path": "",
+                "stale_supporting_artifact_path": "",
+                "missing_check_count": 0,
+                "blocked": False,
+                "next_gate": "ready_to_package",
+                "target_drift_jsd": 0.12,
+                "selective_risk": 0.18,
+                "stress_skip_risk": 0.21,
+                "live_test_top1_lift_vs_deep": 0.04,
+                "benchmark_comparison_ready": True,
+                "benchmark_significant_lift": True,
+                "claims_path": str((output_dir / "analysis" / "research_claims" / "research_claims.json").resolve()),
+                "metrics_json": json.dumps({"target_drift_jsd": 0.12}),
+                "missing_checks_json": json.dumps([]),
+            },
+            {
+                "claim_key": "claim_gap",
+                "title": "Benchmark evidence is incomplete",
+                "role": "backup",
+                "status": "attention",
+                "claim_readiness_status": "blocked",
+                "summary": "Backup claim is blocked pending repeated benchmark evidence.",
+                "live_signal_status": "ready",
+                "benchmark_evidence_status": "missing",
+                "repeated_evidence_status": "attention",
+                "slice_evidence_status": "ready",
+                "risk_evidence_status": "attention",
+                "artifact_pack_status": "stale",
+                "supporting_artifact_count": 2,
+                "existing_supporting_artifact_count": 1,
+                "missing_supporting_artifact_count": 1,
+                "stale_supporting_artifact_count": 1,
+                "supporting_artifact_path_status": "partial",
+                "supporting_artifact_freshness_status": "stale",
+                "missing_supporting_artifact_path": "/tmp/missing.json",
+                "stale_supporting_artifact_path": "/tmp/stale.json",
+                "missing_check_count": 2,
+                "blocked": True,
+                "next_gate": "rerun_benchmark",
+                "target_drift_jsd": 0.22,
+                "selective_risk": 0.37,
+                "stress_skip_risk": 0.59,
+                "live_test_top1_lift_vs_deep": 0.01,
+                "benchmark_comparison_ready": False,
+                "benchmark_significant_lift": False,
+                "claims_path": str((output_dir / "analysis" / "research_claims" / "research_claims.json").resolve()),
+                "metrics_json": json.dumps({"target_drift_jsd": 0.22}),
+                "missing_checks_json": json.dumps(["rerun benchmark", "refresh pack"]),
+            },
+        ]
+    ).to_csv(base_dir / "research_claim_registry.csv", index=False)
+    (base_dir / "research_platform_maturity.json").write_text(
+        json.dumps(
+            {
+                "anchor_run_id": "run_a",
+                "anchor_run": {"run_id": "run_a", "research_stage": "review_ready"},
+                "strongest_benchmark_lock": {"benchmark_id": "smokebench", "benchmark_strength_score": 0.73},
+                "claim_ready_count": 1,
+                "claim_blocked_count": 1,
+                "claim_total_count": 2,
+                "incomplete_benchmark_lock_count": 1,
+                "stale_benchmark_manifest_count": 0,
+                "stale_claim_artifact_count": 1,
+                "submission_status": "internal_review",
+                "ready_for_external_review": False,
+                "blockers": ["Need repeated benchmark"],
+                "top_next_gate": "rerun_benchmark",
+                "summary": ["Research platform branch is ready for warehouse ingestion."],
+                "actions": ["Resolve the repeated benchmark gap before external review."],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (base_dir / "research_platform_manifest.json").write_text(
+        json.dumps(
+            {
+                "anchor_run_id": "run_a",
+                "artifact_root": str(base_dir.resolve()),
+                "tables": {
+                    "run_research_registry": {"row_count": 1},
+                    "benchmark_lock_atlas": {"row_count": 1},
+                    "research_claim_registry": {"row_count": 2},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _build_minimal_workspace(tmp_path: Path) -> tuple[Path, Path]:
     data_dir = tmp_path / "data" / "raw"
     output_dir = tmp_path / "outputs"
@@ -349,6 +678,8 @@ def _build_minimal_workspace(tmp_path: Path) -> tuple[Path, Path]:
     _write_minimal_run_artifacts(output_dir)
     _write_minimal_control_room(output_dir)
     _write_minimal_creator_family(output_dir)
+    _write_minimal_creator_market_branch(output_dir)
+    _write_minimal_research_platform_branch(output_dir)
     return data_dir, output_dir
 
 
@@ -369,8 +700,14 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert (warehouse_root / "warehouse_manifest.json").exists()
     assert (warehouse_root / "warehouse_verification.json").exists()
     assert (warehouse_root / "bronze" / "control_room_snapshot.parquet").exists()
+    assert (warehouse_root / "bronze" / "creator_market_scene_pulse.parquet").exists()
+    assert (warehouse_root / "bronze" / "research_platform_run_registry.parquet").exists()
     assert (warehouse_root / "silver" / "model_run_summary.parquet").exists()
+    assert (warehouse_root / "silver" / "creator_market_scene_summary.parquet").exists()
+    assert (warehouse_root / "silver" / "research_platform_status_summary.parquet").exists()
     assert (warehouse_root / "gold" / "mart_creator_opportunities.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_creator_market_watchlist.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_research_platform_status.parquet").exists()
 
     control_room_snapshot = pd.read_parquet(warehouse_root / "bronze" / "control_room_snapshot.parquet")
     assert control_room_snapshot.loc[0, "selected_run_id"] == "run_a"
@@ -383,6 +720,20 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
 
     creator_opportunities = pd.read_parquet(warehouse_root / "gold" / "mart_creator_opportunities.parquet")
     assert creator_opportunities.loc[0, "artist_name"] == "Artist X"
+
+    creator_market_scene_summary = pd.read_parquet(warehouse_root / "silver" / "creator_market_scene_summary.parquet")
+    assert creator_market_scene_summary.loc[0, "scene_name"] == "scene-1"
+    assert creator_market_scene_summary.loc[0, "report_family_count"] == 1
+
+    research_platform_status = pd.read_parquet(warehouse_root / "silver" / "research_platform_status_summary.parquet")
+    assert research_platform_status.loc[0, "anchor_run_id"] == "run_a"
+    assert research_platform_status.loc[0, "claim_total_count"] == 2
+
+    creator_market_watchlist = pd.read_parquet(warehouse_root / "gold" / "mart_creator_market_watchlist.parquet")
+    assert creator_market_watchlist.loc[0, "artist_name"] == "Artist X"
+
+    research_platform_mart = pd.read_parquet(warehouse_root / "gold" / "mart_research_platform_status.parquet")
+    assert research_platform_mart.loc[0, "status_posture"] == "blocked"
 
     verification = json.loads((warehouse_root / "warehouse_verification.json").read_text(encoding="utf-8"))
     assert verification["status"] == "pass"
@@ -412,11 +763,39 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
         creator_row = con.execute(
             "SELECT artist_name, priority_now_count FROM creator_priority_now ORDER BY max_opportunity_score DESC"
         ).fetchone()
+        creator_market_row = con.execute(
+            """
+            SELECT artist_name, scene_name, scene_priority_now_count
+            FROM creator_market_priority_now
+            ORDER BY market_priority_score DESC
+            """
+        ).fetchone()
+        research_status_row = con.execute(
+            """
+            SELECT anchor_run_id, status_posture, submission_status
+            FROM latest_research_platform_status
+            """
+        ).fetchone()
+        blocked_claim_row = con.execute(
+            """
+            SELECT claim_key, blocked
+            FROM research_platform_blocked_claims
+            ORDER BY watchlist_score DESC
+            """
+        ).fetchone()
         consistency_rows = con.execute(
             """
             SELECT object_name, row_count_match, column_match, logical_type_match
             FROM warehouse_consistency_checks
-            WHERE object_name IN ('control_room_snapshot', 'mart_ops_overview', 'latest_ops_overview')
+            WHERE object_name IN (
+              'control_room_snapshot',
+              'creator_market_scene_summary',
+              'mart_creator_market_watchlist',
+              'mart_ops_overview',
+              'mart_research_platform_status',
+              'latest_ops_overview',
+              'latest_research_platform_status'
+            )
             ORDER BY object_name
             """
         ).fetchall()
@@ -424,7 +803,7 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
             """
             SELECT expected_rows, expected_column_count
             FROM warehouse_asset_manifest
-            WHERE asset_name = 'control_room_snapshot'
+            WHERE asset_name = 'mart_research_platform_status'
             """
         ).fetchone()
         selected_run_row = con.execute(
@@ -436,10 +815,17 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
 
     assert ops_row == ("run_a", "attention", "stale")
     assert creator_row == ("Artist X", 1)
+    assert creator_market_row == ("Artist X", "scene-1", 2)
+    assert research_status_row == ("run_a", "blocked", "internal_review")
+    assert blocked_claim_row == ("claim_gap", True)
     assert consistency_rows == [
         ("control_room_snapshot", True, True, True),
+        ("creator_market_scene_summary", True, True, True),
         ("latest_ops_overview", True, True, True),
+        ("latest_research_platform_status", True, True, True),
+        ("mart_creator_market_watchlist", True, True, True),
         ("mart_ops_overview", True, True, True),
+        ("mart_research_platform_status", True, True, True),
     ]
     assert metadata_row is not None
     assert metadata_row[0] == 1

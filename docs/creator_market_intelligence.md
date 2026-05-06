@@ -31,3 +31,4 @@ Suggested use:
 1. Generate or backfill a few creator report families with `make public-insights`.
 2. Run this branch to convert them into reusable market views.
 3. Feed the strongest scenes, bridges, and migration routes into creator strategy, cultural analysis, or outward packages.
+4. Treat `creator_market_brief.md`, `scene_market_pulse.csv`, and `opportunity_lane_atlas.csv` as the default downstream handoff set for branch-portfolio and outward-package surfaces when you want the creator branch to read as a repeatable market story instead of a single report family.

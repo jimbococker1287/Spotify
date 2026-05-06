@@ -186,6 +186,10 @@ def test_build_research_claims_report_ranks_primary_and_backup(tmp_path: Path) -
     assert report["primary_claim"]["metrics"]["repeated_run_count"] == 3
     assert report["primary_claim"]["metrics"]["consistent_slice_run_count"] == 3
     assert report["primary_claim"]["metrics"]["dominant_context_driver"] == "behavioral"
+    assert report["submission_readiness"]["status"] == "promising_but_unlocked"
+    assert report["submission_readiness"]["ready_for_external_review"] is False
+    assert any("comparison_ready=`False`" in item for item in report["submission_readiness"]["blockers"])
+    assert report["artifact_portability"]["all_supporting_artifacts_portable"] is True
 
 
 def test_write_research_claims_report_creates_brief_and_outline(tmp_path: Path) -> None:
@@ -206,6 +210,7 @@ def test_write_research_claims_report_creates_brief_and_outline(tmp_path: Path) 
     outline = paths["outline_md"].read_text(encoding="utf-8")
     assert "Primary Claim" in markdown
     assert "Backup Claim" in markdown
+    assert "Artifact Portability" in markdown
     assert "Publication Outline" in outline
 
 
@@ -266,6 +271,12 @@ def test_candidate_ranking_claim_uses_retrieval_benchmark_lock_when_available(tm
     assert candidate_claim["metrics"]["benchmark_significant_lift"] is True
     assert candidate_claim["metrics"]["benchmark_deep_comparator_ready"] is True
     assert not any("Add retrieval and reranker models" in item for item in candidate_claim["missing_checks"])
+    assert candidate_claim["supporting_artifacts_portable"] == [
+        "runs/run_full/run_results.json",
+        "runs/run_full/analysis/ablation_summary.csv",
+        "runs/run_full/analysis/backtest_significance.csv",
+        "history/benchmark_lock_demo_ready_manifest.json",
+    ]
 
 
 def test_candidate_ranking_claim_calls_out_missing_deep_comparator_evidence(tmp_path: Path) -> None:
@@ -334,3 +345,29 @@ def test_candidate_ranking_claim_calls_out_missing_deep_comparator_evidence(tmp_
     assert candidate_claim["metrics"]["benchmark_deep_comparator_ready"] is False
     assert any("research-grade comparator guard" in item for item in candidate_claim["missing_checks"])
     assert any("comparator guard failed" in item.lower() for item in candidate_claim["evidence"])
+    assert report["submission_readiness"]["status"] == "promising_but_unlocked"
+    assert report["submission_readiness"]["ready_for_external_review"] is False
+
+
+def test_support_matrix_exposes_artifact_portability_and_submission_stays_conservative(tmp_path: Path) -> None:
+    outputs, benchmark_manifest = _fixture_outputs(tmp_path)
+    run_dir = outputs / "runs" / "run_full"
+
+    report = build_research_claims_report(
+        outputs,
+        run_dir=run_dir,
+        benchmark_manifest_path=benchmark_manifest,
+    )
+
+    primary_support = next(row for row in report["claim_support_matrix"] if row["role"] == "primary")
+    backup_support = next(row for row in report["claim_support_matrix"] if row["role"] == "backup")
+
+    assert primary_support["artifact_pack_status"] == "ready"
+    assert primary_support["artifact_portability_status"] == "ready"
+    assert primary_support["portable_artifact_count"] == primary_support["supporting_artifact_count"]
+    assert backup_support["artifact_portability_status"] == "ready"
+    assert report["run"]["run_dir_portable"] == "runs/run_full"
+    assert report["benchmark_lock"]["manifest_path_portable"] == "history/benchmark_lock_demo_manifest.json"
+    assert report["artifact_portability"]["path_mode"] == "relative_to_output_dir_when_possible"
+    assert report["artifact_portability"]["portable_supporting_artifact_count"] >= 1
+    assert any("Supporting artifacts are portable enough for packaging." in item for item in report["submission_readiness"]["summary"])

@@ -75,6 +75,28 @@ def _build_sample_outputs(output_root: Path) -> None:
             "brief_view_markdown": {"scene_strategy_watch": str(scene_strategy_view)},
         },
     )
+    creator_market_dir = output_root / "analysis" / "creator_market_intelligence"
+    _write_text(creator_market_dir / "creator_market_brief.md", "# Creator Market Brief\n")
+    _write_json(
+        creator_market_dir / "creator_market_brief.json",
+        {
+            "report_family_count": 3,
+            "top_scene": {"scene_name": "scene-2"},
+            "top_lane": {"scene_name": "scene-1", "primary_driver": "seed_adjacency"},
+        },
+    )
+    _write_text(
+        creator_market_dir / "scene_market_pulse.csv",
+        "scene_name,family_count\nscene-2,3\n",
+    )
+    _write_text(
+        creator_market_dir / "opportunity_lane_atlas.csv",
+        "scene_name,primary_driver\nscene-1,seed_adjacency\n",
+    )
+    _write_json(
+        creator_market_dir / "creator_market_manifest.json",
+        {"report_family_count": 3},
+    )
 
     run_dir = output_root / "runs" / "run_full_anchor"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +135,10 @@ def test_build_branch_portfolio_report_distinguishes_four_primary_branches(tmp_p
     assert "audience" in branches["taste_os"]
     assert "success_metric" in branches["safety_research"]
     assert any("report_family.md" in artifact for artifact in branches["creator_intelligence"]["artifacts"])
+    assert any("creator_market_brief.md" in artifact for artifact in branches["creator_intelligence"]["artifacts"])
+    assert any("scene_market_pulse.csv" in artifact for artifact in branches["creator_intelligence"]["artifacts"])
+    assert branches["creator_intelligence"]["market_layer"]["status"] == "ready"
+    assert "aggregates `3` creator families" in branches["creator_intelligence"]["market_layer"]["live_signal"]
     assert any("safety_platform_contract.md" in artifact for artifact in branches["safety_research"]["artifacts"])
 
 
@@ -128,4 +154,5 @@ def test_write_branch_portfolio_artifacts_creates_markdown_and_json(tmp_path: Pa
     markdown = paths["md"].read_text(encoding="utf-8")
     assert "Higher-Level Branch Map" in markdown
     assert "Personal Taste OS" in markdown
+    assert "Creator-market layer" in markdown
     assert "Priority Rules" in markdown

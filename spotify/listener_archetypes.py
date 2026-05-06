@@ -193,6 +193,155 @@ def _dominant_transitions(assignments: pd.DataFrame) -> pd.DataFrame:
     return counts[columns].sort_values(["transition_count", "from_archetype"], ascending=[False, True]).reset_index(drop=True)
 
 
+def _season_parts(date_value: pd.Timestamp) -> tuple[int, int, str]:
+    if pd.isna(date_value):
+        return 0, 0, ""
+    month = int(date_value.month)
+    year = int(date_value.year)
+    if month == 12:
+        return year + 1, 0, "winter"
+    if month in (1, 2):
+        return year, 0, "winter"
+    if month in (3, 4, 5):
+        return year, 1, "spring"
+    if month in (6, 7, 8):
+        return year, 2, "summer"
+    return year, 3, "fall"
+
+
+def _seasonal_archetype_summary(assignments: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "season_label",
+        "season_year",
+        "season",
+        "archetype_label",
+        "day_count",
+        "archetype_share",
+        "mean_streams",
+        "mean_skip_rate",
+        "mean_exploration_ratio",
+        "start_date",
+        "end_date",
+    ]
+    if assignments.empty or "played_date" not in assignments.columns or "archetype_label" not in assignments.columns:
+        return _empty_frame(columns)
+    frame = assignments.copy()
+    parts = frame["played_date"].apply(_season_parts)
+    frame["season_year"] = parts.apply(lambda item: item[0]).astype("int64", copy=False)
+    frame["season_order"] = parts.apply(lambda item: item[1]).astype("int64", copy=False)
+    frame["season"] = parts.apply(lambda item: item[2]).astype(str)
+    frame["season_label"] = frame["season_year"].astype(str) + "-" + frame["season"]
+    seasonal = (
+        frame.groupby(["season_year", "season_order", "season", "season_label", "archetype_label"], dropna=False)
+        .agg(
+            day_count=("played_date", "count"),
+            mean_streams=("total_streams", "mean"),
+            mean_skip_rate=("skip_rate", "mean"),
+            mean_exploration_ratio=("exploration_ratio", "mean"),
+            start_date=("played_date", "min"),
+            end_date=("played_date", "max"),
+        )
+        .reset_index()
+    )
+    season_totals = seasonal.groupby(["season_year", "season_label"], dropna=False)["day_count"].transform("sum")
+    seasonal["archetype_share"] = seasonal["day_count"] / np.maximum(season_totals, 1.0)
+    seasonal = seasonal.sort_values(
+        ["season_year", "season_order", "day_count", "archetype_label"],
+        ascending=[True, True, False, True],
+    ).reset_index(drop=True)
+    return seasonal[columns]
+
+
+def _taste_regime_shifts(monthly_summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "month",
+        "previous_month",
+        "dominant_archetype",
+        "previous_dominant_archetype",
+        "dominant_share",
+        "runner_up_archetype",
+        "runner_up_share",
+        "dominance_gap",
+        "active_archetype_count",
+        "dominant_changed_from_prev_month",
+        "regime_shift_score",
+        "top_share_gain_archetype",
+        "top_share_gain_delta",
+        "top_share_loss_archetype",
+        "top_share_loss_delta",
+        "dominant_mean_skip_rate",
+        "dominant_mean_exploration_ratio",
+    ]
+    if monthly_summary.empty:
+        return _empty_frame(columns)
+
+    share_pivot = monthly_summary.pivot_table(
+        index="month",
+        columns="archetype_label",
+        values="archetype_share",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).sort_index()
+    rows: list[dict[str, object]] = []
+    months = list(share_pivot.index)
+    previous_dominant_label = ""
+    for idx, month in enumerate(months):
+        month_slice = (
+            monthly_summary.loc[monthly_summary["month"].astype(str) == str(month)]
+            .sort_values(["archetype_share", "day_count", "archetype_label"], ascending=[False, False, True])
+            .reset_index(drop=True)
+        )
+        if month_slice.empty:
+            continue
+        dominant = month_slice.iloc[0]
+        runner_up = month_slice.iloc[1] if len(month_slice.index) > 1 else None
+        current_vector = share_pivot.loc[month]
+        previous_month = str(months[idx - 1]) if idx > 0 else ""
+        regime_shift_score = 0.0
+        top_gain_label = ""
+        top_gain_delta = 0.0
+        top_loss_label = ""
+        top_loss_delta = 0.0
+        if idx > 0:
+            previous_vector = share_pivot.loc[months[idx - 1]]
+            deltas = (current_vector - previous_vector).sort_index()
+            regime_shift_score = float(0.5 * deltas.abs().sum())
+            if not deltas.empty:
+                gain_idx = str(deltas.idxmax())
+                gain_value = float(deltas.max())
+                loss_idx = str(deltas.idxmin())
+                loss_value = float(deltas.min())
+                top_gain_label = gain_idx if gain_value > 0 else ""
+                top_gain_delta = gain_value if gain_value > 0 else 0.0
+                top_loss_label = loss_idx if loss_value < 0 else ""
+                top_loss_delta = loss_value if loss_value < 0 else 0.0
+        rows.append(
+            {
+                "month": str(month),
+                "previous_month": previous_month,
+                "dominant_archetype": str(dominant["archetype_label"]),
+                "previous_dominant_archetype": previous_dominant_label,
+                "dominant_share": float(dominant["archetype_share"]),
+                "runner_up_archetype": str(runner_up["archetype_label"]) if runner_up is not None else "",
+                "runner_up_share": float(runner_up["archetype_share"]) if runner_up is not None else 0.0,
+                "dominance_gap": float(
+                    float(dominant["archetype_share"]) - float(runner_up["archetype_share"]) if runner_up is not None else dominant["archetype_share"]
+                ),
+                "active_archetype_count": int(len(month_slice.index)),
+                "dominant_changed_from_prev_month": bool(idx > 0 and str(dominant["archetype_label"]) != previous_dominant_label),
+                "regime_shift_score": regime_shift_score,
+                "top_share_gain_archetype": top_gain_label,
+                "top_share_gain_delta": top_gain_delta,
+                "top_share_loss_archetype": top_loss_label,
+                "top_share_loss_delta": top_loss_delta,
+                "dominant_mean_skip_rate": float(dominant["mean_skip_rate"]),
+                "dominant_mean_exploration_ratio": float(dominant["mean_exploration_ratio"]),
+            }
+        )
+        previous_dominant_label = str(dominant["archetype_label"])
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _build_taste_state_brief(
     assignments: pd.DataFrame,
     cluster_summary: pd.DataFrame,
@@ -249,6 +398,118 @@ def _build_taste_state_brief(
         "highest_exploration_ratio": float(highest_exploration["exploration_ratio"]),
         "most_variable_month": str(most_variable_month or ""),
         "top_transition": top_transition,
+        "summary": summary,
+        "actions": actions,
+    }
+
+
+def _build_taste_evolution_brief(
+    regime_shifts: pd.DataFrame,
+    seasonal_summary: pd.DataFrame,
+    transitions: pd.DataFrame,
+) -> dict[str, Any]:
+    if regime_shifts.empty and seasonal_summary.empty and transitions.empty:
+        return {
+            "status": "empty",
+            "summary": [],
+            "actions": [],
+        }
+
+    biggest_shift = {}
+    if not regime_shifts.empty:
+        candidates = regime_shifts.loc[regime_shifts["previous_month"].astype(str) != ""].copy()
+        if not candidates.empty:
+            biggest_shift = (
+                candidates.sort_values(
+                    ["regime_shift_score", "dominant_changed_from_prev_month", "month"],
+                    ascending=[False, False, True],
+                )
+                .iloc[0]
+                .to_dict()
+            )
+
+    top_transition = transitions.iloc[0].to_dict() if not transitions.empty else {}
+    cross_state = {}
+    if not transitions.empty:
+        cross_state_rows = transitions.loc[
+            transitions["from_archetype"].astype(str) != transitions["to_archetype"].astype(str)
+        ].copy()
+        if not cross_state_rows.empty:
+            cross_state = (
+                cross_state_rows.sort_values(
+                    ["transition_count", "from_archetype", "to_archetype"],
+                    ascending=[False, True, True],
+                )
+                .iloc[0]
+                .to_dict()
+            )
+
+    most_seasonal = {}
+    if not seasonal_summary.empty:
+        seasonal_profile = (
+            seasonal_summary.groupby(["season", "archetype_label"], dropna=False)["archetype_share"]
+            .mean()
+            .reset_index(name="mean_share")
+        )
+        if not seasonal_profile.empty:
+            seasonality = (
+                seasonal_profile.groupby("archetype_label", dropna=False)
+                .agg(
+                    peak_share=("mean_share", "max"),
+                    trough_share=("mean_share", "min"),
+                )
+                .reset_index()
+            )
+            seasonality["seasonality_gap"] = seasonality["peak_share"] - seasonality["trough_share"]
+            strongest = (
+                seasonality.sort_values(["seasonality_gap", "peak_share", "archetype_label"], ascending=[False, False, True])
+                .iloc[0]
+            )
+            profile_rows = seasonal_profile.loc[
+                seasonal_profile["archetype_label"].astype(str) == str(strongest["archetype_label"])
+            ].sort_values(["mean_share", "season"], ascending=[False, True])
+            peak_row = profile_rows.iloc[0] if not profile_rows.empty else None
+            most_seasonal = {
+                "archetype_label": str(strongest["archetype_label"]),
+                "seasonality_gap": float(strongest["seasonality_gap"]),
+                "peak_season": str(peak_row["season"]) if peak_row is not None else "",
+                "peak_season_share": float(peak_row["mean_share"]) if peak_row is not None else 0.0,
+            }
+
+    summary: list[str] = []
+    if biggest_shift:
+        if bool(biggest_shift.get("dominant_changed_from_prev_month")):
+            summary.append(
+                f"Largest month-over-month regime shift lands in `{biggest_shift.get('month', '')}`, where dominance moved from `{biggest_shift.get('previous_dominant_archetype', '')}` to `{biggest_shift.get('dominant_archetype', '')}` at shift score `{float(biggest_shift.get('regime_shift_score', 0.0)):.3f}`."
+            )
+        else:
+            summary.append(
+                f"Largest month-over-month regime shift lands in `{biggest_shift.get('month', '')}` with dominant archetype `{biggest_shift.get('dominant_archetype', '')}` at shift score `{float(biggest_shift.get('regime_shift_score', 0.0)):.3f}`."
+            )
+    if most_seasonal:
+        summary.append(
+            f"Most seasonal archetype is `{most_seasonal.get('archetype_label', '')}`, peaking in `{most_seasonal.get('peak_season', '')}` at share `{float(most_seasonal.get('peak_season_share', 0.0)):.3f}`."
+        )
+    if cross_state:
+        summary.append(
+            f"Largest cross-state transition is `{cross_state.get('from_archetype', '')} -> {cross_state.get('to_archetype', '')}` with share `{float(cross_state.get('transition_share', 0.0)):.3f}`."
+        )
+    elif top_transition:
+        summary.append(
+            f"Most common taste-state transition overall is `{top_transition.get('from_archetype', '')} -> {top_transition.get('to_archetype', '')}`."
+        )
+
+    actions = [
+        "Use the highest regime-shift month as the first retrospective slice when explaining taste evolution changes over time.",
+        "Use the most seasonal archetype as the calendar-aware slice for playlist, context, or discovery experiments.",
+        "Use the biggest cross-state transition as the handoff sequence when designing taste-state recovery or escalation paths.",
+    ]
+    return {
+        "status": "ok",
+        "biggest_regime_shift": biggest_shift,
+        "most_seasonal_archetype": most_seasonal,
+        "top_transition": top_transition,
+        "top_cross_state_transition": cross_state,
         "summary": summary,
         "actions": actions,
     }
@@ -332,7 +593,10 @@ def build_listener_archetypes(
     monthly_summary = monthly_summary.sort_values(["month", "day_count"], ascending=[True, False]).reset_index(drop=True)
 
     transitions = _dominant_transitions(assignments)
+    regime_shifts = _taste_regime_shifts(monthly_summary)
+    seasonal_summary = _seasonal_archetype_summary(assignments)
     brief_payload = _build_taste_state_brief(assignments, cluster_summary, monthly_summary, transitions)
+    evolution_payload = _build_taste_evolution_brief(regime_shifts, seasonal_summary, transitions)
 
     output_root = output_dir / "analysis" / "listener_archetypes"
     output_root.mkdir(parents=True, exist_ok=True)
@@ -443,7 +707,50 @@ def build_listener_archetypes(
         transitions.to_dict(orient="records"),
         ["from_archetype", "to_archetype", "transition_count", "transition_share"],
     )
+    regime_shift_columns = [
+        "month",
+        "previous_month",
+        "dominant_archetype",
+        "previous_dominant_archetype",
+        "dominant_share",
+        "runner_up_archetype",
+        "runner_up_share",
+        "dominance_gap",
+        "active_archetype_count",
+        "dominant_changed_from_prev_month",
+        "regime_shift_score",
+        "top_share_gain_archetype",
+        "top_share_gain_delta",
+        "top_share_loss_archetype",
+        "top_share_loss_delta",
+        "dominant_mean_skip_rate",
+        "dominant_mean_exploration_ratio",
+    ]
+    regime_shifts_csv = _write_csv(
+        output_root / "taste_evolution_regime_shifts.csv",
+        _rows_for_columns(regime_shifts, regime_shift_columns),
+        regime_shift_columns,
+    )
+    seasonal_columns = [
+        "season_label",
+        "season_year",
+        "season",
+        "archetype_label",
+        "day_count",
+        "archetype_share",
+        "mean_streams",
+        "mean_skip_rate",
+        "mean_exploration_ratio",
+        "start_date",
+        "end_date",
+    ]
+    seasonal_csv = _write_csv(
+        output_root / "listener_archetype_seasonal.csv",
+        _rows_for_columns(seasonal_summary, seasonal_columns),
+        seasonal_columns,
+    )
     brief_json = write_json(output_root / "taste_state_brief.json", brief_payload)
+    evolution_json = write_json(output_root / "taste_evolution_brief.json", evolution_payload)
     summary_json = write_json(
         output_root / "listener_archetype_summary.json",
         {
@@ -451,6 +758,14 @@ def build_listener_archetypes(
             "day_count": int(len(assignments.index)),
             "archetypes": _json_ready_records(cluster_summary),
         },
+    )
+    regime_shifts_json = write_json(
+        output_root / "taste_evolution_regime_shifts.json",
+        _json_ready_records(regime_shifts),
+    )
+    seasonal_json = write_json(
+        output_root / "listener_archetype_seasonal.json",
+        _json_ready_records(seasonal_summary),
     )
     brief_md = write_markdown(
         output_root / "taste_state_brief.md",
@@ -464,12 +779,38 @@ def build_listener_archetypes(
             *[f"- {line}" for line in brief_payload.get("actions", [])],
         ],
     )
+    evolution_md = write_markdown(
+        output_root / "taste_evolution_brief.md",
+        [
+            "# Taste Evolution Brief",
+            "",
+            *[f"- {line}" for line in evolution_payload.get("summary", [])],
+            "",
+            "## Suggested Uses",
+            "",
+            *[f"- {line}" for line in evolution_payload.get("actions", [])],
+        ],
+    )
     logger.info(
         "Built listener archetypes across %d days into %d clusters.",
         len(assignments.index),
         n_clusters,
     )
-    return [assignments_csv, summary_csv, monthly_csv, transitions_csv, summary_json, brief_json, brief_md]
+    return [
+        assignments_csv,
+        summary_csv,
+        monthly_csv,
+        transitions_csv,
+        regime_shifts_csv,
+        seasonal_csv,
+        summary_json,
+        brief_json,
+        brief_md,
+        regime_shifts_json,
+        seasonal_json,
+        evolution_json,
+        evolution_md,
+    ]
 
 
 def main() -> int:

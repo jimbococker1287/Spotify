@@ -64,10 +64,19 @@ WAREHOUSE_CONSISTENCY_TARGETS: tuple[dict[str, object], ...] = (
     {"expected_asset_name": "control_room_snapshot", "object_name": "control_room_snapshot", "object_kind": "table"},
     {"expected_asset_name": "listener_daily_activity", "object_name": "listener_daily_activity", "object_kind": "table"},
     {"expected_asset_name": "model_run_summary", "object_name": "model_run_summary", "object_kind": "table"},
+    {"expected_asset_name": "creator_market_scene_summary", "object_name": "creator_market_scene_summary", "object_kind": "table"},
+    {"expected_asset_name": "research_platform_status_summary", "object_name": "research_platform_status_summary", "object_kind": "table"},
     {"expected_asset_name": "mart_run_quality", "object_name": "mart_run_quality", "object_kind": "table"},
     {"expected_asset_name": "mart_model_registry", "object_name": "mart_model_registry", "object_kind": "table"},
     {"expected_asset_name": "mart_ops_overview", "object_name": "mart_ops_overview", "object_kind": "table"},
+    {"expected_asset_name": "mart_creator_market_watchlist", "object_name": "mart_creator_market_watchlist", "object_kind": "table"},
+    {"expected_asset_name": "mart_research_platform_status", "object_name": "mart_research_platform_status", "object_kind": "table"},
     {"expected_asset_name": "mart_ops_overview", "object_name": "latest_ops_overview", "object_kind": "view"},
+    {
+        "expected_asset_name": "mart_research_platform_status",
+        "object_name": "latest_research_platform_status",
+        "object_kind": "view",
+    },
 )
 
 
@@ -301,6 +310,9 @@ def refresh_analytics_database(
         moonshot_summary_columns = asset_columns_lookup.get("moonshot_summary", set())
         mart_ops_overview_columns = asset_columns_lookup.get("mart_ops_overview", set())
         mart_creator_opportunities_columns = asset_columns_lookup.get("mart_creator_opportunities", set())
+        mart_creator_market_watchlist_columns = asset_columns_lookup.get("mart_creator_market_watchlist", set())
+        mart_research_platform_status_columns = asset_columns_lookup.get("mart_research_platform_status", set())
+        mart_research_claim_watchlist_columns = asset_columns_lookup.get("mart_research_claim_watchlist", set())
 
         if {"run_id", "run_timestamp"}.issubset(run_manifests_columns) and {"run_id"}.issubset(run_results_columns):
             con.execute(
@@ -479,6 +491,61 @@ def refresh_analytics_database(
                 ORDER BY
                   CAST(max_opportunity_score AS DOUBLE) DESC NULLS LAST,
                   CAST(priority_now_count AS BIGINT) DESC NULLS LAST
+                """
+            )
+        if {
+            "artist_name",
+            "scene_name",
+            "scene_priority_now_count",
+            "market_priority_score",
+            "avg_opportunity_score",
+        }.issubset(mart_creator_market_watchlist_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW creator_market_priority_now AS
+                SELECT *
+                FROM mart_creator_market_watchlist
+                WHERE
+                  COALESCE(CAST(scene_priority_now_count AS BIGINT), 0) > 0
+                  OR COALESCE(CAST(market_priority_score AS DOUBLE), 0) > 0
+                ORDER BY
+                  CAST(market_priority_score AS DOUBLE) DESC NULLS LAST,
+                  CAST(avg_opportunity_score AS DOUBLE) DESC NULLS LAST,
+                  CAST(scene_priority_now_count AS BIGINT) DESC NULLS LAST,
+                  artist_name
+                """
+            )
+        if {
+            "anchor_run_id",
+            "anchor_profile",
+            "anchor_research_stage",
+            "status_posture",
+            "submission_status",
+            "ready_for_external_review",
+        }.issubset(mart_research_platform_status_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW latest_research_platform_status AS
+                SELECT *
+                FROM mart_research_platform_status
+                """
+            )
+        if {
+            "claim_key",
+            "blocked",
+            "watchlist_score",
+            "missing_check_count",
+        }.issubset(mart_research_claim_watchlist_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW research_platform_blocked_claims AS
+                SELECT *
+                FROM mart_research_claim_watchlist
+                WHERE COALESCE(CAST(blocked AS BOOLEAN), FALSE)
+                ORDER BY
+                  CAST(watchlist_score AS DOUBLE) DESC NULLS LAST,
+                  CAST(missing_check_count AS BIGINT) DESC NULLS LAST,
+                  claim_key
                 """
             )
         verify_analytics_duckdb_consistency(con, logger=logger)

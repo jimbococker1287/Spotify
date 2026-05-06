@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .portfolio_artifacts import PortfolioArtifactBundle, load_portfolio_artifact_bundle
-from .run_artifacts import write_json, write_markdown
+from .run_artifacts import safe_read_json, write_json, write_markdown
 
 
 BRANCH_DEFINITIONS: tuple[dict[str, object], ...] = (
@@ -107,6 +107,73 @@ def _status_bucket(*, ready: bool, attention: bool = False, gaps: bool = False) 
     return "missing"
 
 
+def _existing_path(path: Path) -> str:
+    return str(path.resolve()) if path.exists() else ""
+
+
+def _creator_market_layer(output_root: Path) -> dict[str, object]:
+    artifact_root = output_root / "analysis" / "creator_market_intelligence"
+    brief_json = artifact_root / "creator_market_brief.json"
+    brief_md = artifact_root / "creator_market_brief.md"
+    scene_market_pulse_csv = artifact_root / "scene_market_pulse.csv"
+    opportunity_lane_atlas_csv = artifact_root / "opportunity_lane_atlas.csv"
+    manifest_json = artifact_root / "creator_market_manifest.json"
+    brief_payload = _coerce_dict(safe_read_json(brief_json, default={}))
+    manifest_payload = _coerce_dict(safe_read_json(manifest_json, default={}))
+
+    report_family_count = int(
+        manifest_payload.get("report_family_count")
+        or brief_payload.get("report_family_count")
+        or 0
+    )
+    top_scene = _coerce_dict(brief_payload.get("top_scene"))
+    top_lane = _coerce_dict(brief_payload.get("top_lane"))
+    scene_name = str(top_scene.get("scene_name", "")).strip()
+    lane_scene = str(top_lane.get("scene_name", "")).strip()
+    lane_driver = str(top_lane.get("primary_driver", "")).strip()
+
+    artifacts = [
+        path
+        for path in (
+            _existing_path(brief_md),
+            _existing_path(brief_json),
+            _existing_path(scene_market_pulse_csv),
+            _existing_path(opportunity_lane_atlas_csv),
+            _existing_path(manifest_json),
+        )
+        if path
+    ]
+    ready = bool(_existing_path(brief_md) and _existing_path(scene_market_pulse_csv) and _existing_path(opportunity_lane_atlas_csv))
+    attention = bool(artifacts)
+    status = _status_bucket(
+        ready=ready,
+        attention=attention,
+        gaps=bool(_existing_path(brief_md) and not ready),
+    )
+    details: list[str] = []
+    if report_family_count:
+        details.append(f"aggregates `{report_family_count}` creator families")
+    if scene_name:
+        details.append(f"top scene `{scene_name}`")
+    if lane_scene and lane_driver:
+        details.append(f"top lane `{lane_scene} / {lane_driver}`")
+    live_signal = (
+        f"Creator-market layer {'; '.join(details)}."
+        if details
+        else "Creator-market rollup artifacts are missing."
+    )
+    return {
+        "status": status,
+        "live_signal": live_signal,
+        "brief_md": _existing_path(brief_md),
+        "brief_json": _existing_path(brief_json),
+        "scene_market_pulse_csv": _existing_path(scene_market_pulse_csv),
+        "opportunity_lane_atlas_csv": _existing_path(opportunity_lane_atlas_csv),
+        "manifest_json": _existing_path(manifest_json),
+        "artifacts": artifacts,
+    }
+
+
 def _build_taste_os_branch(bundle: PortfolioArtifactBundle, definition: dict[str, object]) -> dict[str, object]:
     payload = bundle.taste_os_showcase_payload
     canonical_examples = _coerce_list(payload.get("canonical_examples"))
@@ -165,14 +232,17 @@ def _build_creator_branch(bundle: PortfolioArtifactBundle, definition: dict[str,
     existing_brief_views = [path for path in bundle.creator_brief_markdown_paths.values() if path.exists()]
     primary_report = bundle.creator_primary_report_path
     report_family_index = bundle.creator_report_family_md_path
+    market_layer = _creator_market_layer(bundle.output_root)
     ready = primary_report is not None and primary_report.exists() and len(existing_views) >= 4
     status = _status_bucket(ready=ready, attention=bundle.creator_manifest_path is not None)
-    summary = (
+    report_family_summary = (
         f"Latest creator family exposes `{len(existing_views)}` comparison views, `{len(existing_brief_views)}` brief views, "
         f"and `{('has' if report_family_index and report_family_index.exists() else 'does not have')}` a report-family index."
         if bundle.creator_manifest
         else "Creator-intelligence report-family artifacts are missing."
     )
+    market_summary = str(market_layer.get("live_signal", "")).strip()
+    summary = f"{report_family_summary} {market_summary}".strip()
     artifacts = [str(primary_report)] if primary_report is not None else []
     artifacts.extend(str(path) for path in existing_views)
     artifacts.extend(str(path) for path in existing_brief_views)
@@ -180,10 +250,12 @@ def _build_creator_branch(bundle: PortfolioArtifactBundle, definition: dict[str,
         artifacts.append(str(report_family_index))
     if bundle.creator_manifest_path is not None:
         artifacts.append(str(bundle.creator_manifest_path))
+    artifacts.extend(str(path) for path in _coerce_list(market_layer.get("artifacts")))
     return {
         **definition,
         "status": status,
         "live_signal": summary,
+        "market_layer": market_layer,
         "artifacts": artifacts,
     }
 
@@ -303,10 +375,17 @@ def write_branch_portfolio_artifacts(report: dict[str, object], *, output_dir: P
                 f"- Deprioritize rule: {branch.get('deprioritize_rule', '')}",
                 f"- Depends on: `{', '.join(str(item) for item in _coerce_list(branch.get('depends_on'))) or 'none'}`",
                 f"- Overlaps with: `{', '.join(str(item) for item in _coerce_list(branch.get('overlaps'))) or 'none'}`",
-                "",
-                "Docs:",
             ]
         )
+        market_layer = _coerce_dict(branch.get("market_layer"))
+        if market_layer:
+            lines.extend(
+                [
+                    f"- Creator-market layer: `{market_layer.get('status', '')}`",
+                    f"- Creator-market signal: {market_layer.get('live_signal', '')}",
+                ]
+            )
+        lines.extend(["", "Docs:"])
         for doc_path in _coerce_list(branch.get("docs")):
             lines.append(f"- `{doc_path}`")
         lines.extend(["", "Artifacts:"])

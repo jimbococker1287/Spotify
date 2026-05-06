@@ -97,6 +97,22 @@ def _build_sample_outputs(output_root: Path) -> None:
             "brief_view_markdown": {"scene_strategy_watch": str(scene_strategy)},
         },
     )
+    creator_market_dir = output_root / "analysis" / "creator_market_intelligence"
+    creator_market_brief = creator_market_dir / "creator_market_brief.md"
+    scene_market_pulse = creator_market_dir / "scene_market_pulse.csv"
+    opportunity_lane_atlas = creator_market_dir / "opportunity_lane_atlas.csv"
+    _write_text(creator_market_brief, "# Creator Market Brief\n")
+    _write_text(scene_market_pulse, "scene_name,family_count\nscene-2,3\n")
+    _write_text(opportunity_lane_atlas, "scene_name,primary_driver\nscene-1,seed_adjacency\n")
+    _write_json(
+        creator_market_dir / "creator_market_brief.json",
+        {
+            "report_family_count": 3,
+            "top_scene": {"scene_name": "scene-2"},
+            "top_lane": {"scene_name": "scene-1", "primary_driver": "seed_adjacency"},
+        },
+    )
+    _write_json(creator_market_dir / "creator_market_manifest.json", {"report_family_count": 3})
 
     run_dir = output_root / "runs" / "run_full_anchor"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +182,9 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert (package_root / "creator_intelligence" / "creator_label_intelligence.md").exists()
     assert (package_root / "creator_intelligence" / "report_family.md").exists()
     assert (package_root / "creator_intelligence" / "scene_strategy_watch.md").exists()
+    assert (package_root / "creator_intelligence" / "creator_market_brief.md").exists()
+    assert (package_root / "creator_intelligence" / "scene_market_pulse.csv").exists()
+    assert (package_root / "creator_intelligence" / "opportunity_lane_atlas.csv").exists()
     assert (package_root / "safety_research" / "research_claims.md").exists()
     assert (package_root / "safety_research" / "safety_platform_contract.md").exists()
     assert (package_root / "safety_research" / "claim_support_matrix.md").exists()
@@ -177,8 +196,12 @@ def test_outward_package_copies_four_branch_assets_and_generates_summary(tmp_pat
     assert package_payload["copied_artifacts"]["claim_to_demo_md"]
     assert package_payload["copied_artifacts"]["taste_os_md"]
     assert package_payload["copied_artifacts"]["creator_report_family_md"]
+    assert package_payload["copied_artifacts"]["creator_market_brief_md"]
+    assert package_payload["copied_artifacts"]["creator_scene_market_pulse_csv"]
+    assert package_payload["copied_artifacts"]["creator_opportunity_lane_atlas_csv"]
     assert package_payload["copied_artifacts"]["safety_platform_contract_md"]
     assert package_payload["copied_artifacts"]["claim_support_md"]
     assert package_payload["copied_artifacts"]["submission_readiness_md"]
+    assert report["selected_artifacts"]["creator_intelligence"]["creator_market_status"] == "ready"
     safety_showcase = paths["safety_research_showcase_md"].read_text(encoding="utf-8")
     assert "Believable submission path: `True`" in safety_showcase

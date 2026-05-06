@@ -96,6 +96,23 @@ def _to_bool_fraction(series: pd.Series) -> pd.Series:
     return pd.to_numeric(normalized, errors="coerce")
 
 
+def _to_bool_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype="boolean")
+    normalized = series.map(
+        lambda value: (
+            True
+            if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes", "y"}
+            else (
+                False
+                if isinstance(value, str) and value.strip().lower() in {"false", "0", "no", "n"}
+                else (None if pd.isna(value) else bool(value))
+            )
+        )
+    )
+    return normalized.astype("boolean")
+
+
 def _count_truthy(values: pd.Series) -> int:
     count = 0
     for value in values:
@@ -174,6 +191,21 @@ def _reindex_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         if column not in frame.columns:
             frame[column] = None
     return frame[columns]
+
+
+def _load_analysis_table_frame(
+    path: Path,
+    columns: list[str],
+    *,
+    datetime_columns: tuple[str, ...] = (),
+) -> pd.DataFrame:
+    df = safe_read_csv(path)
+    if df.empty:
+        return _empty_frame(columns)
+    for column in datetime_columns:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], errors="coerce", format="mixed")
+    return _reindex_frame(df, columns)
 
 
 def _prepare_experiment_history_frame(path: Path) -> pd.DataFrame:
@@ -481,6 +513,374 @@ def _load_creator_report_family_assets(
     return family_df, ranking_df, scene_df, scene_seed_df
 
 
+def _creator_market_snapshot_frames(
+    output_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    scene_columns = [
+        "scene_name",
+        "family_count",
+        "avg_scene_local_play_share",
+        "avg_opportunity_score",
+        "total_priority_now",
+        "total_watchlist",
+        "avg_release_pressure",
+        "avg_label_concentration",
+        "avg_inbound_target_share",
+        "avg_outbound_source_share",
+        "avg_seed_bridge_count",
+        "dominant_driver",
+        "top_opportunity_artist",
+        "top_migration_route",
+        "strategy_posture",
+        "momentum_score",
+    ]
+    lane_columns = [
+        "scene_name",
+        "primary_driver",
+        "family_count",
+        "artist_count",
+        "opportunity_count",
+        "priority_now_count",
+        "watchlist_count",
+        "avg_opportunity_score",
+        "avg_scene_local_play_share",
+        "avg_scene_release_pressure",
+        "avg_scene_label_concentration",
+        "avg_seed_bridge_count",
+        "avg_fan_migration_score",
+        "avg_release_whitespace_score",
+        "avg_local_gap_score",
+        "avg_scene_momentum_score",
+        "representative_artist",
+        "lane_posture",
+        "lane_attractiveness_score",
+    ]
+    migration_columns = [
+        "source_artist",
+        "target_artist",
+        "family_count",
+        "route_mentions",
+        "total_transition_count",
+        "avg_source_out_share",
+        "avg_target_in_share",
+        "source_scene_name",
+        "target_scene_name",
+        "route_strength_score",
+    ]
+    bridge_columns = [
+        "scene_name",
+        "seed_artist",
+        "family_count",
+        "opportunity_count",
+        "avg_opportunity_score",
+        "avg_bridge_artist_count",
+        "avg_scene_local_play_share",
+        "avg_scene_release_pressure",
+        "avg_scene_label_concentration",
+        "top_opportunity_artist",
+        "dominant_driver",
+        "bridge_score",
+    ]
+    whitespace_columns = [
+        "artist_name",
+        "scene_name",
+        "family_count",
+        "avg_opportunity_score",
+        "avg_release_whitespace_score",
+        "max_days_since_latest_release",
+        "avg_seed_bridge_count",
+        "dominant_labels",
+        "primary_driver",
+        "whitespace_signal_score",
+    ]
+    brief_columns = [
+        "report_family_count",
+        "top_scene_json",
+        "top_lane_json",
+        "top_route_json",
+        "top_bridge_json",
+        "top_whitespace_json",
+        "summary_json",
+        "actions_json",
+        "raw_json",
+    ]
+    manifest_columns = [
+        "report_family_count",
+        "manifest_backed_report_family_count",
+        "asset_backed_report_family_count",
+        "complete_report_family_count",
+        "partial_report_family_count",
+        "partial_report_family_ids_json",
+        "table_count",
+        "artifact_root",
+        "raw_json",
+    ]
+    base_dir = output_dir / "analysis" / "creator_market_intelligence"
+    scene_market_pulse = _load_analysis_table_frame(base_dir / "scene_market_pulse.csv", scene_columns)
+    opportunity_lane_atlas = _load_analysis_table_frame(base_dir / "opportunity_lane_atlas.csv", lane_columns)
+    market_migration_network = _load_analysis_table_frame(base_dir / "market_migration_network.csv", migration_columns)
+    seed_scene_bridge_atlas = _load_analysis_table_frame(base_dir / "seed_scene_bridge_atlas.csv", bridge_columns)
+    release_whitespace_atlas = _load_analysis_table_frame(base_dir / "release_whitespace_atlas.csv", whitespace_columns)
+
+    brief_payload = safe_read_json(base_dir / "creator_market_brief.json", default={})
+    if isinstance(brief_payload, dict):
+        brief_snapshot = pd.DataFrame(
+            [
+                {
+                    "report_family_count": brief_payload.get("report_family_count"),
+                    "top_scene_json": _json_string(brief_payload.get("top_scene")),
+                    "top_lane_json": _json_string(brief_payload.get("top_lane")),
+                    "top_route_json": _json_string(brief_payload.get("top_route")),
+                    "top_bridge_json": _json_string(brief_payload.get("top_bridge")),
+                    "top_whitespace_json": _json_string(brief_payload.get("top_whitespace")),
+                    "summary_json": _json_string(brief_payload.get("summary")),
+                    "actions_json": _json_string(brief_payload.get("actions")),
+                    "raw_json": _json_string(brief_payload),
+                }
+            ],
+            columns=brief_columns,
+        )
+    else:
+        brief_snapshot = _empty_frame(brief_columns)
+
+    manifest_payload = safe_read_json(base_dir / "creator_market_manifest.json", default={})
+    if isinstance(manifest_payload, dict):
+        tables_payload = manifest_payload.get("tables", {})
+        table_count = len(tables_payload) if isinstance(tables_payload, dict) else 0
+        manifest_snapshot = pd.DataFrame(
+            [
+                {
+                    "report_family_count": manifest_payload.get("report_family_count"),
+                    "manifest_backed_report_family_count": manifest_payload.get("manifest_backed_report_family_count"),
+                    "asset_backed_report_family_count": manifest_payload.get("asset_backed_report_family_count"),
+                    "complete_report_family_count": manifest_payload.get("complete_report_family_count"),
+                    "partial_report_family_count": manifest_payload.get("partial_report_family_count"),
+                    "partial_report_family_ids_json": _json_string(manifest_payload.get("partial_report_family_ids")),
+                    "table_count": table_count,
+                    "artifact_root": manifest_payload.get("artifact_root"),
+                    "raw_json": _json_string(manifest_payload),
+                }
+            ],
+            columns=manifest_columns,
+        )
+    else:
+        manifest_snapshot = _empty_frame(manifest_columns)
+
+    return (
+        scene_market_pulse,
+        opportunity_lane_atlas,
+        market_migration_network,
+        seed_scene_bridge_atlas,
+        release_whitespace_atlas,
+        brief_snapshot,
+        manifest_snapshot,
+    )
+
+
+def _research_platform_snapshot_frames(
+    output_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    run_registry_columns = [
+        "run_id",
+        "profile",
+        "timestamp",
+        "promoted",
+        "champion_gate_status",
+        "benchmark_protocol_present",
+        "safety_platform_contract_present",
+        "conformal_summary_count",
+        "backtest_model_count",
+        "benchmark_contract_version",
+        "benchmark_comparison_mode",
+        "safety_api_group_count",
+        "spotify_wrapper_count",
+        "portability_note_count",
+        "portability_signal_status",
+        "research_artifact_ratio",
+        "research_stage",
+        "claim_pack_attached",
+        "claim_pack_path",
+        "claim_pack_freshness_status",
+        "claim_pack_stale_source_path",
+        "claim_pack_stale_source_count",
+        "run_manifest_path",
+        "run_manifest_timestamp",
+        "run_manifest_age_hours",
+        "benchmark_protocol_path",
+        "safety_platform_contract_path",
+        "target_drift_jsd",
+        "test_selective_risk",
+        "test_abstention_rate",
+        "robustness_gap",
+        "stress_skip_risk",
+        "ops_coverage_ratio",
+    ]
+    benchmark_columns = [
+        "benchmark_id",
+        "canonical_profile",
+        "comparison_mode",
+        "comparison_ready",
+        "comparison_status",
+        "run_count",
+        "model_count",
+        "present_artifact_count",
+        "required_artifact_count",
+        "required_artifact_ratio",
+        "significant_pair_count",
+        "comparison_blocker_count",
+        "top_comparison_blocker",
+        "comparison_blockers_json",
+        "comparator_guard_status",
+        "deep_comparator_ready",
+        "observed_model_classes_json",
+        "best_model_name",
+        "best_model_type",
+        "best_val_top1_mean",
+        "best_test_top1_mean",
+        "top_significant_pair",
+        "top_significant_margin",
+        "manifest_freshness_status",
+        "manifest_stale_source_path",
+        "manifest_stale_source_count",
+        "manifest_age_hours",
+        "summary_path",
+        "significance_path",
+        "benchmark_strength_score",
+        "manifest_path",
+    ]
+    claim_columns = [
+        "claim_key",
+        "title",
+        "role",
+        "status",
+        "claim_readiness_status",
+        "summary",
+        "live_signal_status",
+        "benchmark_evidence_status",
+        "repeated_evidence_status",
+        "slice_evidence_status",
+        "risk_evidence_status",
+        "artifact_pack_status",
+        "supporting_artifact_count",
+        "existing_supporting_artifact_count",
+        "missing_supporting_artifact_count",
+        "stale_supporting_artifact_count",
+        "supporting_artifact_path_status",
+        "supporting_artifact_freshness_status",
+        "missing_supporting_artifact_path",
+        "stale_supporting_artifact_path",
+        "missing_check_count",
+        "blocked",
+        "next_gate",
+        "target_drift_jsd",
+        "selective_risk",
+        "stress_skip_risk",
+        "live_test_top1_lift_vs_deep",
+        "benchmark_comparison_ready",
+        "benchmark_significant_lift",
+        "claims_path",
+        "metrics_json",
+        "missing_checks_json",
+    ]
+    maturity_columns = [
+        "anchor_run_id",
+        "anchor_run_json",
+        "strongest_benchmark_lock_json",
+        "strongest_benchmark_id",
+        "claim_ready_count",
+        "claim_blocked_count",
+        "claim_total_count",
+        "incomplete_benchmark_lock_count",
+        "stale_benchmark_manifest_count",
+        "stale_claim_artifact_count",
+        "submission_status",
+        "ready_for_external_review",
+        "blockers_json",
+        "top_blocker",
+        "top_next_gate",
+        "summary_json",
+        "actions_json",
+        "raw_json",
+    ]
+    manifest_columns = [
+        "anchor_run_id",
+        "artifact_root",
+        "table_count",
+        "raw_json",
+    ]
+    base_dir = output_dir / "analysis" / "research_platform_lab"
+    run_registry = _load_analysis_table_frame(
+        base_dir / "run_research_registry.csv",
+        run_registry_columns,
+        datetime_columns=("timestamp", "run_manifest_timestamp"),
+    )
+    benchmark_lock_atlas = _load_analysis_table_frame(base_dir / "benchmark_lock_atlas.csv", benchmark_columns)
+    claim_registry = _load_analysis_table_frame(base_dir / "research_claim_registry.csv", claim_columns)
+
+    maturity_payload = safe_read_json(base_dir / "research_platform_maturity.json", default={})
+    if isinstance(maturity_payload, dict):
+        strongest_benchmark = (
+            maturity_payload.get("strongest_benchmark_lock", {})
+            if isinstance(maturity_payload.get("strongest_benchmark_lock"), dict)
+            else {}
+        )
+        blockers = maturity_payload.get("blockers", [])
+        top_blocker = None
+        if isinstance(blockers, list):
+            for blocker in blockers:
+                text = str(blocker).strip()
+                if text:
+                    top_blocker = text
+                    break
+        maturity_snapshot = pd.DataFrame(
+            [
+                {
+                    "anchor_run_id": maturity_payload.get("anchor_run_id"),
+                    "anchor_run_json": _json_string(maturity_payload.get("anchor_run")),
+                    "strongest_benchmark_lock_json": _json_string(maturity_payload.get("strongest_benchmark_lock")),
+                    "strongest_benchmark_id": strongest_benchmark.get("benchmark_id"),
+                    "claim_ready_count": maturity_payload.get("claim_ready_count"),
+                    "claim_blocked_count": maturity_payload.get("claim_blocked_count"),
+                    "claim_total_count": maturity_payload.get("claim_total_count"),
+                    "incomplete_benchmark_lock_count": maturity_payload.get("incomplete_benchmark_lock_count"),
+                    "stale_benchmark_manifest_count": maturity_payload.get("stale_benchmark_manifest_count"),
+                    "stale_claim_artifact_count": maturity_payload.get("stale_claim_artifact_count"),
+                    "submission_status": maturity_payload.get("submission_status"),
+                    "ready_for_external_review": maturity_payload.get("ready_for_external_review"),
+                    "blockers_json": _json_string(blockers),
+                    "top_blocker": top_blocker,
+                    "top_next_gate": maturity_payload.get("top_next_gate"),
+                    "summary_json": _json_string(maturity_payload.get("summary")),
+                    "actions_json": _json_string(maturity_payload.get("actions")),
+                    "raw_json": _json_string(maturity_payload),
+                }
+            ],
+            columns=maturity_columns,
+        )
+    else:
+        maturity_snapshot = _empty_frame(maturity_columns)
+
+    manifest_payload = safe_read_json(base_dir / "research_platform_manifest.json", default={})
+    if isinstance(manifest_payload, dict):
+        tables_payload = manifest_payload.get("tables", {})
+        table_count = len(tables_payload) if isinstance(tables_payload, dict) else 0
+        manifest_snapshot = pd.DataFrame(
+            [
+                {
+                    "anchor_run_id": manifest_payload.get("anchor_run_id"),
+                    "artifact_root": manifest_payload.get("artifact_root"),
+                    "table_count": table_count,
+                    "raw_json": _json_string(manifest_payload),
+                }
+            ],
+            columns=manifest_columns,
+        )
+    else:
+        manifest_snapshot = _empty_frame(manifest_columns)
+
+    return run_registry, benchmark_lock_atlas, claim_registry, maturity_snapshot, manifest_snapshot
+
+
 def _build_listener_daily_activity(raw_streaming_history: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "played_date",
@@ -757,6 +1157,214 @@ def _build_creator_report_family_summary(
         if column not in family_summary.columns:
             family_summary[column] = None
     return family_summary[columns].sort_values("report_family_id").reset_index(drop=True)
+
+
+def _build_creator_market_scene_summary(
+    scene_market_pulse: pd.DataFrame,
+    opportunity_lane_atlas: pd.DataFrame,
+    creator_market_brief_snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "scene_name",
+        "family_count",
+        "lane_count",
+        "artist_count",
+        "priority_now_count",
+        "watchlist_count",
+        "avg_scene_local_play_share",
+        "avg_opportunity_score",
+        "avg_release_pressure",
+        "avg_label_concentration",
+        "avg_inbound_target_share",
+        "avg_seed_bridge_count",
+        "dominant_driver",
+        "representative_artist",
+        "top_opportunity_artist",
+        "top_migration_route",
+        "strategy_posture",
+        "lane_posture",
+        "momentum_score",
+        "lane_attractiveness_score",
+        "report_family_count",
+    ]
+    if scene_market_pulse.empty:
+        return _empty_frame(columns)
+    summary = scene_market_pulse.copy().rename(
+        columns={
+            "total_priority_now": "priority_now_count",
+            "total_watchlist": "watchlist_count",
+        }
+    )
+    for column in [
+        "family_count",
+        "priority_now_count",
+        "watchlist_count",
+        "avg_scene_local_play_share",
+        "avg_opportunity_score",
+        "avg_release_pressure",
+        "avg_label_concentration",
+        "avg_inbound_target_share",
+        "avg_seed_bridge_count",
+        "momentum_score",
+    ]:
+        if column in summary.columns:
+            summary[column] = _to_numeric(summary[column])
+
+    if not opportunity_lane_atlas.empty and "scene_name" in opportunity_lane_atlas.columns:
+        lane = opportunity_lane_atlas.copy()
+        lane["artist_count"] = _to_numeric(lane.get("artist_count", pd.Series(index=lane.index)))
+        lane["lane_attractiveness_score"] = _to_numeric(
+            lane.get("lane_attractiveness_score", pd.Series(index=lane.index))
+        )
+        lane_grouped = (
+            lane.groupby("scene_name", dropna=False)
+            .agg(
+                lane_count=("primary_driver", "count"),
+                artist_count=("artist_count", "sum"),
+                lane_attractiveness_score=("lane_attractiveness_score", "max"),
+            )
+            .reset_index()
+        )
+        lane_top = (
+            lane.sort_values(["scene_name", "lane_attractiveness_score"], ascending=[True, False])
+            .drop_duplicates(subset=["scene_name"], keep="first")[["scene_name", "representative_artist", "lane_posture"]]
+        )
+        summary = summary.merge(lane_grouped, on="scene_name", how="left").merge(lane_top, on="scene_name", how="left")
+
+    report_family_count = None
+    if not creator_market_brief_snapshot.empty:
+        report_family_count = creator_market_brief_snapshot.iloc[0].get("report_family_count")
+    summary["report_family_count"] = report_family_count
+    for column in columns:
+        if column not in summary.columns:
+            summary[column] = None
+    return summary[columns].sort_values(
+        ["momentum_score", "priority_now_count", "avg_opportunity_score"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def _build_research_platform_status_summary(
+    run_research_registry: pd.DataFrame,
+    benchmark_lock_atlas: pd.DataFrame,
+    research_claim_registry: pd.DataFrame,
+    research_platform_maturity_snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "anchor_run_id",
+        "anchor_profile",
+        "anchor_timestamp",
+        "anchor_research_stage",
+        "submission_status",
+        "ready_for_external_review",
+        "claim_ready_count",
+        "claim_blocked_count",
+        "claim_total_count",
+        "blocked_live_signal_count",
+        "blocked_benchmark_gap_count",
+        "incomplete_benchmark_lock_count",
+        "comparison_ready_benchmark_count",
+        "stale_benchmark_manifest_count",
+        "stale_claim_artifact_count",
+        "strongest_benchmark_id",
+        "strongest_benchmark_score",
+        "top_next_gate",
+        "top_blocker",
+    ]
+    if (
+        run_research_registry.empty
+        and benchmark_lock_atlas.empty
+        and research_claim_registry.empty
+        and research_platform_maturity_snapshot.empty
+    ):
+        return _empty_frame(columns)
+
+    maturity = research_platform_maturity_snapshot.iloc[0].to_dict() if not research_platform_maturity_snapshot.empty else {}
+    anchor_run_id = str(maturity.get("anchor_run_id", "") or "").strip()
+
+    anchor_profile = None
+    anchor_timestamp = None
+    anchor_research_stage = None
+    if not run_research_registry.empty:
+        run_registry = run_research_registry.copy()
+        if "timestamp" in run_registry.columns:
+            run_registry["timestamp"] = pd.to_datetime(run_registry["timestamp"], errors="coerce", format="mixed")
+            run_registry = run_registry.sort_values(["timestamp", "run_id"], ascending=[False, False])
+        anchor_row = run_registry.iloc[0]
+        if anchor_run_id and "run_id" in run_registry.columns:
+            matching = run_registry.loc[run_registry["run_id"].astype(str) == anchor_run_id]
+            if not matching.empty:
+                anchor_row = matching.iloc[0]
+        anchor_profile = anchor_row.get("profile")
+        anchor_timestamp = anchor_row.get("timestamp")
+        anchor_research_stage = anchor_row.get("research_stage")
+
+    blocked_live_signal_count = 0
+    blocked_benchmark_gap_count = 0
+    claim_ready_count = maturity.get("claim_ready_count")
+    claim_blocked_count = maturity.get("claim_blocked_count")
+    claim_total_count = maturity.get("claim_total_count")
+    if not research_claim_registry.empty:
+        claims = research_claim_registry.copy()
+        claims["blocked"] = _to_bool_series(claims.get("blocked", pd.Series(index=claims.index)))
+        claims["benchmark_comparison_ready"] = _to_bool_series(
+            claims.get("benchmark_comparison_ready", pd.Series(index=claims.index))
+        )
+        live_status = claims.get("live_signal_status", pd.Series(index=claims.index, dtype="object")).astype(str).str.lower()
+        blocked_live_signal_count = int(
+            (claims["blocked"].fillna(False) & live_status.isin({"ready", "live", "pass", "supported"})).sum()
+        )
+        blocked_benchmark_gap_count = int(
+            (claims["blocked"].fillna(False) & ~claims["benchmark_comparison_ready"].fillna(False)).sum()
+        )
+        if claim_ready_count is None:
+            claim_ready_count = int(
+                claims.get("claim_readiness_status", pd.Series(index=claims.index, dtype="object")).astype(str).str.lower().isin({"ready", "pass"}).sum()
+            )
+        if claim_blocked_count is None:
+            claim_blocked_count = int(claims["blocked"].fillna(False).sum())
+        if claim_total_count is None:
+            claim_total_count = int(len(claims.index))
+
+    comparison_ready_benchmark_count = 0
+    strongest_benchmark_id = maturity.get("strongest_benchmark_id")
+    strongest_benchmark_score = None
+    if not benchmark_lock_atlas.empty:
+        benchmarks = benchmark_lock_atlas.copy()
+        benchmarks["comparison_ready"] = _to_bool_series(
+            benchmarks.get("comparison_ready", pd.Series(index=benchmarks.index))
+        )
+        benchmarks["benchmark_strength_score"] = _to_numeric(
+            benchmarks.get("benchmark_strength_score", pd.Series(index=benchmarks.index))
+        )
+        comparison_ready_benchmark_count = int(benchmarks["comparison_ready"].fillna(False).sum())
+        strongest = benchmarks.sort_values(["benchmark_strength_score", "benchmark_id"], ascending=[False, True]).iloc[0]
+        if not strongest_benchmark_id:
+            strongest_benchmark_id = strongest.get("benchmark_id")
+        strongest_benchmark_score = strongest.get("benchmark_strength_score")
+
+    row = {
+        "anchor_run_id": anchor_run_id or None,
+        "anchor_profile": anchor_profile,
+        "anchor_timestamp": anchor_timestamp,
+        "anchor_research_stage": anchor_research_stage,
+        "submission_status": maturity.get("submission_status"),
+        "ready_for_external_review": maturity.get("ready_for_external_review"),
+        "claim_ready_count": claim_ready_count,
+        "claim_blocked_count": claim_blocked_count,
+        "claim_total_count": claim_total_count,
+        "blocked_live_signal_count": blocked_live_signal_count,
+        "blocked_benchmark_gap_count": blocked_benchmark_gap_count,
+        "incomplete_benchmark_lock_count": maturity.get("incomplete_benchmark_lock_count"),
+        "comparison_ready_benchmark_count": comparison_ready_benchmark_count,
+        "stale_benchmark_manifest_count": maturity.get("stale_benchmark_manifest_count"),
+        "stale_claim_artifact_count": maturity.get("stale_claim_artifact_count"),
+        "strongest_benchmark_id": strongest_benchmark_id,
+        "strongest_benchmark_score": strongest_benchmark_score,
+        "top_next_gate": maturity.get("top_next_gate"),
+        "top_blocker": maturity.get("top_blocker"),
+    }
+    return pd.DataFrame([row], columns=columns)
 
 
 def _build_mart_run_quality(model_run_summary: pd.DataFrame) -> pd.DataFrame:
@@ -1049,6 +1657,188 @@ def _build_mart_creator_scene_pressure(creator_scene_summary: pd.DataFrame) -> p
     ).reset_index(drop=True)
 
 
+def _build_mart_creator_market_watchlist(
+    release_whitespace_atlas: pd.DataFrame,
+    creator_market_scene_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "artist_name",
+        "scene_name",
+        "family_count",
+        "avg_opportunity_score",
+        "avg_release_whitespace_score",
+        "whitespace_signal_score",
+        "avg_seed_bridge_count",
+        "max_days_since_latest_release",
+        "dominant_labels",
+        "primary_driver",
+        "scene_priority_now_count",
+        "scene_momentum_score",
+        "scene_strategy_posture",
+        "scene_dominant_driver",
+        "market_priority_score",
+    ]
+    if release_whitespace_atlas.empty:
+        return _empty_frame(columns)
+    watchlist = release_whitespace_atlas.copy()
+    for column in [
+        "family_count",
+        "avg_opportunity_score",
+        "avg_release_whitespace_score",
+        "whitespace_signal_score",
+        "avg_seed_bridge_count",
+        "max_days_since_latest_release",
+    ]:
+        if column in watchlist.columns:
+            watchlist[column] = _to_numeric(watchlist[column])
+
+    if not creator_market_scene_summary.empty and "scene_name" in creator_market_scene_summary.columns:
+        scene_summary = creator_market_scene_summary.rename(
+            columns={
+                "priority_now_count": "scene_priority_now_count",
+                "momentum_score": "scene_momentum_score",
+                "strategy_posture": "scene_strategy_posture",
+                "dominant_driver": "scene_dominant_driver",
+            }
+        )[
+            [
+                "scene_name",
+                "scene_priority_now_count",
+                "scene_momentum_score",
+                "scene_strategy_posture",
+                "scene_dominant_driver",
+            ]
+        ]
+        watchlist = watchlist.merge(scene_summary, on="scene_name", how="left")
+
+    watchlist["market_priority_score"] = (
+        _to_numeric(watchlist.get("whitespace_signal_score", pd.Series(index=watchlist.index))).fillna(0.0) * 0.7
+        + _to_numeric(watchlist.get("scene_momentum_score", pd.Series(index=watchlist.index))).fillna(0.0) * 0.3
+        + _to_numeric(watchlist.get("scene_priority_now_count", pd.Series(index=watchlist.index))).fillna(0.0) * 0.05
+    )
+    for column in columns:
+        if column not in watchlist.columns:
+            watchlist[column] = None
+    return watchlist[columns].sort_values(
+        ["market_priority_score", "avg_opportunity_score", "max_days_since_latest_release"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+
+def _build_mart_research_platform_status(research_platform_status_summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "anchor_run_id",
+        "anchor_profile",
+        "anchor_timestamp",
+        "anchor_research_stage",
+        "submission_status",
+        "ready_for_external_review",
+        "status_posture",
+        "claim_ready_count",
+        "claim_blocked_count",
+        "claim_total_count",
+        "incomplete_benchmark_lock_count",
+        "comparison_ready_benchmark_count",
+        "stale_benchmark_manifest_count",
+        "stale_claim_artifact_count",
+        "strongest_benchmark_id",
+        "strongest_benchmark_score",
+        "top_next_gate",
+        "top_blocker",
+    ]
+    if research_platform_status_summary.empty:
+        return _empty_frame(columns)
+    status = research_platform_status_summary.copy()
+    ready = _to_bool_series(status.get("ready_for_external_review", pd.Series(index=status.index))).fillna(False)
+    blocked_claims = _to_numeric(status.get("claim_blocked_count", pd.Series(index=status.index))).fillna(0.0)
+    incomplete_locks = _to_numeric(status.get("incomplete_benchmark_lock_count", pd.Series(index=status.index))).fillna(0.0)
+    stale_artifacts = (
+        _to_numeric(status.get("stale_claim_artifact_count", pd.Series(index=status.index))).fillna(0.0)
+        + _to_numeric(status.get("stale_benchmark_manifest_count", pd.Series(index=status.index))).fillna(0.0)
+    )
+    status["status_posture"] = "attention"
+    status.loc[(blocked_claims > 0) | (incomplete_locks > 0), "status_posture"] = "blocked"
+    status.loc[ready & (blocked_claims <= 0) & (incomplete_locks <= 0) & (stale_artifacts <= 0), "status_posture"] = "ready"
+    for column in columns:
+        if column not in status.columns:
+            status[column] = None
+    return status[columns].reset_index(drop=True)
+
+
+def _build_mart_research_claim_watchlist(
+    research_claim_registry: pd.DataFrame,
+    research_platform_status_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "claim_key",
+        "title",
+        "role",
+        "status",
+        "claim_readiness_status",
+        "blocked",
+        "missing_check_count",
+        "next_gate",
+        "live_signal_status",
+        "benchmark_evidence_status",
+        "benchmark_comparison_ready",
+        "benchmark_significant_lift",
+        "artifact_pack_status",
+        "supporting_artifact_count",
+        "missing_supporting_artifact_count",
+        "stale_supporting_artifact_count",
+        "supporting_artifact_freshness_status",
+        "target_drift_jsd",
+        "selective_risk",
+        "stress_skip_risk",
+        "live_test_top1_lift_vs_deep",
+        "submission_status",
+        "ready_for_external_review",
+        "watchlist_score",
+    ]
+    if research_claim_registry.empty:
+        return _empty_frame(columns)
+    watchlist = research_claim_registry.copy()
+    watchlist["blocked"] = _to_bool_series(watchlist.get("blocked", pd.Series(index=watchlist.index)))
+    watchlist["benchmark_comparison_ready"] = _to_bool_series(
+        watchlist.get("benchmark_comparison_ready", pd.Series(index=watchlist.index))
+    )
+    watchlist["benchmark_significant_lift"] = _to_bool_series(
+        watchlist.get("benchmark_significant_lift", pd.Series(index=watchlist.index))
+    )
+    for column in [
+        "missing_check_count",
+        "supporting_artifact_count",
+        "missing_supporting_artifact_count",
+        "stale_supporting_artifact_count",
+        "target_drift_jsd",
+        "selective_risk",
+        "stress_skip_risk",
+        "live_test_top1_lift_vs_deep",
+    ]:
+        if column in watchlist.columns:
+            watchlist[column] = _to_numeric(watchlist[column])
+
+    if not research_platform_status_summary.empty:
+        summary_row = research_platform_status_summary.iloc[0]
+        watchlist["submission_status"] = summary_row.get("submission_status")
+        watchlist["ready_for_external_review"] = summary_row.get("ready_for_external_review")
+
+    watchlist["watchlist_score"] = (
+        watchlist["blocked"].fillna(False).astype("int64") * 100.0
+        + watchlist.get("missing_check_count", pd.Series(index=watchlist.index)).fillna(0.0) * 10.0
+        + watchlist.get("stale_supporting_artifact_count", pd.Series(index=watchlist.index)).fillna(0.0) * 5.0
+        + watchlist.get("selective_risk", pd.Series(index=watchlist.index)).fillna(0.0) * 10.0
+        + watchlist.get("stress_skip_risk", pd.Series(index=watchlist.index)).fillna(0.0) * 10.0
+    )
+    for column in columns:
+        if column not in watchlist.columns:
+            watchlist[column] = None
+    return watchlist[columns].sort_values(
+        ["watchlist_score", "missing_check_count", "claim_key"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+
 def build_analytics_warehouse_bundle(
     *,
     data_dir: Path,
@@ -1078,6 +1868,22 @@ def build_analytics_warehouse_bundle(
         bronze_creator_scene,
         bronze_creator_scene_seed,
     ) = _load_creator_report_family_assets(output_dir)
+    (
+        bronze_creator_market_scene_pulse,
+        bronze_creator_market_opportunity_lane_atlas,
+        bronze_creator_market_migration_network,
+        bronze_creator_market_seed_bridge_atlas,
+        bronze_creator_market_release_whitespace_atlas,
+        bronze_creator_market_brief_snapshot,
+        bronze_creator_market_manifest_snapshot,
+    ) = _creator_market_snapshot_frames(output_dir)
+    (
+        bronze_research_platform_run_registry,
+        bronze_research_platform_benchmark_lock_atlas,
+        bronze_research_platform_claim_registry,
+        bronze_research_platform_maturity_snapshot,
+        bronze_research_platform_manifest_snapshot,
+    ) = _research_platform_snapshot_frames(output_dir)
 
     bronze = {
         "raw_streaming_history": bronze_raw_streaming,
@@ -1097,6 +1903,18 @@ def build_analytics_warehouse_bundle(
         "creator_ranking_opportunities": bronze_creator_ranking,
         "creator_scene_summary": bronze_creator_scene,
         "creator_scene_seed_summary": bronze_creator_scene_seed,
+        "creator_market_scene_pulse": bronze_creator_market_scene_pulse,
+        "creator_market_opportunity_lane_atlas": bronze_creator_market_opportunity_lane_atlas,
+        "creator_market_migration_network": bronze_creator_market_migration_network,
+        "creator_market_seed_bridge_atlas": bronze_creator_market_seed_bridge_atlas,
+        "creator_market_release_whitespace_atlas": bronze_creator_market_release_whitespace_atlas,
+        "creator_market_brief_snapshot": bronze_creator_market_brief_snapshot,
+        "creator_market_manifest_snapshot": bronze_creator_market_manifest_snapshot,
+        "research_platform_run_registry": bronze_research_platform_run_registry,
+        "research_platform_benchmark_lock_atlas": bronze_research_platform_benchmark_lock_atlas,
+        "research_platform_claim_registry": bronze_research_platform_claim_registry,
+        "research_platform_maturity_snapshot": bronze_research_platform_maturity_snapshot,
+        "research_platform_manifest_snapshot": bronze_research_platform_manifest_snapshot,
     }
 
     silver_listener_daily = _build_listener_daily_activity(bronze_raw_streaming)
@@ -1116,12 +1934,25 @@ def build_analytics_warehouse_bundle(
         bronze_creator_scene,
         bronze_creator_scene_seed,
     )
+    silver_creator_market_scene_summary = _build_creator_market_scene_summary(
+        bronze_creator_market_scene_pulse,
+        bronze_creator_market_opportunity_lane_atlas,
+        bronze_creator_market_brief_snapshot,
+    )
+    silver_research_platform_status_summary = _build_research_platform_status_summary(
+        bronze_research_platform_run_registry,
+        bronze_research_platform_benchmark_lock_atlas,
+        bronze_research_platform_claim_registry,
+        bronze_research_platform_maturity_snapshot,
+    )
 
     silver = {
         "listener_daily_activity": silver_listener_daily,
         "model_run_summary": silver_model_run_summary,
         "ops_review_snapshot": silver_ops_review_snapshot,
         "creator_report_family_summary": silver_creator_report_summary,
+        "creator_market_scene_summary": silver_creator_market_scene_summary,
+        "research_platform_status_summary": silver_research_platform_status_summary,
     }
 
     gold_run_quality = _build_mart_run_quality(silver_model_run_summary)
@@ -1129,6 +1960,17 @@ def build_analytics_warehouse_bundle(
     gold_ops_overview = _build_mart_ops_overview(silver_ops_review_snapshot, bronze_control_room_history)
     gold_creator_opportunities = _build_mart_creator_opportunities(bronze_creator_ranking)
     gold_creator_scene_pressure = _build_mart_creator_scene_pressure(bronze_creator_scene)
+    gold_creator_market_watchlist = _build_mart_creator_market_watchlist(
+        bronze_creator_market_release_whitespace_atlas,
+        silver_creator_market_scene_summary,
+    )
+    gold_research_platform_status = _build_mart_research_platform_status(
+        silver_research_platform_status_summary
+    )
+    gold_research_claim_watchlist = _build_mart_research_claim_watchlist(
+        bronze_research_platform_claim_registry,
+        silver_research_platform_status_summary,
+    )
 
     gold = {
         "mart_run_quality": gold_run_quality,
@@ -1136,6 +1978,9 @@ def build_analytics_warehouse_bundle(
         "mart_ops_overview": gold_ops_overview,
         "mart_creator_opportunities": gold_creator_opportunities,
         "mart_creator_scene_pressure": gold_creator_scene_pressure,
+        "mart_creator_market_watchlist": gold_creator_market_watchlist,
+        "mart_research_platform_status": gold_research_platform_status,
+        "mart_research_claim_watchlist": gold_research_claim_watchlist,
     }
 
     warehouse_root = output_dir / "analytics" / "warehouse"
@@ -1149,14 +1994,25 @@ def build_analytics_warehouse_bundle(
             "silver_assets": len(silver),
             "gold_assets": len(gold),
             "creator_report_family_count": int(len(bronze_creator_report_families.index)),
+            "creator_market_report_family_count": (
+                int(bronze_creator_market_brief_snapshot.iloc[0]["report_family_count"])
+                if not bronze_creator_market_brief_snapshot.empty
+                and pd.notna(bronze_creator_market_brief_snapshot.iloc[0]["report_family_count"])
+                else 0
+            ),
+            "research_platform_anchor_run_id": (
+                bronze_research_platform_maturity_snapshot.iloc[0]["anchor_run_id"]
+                if not bronze_research_platform_maturity_snapshot.empty
+                else None
+            ),
             "latest_control_room_run_id": (
                 bronze_control_room.iloc[0]["latest_run_id"] if not bronze_control_room.empty else None
             ),
         },
         "lineage": [
-            "bronze captures locally prepared raw history, run artifacts, control-room snapshots, and creator report-family exports.",
-            "silver standardizes listener behavior, per-model run summaries, ops review status, and creator family summaries.",
-            "gold exposes analytics marts for run quality, model registry, ops overview, and creator opportunity pressure.",
+            "bronze captures locally prepared raw history, run artifacts, control-room snapshots, creator report-family exports, creator-market branch outputs, and research-platform branch outputs.",
+            "silver standardizes listener behavior, per-model run summaries, ops review status, creator family summaries, creator-market scene rollups, and research-platform status rollups.",
+            "gold exposes analytics marts for run quality, model registry, ops overview, creator opportunity pressure, creator-market watchlists, and research-platform status tracking.",
         ],
     }
     return AnalyticsWarehouseBundle(

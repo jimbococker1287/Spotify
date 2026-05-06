@@ -21,15 +21,23 @@ This writes:
 - `outputs/analysis/listener_archetypes/listener_archetype_summary.csv`
 - `outputs/analysis/listener_archetypes/listener_archetype_summary.json`
 - `outputs/analysis/listener_archetypes/listener_archetype_monthly.csv`
+- `outputs/analysis/listener_archetypes/listener_archetype_seasonal.csv`
+- `outputs/analysis/listener_archetypes/listener_archetype_seasonal.json`
 - `outputs/analysis/listener_archetypes/listener_archetype_transitions.csv`
+- `outputs/analysis/listener_archetypes/taste_evolution_regime_shifts.csv`
+- `outputs/analysis/listener_archetypes/taste_evolution_regime_shifts.json`
 - `outputs/analysis/listener_archetypes/taste_state_brief.json`
 - `outputs/analysis/listener_archetypes/taste_state_brief.md`
+- `outputs/analysis/listener_archetypes/taste_evolution_brief.json`
+- `outputs/analysis/listener_archetypes/taste_evolution_brief.md`
 
 Use it to answer:
 
 - what kinds of listening states show up repeatedly in local behavior
 - which states are highest-skip or most exploratory
 - how taste states transition across days
+- where month-over-month regime shifts are strongest
+- which archetypes are most seasonal across winter / spring / summer / fall
 - which archetypes should become explicit Taste OS modes or evaluation slices
 
 ## Quant Decision Lab

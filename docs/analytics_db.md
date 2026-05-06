@@ -65,6 +65,18 @@ Raw-ish prepared assets for local analytics:
 - `creator_ranking_opportunities`
 - `creator_scene_summary`
 - `creator_scene_seed_summary`
+- `creator_market_scene_pulse`
+- `creator_market_opportunity_lane_atlas`
+- `creator_market_migration_network`
+- `creator_market_seed_bridge_atlas`
+- `creator_market_release_whitespace_atlas`
+- `creator_market_brief_snapshot`
+- `creator_market_manifest_snapshot`
+- `research_platform_run_registry`
+- `research_platform_benchmark_lock_atlas`
+- `research_platform_claim_registry`
+- `research_platform_maturity_snapshot`
+- `research_platform_manifest_snapshot`
 
 ### Silver
 
@@ -74,6 +86,8 @@ Curated modeling and business-analysis tables:
 - `model_run_summary`
 - `ops_review_snapshot`
 - `creator_report_family_summary`
+- `creator_market_scene_summary`
+- `research_platform_status_summary`
 
 ### Gold
 
@@ -84,6 +98,9 @@ Semantic marts for decision work:
 - `mart_ops_overview`
 - `mart_creator_opportunities`
 - `mart_creator_scene_pressure`
+- `mart_creator_market_watchlist`
+- `mart_research_platform_status`
+- `mart_research_claim_watchlist`
 
 ## DuckDB Surface
 
@@ -98,11 +115,16 @@ Useful base tables:
 - `creator_scene_summary`
 - `listener_daily_activity`
 - `model_run_summary`
+- `creator_market_scene_summary`
+- `research_platform_status_summary`
 - `mart_run_quality`
 - `mart_model_registry`
 - `mart_ops_overview`
 - `mart_creator_opportunities`
 - `mart_creator_scene_pressure`
+- `mart_creator_market_watchlist`
+- `mart_research_platform_status`
+- `mart_research_claim_watchlist`
 - `warehouse_asset_manifest`
 - `warehouse_asset_columns`
 - `warehouse_consistency_checks`
@@ -120,6 +142,9 @@ Useful views:
 - `moonshot_run_summary`
 - `latest_ops_overview`
 - `creator_priority_now`
+- `creator_market_priority_now`
+- `latest_research_platform_status`
+- `research_platform_blocked_claims`
 
 ## Example Queries
 
@@ -180,9 +205,33 @@ from mart_creator_scene_pressure
 order by mean_opportunity_score desc nulls last;
 ```
 
+Creator-market priority watch:
+
+```sql
+select artist_name, scene_name, market_priority_score, scene_strategy_posture
+from creator_market_priority_now
+order by market_priority_score desc nulls last
+limit 25;
+```
+
+Research-platform status:
+
+```sql
+select anchor_run_id, anchor_research_stage, status_posture, submission_status, top_blocker
+from latest_research_platform_status;
+```
+
+Blocked research claims:
+
+```sql
+select claim_key, title, next_gate, watchlist_score
+from research_platform_blocked_claims
+order by watchlist_score desc nulls last;
+```
+
 ## Recommended Workflow
 
 1. Run `make analytics-db` after a major training or reporting refresh.
 2. Open `outputs/analytics/spotify_analytics.duckdb` in DuckDB tooling or query it directly from Python.
 3. Use the warehouse Parquet assets when you want a stable, file-based local data pipeline.
-4. Treat the gold marts as the default starting point for notebooks, dashboards, and experimental branch work.
+4. Treat the gold marts as the default starting point for notebooks, dashboards, and experimental branch work, including the creator-market and research-platform branches.
