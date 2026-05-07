@@ -57,6 +57,14 @@ def _write_csv_rows(path: Path, rows: list[dict[str, object]]) -> Path | None:
     return path
 
 
+def _coerce_dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
+
+
 def _analysis_prefix_for_model_type(model_type: str) -> str | None:
     normalized = str(model_type).strip().lower()
     if normalized == "deep":
@@ -125,6 +133,10 @@ def _load_benchmark_bundle(manifest_path: Path | None) -> dict[str, object]:
     }
 
 
+def _existing_research_claims_path(output_root: Path) -> Path:
+    return output_root / "analysis" / "research_claims" / "research_claims.json"
+
+
 def _portable_path(path: Path, *, output_root: Path) -> tuple[str, bool, str]:
     resolved = path.expanduser().resolve()
     try:
@@ -181,6 +193,41 @@ def _artifact_portability_summary(claims: list[dict[str, object]]) -> dict[str, 
         "all_supporting_artifacts_present": bool(total > 0 and existing == total),
         "non_portable_examples": non_portable_examples[:5],
     }
+
+
+def _resolve_report_run_dir(existing_report: dict[str, object], *, output_root: Path) -> Path | None:
+    run_payload = _coerce_dict(existing_report.get("run"))
+    portable = str(run_payload.get("run_dir_portable", "")).strip()
+    if portable:
+        candidate = (output_root / portable).resolve()
+        if candidate.exists():
+            return candidate
+    absolute = str(run_payload.get("run_dir", "")).strip()
+    if absolute:
+        candidate = Path(absolute).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+    run_id = str(run_payload.get("run_id", "")).strip()
+    if run_id:
+        candidate = (output_root / "runs" / run_id).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_report_benchmark_manifest(existing_report: dict[str, object], *, output_root: Path) -> Path | None:
+    benchmark_payload = _coerce_dict(existing_report.get("benchmark_lock"))
+    portable = str(benchmark_payload.get("manifest_path_portable", "")).strip()
+    if portable:
+        candidate = (output_root / portable).resolve()
+        if candidate.exists():
+            return candidate
+    absolute = str(benchmark_payload.get("manifest_path", "")).strip()
+    if absolute:
+        candidate = Path(absolute).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+    return _latest_benchmark_manifest(output_root)
 
 
 def _enrich_claim_artifacts(
@@ -1054,6 +1101,24 @@ def _build_submission_readiness(
     }
 
 
+def _benchmark_table_rows(summary_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "model_name": str(row.get("model_name", "")),
+            "model_type": str(row.get("model_type", "")),
+            "run_count": int(float(row.get("run_count", 0) or 0)),
+            "val_top1_mean": _safe_float(row.get("val_top1_mean")),
+            "test_top1_mean": _safe_float(row.get("test_top1_mean")),
+            "val_top1_ci95": _safe_float(row.get("val_top1_ci95")),
+        }
+        for row in sorted(
+            summary_rows,
+            key=lambda row: _safe_float(row.get("val_top1_mean")),
+            reverse=True,
+        )[:8]
+    ]
+
+
 def build_research_claims_report(
     output_dir: Path,
     *,
@@ -1105,21 +1170,7 @@ def build_research_claims_report(
     ]
     benchmark_summary_rows = benchmark_bundle.get("summary_rows", [])
     benchmark_summary_rows = benchmark_summary_rows if isinstance(benchmark_summary_rows, list) else []
-    benchmark_table = [
-        {
-            "model_name": str(row.get("model_name", "")),
-            "model_type": str(row.get("model_type", "")),
-            "run_count": int(float(row.get("run_count", 0) or 0)),
-            "val_top1_mean": _safe_float(row.get("val_top1_mean")),
-            "test_top1_mean": _safe_float(row.get("test_top1_mean")),
-            "val_top1_ci95": _safe_float(row.get("val_top1_ci95")),
-        }
-        for row in sorted(
-            benchmark_summary_rows,
-            key=lambda row: _safe_float(row.get("val_top1_mean")),
-            reverse=True,
-        )[:8]
-    ]
+    benchmark_table = _benchmark_table_rows(benchmark_summary_rows)
 
     claim_gaps = []
     for claim in claims:
@@ -1191,6 +1242,204 @@ def build_research_claims_report(
         claim_gaps=report["claim_gaps"],
     )
     return report
+
+
+def _repair_existing_research_claims_report(
+    existing_report: dict[str, object],
+    *,
+    output_root: Path,
+    run_dir: Path | None,
+    benchmark_manifest_path: Path | None,
+) -> dict[str, object]:
+    claims = [
+        _enrich_claim_artifacts(dict(claim), output_root=output_root)
+        for claim in _coerce_list(existing_report.get("claims"))
+        if isinstance(claim, dict)
+    ]
+    benchmark_bundle = _load_benchmark_bundle(benchmark_manifest_path)
+    benchmark_summary_rows = benchmark_bundle.get("summary_rows", [])
+    benchmark_summary_rows = benchmark_summary_rows if isinstance(benchmark_summary_rows, list) else []
+    benchmark_manifest = _coerce_dict(benchmark_bundle.get("manifest"))
+    benchmark_lock = {
+        "manifest_path": str(benchmark_bundle.get("manifest_path", "")),
+        "manifest_path_portable": (
+            _portable_path(Path(str(benchmark_bundle.get("manifest_path", ""))), output_root=output_root)[0]
+            if str(benchmark_bundle.get("manifest_path", "")).strip()
+            else str(_coerce_dict(existing_report.get("benchmark_lock")).get("manifest_path_portable", "")).strip()
+        ),
+        "benchmark_id": str(benchmark_manifest.get("benchmark_id", _coerce_dict(existing_report.get("benchmark_lock")).get("benchmark_id", ""))).strip(),
+        "comparison_ready": bool(
+            benchmark_manifest.get(
+                "comparison_ready",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparison_ready", False),
+            )
+        ),
+        "model_class_mix": dict(
+            benchmark_manifest.get(
+                "model_class_mix",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("model_class_mix", {}),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "model_class_mix",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("model_class_mix", {}),
+            ),
+            dict,
+        )
+        else {},
+        "comparator_guard": dict(
+            benchmark_manifest.get(
+                "comparator_guard",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparator_guard", {}),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "comparator_guard",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparator_guard", {}),
+            ),
+            dict,
+        )
+        else {},
+        "summary": list(
+            benchmark_manifest.get(
+                "summary",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("summary", []),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "summary",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("summary", []),
+            ),
+            list,
+        )
+        else [],
+    }
+
+    run_payload = _coerce_dict(existing_report.get("run"))
+    if run_dir is not None and run_dir.exists():
+        run_manifest = _coerce_dict(safe_read_json(run_dir / "run_manifest.json", default={}))
+        run_payload = {
+            "run_id": str(run_manifest.get("run_id", run_payload.get("run_id", run_dir.name))).strip(),
+            "profile": str(run_manifest.get("profile", run_payload.get("profile", ""))).strip(),
+            "timestamp": str(run_manifest.get("timestamp", run_payload.get("timestamp", ""))).strip(),
+            "run_dir": str(run_dir.resolve()),
+            "run_dir_portable": _portable_path(run_dir, output_root=output_root)[0],
+        }
+
+    primary_key = str(_coerce_dict(existing_report.get("primary_claim")).get("key", "")).strip()
+    backup_key = str(_coerce_dict(existing_report.get("backup_claim")).get("key", "")).strip()
+    claims_by_key = {
+        str(claim.get("key", "")).strip(): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("key", "")).strip()
+    }
+    sorted_claims = sorted(claims, key=_claim_sort_key, reverse=True)
+    primary_claim = claims_by_key.get(primary_key, sorted_claims[0] if sorted_claims else {})
+    backup_claim = claims_by_key.get(
+        backup_key,
+        next(
+            (
+                claim
+                for claim in sorted_claims
+                if str(claim.get("key", "")).strip() != str(primary_claim.get("key", "")).strip()
+            ),
+            {},
+        ),
+    )
+
+    claim_gaps: list[str] = []
+    for claim in claims:
+        for item in claim.get("missing_checks", []):
+            text = str(item).strip()
+            if text and text not in claim_gaps:
+                claim_gaps.append(text)
+
+    evaluation_tables = _coerce_dict(existing_report.get("evaluation_tables"))
+    evaluation_tables["benchmark_lock"] = _benchmark_table_rows(benchmark_summary_rows) or [
+        row
+        for row in _coerce_list(evaluation_tables.get("benchmark_lock"))
+        if isinstance(row, dict)
+    ]
+
+    report = {
+        "run": run_payload,
+        "benchmark_lock": benchmark_lock,
+        "claims": claims,
+        "primary_claim": primary_claim,
+        "backup_claim": backup_claim,
+        "believable_submission_path": _STATUS_RANK.get(str(primary_claim.get("status", "")), 0) >= 2
+        and _STATUS_RANK.get(str(backup_claim.get("status", "")), 0) >= 1,
+        "artifact_portability": _artifact_portability_summary(claims),
+        "evaluation_tables": evaluation_tables,
+        "claim_gaps": claim_gaps[:8],
+        "publication_outline": _publication_outline(primary_claim, backup_claim),
+    }
+    role_map = {
+        str(primary_claim.get("key", "")): "primary",
+        str(backup_claim.get("key", "")): "backup",
+    }
+    claim_support_matrix = [
+        _claim_support_row(
+            claim,
+            role=role_map.get(str(claim.get("key", "")), "supporting"),
+            benchmark_ready=bool(report["benchmark_lock"]["comparison_ready"]),
+        )
+        for claim in claims
+        if isinstance(claim, dict)
+    ]
+    report["claim_support_matrix"] = claim_support_matrix
+    report["submission_readiness"] = _build_submission_readiness(
+        primary_claim=primary_claim,
+        backup_claim=backup_claim,
+        benchmark_lock=report["benchmark_lock"],
+        evaluation_tables=report["evaluation_tables"],
+        claim_support_matrix=claim_support_matrix,
+        claim_gaps=report["claim_gaps"],
+    )
+    return report
+
+
+def refresh_research_claims_report(
+    output_dir: Path,
+    *,
+    existing_report_path: Path | None = None,
+    run_dir: Path | None = None,
+    benchmark_manifest_path: Path | None = None,
+) -> dict[str, object]:
+    output_root = output_dir.expanduser().resolve()
+    resolved_report_path = (
+        existing_report_path.expanduser().resolve()
+        if existing_report_path is not None
+        else _existing_research_claims_path(output_root).resolve()
+    )
+    if not resolved_report_path.exists():
+        raise FileNotFoundError(f"Existing research-claims report not found: {resolved_report_path}")
+    existing_report = _coerce_dict(safe_read_json(resolved_report_path, default={}))
+    resolved_run_dir = (
+        run_dir.expanduser().resolve()
+        if run_dir is not None
+        else _resolve_report_run_dir(existing_report, output_root=output_root)
+    )
+    resolved_benchmark_manifest = (
+        benchmark_manifest_path.expanduser().resolve()
+        if benchmark_manifest_path is not None
+        else _resolve_report_benchmark_manifest(existing_report, output_root=output_root)
+    )
+    if resolved_run_dir is not None and resolved_run_dir.exists():
+        return build_research_claims_report(
+            output_root,
+            run_dir=resolved_run_dir,
+            benchmark_manifest_path=resolved_benchmark_manifest,
+        )
+    return _repair_existing_research_claims_report(
+        existing_report,
+        output_root=output_root,
+        run_dir=resolved_run_dir,
+        benchmark_manifest_path=resolved_benchmark_manifest,
+    )
 
 
 def write_research_claims_report(
@@ -1420,16 +1669,37 @@ def main() -> int:
         default=None,
         help="Explicit outputs/history/benchmark_lock_<id>_manifest.json file.",
     )
+    parser.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Refresh or repair an existing research-claim pack from the local outputs tree without retraining.",
+    )
+    parser.add_argument(
+        "--existing-report",
+        type=str,
+        default=None,
+        help="Explicit outputs/analysis/research_claims/research_claims.json file to refresh or repair.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
     benchmark_manifest = Path(args.benchmark_manifest).expanduser().resolve() if args.benchmark_manifest else None
+    existing_report = Path(args.existing_report).expanduser().resolve() if args.existing_report else None
 
-    report = build_research_claims_report(
-        output_dir,
-        run_dir=run_dir,
-        benchmark_manifest_path=benchmark_manifest,
+    report = (
+        refresh_research_claims_report(
+            output_dir,
+            existing_report_path=existing_report,
+            run_dir=run_dir,
+            benchmark_manifest_path=benchmark_manifest,
+        )
+        if args.refresh_existing
+        else build_research_claims_report(
+            output_dir,
+            run_dir=run_dir,
+            benchmark_manifest_path=benchmark_manifest,
+        )
     )
     paths = write_research_claims_report(report, output_dir=output_dir)
     primary_claim = report.get("primary_claim", {})
@@ -1446,11 +1716,14 @@ def main() -> int:
     print(f"backup_claim={backup_claim.get('key', '')}")
     print(f"backup_status={backup_claim.get('status', '')}")
     print(f"believable_submission_path={report.get('believable_submission_path', False)}")
+    if args.refresh_existing:
+        print("refresh_existing=true")
     return 0
 
 
 __all__ = [
     "build_research_claims_report",
+    "refresh_research_claims_report",
     "write_research_claims_report",
     "main",
 ]

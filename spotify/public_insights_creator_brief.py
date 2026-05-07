@@ -158,6 +158,17 @@ def _existing_report_path(report_dir: Path, raw_path: object) -> Path | None:
     return path.resolve() if path.exists() else None
 
 
+def _basename_reanchor_path(report_dir: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    filename = Path(text).name.strip()
+    if not filename:
+        return None
+    candidate = (report_dir / filename).resolve()
+    return candidate if candidate.exists() else None
+
+
 def _artifact_modified_at(path: Path | None) -> str | None:
     if path is None or not path.exists():
         return None
@@ -186,14 +197,17 @@ def _resolve_report_artifact_path(
     report_dir: Path,
     raw_path: object,
     candidates: list[Path],
-) -> str | None:
+) -> tuple[str | None, str]:
     existing_path = _existing_report_path(report_dir, raw_path)
     if existing_path is not None:
-        return str(existing_path)
+        return str(existing_path), "manifest_reference"
+    basename_path = _basename_reanchor_path(report_dir, raw_path)
+    if basename_path is not None:
+        return str(basename_path), "basename_reanchor"
     for candidate in candidates:
         if candidate.exists():
-            return str(candidate.resolve())
-    return None
+            return str(candidate.resolve()), "conventional_filename"
+    return None, "missing"
 
 
 def normalize_creator_report_family_manifest(
@@ -220,15 +234,20 @@ def normalize_creator_report_family_manifest(
     brief_md = _coerce_manifest_map(manifest.get("brief_view_markdown"))
     brief_csv = _coerce_manifest_map(manifest.get("brief_view_csv"))
 
-    primary_report_path = _resolve_report_artifact_path(
+    primary_report_path, primary_report_source = _resolve_report_artifact_path(
         report_dir,
         manifest.get("primary_report"),
         [report_dir / f"{stem}.md"],
     )
-    primary_report_json = _resolve_report_artifact_path(
+    primary_report_json, primary_report_json_source = _resolve_report_artifact_path(
         report_dir,
         manifest.get("primary_report_json"),
         [report_dir / f"{stem}.json"],
+    )
+    artifact_index_markdown, artifact_index_source = _resolve_report_artifact_path(
+        report_dir,
+        manifest.get("artifact_index_markdown"),
+        [report_dir / f"{stem}_report_family.md"],
     )
     if primary_report_path:
         normalized["primary_report"] = primary_report_path
@@ -238,23 +257,29 @@ def normalize_creator_report_family_manifest(
         normalized["primary_report_json"] = primary_report_json
     else:
         normalized.pop("primary_report_json", None)
+    if artifact_index_markdown:
+        normalized["artifact_index_markdown"] = artifact_index_markdown
+    else:
+        normalized.pop("artifact_index_markdown", None)
 
     normalized_comparison_md = {key: value for key, value in comparison_md.items() if key not in known_comparison_keys}
     normalized_comparison_csv = {key: value for key, value in comparison_csv.items() if key not in known_comparison_keys}
     normalized_brief_md = {key: value for key, value in brief_md.items() if key not in known_brief_keys}
     normalized_brief_csv = {key: value for key, value in brief_csv.items() if key not in known_brief_keys}
     view_inventory: dict[str, dict[str, object]] = {}
+    reanchored_reference_count = 0
+    conventional_recovery_count = 0
 
     for view_key, spec in _CREATOR_REPORT_FAMILY_VIEW_SPECS.items():
         view_group = str(spec.get("view_group", "")).strip()
         markdown_lookup = comparison_md if view_group == "comparison" else brief_md
         csv_lookup = comparison_csv if view_group == "comparison" else brief_csv
-        markdown_path = _resolve_report_artifact_path(
+        markdown_path, markdown_source = _resolve_report_artifact_path(
             report_dir,
             markdown_lookup.get(view_key),
             _creator_report_family_artifact_candidates(report_dir, stem, view_key, artifact_kind="markdown"),
         )
-        csv_path = _resolve_report_artifact_path(
+        csv_path, csv_source = _resolve_report_artifact_path(
             report_dir,
             csv_lookup.get(view_key),
             _creator_report_family_artifact_candidates(report_dir, stem, view_key, artifact_kind="csv"),
@@ -270,6 +295,15 @@ def normalize_creator_report_family_manifest(
             else:
                 normalized_brief_csv[view_key] = csv_path
 
+        if markdown_source == "basename_reanchor":
+            reanchored_reference_count += 1
+        elif markdown_source == "conventional_filename":
+            conventional_recovery_count += 1
+        if csv_source == "basename_reanchor":
+            reanchored_reference_count += 1
+        elif csv_source == "conventional_filename":
+            conventional_recovery_count += 1
+
         markdown_resolved = _existing_report_path(report_dir, markdown_path)
         csv_resolved = _existing_report_path(report_dir, csv_path)
         view_inventory[view_key] = {
@@ -277,6 +311,8 @@ def normalize_creator_report_family_manifest(
             "view_group": view_group,
             "markdown_path": markdown_path,
             "csv_path": csv_path,
+            "markdown_resolution_source": markdown_source,
+            "csv_resolution_source": csv_source,
             "markdown_modified_at": _artifact_modified_at(markdown_resolved),
             "csv_modified_at": _artifact_modified_at(csv_resolved),
             "ready": bool(markdown_path and csv_path),
@@ -353,6 +389,19 @@ def normalize_creator_report_family_manifest(
             "refresh_anchor_ready": all(bool(row.get("ready")) for row in anchor_views.values()),
             "anchor_views": anchor_views,
             "view_inventory": view_inventory,
+            "repair_summary": {
+                "primary_report_resolution_source": primary_report_source,
+                "primary_report_json_resolution_source": primary_report_json_source,
+                "artifact_index_resolution_source": artifact_index_source,
+                "reanchored_reference_count": reanchored_reference_count
+                + int(primary_report_source == "basename_reanchor")
+                + int(primary_report_json_source == "basename_reanchor")
+                + int(artifact_index_source == "basename_reanchor"),
+                "conventional_recovery_count": conventional_recovery_count
+                + int(primary_report_source == "conventional_filename")
+                + int(primary_report_json_source == "conventional_filename")
+                + int(artifact_index_source == "conventional_filename"),
+            },
         }
     )
     if refreshed_at:

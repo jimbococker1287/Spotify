@@ -4,7 +4,7 @@ import csv
 import json
 from pathlib import Path
 
-from spotify.research_claims import build_research_claims_report, write_research_claims_report
+from spotify.research_claims import build_research_claims_report, refresh_research_claims_report, write_research_claims_report
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -371,3 +371,115 @@ def test_support_matrix_exposes_artifact_portability_and_submission_stays_conser
     assert report["artifact_portability"]["path_mode"] == "relative_to_output_dir_when_possible"
     assert report["artifact_portability"]["portable_supporting_artifact_count"] >= 1
     assert any("Supporting artifacts are portable enough for packaging." in item for item in report["submission_readiness"]["summary"])
+
+
+def test_refresh_research_claims_report_rebuilds_from_existing_outputs_tree(tmp_path: Path) -> None:
+    outputs, benchmark_manifest = _fixture_outputs(tmp_path)
+    run_dir = outputs / "runs" / "run_full"
+
+    initial_report = build_research_claims_report(
+        outputs,
+        run_dir=run_dir,
+        benchmark_manifest_path=benchmark_manifest,
+    )
+    research_dir = outputs / "analysis" / "research_claims"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    stale_payload = dict(initial_report)
+    stale_payload["run"] = dict(initial_report["run"])
+    stale_payload["run"]["run_dir"] = "/tmp/stale/run_full"
+    stale_payload["run"]["run_dir_portable"] = "runs/run_full"
+    stale_payload["benchmark_lock"] = dict(initial_report["benchmark_lock"])
+    stale_payload["benchmark_lock"]["manifest_path"] = "/tmp/stale/benchmark_lock_demo_manifest.json"
+    stale_payload["benchmark_lock"]["manifest_path_portable"] = "history/benchmark_lock_demo_manifest.json"
+    (research_dir / "research_claims.json").write_text(json.dumps(stale_payload, indent=2), encoding="utf-8")
+
+    refreshed = refresh_research_claims_report(outputs)
+
+    assert refreshed["run"]["run_dir_portable"] == "runs/run_full"
+    assert refreshed["benchmark_lock"]["manifest_path_portable"] == "history/benchmark_lock_demo_manifest.json"
+    assert refreshed["primary_claim"]["supporting_artifacts_portable"][0] == "runs/run_full/analysis/data_drift_summary.json"
+    assert refreshed["submission_readiness"]["status"] == "promising_but_unlocked"
+    assert refreshed["submission_readiness"]["ready_for_external_review"] is False
+
+
+def test_refresh_research_claims_report_repairs_existing_pack_when_run_dir_is_unavailable(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    history_dir = outputs / "history"
+    benchmark_manifest = history_dir / "benchmark_lock_demo_manifest.json"
+    _write_json(
+        benchmark_manifest,
+        {
+            "benchmark_id": "demo",
+            "comparison_ready": False,
+            "summary": ["Benchmark lock is not ready yet."],
+        },
+    )
+    research_dir = outputs / "analysis" / "research_claims"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    existing_payload = {
+        "run": {
+            "run_id": "run_missing",
+            "profile": "full",
+            "timestamp": "2026-03-29T12:00:00+00:00",
+            "run_dir": "/tmp/stale/run_missing",
+            "run_dir_portable": "runs/run_missing",
+        },
+        "benchmark_lock": {
+            "benchmark_id": "demo",
+            "comparison_ready": False,
+            "manifest_path": "/tmp/stale/benchmark_lock_demo_manifest.json",
+            "manifest_path_portable": "history/benchmark_lock_demo_manifest.json",
+            "summary": ["Benchmark lock is not ready yet."],
+        },
+        "claims": [
+            {
+                "key": "shift_robustness",
+                "title": "Failure concentration is measurable under drift, slice shift, and repeated-session regimes",
+                "status": "analysis_ready",
+                "summary": "Stored claim summary.",
+                "metrics": {
+                    "repeated_run_count": 3,
+                    "consistent_slice_run_count": 3,
+                    "worst_robustness_gap": 0.57,
+                    "selective_risk": 0.68,
+                    "abstention_rate": 0.0,
+                    "stress_skip_risk": 0.61,
+                },
+                "missing_checks": ["Retune abstention so the uncertainty story shows non-zero refusal rather than full-coverage risk."],
+                "supporting_artifacts": ["/tmp/stale/outputs/runs/run_missing/analysis/data_drift_summary.json"],
+                "supporting_artifacts_portable": ["runs/run_missing/analysis/data_drift_summary.json"],
+            },
+            {
+                "key": "candidate_ranking",
+                "title": "Candidate-ranking surfaces outperform current direct-softmax deep baselines",
+                "status": "promising_but_unlocked",
+                "summary": "Stored candidate ranking summary.",
+                "metrics": {
+                    "benchmark_comparison_ready": False,
+                    "benchmark_retrieval_ready": False,
+                    "benchmark_significant_lift": False,
+                    "live_test_top1_lift_vs_deep": 0.10,
+                },
+                "missing_checks": ["Finish the repeated-seed benchmark lock with at least 3 runs and a complete manifest artifact pack."],
+                "supporting_artifacts": ["/tmp/stale/outputs/history/benchmark_lock_demo_manifest.json"],
+                "supporting_artifacts_portable": ["history/benchmark_lock_demo_manifest.json"],
+            },
+        ],
+        "primary_claim": {"key": "shift_robustness"},
+        "backup_claim": {"key": "candidate_ranking"},
+        "evaluation_tables": {
+            "run_leaderboard": [],
+            "benchmark_lock": [],
+        },
+    }
+    (research_dir / "research_claims.json").write_text(json.dumps(existing_payload, indent=2), encoding="utf-8")
+
+    repaired = refresh_research_claims_report(outputs)
+
+    assert repaired["run"]["run_dir_portable"] == "runs/run_missing"
+    assert repaired["benchmark_lock"]["manifest_path_portable"] == "history/benchmark_lock_demo_manifest.json"
+    assert repaired["claims"][0]["supporting_artifact_summary"]["artifact_pack_status"] == "attention"
+    assert repaired["claims"][1]["supporting_artifacts_portable"] == ["history/benchmark_lock_demo_manifest.json"]
+    assert repaired["artifact_portability"]["portable_supporting_artifact_count"] == 2
+    assert repaired["submission_readiness"]["status"] == "promising_but_unlocked"
+    assert repaired["submission_readiness"]["ready_for_external_review"] is False

@@ -76,6 +76,25 @@ def _normalize_series(series: pd.Series, *, higher_is_better: bool) -> pd.Series
     return scaled.astype("float64", copy=False)
 
 
+def _bounded_unit_score(value: object, *, default: float = 0.0) -> float:
+    numeric = _safe_float(value)
+    if not math.isfinite(numeric):
+        return default
+    return min(1.0, max(0.0, numeric))
+
+
+def _join_unique(items: list[object] | tuple[object, ...] | set[object]) -> str:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        values.append(text)
+        seen.add(text)
+    return " | ".join(values)
+
+
 def _extract_selected_run_id(output_dir: Path) -> str:
     control_room = safe_read_json(output_dir / "analytics" / "control_room.json", default={})
     if isinstance(control_room, dict):
@@ -411,8 +430,12 @@ def _listener_archetype_context(output_dir: Path) -> dict[str, Any]:
     output_root = output_dir / "analysis" / "listener_archetypes"
     brief = safe_read_json(output_root / "taste_state_brief.json", default={})
     summary = safe_read_json(output_root / "listener_archetype_summary.json", default={})
+    evolution = safe_read_json(output_root / "taste_evolution_brief.json", default={})
+    regime_shifts = safe_read_json(output_root / "taste_evolution_regime_shifts.json", default=[])
+    seasonal = safe_read_json(output_root / "listener_archetype_seasonal.json", default=[])
     brief_payload = brief if isinstance(brief, dict) else {}
     summary_payload = summary if isinstance(summary, dict) else {}
+    evolution_payload = evolution if isinstance(evolution, dict) else {}
     archetype_rows = summary_payload.get("archetypes", [])
     archetype_lookup: dict[str, dict[str, object]] = {}
     if isinstance(archetype_rows, list):
@@ -426,6 +449,13 @@ def _listener_archetype_context(output_dir: Path) -> dict[str, Any]:
     dominant_label = str(brief_payload.get("dominant_archetype", "")).strip()
     highest_skip_label = str(brief_payload.get("highest_skip_archetype", "")).strip()
     exploratory_label = str(brief_payload.get("highest_exploration_archetype", "")).strip()
+    regime_rows = [_native_value(row) for row in regime_shifts if isinstance(row, dict)] if isinstance(regime_shifts, list) else []
+    seasonal_rows = [_native_value(row) for row in seasonal if isinstance(row, dict)] if isinstance(seasonal, list) else []
+    lifecycle_available = bool(
+        (str(evolution_payload.get("status", "")).strip().lower() == "ok")
+        or regime_rows
+        or seasonal_rows
+    )
     available = bool(dominant_label or highest_skip_label or exploratory_label)
     return {
         "status": "ok" if available else "missing",
@@ -436,6 +466,12 @@ def _listener_archetype_context(output_dir: Path) -> dict[str, Any]:
         "dominant_archetype": dominant_label,
         "highest_skip_archetype": highest_skip_label,
         "highest_exploration_archetype": exploratory_label,
+        "lifecycle": {
+            "available": lifecycle_available,
+            "evolution_brief": evolution_payload,
+            "regime_shifts": regime_rows,
+            "seasonal": seasonal_rows,
+        },
     }
 
 
@@ -452,6 +488,211 @@ def _compact_record(row: dict[str, object], columns: list[str], *, selection_bas
     payload = {column: _native_value(row.get(column)) for column in columns}
     payload["selection_basis"] = selection_basis
     return payload
+
+
+def _archetype_lifecycle_profile(archetype_label: str, listener_context: dict[str, Any]) -> dict[str, object]:
+    label = str(archetype_label).strip()
+    lifecycle = listener_context.get("lifecycle", {})
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    if not label or not bool(lifecycle.get("available")):
+        return {
+            "available": False,
+            "archetype_label": label,
+            "regime_shift_months": [],
+            "dominant_months": [],
+            "top_share_gain_months": [],
+            "top_share_loss_months": [],
+            "biggest_regime_shift_month": "",
+            "biggest_regime_shift_role": "",
+            "is_most_seasonal_archetype": False,
+            "peak_season": "",
+            "peak_season_label": "",
+            "peak_season_share": None,
+            "seasonality_gap": None,
+            "active_seasons": [],
+            "top_cross_state_transition_label": "",
+            "top_cross_state_transition_involved": False,
+        }
+
+    evolution_brief = lifecycle.get("evolution_brief", {})
+    evolution_brief = evolution_brief if isinstance(evolution_brief, dict) else {}
+    regime_rows = lifecycle.get("regime_shifts", [])
+    regime_rows = regime_rows if isinstance(regime_rows, list) else []
+    seasonal_rows = lifecycle.get("seasonal", [])
+    seasonal_rows = seasonal_rows if isinstance(seasonal_rows, list) else []
+
+    regime_shift_months: list[str] = []
+    dominant_months: list[str] = []
+    top_share_gain_months: list[str] = []
+    top_share_loss_months: list[str] = []
+    for row in regime_rows:
+        if not isinstance(row, dict):
+            continue
+        month = str(row.get("month", "")).strip()
+        if not month:
+            continue
+        score = _safe_float(row.get("regime_shift_score"))
+        dominant = str(row.get("dominant_archetype", "")).strip()
+        previous = str(row.get("previous_dominant_archetype", "")).strip()
+        gain = str(row.get("top_share_gain_archetype", "")).strip()
+        loss = str(row.get("top_share_loss_archetype", "")).strip()
+        if dominant == label:
+            dominant_months.append(month)
+        if gain == label:
+            top_share_gain_months.append(month)
+        if loss == label:
+            top_share_loss_months.append(month)
+        if math.isfinite(score) and score > 0 and label in {dominant, previous, gain, loss}:
+            regime_shift_months.append(month)
+
+    biggest_regime_shift = evolution_brief.get("biggest_regime_shift", {})
+    biggest_regime_shift = biggest_regime_shift if isinstance(biggest_regime_shift, dict) else {}
+    biggest_regime_shift_month = str(biggest_regime_shift.get("month", "")).strip()
+    biggest_regime_shift_role = ""
+    if str(biggest_regime_shift.get("dominant_archetype", "")).strip() == label:
+        biggest_regime_shift_role = "dominant_archetype"
+    elif str(biggest_regime_shift.get("previous_dominant_archetype", "")).strip() == label:
+        biggest_regime_shift_role = "previous_dominant_archetype"
+    elif str(biggest_regime_shift.get("top_share_gain_archetype", "")).strip() == label:
+        biggest_regime_shift_role = "top_share_gain_archetype"
+    elif str(biggest_regime_shift.get("top_share_loss_archetype", "")).strip() == label:
+        biggest_regime_shift_role = "top_share_loss_archetype"
+
+    most_seasonal = evolution_brief.get("most_seasonal_archetype", {})
+    most_seasonal = most_seasonal if isinstance(most_seasonal, dict) else {}
+    is_most_seasonal = str(most_seasonal.get("archetype_label", "")).strip() == label
+
+    seasonal_slice = pd.DataFrame(
+        [row for row in seasonal_rows if isinstance(row, dict) and str(row.get("archetype_label", "")).strip() == label]
+    )
+    peak_season = ""
+    peak_season_label = ""
+    peak_season_share = None
+    seasonality_gap = None
+    active_seasons: list[str] = []
+    if not seasonal_slice.empty:
+        seasonal_slice["archetype_share"] = pd.to_numeric(seasonal_slice.get("archetype_share"), errors="coerce")
+        season_profile = (
+            seasonal_slice.groupby("season", dropna=False)["archetype_share"]
+            .mean()
+            .reset_index(name="mean_share")
+            .sort_values(["mean_share", "season"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        season_label_profile = (
+            seasonal_slice.groupby(["season_label", "season"], dropna=False)["archetype_share"]
+            .mean()
+            .reset_index(name="mean_share")
+            .sort_values(["mean_share", "season_label"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        active_seasons = [str(item) for item in season_profile["season"].astype(str).tolist()]
+        if not season_profile.empty:
+            peak_row = season_profile.iloc[0]
+            peak_season = str(peak_row["season"])
+            peak_season_share = _native_value(peak_row["mean_share"])
+            if len(season_profile.index) > 1:
+                seasonality_gap = _native_value(float(season_profile.iloc[0]["mean_share"] - season_profile.iloc[-1]["mean_share"]))
+            else:
+                seasonality_gap = 0.0
+        if not season_label_profile.empty:
+            peak_season_label = str(season_label_profile.iloc[0]["season_label"])
+
+    top_cross_state = evolution_brief.get("top_cross_state_transition", {})
+    top_cross_state = top_cross_state if isinstance(top_cross_state, dict) else {}
+    from_label = str(top_cross_state.get("from_archetype", "")).strip()
+    to_label = str(top_cross_state.get("to_archetype", "")).strip()
+    top_cross_state_label = f"{from_label} -> {to_label}" if from_label or to_label else ""
+
+    return _native_value(
+        {
+            "available": True,
+            "archetype_label": label,
+            "regime_shift_months": sorted(dict.fromkeys(regime_shift_months)),
+            "dominant_months": sorted(dict.fromkeys(dominant_months)),
+            "top_share_gain_months": sorted(dict.fromkeys(top_share_gain_months)),
+            "top_share_loss_months": sorted(dict.fromkeys(top_share_loss_months)),
+            "biggest_regime_shift_month": biggest_regime_shift_month,
+            "biggest_regime_shift_role": biggest_regime_shift_role,
+            "is_most_seasonal_archetype": is_most_seasonal,
+            "peak_season": peak_season,
+            "peak_season_label": peak_season_label,
+            "peak_season_share": peak_season_share,
+            "seasonality_gap": seasonality_gap,
+            "active_seasons": active_seasons,
+            "top_cross_state_transition_label": top_cross_state_label,
+            "top_cross_state_transition_involved": label in {from_label, to_label} and bool(top_cross_state_label),
+        }
+    )
+
+
+def _annotate_policy_or_scenario(
+    record: dict[str, object],
+    *,
+    lifecycle_profile: dict[str, object],
+    target: str,
+) -> dict[str, object]:
+    if not record:
+        return record
+    profile = lifecycle_profile if isinstance(lifecycle_profile, dict) else {}
+    if not bool(profile.get("available")):
+        record["lifecycle_signals"] = []
+        record["lifecycle_annotation"] = ""
+        return record
+
+    label = str(profile.get("archetype_label", "")).strip()
+    biggest_shift_month = str(profile.get("biggest_regime_shift_month", "")).strip()
+    biggest_shift_role = str(profile.get("biggest_regime_shift_role", "")).strip()
+    regime_shift_months = [str(item) for item in profile.get("regime_shift_months", []) if str(item).strip()]
+    peak_season = str(profile.get("peak_season", "")).strip()
+    peak_season_label = str(profile.get("peak_season_label", "")).strip()
+    cross_state_label = str(profile.get("top_cross_state_transition_label", "")).strip()
+
+    signals: list[str] = []
+    notes: list[str] = []
+    if biggest_shift_role and biggest_shift_month:
+        if biggest_shift_role in {"dominant_archetype", "top_share_gain_archetype"}:
+            signals.append("biggest_regime_shift")
+            notes.append(f"`{label}` is directly involved in the biggest regime shift around `{biggest_shift_month}`.")
+        else:
+            signals.append("regime_shift_active")
+            notes.append(f"`{label}` is part of the biggest regime-shift handoff around `{biggest_shift_month}`.")
+    elif regime_shift_months:
+        signals.append("regime_shift_active")
+        preview = ", ".join(regime_shift_months[:3])
+        notes.append(f"`{label}` shows meaningful month-over-month movement in `{preview}`.")
+
+    if bool(profile.get("is_most_seasonal_archetype")) and peak_season:
+        signals.append("most_seasonal_archetype")
+        if peak_season_label:
+            notes.append(f"`{label}` is the most seasonal archetype and peaks in `{peak_season_label}`.")
+        else:
+            notes.append(f"`{label}` is the most seasonal archetype and peaks in `{peak_season}`.")
+    elif peak_season:
+        signals.append("seasonal_peak")
+        if peak_season_label:
+            notes.append(f"`{label}` peaks in `{peak_season_label}`.")
+        else:
+            notes.append(f"`{label}` peaks in `{peak_season}`.")
+
+    if bool(profile.get("top_cross_state_transition_involved")) and cross_state_label:
+        signals.append("cross_state_transition")
+        notes.append(f"It participates in the largest cross-state transition `{cross_state_label}`.")
+
+    if target == "policy":
+        if "biggest_regime_shift" in signals or "regime_shift_active" in signals:
+            notes.append("Re-check this policy first when taste mix shifts instead of treating the lane as static.")
+        if "most_seasonal_archetype" in signals or "seasonal_peak" in signals:
+            notes.append("Replay this policy near the seasonal peak before assuming year-round stability.")
+    else:
+        if "biggest_regime_shift" in signals or "regime_shift_active" in signals:
+            notes.append("Use this scenario first during regime-shift windows.")
+        if "most_seasonal_archetype" in signals or "seasonal_peak" in signals:
+            notes.append("Treat this as a calendar-aware scenario review, not only a generic stress slice.")
+
+    record["lifecycle_signals"] = signals
+    record["lifecycle_annotation"] = " ".join(notes)
+    return record
 
 
 def _select_model_recommendation(model_frontier: pd.DataFrame, role: str) -> dict[str, object]:
@@ -625,6 +866,10 @@ def _build_archetype_decision_bridge(
     scenario_sensitivity: pd.DataFrame,
 ) -> tuple[dict[str, Any], list[str]]:
     listener_context = _listener_archetype_context(output_dir)
+    lifecycle_context = listener_context.get("lifecycle", {})
+    lifecycle_context = lifecycle_context if isinstance(lifecycle_context, dict) else {}
+    evolution_brief = lifecycle_context.get("evolution_brief", {})
+    evolution_brief = evolution_brief if isinstance(evolution_brief, dict) else {}
     summary = [f"Latest quant decision anchor is `{run_dir.name}`."]
     if not listener_context["available"]:
         summary.append("Listener archetype outputs were not available, so archetype-specific bridge recommendations were skipped.")
@@ -641,6 +886,7 @@ def _build_archetype_decision_bridge(
                 "dominant_archetype": listener_context["dominant_archetype"],
                 "highest_skip_archetype": listener_context["highest_skip_archetype"],
                 "highest_exploration_archetype": listener_context["highest_exploration_archetype"],
+                "lifecycle_available": False,
             },
             "archetype_recommendations": [],
             "summary": summary,
@@ -659,6 +905,20 @@ def _build_archetype_decision_bridge(
 
     brief = listener_context["brief"]
     lookup = listener_context["archetype_lookup"]
+    if bool(lifecycle_context.get("available")):
+        biggest_shift = evolution_brief.get("biggest_regime_shift", {})
+        biggest_shift = biggest_shift if isinstance(biggest_shift, dict) else {}
+        most_seasonal = evolution_brief.get("most_seasonal_archetype", {})
+        most_seasonal = most_seasonal if isinstance(most_seasonal, dict) else {}
+        biggest_shift_month = str(biggest_shift.get("month", "")).strip()
+        if biggest_shift_month:
+            summary.append(f"Listener lifecycle shows the largest regime shift in `{biggest_shift_month}`.")
+        most_seasonal_label = str(most_seasonal.get("archetype_label", "")).strip()
+        peak_season = str(most_seasonal.get("peak_season", "")).strip()
+        if most_seasonal_label and peak_season:
+            summary.append(f"Most seasonal archetype is `{most_seasonal_label}`, peaking in `{peak_season}`.")
+    else:
+        summary.append("Listener lifecycle outputs were not available, so the bridge stays on steady-state archetype summaries only.")
     roles = [
         {
             "role": "dominant",
@@ -691,9 +951,18 @@ def _build_archetype_decision_bridge(
         label = str(role["archetype_label"]).strip()
         if not label:
             continue
+        lifecycle_profile = _archetype_lifecycle_profile(label, listener_context)
         model = _select_model_recommendation(model_frontier, str(role["role"]))
-        policy = _select_policy_recommendation(policy_frontier, str(role["role"]))
-        scenario = _select_scenario_focus(scenario_sensitivity, str(role["role"]))
+        policy = _annotate_policy_or_scenario(
+            _select_policy_recommendation(policy_frontier, str(role["role"])),
+            lifecycle_profile=lifecycle_profile,
+            target="policy",
+        )
+        scenario = _annotate_policy_or_scenario(
+            _select_scenario_focus(scenario_sensitivity, str(role["role"])),
+            lifecycle_profile=lifecycle_profile,
+            target="scenario",
+        )
         recommendation = {
             "role": role["role"],
             "title": role["title"],
@@ -702,6 +971,7 @@ def _build_archetype_decision_bridge(
             "archetype_metric_name": role["metric_name"],
             "archetype_metric_value": _native_value(role["metric_value"]),
             "archetype_details": lookup.get(label, {}),
+            "lifecycle_context": lifecycle_profile,
             "recommended_model": model,
             "recommended_policy": policy,
             "scenario_focus": scenario,
@@ -728,6 +998,11 @@ def _build_archetype_decision_bridge(
             "summary": _native_value(brief.get("summary", [])),
             "actions": _native_value(brief.get("actions", [])),
             "archetype_count": len(lookup),
+            "lifecycle_available": bool(lifecycle_context.get("available")),
+            "taste_evolution_summary": _native_value(evolution_brief.get("summary", [])),
+            "taste_evolution_actions": _native_value(evolution_brief.get("actions", [])),
+            "biggest_regime_shift": _native_value(evolution_brief.get("biggest_regime_shift", {})),
+            "most_seasonal_archetype": _native_value(evolution_brief.get("most_seasonal_archetype", {})),
         },
         "archetype_recommendations": recommendations,
         "summary": summary,
@@ -753,7 +1028,17 @@ def _build_archetype_decision_bridge(
                 f"- Archetype: `{recommendation.get('archetype_label', '')}` ({recommendation.get('archetype_metric_name', '')}: `{recommendation.get('archetype_metric_value', '')}`)",
                 f"- Model: `{model.get('model_name', '')}`. {model.get('selection_basis', '')}",
                 f"- Policy: `{policy.get('policy_name', '')}`. {policy.get('selection_basis', '')}",
+                (
+                    f"- Policy lifecycle: {policy.get('lifecycle_annotation', '')}"
+                    if str(policy.get("lifecycle_annotation", "")).strip()
+                    else ""
+                ),
                 f"- Scenario focus: `{scenario.get('scenario', '')}`. {scenario.get('selection_basis', '')}",
+                (
+                    f"- Scenario lifecycle: {scenario.get('lifecycle_annotation', '')}"
+                    if str(scenario.get("lifecycle_annotation", "")).strip()
+                    else ""
+                ),
                 "",
             ]
         )
@@ -765,6 +1050,413 @@ def _build_archetype_decision_bridge(
         ]
     )
     return payload, markdown
+
+
+def _bridge_alignment_for_combo(
+    *,
+    model_name: str,
+    policy_name: str,
+    scenario: str,
+    bridge_payload: dict[str, Any],
+) -> dict[str, object]:
+    recommendations = bridge_payload.get("archetype_recommendations", []) if isinstance(bridge_payload, dict) else []
+    if not isinstance(recommendations, list):
+        recommendations = []
+
+    best_score = 0.0
+    matched_roles: list[str] = []
+    matched_labels: list[str] = []
+    lifecycle_signals: list[str] = []
+    high_skip_context = False
+    high_skip_label = ""
+    high_skip_rate = float("nan")
+
+    for recommendation in recommendations:
+        if not isinstance(recommendation, dict):
+            continue
+        role = str(recommendation.get("role", "")).strip()
+        label = str(recommendation.get("archetype_label", "")).strip()
+        recommended_model = recommendation.get("recommended_model", {})
+        recommended_policy = recommendation.get("recommended_policy", {})
+        scenario_focus = recommendation.get("scenario_focus", {})
+        recommended_model = recommended_model if isinstance(recommended_model, dict) else {}
+        recommended_policy = recommended_policy if isinstance(recommended_policy, dict) else {}
+        scenario_focus = scenario_focus if isinstance(scenario_focus, dict) else {}
+
+        model_match = model_name == str(recommended_model.get("model_name", "")).strip()
+        policy_match = policy_name == str(recommended_policy.get("policy_name", "")).strip()
+        scenario_match = scenario == str(scenario_focus.get("scenario", "")).strip()
+        role_score = (0.30 if model_match else 0.0) + (0.35 if policy_match else 0.0) + (0.35 if scenario_match else 0.0)
+        best_score = max(best_score, role_score)
+        if role_score >= 0.65:
+            matched_roles.append(role)
+            matched_labels.append(label)
+
+        context_match = role_score >= 0.85 or scenario_match
+        if context_match:
+            for signal_source in [recommended_policy.get("lifecycle_signals", []), scenario_focus.get("lifecycle_signals", [])]:
+                if isinstance(signal_source, list):
+                    lifecycle_signals.extend(str(signal) for signal in signal_source)
+            if role == "high_skip":
+                high_skip_context = True
+                high_skip_label = label
+                high_skip_rate = _safe_float(recommendation.get("archetype_metric_value"))
+
+    lifecycle_drift_signals = {"biggest_regime_shift", "regime_shift_active", "cross_state_transition"}
+    return {
+        "bridge_alignment_score": best_score,
+        "matched_roles": matched_roles,
+        "matched_labels": matched_labels,
+        "lifecycle_signals": lifecycle_signals,
+        "lifecycle_drift_context": bool(lifecycle_drift_signals.intersection(set(lifecycle_signals))),
+        "high_skip_context": high_skip_context,
+        "high_skip_label": high_skip_label,
+        "high_skip_rate": high_skip_rate,
+    }
+
+
+def _build_scenario_utility_simulation(
+    *,
+    run_dir: Path,
+    model_frontier: pd.DataFrame,
+    policy_frontier: pd.DataFrame,
+    scenario_sensitivity: pd.DataFrame,
+    bridge_payload: dict[str, Any],
+    drift_summary: dict[str, object],
+) -> tuple[dict[str, Any], list[dict[str, object]], list[str], list[str]]:
+    columns = [
+        "rank",
+        "model_name",
+        "policy_name",
+        "scenario",
+        "utility_score",
+        "model_utility_component",
+        "policy_utility_component",
+        "scenario_resilience_component",
+        "safe_improvement_component",
+        "bridge_alignment_component",
+        "risk_penalty",
+        "model_frontier_status",
+        "policy_frontier_status",
+        "policy_family",
+        "model_test_top1",
+        "model_selective_risk",
+        "model_accepted_rate",
+        "policy_mean_skip_risk",
+        "policy_worst_skip_risk",
+        "scenario_pressure_score",
+        "scenario_baseline_skip_risk",
+        "scenario_best_safe_skip_risk",
+        "scenario_safe_skip_improvement",
+        "drift_jsd",
+        "archetype_roles",
+        "archetype_labels",
+        "lifecycle_signals",
+        "high_skip_context",
+        "high_drift_context",
+        "notes",
+    ]
+    weights = {
+        "model_frontier_utility": 0.38,
+        "policy_frontier_utility": 0.32,
+        "scenario_resilience": 0.15,
+        "archetype_bridge_alignment": 0.10,
+        "safe_skip_improvement": 0.05,
+    }
+    penalties = {
+        "non_safe_high_skip_policy": 0.05,
+        "non_safe_high_pressure_scenario": 0.04,
+        "incomplete_risk_under_drift": 0.03,
+        "elevated_selective_risk_under_drift": 0.03,
+    }
+    missing_inputs: list[str] = []
+    if model_frontier.empty:
+        missing_inputs.append("model_frontier")
+    if policy_frontier.empty:
+        missing_inputs.append("policy_frontier")
+    if scenario_sensitivity.empty:
+        missing_inputs.append("scenario_sensitivity")
+
+    target_drift = drift_summary.get("target_drift", {}) if isinstance(drift_summary.get("target_drift"), dict) else {}
+    drift_jsd = _safe_float(target_drift.get("train_vs_test_jsd"))
+    high_global_drift = math.isfinite(drift_jsd) and drift_jsd >= 0.20
+    score_formula = {
+        "description": "utility_score = weighted model utility + policy utility + scenario resilience + bridge alignment + safe-skip improvement - risk penalties",
+        "weights": weights,
+        "penalties": penalties,
+        "high_drift_jsd_threshold": 0.20,
+        "high_skip_thresholds": {
+            "policy_mean_skip_risk": 0.60,
+            "policy_worst_skip_risk": 0.65,
+            "scenario_baseline_skip_risk": 0.65,
+            "scenario_best_safe_skip_risk": 0.60,
+        },
+    }
+
+    if missing_inputs:
+        summary = [
+            f"Latest quant decision anchor is `{run_dir.name}`.",
+            f"Scenario utility simulation was skipped because these inputs were missing: `{', '.join(missing_inputs)}`.",
+        ]
+        payload = {
+            "status": "insufficient_inputs",
+            "run_id": run_dir.name,
+            "missing_inputs": missing_inputs,
+            "score_formula": score_formula,
+            "drift_jsd": _native_value(drift_jsd),
+            "row_count": 0,
+            "top_combinations": [],
+            "combinations": [],
+            "summary": summary,
+        }
+        markdown = [
+            "# Scenario Utility Simulation",
+            "",
+            *[f"- {line}" for line in summary],
+            "",
+            "## Formula",
+            "",
+            f"- {score_formula['description']}",
+        ]
+        return payload, [], markdown, columns
+
+    model_candidates = _prefer_efficient_rows(model_frontier).copy()
+    policy_candidates = _prefer_efficient_rows(policy_frontier).copy()
+    scenarios = scenario_sensitivity.copy()
+
+    model_candidate_source = (
+        "pareto_efficient" if "is_pareto_efficient" in model_frontier.columns and bool(model_frontier["is_pareto_efficient"].fillna(False).astype(bool).any()) else "all_available"
+    )
+    policy_candidate_source = (
+        "pareto_efficient" if "is_pareto_efficient" in policy_frontier.columns and bool(policy_frontier["is_pareto_efficient"].fillna(False).astype(bool).any()) else "all_available"
+    )
+
+    for column in ["utility_score", "test_top1", "test_selective_risk", "test_accepted_rate"]:
+        if column not in model_candidates.columns:
+            model_candidates[column] = np.nan
+        model_candidates[column] = pd.to_numeric(model_candidates[column], errors="coerce")
+    for column in ["utility_score", "mean_skip_risk", "worst_skip_risk", "mean_end_risk"]:
+        if column not in policy_candidates.columns:
+            policy_candidates[column] = np.nan
+        policy_candidates[column] = pd.to_numeric(policy_candidates[column], errors="coerce")
+    for column in [
+        "pressure_score",
+        "baseline_skip_risk",
+        "best_safe_skip_risk",
+        "safe_skip_improvement_vs_baseline",
+    ]:
+        if column not in scenarios.columns:
+            scenarios[column] = np.nan
+        scenarios[column] = pd.to_numeric(scenarios[column], errors="coerce")
+
+    scenarios["scenario_resilience_component"] = _normalize_series(scenarios["pressure_score"], higher_is_better=False).fillna(0.0)
+    scenarios["safe_improvement_component"] = _normalize_series(
+        scenarios["safe_skip_improvement_vs_baseline"],
+        higher_is_better=True,
+    ).fillna(0.0)
+    pressure_values = pd.to_numeric(scenarios["pressure_score"], errors="coerce")
+    high_pressure_threshold = float(pressure_values.quantile(0.75)) if pressure_values.notna().any() else float("nan")
+
+    rows: list[dict[str, object]] = []
+    model_candidates = model_candidates.sort_values(["utility_score", "test_top1"], ascending=[False, False], na_position="last")
+    policy_candidates = policy_candidates.sort_values(
+        ["utility_score", "mean_skip_risk", "mean_end_risk"],
+        ascending=[False, True, True],
+        na_position="last",
+    )
+    scenarios = scenarios.sort_values(["pressure_score", "baseline_skip_risk"], ascending=[False, False], na_position="last")
+
+    for _, model in model_candidates.iterrows():
+        model_name = str(model.get("model_name", "")).strip()
+        model_component = _bounded_unit_score(model.get("utility_score"))
+        model_selective_risk = _safe_float(model.get("test_selective_risk"))
+        model_risk_complete = bool(model.get("risk_complete", False))
+        for _, policy in policy_candidates.iterrows():
+            policy_name = str(policy.get("policy_name", "")).strip()
+            policy_family = str(policy.get("policy_family", "")).strip()
+            policy_component = _bounded_unit_score(policy.get("utility_score"))
+            policy_skip = _safe_float(policy.get("mean_skip_risk"))
+            policy_worst_skip = _safe_float(policy.get("worst_skip_risk"))
+            for _, scenario_row in scenarios.iterrows():
+                scenario_name = str(scenario_row.get("scenario", "")).strip()
+                scenario_resilience = _bounded_unit_score(scenario_row.get("scenario_resilience_component"))
+                safe_improvement = _bounded_unit_score(scenario_row.get("safe_improvement_component"))
+                pressure_score = _safe_float(scenario_row.get("pressure_score"))
+                baseline_skip = _safe_float(scenario_row.get("baseline_skip_risk"))
+                best_safe_skip = _safe_float(scenario_row.get("best_safe_skip_risk"))
+                scenario_high_pressure = (
+                    math.isfinite(pressure_score)
+                    and math.isfinite(high_pressure_threshold)
+                    and pressure_score >= high_pressure_threshold
+                    and pressure_score > 0.0
+                )
+                alignment = _bridge_alignment_for_combo(
+                    model_name=model_name,
+                    policy_name=policy_name,
+                    scenario=scenario_name,
+                    bridge_payload=bridge_payload,
+                )
+                bridge_component = _bounded_unit_score(alignment.get("bridge_alignment_score"))
+                lifecycle_signals = [
+                    str(signal)
+                    for signal in alignment.get("lifecycle_signals", [])
+                    if str(signal).strip()
+                ]
+                high_skip_context = bool(alignment.get("high_skip_context")) or (
+                    math.isfinite(policy_skip) and policy_skip >= 0.60
+                ) or (
+                    math.isfinite(policy_worst_skip) and policy_worst_skip >= 0.65
+                ) or (
+                    math.isfinite(baseline_skip) and baseline_skip >= 0.65
+                ) or (
+                    math.isfinite(best_safe_skip) and best_safe_skip >= 0.60
+                )
+                lifecycle_drift_context = bool(alignment.get("lifecycle_drift_context"))
+                high_drift_context = high_global_drift or lifecycle_drift_context
+
+                risk_penalty = 0.0
+                if high_skip_context and policy_family != "safe":
+                    risk_penalty += penalties["non_safe_high_skip_policy"]
+                if scenario_high_pressure and policy_family != "safe":
+                    risk_penalty += penalties["non_safe_high_pressure_scenario"]
+                if high_drift_context and not model_risk_complete:
+                    risk_penalty += penalties["incomplete_risk_under_drift"]
+                if high_drift_context and math.isfinite(model_selective_risk) and model_selective_risk > 0.45:
+                    risk_penalty += penalties["elevated_selective_risk_under_drift"]
+
+                utility_score = (
+                    weights["model_frontier_utility"] * model_component
+                    + weights["policy_frontier_utility"] * policy_component
+                    + weights["scenario_resilience"] * scenario_resilience
+                    + weights["archetype_bridge_alignment"] * bridge_component
+                    + weights["safe_skip_improvement"] * safe_improvement
+                    - risk_penalty
+                )
+                utility_score = min(1.0, max(0.0, utility_score))
+
+                notes: list[str] = []
+                matched_roles = [str(role) for role in alignment.get("matched_roles", []) if str(role).strip()]
+                matched_labels = [str(label) for label in alignment.get("matched_labels", []) if str(label).strip()]
+                if matched_roles:
+                    notes.append(f"Bridge alignment with `{_join_unique(matched_roles)}` archetype lane(s).")
+                if high_skip_context:
+                    skip_label = str(alignment.get("high_skip_label", "")).strip()
+                    skip_rate = _safe_float(alignment.get("high_skip_rate"))
+                    if skip_label and math.isfinite(skip_rate):
+                        notes.append(f"High-skip bridge context: `{skip_label}` skip rate `{skip_rate:.3f}`; keep skip-risk guardrails visible.")
+                    else:
+                        notes.append("High-skip operating context: skip risk is elevated in the policy or scenario slice.")
+                if high_global_drift and math.isfinite(drift_jsd):
+                    notes.append(f"High-drift context: target drift JSD `{drift_jsd:.3f}`; refresh calibration before promotion.")
+                if lifecycle_drift_context:
+                    notes.append(f"Lifecycle drift context: `{_join_unique(lifecycle_signals)}` signal(s) from the archetype bridge.")
+                if scenario_high_pressure:
+                    notes.append("Scenario pressure is in the top quartile; review stress losses before rollout.")
+                if risk_penalty > 0:
+                    notes.append(f"Risk penalty `{risk_penalty:.2f}` applied for non-safe policy or drift-sensitive model risk.")
+
+                rows.append(
+                    {
+                        "rank": 0,
+                        "model_name": model_name,
+                        "policy_name": policy_name,
+                        "scenario": scenario_name,
+                        "utility_score": round(utility_score, 6),
+                        "model_utility_component": round(model_component, 6),
+                        "policy_utility_component": round(policy_component, 6),
+                        "scenario_resilience_component": round(scenario_resilience, 6),
+                        "safe_improvement_component": round(safe_improvement, 6),
+                        "bridge_alignment_component": round(bridge_component, 6),
+                        "risk_penalty": round(risk_penalty, 6),
+                        "model_frontier_status": _native_value(model.get("frontier_status")),
+                        "policy_frontier_status": _native_value(policy.get("frontier_status")),
+                        "policy_family": policy_family,
+                        "model_test_top1": _native_value(model.get("test_top1")),
+                        "model_selective_risk": _native_value(model.get("test_selective_risk")),
+                        "model_accepted_rate": _native_value(model.get("test_accepted_rate")),
+                        "policy_mean_skip_risk": _native_value(policy.get("mean_skip_risk")),
+                        "policy_worst_skip_risk": _native_value(policy.get("worst_skip_risk")),
+                        "scenario_pressure_score": _native_value(scenario_row.get("pressure_score")),
+                        "scenario_baseline_skip_risk": _native_value(scenario_row.get("baseline_skip_risk")),
+                        "scenario_best_safe_skip_risk": _native_value(scenario_row.get("best_safe_skip_risk")),
+                        "scenario_safe_skip_improvement": _native_value(scenario_row.get("safe_skip_improvement_vs_baseline")),
+                        "drift_jsd": _native_value(drift_jsd),
+                        "archetype_roles": _join_unique(matched_roles),
+                        "archetype_labels": _join_unique(matched_labels),
+                        "lifecycle_signals": _join_unique(lifecycle_signals),
+                        "high_skip_context": high_skip_context,
+                        "high_drift_context": high_drift_context,
+                        "notes": " ".join(notes),
+                    }
+                )
+
+    simulation_frame = pd.DataFrame(rows)
+    if not simulation_frame.empty:
+        simulation_frame = simulation_frame.sort_values(
+            [
+                "utility_score",
+                "bridge_alignment_component",
+                "model_utility_component",
+                "policy_utility_component",
+                "scenario_resilience_component",
+            ],
+            ascending=[False, False, False, False, False],
+        ).reset_index(drop=True)
+        simulation_frame["rank"] = np.arange(1, len(simulation_frame.index) + 1)
+        rows = [_native_value(row) for row in simulation_frame[columns].to_dict(orient="records")]
+
+    top_rows = rows[:10]
+    top = top_rows[0] if top_rows else {}
+    summary = [
+        f"Latest quant decision anchor is `{run_dir.name}`.",
+        f"Simulated `{len(rows)}` model / policy / scenario combinations using `{model_candidate_source}` model rows and `{policy_candidate_source}` policy rows.",
+    ]
+    if top:
+        summary.append(
+            f"Top simulated combo is model `{top.get('model_name', '')}`, policy `{top.get('policy_name', '')}`, scenario `{top.get('scenario', '')}` at utility `{_safe_float(top.get('utility_score')):.3f}`."
+        )
+    if high_global_drift and math.isfinite(drift_jsd):
+        summary.append(f"High target drift is active at JSD `{drift_jsd:.3f}`, so drift-sensitive notes are attached to candidate rows.")
+
+    payload = {
+        "status": "ok",
+        "run_id": run_dir.name,
+        "candidate_strategy": {
+            "models": model_candidate_source,
+            "policies": policy_candidate_source,
+            "scenarios": "all_sensitivity_rows",
+        },
+        "score_formula": score_formula,
+        "drift_jsd": _native_value(drift_jsd),
+        "row_count": len(rows),
+        "top_combinations": top_rows,
+        "combinations": rows,
+        "summary": summary,
+    }
+
+    markdown = [
+        "# Scenario Utility Simulation",
+        "",
+        *[f"- {line}" for line in summary],
+        "",
+        "## Formula",
+        "",
+        f"- {score_formula['description']}",
+        f"- Weights: model `{weights['model_frontier_utility']:.2f}`, policy `{weights['policy_frontier_utility']:.2f}`, scenario resilience `{weights['scenario_resilience']:.2f}`, bridge alignment `{weights['archetype_bridge_alignment']:.2f}`, safe skip improvement `{weights['safe_skip_improvement']:.2f}`.",
+        "",
+        "## Top Combinations",
+        "",
+        "| Rank | Model | Policy | Scenario | Utility | Context Notes |",
+        "| ---: | --- | --- | --- | ---: | --- |",
+    ]
+    for row in top_rows[:8]:
+        notes = str(row.get("notes", "")).replace("|", "/")
+        markdown.append(
+            f"| {row.get('rank', '')} | `{row.get('model_name', '')}` | `{row.get('policy_name', '')}` | `{row.get('scenario', '')}` | `{_safe_float(row.get('utility_score')):.3f}` | {notes} |"
+        )
+    if not top_rows:
+        markdown.append("|  |  |  |  |  | No combinations were available. |")
+    return payload, rows, markdown, columns
 
 
 def _brief_lines(
@@ -927,6 +1619,24 @@ def build_quant_decision_lab(
     )
     paths.append(write_json(output_root / "archetype_decision_bridge.json", bridge_payload))
     paths.append(write_markdown(output_root / "archetype_decision_bridge.md", bridge_markdown))
+
+    simulation_payload, simulation_rows, simulation_markdown, simulation_columns = _build_scenario_utility_simulation(
+        run_dir=resolved_run_dir,
+        model_frontier=model_frontier,
+        policy_frontier=policy_frontier,
+        scenario_sensitivity=scenario_sensitivity,
+        bridge_payload=bridge_payload,
+        drift_summary=drift_summary if isinstance(drift_summary, dict) else {},
+    )
+    paths.append(
+        _write_csv(
+            output_root / "scenario_utility_simulation.csv",
+            simulation_rows,
+            simulation_columns,
+        )
+    )
+    paths.append(write_json(output_root / "scenario_utility_simulation.json", simulation_payload))
+    paths.append(write_markdown(output_root / "scenario_utility_simulation.md", simulation_markdown))
 
     brief_payload, brief_markdown = _brief_lines(
         run_dir=resolved_run_dir,

@@ -360,3 +360,239 @@ def test_build_creator_market_intelligence_counts_complete_and_partial_families(
     assert manifest_payload["partial_report_family_count"] == 1
     assert manifest_payload["partial_report_family_ids"] == [partial_family]
     assert brief_payload["report_family_count"] == 2
+
+
+def test_build_creator_market_intelligence_writes_multi_family_trend_deltas(tmp_path: Path) -> None:
+    logger = _logger()
+    root = tmp_path / "outputs" / "analysis" / "public_spotify" / "creator_label_intelligence"
+    early_family = "creator_label_intelligence_alpha-family"
+    late_family = "creator_label_intelligence_beta-family"
+
+    _write_json(
+        root / f"{early_family}_report_family.json",
+        {
+            "primary_report": "alpha.md",
+            "packaging_metadata": {"normalized_at": "2026-01-01T00:00:00+00:00"},
+        },
+    )
+    _write_json(
+        root / f"{late_family}_report_family.json",
+        {
+            "primary_report": "beta.md",
+            "packaging_metadata": {"normalized_at": "2026-02-01T00:00:00+00:00"},
+        },
+    )
+    _write_csv(
+        root / f"{early_family}_scene_comparison.csv",
+        [
+            {
+                "scene_id": 2,
+                "scene_name": "scene-neon",
+                "scene_local_play_share": 0.10,
+                "avg_opportunity_score": 0.20,
+                "priority_now_count": 1,
+                "watchlist_count": 0,
+                "scene_release_pressure": 0.05,
+                "scene_label_concentration": 0.10,
+                "top_opportunity_artist": "Artist Early",
+                "top_opportunity_score": 0.20,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{late_family}_scene_comparison.csv",
+        [
+            {
+                "scene_id": 2,
+                "scene_name": "scene-neon",
+                "scene_local_play_share": 0.35,
+                "avg_opportunity_score": 0.42,
+                "priority_now_count": 4,
+                "watchlist_count": 1,
+                "scene_release_pressure": 0.20,
+                "scene_label_concentration": 0.08,
+                "top_opportunity_artist": "Artist Late",
+                "top_opportunity_score": 0.55,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{early_family}_opportunities.csv",
+        [
+            {
+                "artist_name": "Lane Artist Early",
+                "scene_name": "scene-neon",
+                "primary_driver": "seed_adjacency",
+                "opportunity_band": "watchlist",
+                "opportunity_score": 0.30,
+                "scene_local_play_share": 0.10,
+                "scene_release_pressure": 0.05,
+                "scene_label_concentration": 0.10,
+                "fan_migration_score": 0.40,
+                "release_whitespace_score": 0.20,
+                "local_gap_score": 0.20,
+                "scene_momentum_score": 0.30,
+                "connected_seed_artists": json.dumps(["Seed Early"]),
+                "dominant_release_labels": json.dumps(["Indie"]),
+                "days_since_latest_release": 30,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{late_family}_opportunities.csv",
+        [
+            {
+                "artist_name": "Lane Artist Late",
+                "scene_name": "scene-neon",
+                "primary_driver": "seed_adjacency",
+                "opportunity_band": "priority_now",
+                "opportunity_score": 0.55,
+                "scene_local_play_share": 0.35,
+                "scene_release_pressure": 0.20,
+                "scene_label_concentration": 0.08,
+                "fan_migration_score": 0.65,
+                "release_whitespace_score": 0.60,
+                "local_gap_score": 0.45,
+                "scene_momentum_score": 0.70,
+                "connected_seed_artists": json.dumps(["Seed Late"]),
+                "dominant_release_labels": json.dumps(["Indie"]),
+                "days_since_latest_release": 240,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{early_family}_migration_watch.csv",
+        [
+            {
+                "source_artist": "Route Source",
+                "target_artist": "Route Target",
+                "source_scene_id": 2,
+                "target_scene_id": 2,
+                "source_out_share": 0.20,
+                "target_in_share": 0.15,
+                "transition_count": 25,
+            }
+        ],
+    )
+    _write_csv(
+        root / f"{late_family}_migration_watch.csv",
+        [
+            {
+                "source_artist": "Route Source",
+                "target_artist": "Route Target",
+                "source_scene_id": 2,
+                "target_scene_id": 2,
+                "source_out_share": 0.36,
+                "target_in_share": 0.31,
+                "transition_count": 80,
+            }
+        ],
+    )
+
+    paths = build_creator_market_intelligence(output_dir=tmp_path / "outputs", logger=logger)
+
+    output_root = tmp_path / "outputs" / "analysis" / "creator_market_intelligence"
+    trend_csv = output_root / "creator_market_trend_deltas.csv"
+    trend_json = output_root / "creator_market_trend_deltas.json"
+    trend_md = output_root / "creator_market_trend_deltas.md"
+    trend_deltas = pd.read_csv(trend_csv)
+    manifest_payload = json.loads((output_root / "creator_market_manifest.json").read_text(encoding="utf-8"))
+    brief_payload = json.loads((output_root / "creator_market_brief.json").read_text(encoding="utf-8"))
+    markdown_text = trend_md.read_text(encoding="utf-8")
+
+    assert trend_csv in paths
+    assert trend_json in paths
+    assert trend_md in paths
+    assert set(trend_deltas["signal_type"]) >= {
+        "rising_scene",
+        "repeated_opportunity_lane",
+        "repeated_migration_route",
+        "stale_release_whitespace",
+    }
+    rising_scene = trend_deltas.loc[trend_deltas["signal_type"].eq("rising_scene")].iloc[0]
+    assert rising_scene["scene_name"] == "scene-neon"
+    assert rising_scene["first_report_family_id"] == early_family
+    assert rising_scene["latest_report_family_id"] == late_family
+    assert float(rising_scene["delta_value"]) > 0.0
+
+    repeated_lane = trend_deltas.loc[trend_deltas["signal_type"].eq("repeated_opportunity_lane")].iloc[0]
+    assert repeated_lane["signal_key"] == "scene-neon / seed_adjacency"
+    assert int(repeated_lane["family_count"]) == 2
+
+    repeated_route = trend_deltas.loc[trend_deltas["signal_type"].eq("repeated_migration_route")].iloc[0]
+    assert repeated_route["signal_key"] == "Route Source -> Route Target"
+    assert int(repeated_route["family_count"]) == 2
+
+    stale_release = trend_deltas.loc[trend_deltas["signal_type"].eq("stale_release_whitespace")].iloc[0]
+    assert stale_release["signal_key"] == "Lane Artist Late"
+    assert float(stale_release["latest_value"]) == 240.0
+
+    assert len(json.loads(trend_json.read_text(encoding="utf-8"))) == len(trend_deltas.index)
+    assert manifest_payload["tables"]["creator_market_trend_deltas"]["row_count"] == len(trend_deltas.index)
+    assert manifest_payload["tables"]["creator_market_trend_deltas"]["markdown_path"] == str(trend_md)
+    assert brief_payload["trend_delta_counts"]["rising_scene"] == 1
+    assert "Rising Scenes" in markdown_text
+    assert "Repeated Migration Routes" in markdown_text
+
+
+def test_build_creator_market_intelligence_flags_sparse_release_metadata(tmp_path: Path) -> None:
+    logger = _logger()
+    root = tmp_path / "outputs" / "analysis" / "public_spotify" / "creator_label_intelligence"
+    family_a = "creator_label_intelligence_sparse-a"
+    family_b = "creator_label_intelligence_sparse-b"
+
+    _write_json(
+        root / f"{family_a}_report_family.json",
+        {
+            "primary_report": "sparse-a.md",
+            "packaging_metadata": {"normalized_at": "2026-01-01T00:00:00+00:00"},
+        },
+    )
+    _write_json(
+        root / f"{family_b}_report_family.json",
+        {
+            "primary_report": "sparse-b.md",
+            "packaging_metadata": {"normalized_at": "2026-01-02T00:00:00+00:00"},
+        },
+    )
+    for family_id, artist_name in [(family_a, "Sparse Artist A"), (family_b, "Sparse Artist B")]:
+        _write_csv(
+            root / f"{family_id}_opportunities.csv",
+            [
+                {
+                    "artist_name": artist_name,
+                    "scene_name": "scene-sparse",
+                    "primary_driver": "release_whitespace",
+                    "opportunity_band": "watchlist",
+                    "opportunity_score": 0.22,
+                    "scene_local_play_share": 0.10,
+                    "scene_release_pressure": 0.05,
+                    "scene_label_concentration": 0.10,
+                    "fan_migration_score": 0.20,
+                    "release_whitespace_score": 0.0,
+                    "local_gap_score": 0.15,
+                    "scene_momentum_score": 0.20,
+                    "connected_seed_artists": json.dumps([]),
+                    "dominant_release_labels": json.dumps([]),
+                    "days_since_latest_release": "",
+                }
+            ],
+        )
+
+    build_creator_market_intelligence(output_dir=tmp_path / "outputs", logger=logger)
+
+    output_root = tmp_path / "outputs" / "analysis" / "creator_market_intelligence"
+    trend_deltas = pd.read_csv(output_root / "creator_market_trend_deltas.csv")
+    whitespace_atlas = pd.read_csv(output_root / "release_whitespace_atlas.csv")
+    markdown_text = (output_root / "creator_market_trend_deltas.md").read_text(encoding="utf-8")
+
+    sparse_rows = trend_deltas.loc[trend_deltas["signal_type"].eq("sparse_release_whitespace_coverage")]
+    assert len(sparse_rows.index) == 1
+    sparse_row = sparse_rows.iloc[0]
+    assert sparse_row["signal_key"] == "release_metadata_coverage"
+    assert float(sparse_row["coverage_ratio"]) == 0.0
+    assert int(sparse_row["metadata_row_count"]) == 0
+    assert int(sparse_row["opportunity_row_count"]) == 2
+    assert sparse_row["severity"] == "high"
+    assert whitespace_atlas.empty
+    assert "coverage `0.000`" in markdown_text

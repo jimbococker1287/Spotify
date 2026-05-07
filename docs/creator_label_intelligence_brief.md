@@ -76,6 +76,7 @@ python -m spotify.public_insights creator-label-intelligence \
 - Keep the command nested under `spotify.public_insights`.
 - Package the outputs as a standalone report family under `outputs/analysis/public_spotify/creator_label_intelligence/`.
 - Normalize `*_report_family.json` around actual markdown and CSV artifacts so the opportunity-lane and scene-strategy surfaces can be re-anchored even when older families used legacy filenames.
+- Re-anchor stale absolute paths by basename when the referenced files still exist inside the current report-family directory, so moved workspaces can be repaired locally.
 - Record packaging freshness in the report-family manifest via `packaging_metadata`, including refresh anchors for `opportunity_lane_comparison` and `scene_strategy_watch`.
 
 ## Operator Rule

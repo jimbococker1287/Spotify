@@ -6,6 +6,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,7 @@ from .run_artifacts import write_markdown
 
 _READY_STATUSES = {"analysis_ready", "submission_candidate"}
 _REVIEW_READY_STATUSES = {"ready", "n/a"}
+_GAP_STATUSES = {"gap", "missing", "attention", "blocked", "incomplete", "stale"}
 
 
 def _safe_float(value: object) -> float:
@@ -32,6 +34,81 @@ def _safe_float(value: object) -> float:
     if not math.isfinite(out):
         return float("nan")
     return out
+
+
+def _finite_or_none(value: object) -> float | None:
+    metric = _safe_float(value)
+    return metric if math.isfinite(metric) else None
+
+
+def _safe_int(value: object) -> int:
+    metric = _safe_float(value)
+    return int(metric) if math.isfinite(metric) else 0
+
+
+def _format_metric(value: object) -> str:
+    metric = _safe_float(value)
+    return f"{metric:.3f}" if math.isfinite(metric) else "n/a"
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if not math.isfinite(float(value)) else float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    return value
+
+
+def _parse_json_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    if not str(value).strip():
+        return []
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def _parse_json_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if not str(value).strip():
+        return {}
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_") or "experiment"
+
+
+def _status_is_gap(value: object) -> bool:
+    normalized = str(value).strip().lower()
+    return bool(normalized and normalized in _GAP_STATUSES)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, np.bool_):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    return normalized in {"1", "true", "yes", "y"}
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> Path:
@@ -666,6 +743,481 @@ def _build_maturity_brief(
     return payload, markdown_lines
 
 
+def _select_anchor_registry_row(run_registry: pd.DataFrame) -> dict[str, object]:
+    if run_registry.empty:
+        return {}
+    if "claim_pack_attached" in run_registry.columns:
+        attached = run_registry.loc[run_registry["claim_pack_attached"].map(_truthy)]
+        if not attached.empty:
+            return attached.iloc[0].to_dict()
+    return run_registry.iloc[0].to_dict()
+
+
+def _select_benchmark_planner_row(benchmark_atlas: pd.DataFrame) -> dict[str, object]:
+    if benchmark_atlas.empty:
+        return {}
+    rows = [row.to_dict() for _, row in benchmark_atlas.iterrows()]
+    incomplete = [
+        row
+        for row in rows
+        if str(row.get("comparison_status", "")).strip().lower() != "ready"
+        or not _truthy(row.get("comparison_ready", False))
+    ]
+    deep_incomplete = [
+        row
+        for row in incomplete
+        if not _truthy(row.get("deep_comparator_ready", False))
+        or "deep comparator" in str(row.get("top_comparison_blocker", "")).lower()
+    ]
+    return (deep_incomplete or incomplete or rows)[0]
+
+
+def _claim_planner_text(row: dict[str, object], missing_checks: list[object]) -> str:
+    parts = [
+        row.get("claim_key", ""),
+        row.get("title", ""),
+        row.get("summary", ""),
+        row.get("next_gate", ""),
+        *missing_checks,
+    ]
+    return " ".join(str(item).strip().lower() for item in parts if str(item).strip())
+
+
+def _claim_gap_fields(row: dict[str, object]) -> list[str]:
+    fields = [
+        "live_signal_status",
+        "benchmark_evidence_status",
+        "repeated_evidence_status",
+        "slice_evidence_status",
+        "risk_evidence_status",
+        "artifact_pack_status",
+        "supporting_artifact_path_status",
+        "supporting_artifact_freshness_status",
+    ]
+    return [field for field in fields if _status_is_gap(row.get(field, ""))]
+
+
+def _experiment_priority(score: float) -> str:
+    if score >= 115.0:
+        return "critical"
+    if score >= 95.0:
+        return "high"
+    if score >= 75.0:
+        return "medium"
+    return "watch"
+
+
+def _experiment_score(base: float, row: dict[str, object], gap_fields: list[str]) -> float:
+    role_bonus = 12.0 if str(row.get("role", "")).strip().lower() == "primary" else 0.0
+    blocked_bonus = 10.0 if str(row.get("claim_readiness_status", "")).strip().lower() == "blocked" else 0.0
+    missing_bonus = min(8.0, 2.0 * _safe_int(row.get("missing_check_count")))
+    gap_bonus = min(8.0, 1.5 * len(gap_fields))
+    artifact_bonus = 3.0 if _safe_int(row.get("stale_supporting_artifact_count")) else 0.0
+    return round(base + role_bonus + blocked_bonus + missing_bonus + gap_bonus + artifact_bonus, 2)
+
+
+def _experiment_inputs(
+    *,
+    row: dict[str, object],
+    benchmark_row: dict[str, object],
+    anchor_row: dict[str, object],
+    missing_checks: list[object],
+) -> dict[str, object]:
+    return _json_ready(
+        {
+            "research_claim_registry": {
+                "claim_readiness_status": str(row.get("claim_readiness_status", "")).strip(),
+                "benchmark_evidence_status": str(row.get("benchmark_evidence_status", "")).strip(),
+                "repeated_evidence_status": str(row.get("repeated_evidence_status", "")).strip(),
+                "risk_evidence_status": str(row.get("risk_evidence_status", "")).strip(),
+                "artifact_pack_status": str(row.get("artifact_pack_status", "")).strip(),
+                "next_gate": str(row.get("next_gate", "")).strip(),
+                "missing_checks": [str(item).strip() for item in missing_checks if str(item).strip()][:5],
+            },
+            "benchmark_lock_atlas": {
+                "benchmark_id": str(benchmark_row.get("benchmark_id", "")).strip(),
+                "comparison_status": str(benchmark_row.get("comparison_status", "")).strip(),
+                "deep_comparator_ready": _truthy(benchmark_row.get("deep_comparator_ready", False)),
+                "run_count": _safe_int(benchmark_row.get("run_count")),
+                "top_comparison_blocker": str(benchmark_row.get("top_comparison_blocker", "")).strip(),
+                "manifest_freshness_status": str(benchmark_row.get("manifest_freshness_status", "")).strip(),
+            }
+            if benchmark_row
+            else {},
+            "run_research_registry": {
+                "run_id": str(anchor_row.get("run_id", "")).strip(),
+                "research_stage": str(anchor_row.get("research_stage", "")).strip(),
+                "portability_signal_status": str(anchor_row.get("portability_signal_status", "")).strip(),
+                "test_selective_risk": _finite_or_none(anchor_row.get("test_selective_risk")),
+                "test_abstention_rate": _finite_or_none(anchor_row.get("test_abstention_rate")),
+                "ops_coverage_ratio": _finite_or_none(anchor_row.get("ops_coverage_ratio")),
+            }
+            if anchor_row
+            else {},
+        }
+    )
+
+
+def _experiment_record(
+    *,
+    row: dict[str, object],
+    experiment_type: str,
+    title: str,
+    base_score: float,
+    gap_fields: list[str],
+    missing_checks: list[object],
+    benchmark_row: dict[str, object],
+    anchor_row: dict[str, object],
+    why: str,
+    recommended_experiment: str,
+    success_criteria: list[str],
+    expected_artifacts: list[object],
+    triggered_by: list[str],
+) -> dict[str, object]:
+    score = _experiment_score(base_score, row, gap_fields)
+    claim_key = str(row.get("claim_key", "")).strip() or "unknown_claim"
+    artifacts = [str(item).strip() for item in expected_artifacts if str(item).strip()]
+    return _json_ready(
+        {
+            "rank": 0,
+            "experiment_id": _slug(f"{claim_key}_{experiment_type}"),
+            "experiment_type": experiment_type,
+            "priority": _experiment_priority(score),
+            "rank_score": score,
+            "claim_key": claim_key,
+            "claim_title": str(row.get("title", "")).strip(),
+            "claim_role": str(row.get("role", "")).strip(),
+            "current_status": str(row.get("status", "")).strip(),
+            "current_readiness": str(row.get("claim_readiness_status", "")).strip(),
+            "target_status": "analysis_ready",
+            "next_gate": str(row.get("next_gate", "")).strip(),
+            "gaps_addressed": gap_fields,
+            "triggered_by": triggered_by,
+            "title": title,
+            "why": why,
+            "recommended_experiment": recommended_experiment,
+            "success_criteria": success_criteria,
+            "expected_artifacts": artifacts,
+            "inputs_consumed": _experiment_inputs(
+                row=row,
+                benchmark_row=benchmark_row,
+                anchor_row=anchor_row,
+                missing_checks=missing_checks,
+            ),
+        }
+    )
+
+
+def _build_next_experiment_plan(
+    *,
+    run_registry: pd.DataFrame,
+    benchmark_atlas: pd.DataFrame,
+    claim_registry: pd.DataFrame,
+) -> tuple[dict[str, Any], list[str]]:
+    anchor_row = _select_anchor_registry_row(run_registry)
+    benchmark_row = _select_benchmark_planner_row(benchmark_atlas)
+    claim_rows = [row.to_dict() for _, row in claim_registry.iterrows()] if not claim_registry.empty else []
+    blocked_claims = [
+        row
+        for row in claim_rows
+        if _truthy(row.get("blocked", False))
+        or str(row.get("claim_readiness_status", "")).strip().lower() == "blocked"
+    ]
+
+    experiments: list[dict[str, object]] = []
+    for row in blocked_claims:
+        missing_checks = _parse_json_list(row.get("missing_checks_json", "[]"))
+        metrics = _parse_json_dict(row.get("metrics_json", "{}"))
+        claim_key = str(row.get("claim_key", "")).strip()
+        claim_text = _claim_planner_text(row, missing_checks)
+        gap_fields = _claim_gap_fields(row)
+        triggered_base = [
+            f"{field}={str(row.get(field, '')).strip()}"
+            for field in gap_fields
+            if str(row.get(field, "")).strip()
+        ]
+        if _safe_int(row.get("missing_check_count")):
+            triggered_base.append(f"missing_check_count={_safe_int(row.get('missing_check_count'))}")
+
+        benchmark_status = str(benchmark_row.get("comparison_status", "")).strip().lower()
+        benchmark_needs_deep = bool(
+            benchmark_row
+            and (
+                benchmark_status != "ready"
+                or not _truthy(benchmark_row.get("deep_comparator_ready", False))
+                or "deep comparator" in str(benchmark_row.get("top_comparison_blocker", "")).lower()
+            )
+        )
+        benchmark_claim_gap = (
+            claim_key == "candidate_ranking"
+            or _status_is_gap(row.get("benchmark_evidence_status", ""))
+            or _status_is_gap(row.get("repeated_evidence_status", ""))
+            or ("benchmark_comparison_ready" in metrics and not _truthy(metrics.get("benchmark_comparison_ready", False)))
+        )
+        if benchmark_claim_gap and (
+            benchmark_needs_deep
+            or "deep comparator" in claim_text
+            or "benchmark lock" in claim_text
+            or "repeated-seed" in claim_text
+            or "repeated seed" in claim_text
+        ):
+            benchmark_id = str(benchmark_row.get("benchmark_id", "")).strip() or "current_lock"
+            target_runs = max(3, _safe_int(benchmark_row.get("run_count")))
+            experiments.append(
+                _experiment_record(
+                    row=row,
+                    experiment_type="deep_comparator_benchmark_coverage",
+                    title="Add repeated deep-comparator benchmark coverage",
+                    base_score=100.0,
+                    gap_fields=gap_fields,
+                    missing_checks=missing_checks,
+                    benchmark_row=benchmark_row,
+                    anchor_row=anchor_row,
+                    why=(
+                        f"`{claim_key}` is blocked by benchmark/comparator evidence while lock `{benchmark_id}` "
+                        f"is `{str(benchmark_row.get('comparison_status', 'missing')).strip() or 'missing'}` "
+                        f"with deep_comparator_ready `{_truthy(benchmark_row.get('deep_comparator_ready', False))}`."
+                    ),
+                    recommended_experiment=(
+                        f"Rerun benchmark lock `{benchmark_id}` with a repeated direct-softmax/deep comparator and the candidate "
+                        f"surface for at least `{target_runs}` manifest-backed runs, then regenerate the lock summary, "
+                        "significance table, manifest, and claim pack."
+                    ),
+                    success_criteria=[
+                        "Benchmark atlas reports `comparison_status=ready` for the selected lock.",
+                        f"Summary includes a deep comparator and candidate surface with at least `{target_runs}` manifest-backed runs each.",
+                        f"`{claim_key}` has `benchmark_evidence_status=ready`, `repeated_evidence_status=ready`, and no deep-comparator missing check.",
+                    ],
+                    expected_artifacts=[
+                        benchmark_row.get("summary_path", ""),
+                        benchmark_row.get("significance_path", ""),
+                        benchmark_row.get("manifest_path", ""),
+                        "outputs/analysis/research_claims/research_claims.json",
+                    ],
+                    triggered_by=[
+                        *triggered_base,
+                        str(benchmark_row.get("top_comparison_blocker", "")).strip(),
+                    ],
+                )
+            )
+
+        risk_terms = ("risk", "coverage", "abstention", "conformal", "selective")
+        risk_claim_gap = claim_key == "risk_aware_abstention" or (
+            _status_is_gap(row.get("risk_evidence_status", "")) and any(term in claim_text for term in risk_terms)
+        )
+        if risk_claim_gap or any(term in claim_text for term in ("accuracy-coverage", "coverage loss", "selective-risk")):
+            anchor_run_id = str(anchor_row.get("run_id", "")).strip() or "anchor run"
+            selective_risk = metrics.get("selective_risk", row.get("selective_risk"))
+            abstention_rate = metrics.get("abstention_rate", anchor_row.get("test_abstention_rate"))
+            coverage = metrics.get("conformal_coverage", anchor_row.get("ops_coverage_ratio"))
+            experiments.append(
+                _experiment_record(
+                    row=row,
+                    experiment_type="risk_coverage_tradeoff_evidence",
+                    title="Measure risk/coverage tradeoff before promoting the safety claim",
+                    base_score=92.0,
+                    gap_fields=gap_fields,
+                    missing_checks=missing_checks,
+                    benchmark_row=benchmark_row,
+                    anchor_row=anchor_row,
+                    why=(
+                        f"`{claim_key}` needs calibrated risk evidence; current selective risk is `{_format_metric(selective_risk)}`, "
+                        f"abstention is `{_format_metric(abstention_rate)}`, and coverage is `{_format_metric(coverage)}`."
+                    ),
+                    recommended_experiment=(
+                        f"On `{anchor_run_id}`, sweep abstention thresholds or conformal operating points and export an "
+                        "accuracy/coverage/selective-risk table that shows whether reduced coverage buys a meaningful risk drop."
+                    ),
+                    success_criteria=[
+                        f"`{claim_key}` has `risk_evidence_status=ready` with selective risk, abstention, and coverage all populated.",
+                        "The selected operating point documents the accepted-rate or coverage cost next to the risk reduction.",
+                        "The refreshed claim pack removes the risk/coverage missing check instead of relying on full-coverage metrics alone.",
+                    ],
+                    expected_artifacts=[
+                        "outputs/analysis/risk_coverage_tradeoff.csv",
+                        "outputs/analysis/research_claims/research_claims.json",
+                        row.get("claims_path", ""),
+                    ],
+                    triggered_by=triggered_base + [str(item).strip() for item in missing_checks[:2] if str(item).strip()],
+                )
+            )
+
+        friction_claim_gap = claim_key == "friction_counterfactual" or any(
+            term in claim_text
+            for term in (
+                "friction",
+                "counterfactual",
+                "intervention",
+                "synthetic perturbation",
+                "label path",
+                "degenerate",
+            )
+        )
+        if friction_claim_gap:
+            test_delta = metrics.get("test_mean_delta")
+            auc_lift = metrics.get("test_auc_lift")
+            experiments.append(
+                _experiment_record(
+                    row=row,
+                    experiment_type="friction_counterfactual_trustworthiness",
+                    title="Audit friction-counterfactual trustworthiness",
+                    base_score=88.0,
+                    gap_fields=gap_fields,
+                    missing_checks=missing_checks,
+                    benchmark_row=benchmark_row,
+                    anchor_row=anchor_row,
+                    why=(
+                        f"`{claim_key}` still needs a non-degenerate trust check; current test delta is "
+                        f"`{_format_metric(test_delta)}` and test AUC lift is `{_format_metric(auc_lift)}`."
+                    ),
+                    recommended_experiment=(
+                        "Audit the friction label path, then run a non-degenerate intervention or synthetic perturbation "
+                        "check that separates preference-driven skip risk from friction-driven skip risk across stable slices."
+                    ),
+                    success_criteria=[
+                        "Counterfactual delta is non-zero in the expected direction and stable across at least one repeated slice or seed check.",
+                        "Baseline/full AUC and label-path diagnostics rule out saturated or degenerate friction labels.",
+                        f"`{claim_key}` has no friction-label or intervention missing check after the claim pack refresh.",
+                    ],
+                    expected_artifacts=[
+                        "outputs/runs/<run_id>/analysis/friction_proxy_summary.json",
+                        "outputs/runs/<run_id>/analysis/friction_counterfactual_delta.csv",
+                        "outputs/analysis/research_claims/research_claims.json",
+                    ],
+                    triggered_by=triggered_base + [str(item).strip() for item in missing_checks[:2] if str(item).strip()],
+                )
+            )
+
+        missing_artifacts = _safe_int(row.get("missing_supporting_artifact_count"))
+        stale_artifacts = _safe_int(row.get("stale_supporting_artifact_count"))
+        if missing_artifacts or stale_artifacts:
+            experiments.append(
+                _experiment_record(
+                    row=row,
+                    experiment_type="supporting_artifact_refresh_repair",
+                    title="Repair stale or missing claim evidence paths",
+                    base_score=68.0,
+                    gap_fields=gap_fields,
+                    missing_checks=missing_checks,
+                    benchmark_row=benchmark_row,
+                    anchor_row=anchor_row,
+                    why=(
+                        f"`{claim_key}` references `{missing_artifacts}` missing and `{stale_artifacts}` stale supporting artifact(s), "
+                        "so the claim cannot be analysis-ready until the evidence pack is refreshed."
+                    ),
+                    recommended_experiment=(
+                        "Regenerate the claim pack after the newest supporting artifacts and repair any non-portable or missing paths "
+                        "before re-running the research platform lab."
+                    ),
+                    success_criteria=[
+                        f"`{claim_key}` has zero missing and zero stale supporting artifacts in `research_claim_registry`.",
+                        "Supporting artifact freshness is `ready` and the refreshed claim pack points at the newest benchmark/run files.",
+                    ],
+                    expected_artifacts=[
+                        str(row.get("missing_supporting_artifact_path", "")).strip(),
+                        str(row.get("stale_supporting_artifact_path", "")).strip(),
+                        "outputs/analysis/research_claims/research_claims.json",
+                    ],
+                    triggered_by=[
+                        *triggered_base,
+                        f"missing_supporting_artifact_count={missing_artifacts}",
+                        f"stale_supporting_artifact_count={stale_artifacts}",
+                    ],
+                )
+            )
+
+        if not any(str(item.get("claim_key", "")) == claim_key for item in experiments):
+            experiments.append(
+                _experiment_record(
+                    row=row,
+                    experiment_type="claim_evidence_gap_closure",
+                    title="Close the lead claim evidence gate",
+                    base_score=58.0,
+                    gap_fields=gap_fields,
+                    missing_checks=missing_checks,
+                    benchmark_row=benchmark_row,
+                    anchor_row=anchor_row,
+                    why=f"`{claim_key}` is blocked but did not match a specialized planner template.",
+                    recommended_experiment=(
+                        f"Run the next gate for `{claim_key}`: `{str(row.get('next_gate', '')).strip() or 'refresh the missing evidence'}`."
+                    ),
+                    success_criteria=[
+                        f"`{claim_key}` no longer has missing checks.",
+                        f"`{claim_key}` moves from `{str(row.get('claim_readiness_status', '')).strip()}` to `ready` in the claim registry.",
+                    ],
+                    expected_artifacts=["outputs/analysis/research_claims/research_claims.json"],
+                    triggered_by=triggered_base + [str(item).strip() for item in missing_checks[:2] if str(item).strip()],
+                )
+            )
+
+    experiments = sorted(
+        experiments,
+        key=lambda item: (
+            -_safe_float(item.get("rank_score")),
+            str(item.get("claim_role", "")) != "primary",
+            str(item.get("claim_key", "")),
+            str(item.get("experiment_type", "")),
+        ),
+    )
+    for index, experiment in enumerate(experiments, start=1):
+        experiment["rank"] = index
+
+    type_counts: dict[str, int] = {}
+    for experiment in experiments:
+        experiment_type = str(experiment.get("experiment_type", "")).strip()
+        type_counts[experiment_type] = type_counts.get(experiment_type, 0) + 1
+
+    payload: dict[str, Any] = {
+        "planner_version": "v1",
+        "source_tables": {
+            "run_research_registry_rows": int(len(run_registry.index)),
+            "benchmark_lock_atlas_rows": int(len(benchmark_atlas.index)),
+            "research_claim_registry_rows": int(len(claim_registry.index)),
+        },
+        "blocked_claim_count": int(len(blocked_claims)),
+        "blocked_claim_keys": [str(row.get("claim_key", "")).strip() for row in blocked_claims],
+        "experiment_count": int(len(experiments)),
+        "experiment_type_counts": type_counts,
+        "top_experiment": experiments[0] if experiments else {},
+        "experiments": experiments,
+    }
+
+    markdown_lines = [
+        "# Research Next Experiments",
+        "",
+        (
+            f"Planner consumed `{len(run_registry.index)}` run registry row(s), `{len(benchmark_atlas.index)}` benchmark lock row(s), "
+            f"and `{len(claim_registry.index)}` claim registry row(s)."
+        ),
+        f"Blocked claims: `{len(blocked_claims)}`. Ranked experiments: `{len(experiments)}`.",
+        "",
+    ]
+    if not experiments:
+        markdown_lines.extend(
+            [
+                "No blocked claims currently require a planner-generated experiment.",
+                "Keep using the run registry, benchmark atlas, and claim registry to choose the next research anchor.",
+            ]
+        )
+    else:
+        markdown_lines.extend(["## Ranked Experiments", ""])
+        for experiment in experiments:
+            criteria = experiment.get("success_criteria", [])
+            criteria = criteria if isinstance(criteria, list) else []
+            markdown_lines.extend(
+                [
+                    f"{int(experiment.get('rank', 0))}. `{experiment.get('experiment_id', '')}` - {experiment.get('title', '')}",
+                    f"   - Claim: `{experiment.get('claim_key', '')}` ({experiment.get('current_readiness', '')} -> `{experiment.get('target_status', '')}`)",
+                    f"   - Priority: `{experiment.get('priority', '')}` with score `{_format_metric(experiment.get('rank_score'))}`",
+                    f"   - Why: {experiment.get('why', '')}",
+                    f"   - Experiment: {experiment.get('recommended_experiment', '')}",
+                ]
+            )
+            if criteria:
+                markdown_lines.append(f"   - First success criterion: {criteria[0]}")
+    return payload, markdown_lines
+
+
 def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logger) -> list[Path]:
     now = datetime.now(timezone.utc)
     anchor_run_dir = _resolve_anchor_run_dir(output_dir, run_dir)
@@ -696,6 +1248,11 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
         benchmark_atlas=benchmark_atlas,
         claim_registry=claim_registry,
         research_payload=research_payload,
+    )
+    next_experiment_payload, next_experiment_markdown = _build_next_experiment_plan(
+        run_registry=run_registry,
+        benchmark_atlas=benchmark_atlas,
+        claim_registry=claim_registry,
     )
 
     output_root = output_dir / "analysis" / "research_platform_lab"
@@ -818,6 +1375,7 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
         "anchor_run_id": maturity_payload["anchor_run_id"],
         "artifact_root": str(output_root),
         "tables": {},
+        "reports": {},
     }
     for stem, (frame, columns) in tables.items():
         csv_path = _write_csv(output_root / f"{stem}.csv", _rows_for_columns(frame, columns), columns)
@@ -831,13 +1389,25 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
 
     maturity_json = write_json(output_root / "research_platform_maturity.json", maturity_payload)
     maturity_md = write_markdown(output_root / "research_platform_maturity.md", maturity_markdown)
+    next_experiment_json = write_json(output_root / "research_next_experiments.json", next_experiment_payload)
+    next_experiment_md = write_markdown(output_root / "research_next_experiments.md", next_experiment_markdown)
+    manifest_payload["reports"]["research_platform_maturity"] = {
+        "json_path": str(maturity_json),
+        "markdown_path": str(maturity_md),
+    }
+    manifest_payload["reports"]["research_next_experiments"] = {
+        "experiment_count": int(next_experiment_payload.get("experiment_count", 0) or 0),
+        "json_path": str(next_experiment_json),
+        "markdown_path": str(next_experiment_md),
+    }
     manifest_json = write_json(output_root / "research_platform_manifest.json", manifest_payload)
-    paths.extend([maturity_json, maturity_md, manifest_json])
+    paths.extend([maturity_json, maturity_md, next_experiment_json, next_experiment_md, manifest_json])
     logger.info(
-        "Built research platform lab with %d runs, %d benchmark locks, and %d claims.",
+        "Built research platform lab with %d runs, %d benchmark locks, %d claims, and %d next experiments.",
         len(run_registry.index),
         len(benchmark_atlas.index),
         len(claim_registry.index),
+        int(next_experiment_payload.get("experiment_count", 0) or 0),
     )
     return paths
 

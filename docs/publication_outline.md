@@ -10,6 +10,8 @@ Use `make research-claims` or `python -m spotify.research_claims` to generate:
 - a publication outline
 - an explicit list of missing ablations and validation gaps
 
+When the local `outputs/` tree already exists and only the claim pack has stale paths or portability summaries, use `python -m spotify.research_claims --refresh-existing --output-dir outputs` to refresh the pack without retraining.
+
 ## What The Claim Pack Should Do
 
 - pick one primary claim that is strongest in the current evidence

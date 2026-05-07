@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import time
 
 import duckdb
 import pandas as pd
@@ -683,6 +684,35 @@ def _build_minimal_workspace(tmp_path: Path) -> tuple[Path, Path]:
     return data_dir, output_dir
 
 
+def _load_manifest(warehouse_root: Path) -> dict[str, object]:
+    return json.loads((warehouse_root / "warehouse_manifest.json").read_text(encoding="utf-8"))
+
+
+def _manifest_asset_lookup(manifest: dict[str, object]) -> dict[str, dict[str, object]]:
+    lookup: dict[str, dict[str, object]] = {}
+    layers = manifest.get("layers", {})
+    if not isinstance(layers, dict):
+        return lookup
+    for assets in layers.values():
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name", "") or "")
+            if name:
+                lookup[name] = asset
+    return lookup
+
+
+def _asset_refs_by_name(rows: list[dict[str, object]]) -> set[str]:
+    return {
+        f"{row.get('layer')}.{row.get('asset_name')}"
+        for row in rows
+        if isinstance(row, dict)
+    }
+
+
 def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None:
     logger = logging.getLogger("spotify.test.analytics_warehouse")
     logger.handlers.clear()
@@ -699,6 +729,8 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert warehouse_root.exists()
     assert (warehouse_root / "warehouse_manifest.json").exists()
     assert (warehouse_root / "warehouse_verification.json").exists()
+    assert (warehouse_root / "warehouse_lineage.json").exists()
+    assert (warehouse_root / "warehouse_lineage.md").exists()
     assert (warehouse_root / "bronze" / "control_room_snapshot.parquet").exists()
     assert (warehouse_root / "bronze" / "creator_market_scene_pulse.parquet").exists()
     assert (warehouse_root / "bronze" / "research_platform_run_registry.parquet").exists()
@@ -735,9 +767,145 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     research_platform_mart = pd.read_parquet(warehouse_root / "gold" / "mart_research_platform_status.parquet")
     assert research_platform_mart.loc[0, "status_posture"] == "blocked"
 
+    manifest = _load_manifest(warehouse_root)
+    manifest_assets = _manifest_asset_lookup(manifest)
+    assert manifest["refresh"]["built_assets"] >= 1
+    assert manifest["refresh"]["reused_assets"] == 0
+    assert "lineage_graph" in manifest
+    assert "quality" in manifest
+    assert manifest_assets["creator_market_scene_summary"]["refresh_status"] == "built"
+    assert manifest_assets["mart_research_platform_status"]["branch_backed"]
+    assert manifest_assets["mart_research_platform_status"]["source_fingerprint"]
+    assert manifest_assets["research_platform_claim_registry"]["branch_freshness"]["status"] == "attention"
+
+    lineage_report = json.loads((warehouse_root / "warehouse_lineage.json").read_text(encoding="utf-8"))
+    lineage_edges = {
+        (
+            edge["upstream_layer"],
+            edge["upstream_asset"],
+            edge["downstream_layer"],
+            edge["downstream_asset"],
+        )
+        for edge in lineage_report["lineage"]["edges"]
+    }
+    assert ("bronze", "raw_streaming_history", "silver", "listener_daily_activity") in lineage_edges
+    assert ("silver", "creator_market_scene_summary", "gold", "mart_creator_market_watchlist") in lineage_edges
+    assert ("silver", "research_platform_status_summary", "gold", "mart_research_platform_status") in lineage_edges
+    assert lineage_report["quality"]["summary"]["empty_asset_count"] >= 1
+    assert "bronze.optuna_history" in _asset_refs_by_name(lineage_report["quality"]["empty_assets"])
+    assert lineage_report["quality"]["summary"]["row_count_anomaly_count"] == 0
+    freshness_refs = _asset_refs_by_name(lineage_report["quality"]["branch_backed_artifact_freshness"])
+    assert "bronze.research_platform_claim_registry" in freshness_refs
+
     verification = json.loads((warehouse_root / "warehouse_verification.json").read_text(encoding="utf-8"))
     assert verification["status"] == "pass"
     assert verification["summary"]["failed_assets"] == 0
+    assert verification["refresh"]["built_assets"] >= 1
+    assert verification["refresh"]["reused_assets"] == 0
+
+
+def test_build_analytics_warehouse_reuses_unchanged_branch_backed_assets(tmp_path: Path) -> None:
+    logger = logging.getLogger("spotify.test.analytics_warehouse.incremental")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    data_dir, output_dir = _build_minimal_workspace(tmp_path)
+
+    warehouse_root = build_analytics_warehouse(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+    )
+    creator_parquet = warehouse_root / "bronze" / "creator_market_release_whitespace_atlas.parquet"
+    research_parquet = warehouse_root / "gold" / "mart_research_platform_status.parquet"
+    creator_mtime_first = creator_parquet.stat().st_mtime_ns
+    research_mtime_first = research_parquet.stat().st_mtime_ns
+
+    time.sleep(0.05)
+    warehouse_root = build_analytics_warehouse(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+    )
+    creator_mtime_second = creator_parquet.stat().st_mtime_ns
+    research_mtime_second = research_parquet.stat().st_mtime_ns
+    manifest_second = _load_manifest(warehouse_root)
+    assets_second = _manifest_asset_lookup(manifest_second)
+
+    assert creator_mtime_second == creator_mtime_first
+    assert research_mtime_second == research_mtime_first
+    assert manifest_second["refresh"]["reused_assets"] >= 1
+    assert manifest_second["refresh"]["branch_backed_reused_assets"] >= 1
+    assert assets_second["creator_market_release_whitespace_atlas"]["refresh_status"] == "reused"
+    assert assets_second["mart_research_platform_status"]["refresh_status"] == "reused"
+
+    creator_market_dir = output_dir / "analysis" / "creator_market_intelligence"
+    whitespace_path = creator_market_dir / "release_whitespace_atlas.csv"
+    whitespace_df = pd.read_csv(whitespace_path)
+    whitespace_df.loc[0, "avg_release_whitespace_score"] = 0.73
+    whitespace_df.to_csv(whitespace_path, index=False)
+
+    time.sleep(0.05)
+    warehouse_root = build_analytics_warehouse(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+    )
+    creator_mtime_third = creator_parquet.stat().st_mtime_ns
+    research_mtime_third = research_parquet.stat().st_mtime_ns
+    manifest_third = _load_manifest(warehouse_root)
+    assets_third = _manifest_asset_lookup(manifest_third)
+
+    assert creator_mtime_third > creator_mtime_second
+    assert research_mtime_third == research_mtime_second
+    assert assets_third["creator_market_release_whitespace_atlas"]["refresh_status"] == "rebuilt"
+    assert assets_third["creator_market_release_whitespace_atlas"]["refresh_reason"] == "content_hash_changed"
+    assert assets_third["mart_creator_market_watchlist"]["refresh_status"] == "rebuilt"
+    assert assets_third["mart_research_platform_status"]["refresh_status"] == "reused"
+    assert manifest_third["refresh"]["rebuilt_assets"] >= 1
+
+
+def test_build_analytics_warehouse_reports_row_count_anomalies(tmp_path: Path) -> None:
+    logger = logging.getLogger("spotify.test.analytics_warehouse.quality")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    data_dir, output_dir = _build_minimal_workspace(tmp_path)
+
+    build_analytics_warehouse(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+    )
+    whitespace_path = output_dir / "analysis" / "creator_market_intelligence" / "release_whitespace_atlas.csv"
+    pd.read_csv(whitespace_path).head(0).to_csv(whitespace_path, index=False)
+
+    warehouse_root = build_analytics_warehouse(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        include_video=False,
+        logger=logger,
+    )
+
+    lineage_report = json.loads((warehouse_root / "warehouse_lineage.json").read_text(encoding="utf-8"))
+    anomalies = lineage_report["quality"]["row_count_anomalies"]
+    anomaly_keys = {
+        (row["layer"], row["asset_name"], row["type"])
+        for row in anomalies
+    }
+    assert lineage_report["quality"]["summary"]["row_count_anomaly_count"] >= 1
+    assert (
+        "bronze",
+        "creator_market_release_whitespace_atlas",
+        "row_count_dropped_to_zero",
+    ) in anomaly_keys
+    assert (
+        "gold",
+        "mart_creator_market_watchlist",
+        "row_count_dropped_to_zero",
+    ) in anomaly_keys
 
 
 def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) -> None:
@@ -801,7 +969,7 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
         ).fetchall()
         metadata_row = con.execute(
             """
-            SELECT expected_rows, expected_column_count
+            SELECT expected_rows, expected_column_count, refresh_status, branch_backed, source_fingerprint
             FROM warehouse_asset_manifest
             WHERE asset_name = 'mart_research_platform_status'
             """
@@ -830,4 +998,7 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
     assert metadata_row is not None
     assert metadata_row[0] == 1
     assert metadata_row[1] >= 1
+    assert metadata_row[2] == "built"
+    assert metadata_row[3] is True
+    assert metadata_row[4]
     assert selected_run_row == ("run_a",)

@@ -276,3 +276,68 @@ def test_normalize_creator_report_family_manifest_recovers_refreshable_anchor_vi
     assert packaging["view_inventory"]["opportunity_lane_comparison"]["legacy_markdown_filenames"] == [
         f"{stem}_opportunity_lane_comparison.md"
     ]
+
+
+def test_normalize_creator_report_family_manifest_reanchors_stale_workspace_paths(tmp_path) -> None:
+    report_dir = tmp_path / "creator_label_intelligence"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stem = "creator_label_intelligence_legacy"
+
+    primary_md = report_dir / f"{stem}.md"
+    primary_json = report_dir / f"{stem}.json"
+    report_family_md = report_dir / f"{stem}_report_family.md"
+    lane_md = report_dir / f"{stem}_opportunity_lane_comparison.md"
+    lane_csv = report_dir / f"{stem}_opportunity_lane_comparison.csv"
+    strategy_md = report_dir / f"{stem}_scene_strategy_watch.md"
+    strategy_csv = report_dir / f"{stem}_scene_strategy_watch.csv"
+    for path, content in (
+        (primary_md, "# Brief\n"),
+        (primary_json, "{}"),
+        (report_family_md, "# Report Family\n"),
+        (lane_md, "# Lane\n"),
+        (lane_csv, "scene_name,primary_driver\nscene-1,seed_adjacency\n"),
+        (strategy_md, "# Strategy\n"),
+        (strategy_csv, "scene_name,strategy_posture\nscene-1,accelerate_capture\n"),
+    ):
+        path.write_text(content, encoding="utf-8")
+
+    manifest = {
+        "primary_report": f"/tmp/old-workspace/{primary_md.name}",
+        "primary_report_json": f"/tmp/old-workspace/{primary_json.name}",
+        "artifact_index_markdown": f"/tmp/old-workspace/{report_family_md.name}",
+        "comparison_view_markdown": {
+            "opportunity_lane_comparison": f"/tmp/old-workspace/{lane_md.name}",
+        },
+        "comparison_view_csv": {
+            "opportunity_lane_comparison": f"/tmp/old-workspace/{lane_csv.name}",
+        },
+        "brief_view_markdown": {
+            "scene_strategy_watch": f"/tmp/old-workspace/{strategy_md.name}",
+        },
+        "brief_view_csv": {
+            "scene_strategy_watch": f"/tmp/old-workspace/{strategy_csv.name}",
+        },
+    }
+
+    normalized = normalize_creator_report_family_manifest(
+        manifest,
+        report_dir=report_dir,
+        stem=stem,
+        refreshed_at="2026-05-05T12:00:00+00:00",
+        refresh_source="unit_test",
+    )
+
+    assert normalized["primary_report"] == str(primary_md.resolve())
+    assert normalized["primary_report_json"] == str(primary_json.resolve())
+    assert normalized["artifact_index_markdown"] == str(report_family_md.resolve())
+    assert normalized["comparison_view_markdown"]["opportunity_lane_comparison"] == str(lane_md.resolve())
+    assert normalized["comparison_view_csv"]["opportunity_lane_comparison"] == str(lane_csv.resolve())
+    assert normalized["brief_view_markdown"]["scene_strategy_watch"] == str(strategy_md.resolve())
+    assert normalized["brief_view_csv"]["scene_strategy_watch"] == str(strategy_csv.resolve())
+
+    repair_summary = normalized["packaging_metadata"]["repair_summary"]
+    assert repair_summary["primary_report_resolution_source"] == "basename_reanchor"
+    assert repair_summary["primary_report_json_resolution_source"] == "basename_reanchor"
+    assert repair_summary["artifact_index_resolution_source"] == "basename_reanchor"
+    assert repair_summary["reanchored_reference_count"] == 7
+    assert repair_summary["conventional_recovery_count"] == 0

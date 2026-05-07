@@ -23,6 +23,7 @@ Main outputs:
 - `market_migration_network.csv/json`: strongest artist-to-artist movement routes across saved families.
 - `seed_scene_bridge_atlas.csv/json`: best seed-to-scene bridge combinations.
 - `release_whitespace_atlas.csv/json`: whitespace and release-timing watchlist when public release metadata is available.
+- `creator_market_trend_deltas.csv/json/md`: cross-family deltas that highlight rising scenes, repeated opportunity lanes, repeated migration routes, and sparse or stale release-whitespace coverage.
 - `creator_market_brief.json/md`: short brief summarizing the strongest market signals and next uses.
 - `creator_market_manifest.json`: artifact index plus truthful report-family counts, including how many discovered families are still partial.
 
@@ -30,5 +31,6 @@ Suggested use:
 
 1. Generate or backfill a few creator report families with `make public-insights`.
 2. Run this branch to convert them into reusable market views.
-3. Feed the strongest scenes, bridges, and migration routes into creator strategy, cultural analysis, or outward packages.
-4. Treat `creator_market_brief.md`, `scene_market_pulse.csv`, and `opportunity_lane_atlas.csv` as the default downstream handoff set for branch-portfolio and outward-package surfaces when you want the creator branch to read as a repeatable market story instead of a single report family.
+3. Review `creator_market_trend_deltas.md` when multiple report families exist to separate repeated market patterns from one-off family-specific signals.
+4. Feed the strongest scenes, bridges, and migration routes into creator strategy, cultural analysis, or outward packages.
+5. Treat `creator_market_brief.md`, `scene_market_pulse.csv`, `opportunity_lane_atlas.csv`, and `creator_market_trend_deltas.csv` as the default downstream handoff set for branch-portfolio and outward-package surfaces when you want the creator branch to read as a repeatable market story instead of a single report family.

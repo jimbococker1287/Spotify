@@ -39,10 +39,19 @@ The warehouse writes:
 - `outputs/analytics/warehouse/gold/*.parquet`
 - `outputs/analytics/warehouse/warehouse_manifest.json`
 - `outputs/analytics/warehouse/warehouse_manifest.md`
+- `outputs/analytics/warehouse/warehouse_lineage.json`
+- `outputs/analytics/warehouse/warehouse_lineage.md`
 - `outputs/analytics/warehouse/warehouse_verification.json`
 - `outputs/analytics/warehouse/warehouse_verification.md`
 
-The manifest now records per-asset schema metadata alongside row counts and paths so the warehouse and DuckDB layers can compare the same artifact contract.
+The manifest now records per-asset schema metadata alongside row counts, lineage, refresh status, branch-backed source fingerprints, and quality metadata so the warehouse and DuckDB layers can compare the same artifact contract.
+
+`warehouse_lineage.json` and `warehouse_lineage.md` are the local lineage + quality report. They map bronze inputs into silver tables and gold marts, then summarize:
+
+- Empty assets that may need upstream data.
+- Built, rebuilt, and reused assets from the content-hash refresh policy.
+- Row-count anomalies such as assets that dropped to zero rows or downstream tables that are empty while upstream inputs are populated.
+- Branch-backed artifact freshness based on local source availability and freshness/staleness fields in creator-market and research-platform assets.
 
 ### Bronze
 

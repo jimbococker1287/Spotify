@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -185,6 +186,68 @@ def _schema_records(df: pd.DataFrame) -> list[dict[str, object]]:
     return records
 
 
+def _frame_content_hash(df: pd.DataFrame) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "row_count": int(len(df.index)),
+                "schema": [
+                    {
+                        "name": str(column),
+                        "dtype": str(df[column].dtype),
+                    }
+                    for column in df.columns
+                ],
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    if not df.empty and list(df.columns):
+        row_hashes = pd.util.hash_pandas_object(df, index=False, categorize=False)
+        digest.update(row_hashes.to_numpy(dtype="uint64", copy=False).tobytes())
+    return digest.hexdigest()
+
+
+def _hash_file(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fingerprint_paths(paths: list[Path] | tuple[Path, ...]) -> tuple[list[str], str | None, list[dict[str, object]]]:
+    normalized_paths = sorted(
+        {
+            str(path.expanduser().resolve())
+            for path in paths
+        }
+    )
+    if not normalized_paths:
+        return [], None, []
+    records: list[dict[str, object]] = []
+    for path_text in normalized_paths:
+        path = Path(path_text)
+        exists = path.exists()
+        records.append(
+            {
+                "path": path_text,
+                "exists": exists,
+                "is_file": path.is_file() if exists else False,
+                "size": int(path.stat().st_size) if exists and path.is_file() else None,
+                "sha256": _hash_file(path),
+            }
+        )
+    payload = json.dumps(records, sort_keys=True)
+    return normalized_paths, hashlib.sha256(payload.encode("utf-8")).hexdigest(), records
+
+
 def _reindex_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     frame = df.copy()
     for column in columns:
@@ -206,6 +269,550 @@ def _load_analysis_table_frame(
         if column in df.columns:
             df[column] = pd.to_datetime(df[column], errors="coerce", format="mixed")
     return _reindex_frame(df, columns)
+
+
+def _creator_market_asset_inputs(output_dir: Path) -> dict[str, list[Path]]:
+    base_dir = output_dir / "analysis" / "creator_market_intelligence"
+    scene_market_pulse = base_dir / "scene_market_pulse.csv"
+    opportunity_lane_atlas = base_dir / "opportunity_lane_atlas.csv"
+    market_migration_network = base_dir / "market_migration_network.csv"
+    seed_scene_bridge_atlas = base_dir / "seed_scene_bridge_atlas.csv"
+    release_whitespace_atlas = base_dir / "release_whitespace_atlas.csv"
+    creator_market_brief = base_dir / "creator_market_brief.json"
+    creator_market_manifest = base_dir / "creator_market_manifest.json"
+    return {
+        "creator_market_scene_pulse": [scene_market_pulse],
+        "creator_market_opportunity_lane_atlas": [opportunity_lane_atlas],
+        "creator_market_migration_network": [market_migration_network],
+        "creator_market_seed_bridge_atlas": [seed_scene_bridge_atlas],
+        "creator_market_release_whitespace_atlas": [release_whitespace_atlas],
+        "creator_market_brief_snapshot": [creator_market_brief],
+        "creator_market_manifest_snapshot": [creator_market_manifest],
+        "creator_market_scene_summary": [
+            scene_market_pulse,
+            opportunity_lane_atlas,
+            creator_market_brief,
+        ],
+        "mart_creator_market_watchlist": [
+            scene_market_pulse,
+            opportunity_lane_atlas,
+            release_whitespace_atlas,
+            creator_market_brief,
+        ],
+    }
+
+
+def _research_platform_asset_inputs(output_dir: Path) -> dict[str, list[Path]]:
+    base_dir = output_dir / "analysis" / "research_platform_lab"
+    run_research_registry = base_dir / "run_research_registry.csv"
+    benchmark_lock_atlas = base_dir / "benchmark_lock_atlas.csv"
+    research_claim_registry = base_dir / "research_claim_registry.csv"
+    research_platform_maturity = base_dir / "research_platform_maturity.json"
+    research_platform_manifest = base_dir / "research_platform_manifest.json"
+    return {
+        "research_platform_run_registry": [run_research_registry],
+        "research_platform_benchmark_lock_atlas": [benchmark_lock_atlas],
+        "research_platform_claim_registry": [research_claim_registry],
+        "research_platform_maturity_snapshot": [research_platform_maturity],
+        "research_platform_manifest_snapshot": [research_platform_manifest],
+        "research_platform_status_summary": [
+            run_research_registry,
+            benchmark_lock_atlas,
+            research_claim_registry,
+            research_platform_maturity,
+        ],
+        "mart_research_platform_status": [
+            run_research_registry,
+            benchmark_lock_atlas,
+            research_claim_registry,
+            research_platform_maturity,
+        ],
+        "mart_research_claim_watchlist": [
+            research_claim_registry,
+            research_platform_maturity,
+        ],
+    }
+
+
+WAREHOUSE_LINEAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "listener_daily_activity": ("raw_streaming_history",),
+    "model_run_summary": ("run_manifests", "run_results", "backtest_history"),
+    "ops_review_snapshot": (
+        "control_room_snapshot",
+        "control_room_review_actions",
+        "control_room_history",
+    ),
+    "creator_report_family_summary": (
+        "creator_report_families",
+        "creator_ranking_opportunities",
+        "creator_scene_summary",
+        "creator_scene_seed_summary",
+    ),
+    "creator_market_scene_summary": (
+        "creator_market_scene_pulse",
+        "creator_market_opportunity_lane_atlas",
+        "creator_market_brief_snapshot",
+    ),
+    "research_platform_status_summary": (
+        "research_platform_run_registry",
+        "research_platform_benchmark_lock_atlas",
+        "research_platform_claim_registry",
+        "research_platform_maturity_snapshot",
+    ),
+    "mart_run_quality": ("model_run_summary",),
+    "mart_model_registry": ("model_run_summary",),
+    "mart_ops_overview": ("ops_review_snapshot", "control_room_history"),
+    "mart_creator_opportunities": ("creator_ranking_opportunities",),
+    "mart_creator_scene_pressure": ("creator_scene_summary",),
+    "mart_creator_market_watchlist": (
+        "creator_market_release_whitespace_atlas",
+        "creator_market_scene_summary",
+    ),
+    "mart_research_platform_status": ("research_platform_status_summary",),
+    "mart_research_claim_watchlist": (
+        "research_platform_claim_registry",
+        "research_platform_status_summary",
+    ),
+}
+
+WAREHOUSE_LAYER_ORDER = {"bronze": 0, "silver": 1, "gold": 2}
+WAREHOUSE_FRESHNESS_PROBLEM_STATUSES = {
+    "attention",
+    "blocked",
+    "fail",
+    "failed",
+    "missing",
+    "partial",
+    "stale",
+}
+
+
+def _asset_sort_key(asset: dict[str, object]) -> tuple[int, str]:
+    return (
+        WAREHOUSE_LAYER_ORDER.get(str(asset.get("layer", "") or ""), 99),
+        str(asset.get("name", asset.get("asset_name", "")) or ""),
+    )
+
+
+def _manifest_asset_rows(layer_payloads: dict[str, list[dict[str, object]]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for layer_name in ("bronze", "silver", "gold"):
+        for asset in layer_payloads.get(layer_name, []):
+            row = dict(asset)
+            row["layer"] = layer_name
+            rows.append(row)
+    return sorted(rows, key=_asset_sort_key)
+
+
+def _lineage_edges(layer_payloads: dict[str, list[dict[str, object]]]) -> list[dict[str, object]]:
+    asset_layer_lookup = {
+        str(asset.get("name", "") or ""): str(asset.get("layer", "") or "")
+        for asset in _manifest_asset_rows(layer_payloads)
+    }
+    edges: list[dict[str, object]] = []
+    for downstream_asset, upstream_assets in WAREHOUSE_LINEAGE_DEPENDENCIES.items():
+        downstream_layer = asset_layer_lookup.get(downstream_asset)
+        if downstream_layer is None:
+            continue
+        for upstream_asset in upstream_assets:
+            upstream_layer = asset_layer_lookup.get(upstream_asset)
+            if upstream_layer is None:
+                continue
+            edges.append(
+                {
+                    "upstream_layer": upstream_layer,
+                    "upstream_asset": upstream_asset,
+                    "downstream_layer": downstream_layer,
+                    "downstream_asset": downstream_asset,
+                    "relationship": "derives",
+                }
+            )
+    return sorted(
+        edges,
+        key=lambda row: (
+            WAREHOUSE_LAYER_ORDER.get(str(row["upstream_layer"]), 99),
+            str(row["upstream_asset"]),
+            WAREHOUSE_LAYER_ORDER.get(str(row["downstream_layer"]), 99),
+            str(row["downstream_asset"]),
+        ),
+    )
+
+
+def _asset_ref(layer: str, asset_name: str) -> dict[str, str]:
+    return {"layer": layer, "asset_name": asset_name}
+
+
+def _lineage_asset_records(
+    layer_payloads: dict[str, list[dict[str, object]]],
+    edges: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    upstream_lookup: dict[tuple[str, str], list[dict[str, str]]] = {}
+    downstream_lookup: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for edge in edges:
+        upstream_key = (str(edge["upstream_layer"]), str(edge["upstream_asset"]))
+        downstream_key = (str(edge["downstream_layer"]), str(edge["downstream_asset"]))
+        upstream_lookup.setdefault(downstream_key, []).append(_asset_ref(*upstream_key))
+        downstream_lookup.setdefault(upstream_key, []).append(_asset_ref(*downstream_key))
+
+    records: list[dict[str, object]] = []
+    for asset in _manifest_asset_rows(layer_payloads):
+        layer_name = str(asset.get("layer", "") or "")
+        asset_name = str(asset.get("name", "") or "")
+        key = (layer_name, asset_name)
+        records.append(
+            {
+                "layer": layer_name,
+                "asset_name": asset_name,
+                "rows": int(asset.get("rows", 0) or 0),
+                "refresh_status": str(asset.get("refresh_status", "") or ""),
+                "branch_backed": bool(asset.get("branch_backed", False)),
+                "upstream_assets": sorted(
+                    upstream_lookup.get(key, []),
+                    key=lambda row: (
+                        WAREHOUSE_LAYER_ORDER.get(row["layer"], 99),
+                        row["asset_name"],
+                    ),
+                ),
+                "downstream_assets": sorted(
+                    downstream_lookup.get(key, []),
+                    key=lambda row: (
+                        WAREHOUSE_LAYER_ORDER.get(row["layer"], 99),
+                        row["asset_name"],
+                    ),
+                ),
+            }
+        )
+    return records
+
+
+def _branch_freshness_metadata(
+    df: pd.DataFrame,
+    source_records: list[dict[str, object]],
+) -> dict[str, object] | None:
+    if not source_records:
+        return None
+    missing_sources = [
+        str(record.get("path", "") or "")
+        for record in source_records
+        if not bool(record.get("exists")) or not bool(record.get("is_file"))
+    ]
+    empty_sources = [
+        str(record.get("path", "") or "")
+        for record in source_records
+        if bool(record.get("exists")) and bool(record.get("is_file")) and int(record.get("size", 0) or 0) == 0
+    ]
+    freshness_columns = sorted(
+        str(column)
+        for column in df.columns
+        if "freshness_status" in str(column).lower()
+        or str(column).lower() in {"artifact_pack_status", "manifest_freshness_status"}
+    )
+    count_columns = sorted(
+        str(column)
+        for column in df.columns
+        if "count" in str(column).lower()
+        and any(token in str(column).lower() for token in ("missing", "stale"))
+    )
+
+    status_counts: dict[str, int] = {}
+    problem_status_count = 0
+    for column in freshness_columns:
+        statuses = df[column].dropna().astype(str).str.strip().str.lower()
+        for status, count in statuses.value_counts(sort=False).to_dict().items():
+            if not status:
+                continue
+            status_counts[status] = status_counts.get(status, 0) + int(count)
+            if status in WAREHOUSE_FRESHNESS_PROBLEM_STATUSES:
+                problem_status_count += int(count)
+
+    stale_or_missing_count_total = 0.0
+    for column in count_columns:
+        numeric = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+        stale_or_missing_count_total += float(numeric.sum())
+
+    if missing_sources:
+        status = "missing_source"
+    elif problem_status_count > 0 or stale_or_missing_count_total > 0:
+        status = "attention"
+    elif freshness_columns or count_columns:
+        status = "fresh"
+    elif empty_sources:
+        status = "source_empty"
+    else:
+        status = "source_fresh"
+
+    return {
+        "status": status,
+        "source_count": int(len(source_records)),
+        "missing_source_count": int(len(missing_sources)),
+        "empty_source_count": int(len(empty_sources)),
+        "missing_sources": missing_sources,
+        "empty_sources": empty_sources,
+        "freshness_columns": freshness_columns,
+        "freshness_status_counts": dict(sorted(status_counts.items())),
+        "stale_or_missing_count_total": stale_or_missing_count_total,
+    }
+
+
+def _row_count_anomalies(
+    asset_rows: list[dict[str, object]],
+    edges: list[dict[str, object]],
+    previous_asset_lookup: dict[tuple[str, str], dict[str, Any]],
+) -> list[dict[str, object]]:
+    asset_lookup = {
+        (str(asset.get("layer", "") or ""), str(asset.get("name", "") or "")): asset
+        for asset in asset_rows
+    }
+    upstream_lookup: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for edge in edges:
+        downstream_key = (str(edge["downstream_layer"]), str(edge["downstream_asset"]))
+        upstream_lookup.setdefault(downstream_key, []).append(
+            (str(edge["upstream_layer"]), str(edge["upstream_asset"]))
+        )
+
+    anomalies: list[dict[str, object]] = []
+    for asset in asset_rows:
+        layer_name = str(asset.get("layer", "") or "")
+        asset_name = str(asset.get("name", "") or "")
+        key = (layer_name, asset_name)
+        current_rows = int(asset.get("rows", 0) or 0)
+        previous = previous_asset_lookup.get(key)
+        if previous is not None:
+            previous_rows = int(previous.get("rows", 0) or 0)
+            if previous_rows > 0 and current_rows == 0:
+                anomalies.append(
+                    {
+                        "layer": layer_name,
+                        "asset_name": asset_name,
+                        "type": "row_count_dropped_to_zero",
+                        "previous_rows": previous_rows,
+                        "current_rows": current_rows,
+                    }
+                )
+            elif previous_rows == 0 and current_rows > 0:
+                anomalies.append(
+                    {
+                        "layer": layer_name,
+                        "asset_name": asset_name,
+                        "type": "row_count_recovered_from_zero",
+                        "previous_rows": previous_rows,
+                        "current_rows": current_rows,
+                    }
+                )
+
+        upstream_keys = upstream_lookup.get(key, [])
+        upstream_rows = [
+            int(asset_lookup[upstream_key].get("rows", 0) or 0)
+            for upstream_key in upstream_keys
+            if upstream_key in asset_lookup
+        ]
+        if upstream_rows and current_rows == 0 and any(row_count > 0 for row_count in upstream_rows):
+            anomalies.append(
+                {
+                    "layer": layer_name,
+                    "asset_name": asset_name,
+                    "type": "empty_downstream_with_nonempty_upstream",
+                    "upstream_rows": int(sum(upstream_rows)),
+                    "current_rows": current_rows,
+                }
+            )
+
+    return sorted(
+        anomalies,
+        key=lambda row: (
+            WAREHOUSE_LAYER_ORDER.get(str(row["layer"]), 99),
+            str(row["asset_name"]),
+            str(row["type"]),
+        ),
+    )
+
+
+def _build_warehouse_lineage_report(
+    manifest: dict[str, Any],
+    layer_payloads: dict[str, list[dict[str, object]]],
+    previous_asset_lookup: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, object]:
+    asset_rows = _manifest_asset_rows(layer_payloads)
+    edges = _lineage_edges(layer_payloads)
+    lineage_assets = _lineage_asset_records(layer_payloads, edges)
+    empty_assets = [
+        _asset_ref(str(asset["layer"]), str(asset["name"]))
+        for asset in asset_rows
+        if int(asset.get("rows", 0) or 0) == 0
+    ]
+    rebuilt_assets = [
+        _asset_ref(str(asset["layer"]), str(asset["name"]))
+        for asset in asset_rows
+        if str(asset.get("refresh_status", "") or "") == "rebuilt"
+    ]
+    reused_assets = [
+        _asset_ref(str(asset["layer"]), str(asset["name"]))
+        for asset in asset_rows
+        if str(asset.get("refresh_status", "") or "") == "reused"
+    ]
+    built_assets = [
+        _asset_ref(str(asset["layer"]), str(asset["name"]))
+        for asset in asset_rows
+        if str(asset.get("refresh_status", "") or "") == "built"
+    ]
+    branch_freshness_assets = []
+    for asset in asset_rows:
+        freshness = asset.get("branch_freshness")
+        if not isinstance(freshness, dict):
+            continue
+        branch_freshness_assets.append(
+            {
+                "layer": str(asset["layer"]),
+                "asset_name": str(asset["name"]),
+                **freshness,
+            }
+        )
+
+    freshness_status_counts: dict[str, int] = {}
+    for row in branch_freshness_assets:
+        status = str(row.get("status", "") or "unknown")
+        freshness_status_counts[status] = freshness_status_counts.get(status, 0) + 1
+
+    anomalies = _row_count_anomalies(asset_rows, edges, previous_asset_lookup)
+    quality = {
+        "summary": {
+            "asset_count": int(len(asset_rows)),
+            "empty_asset_count": int(len(empty_assets)),
+            "built_asset_count": int(len(built_assets)),
+            "rebuilt_asset_count": int(len(rebuilt_assets)),
+            "reused_asset_count": int(len(reused_assets)),
+            "row_count_anomaly_count": int(len(anomalies)),
+            "branch_backed_asset_count": int(len(branch_freshness_assets)),
+            "branch_backed_freshness_status_counts": dict(sorted(freshness_status_counts.items())),
+        },
+        "empty_assets": empty_assets,
+        "built_assets": built_assets,
+        "rebuilt_assets": rebuilt_assets,
+        "reused_assets": reused_assets,
+        "row_count_anomalies": anomalies,
+        "branch_backed_artifact_freshness": branch_freshness_assets,
+    }
+    lineage = {
+        "edges": edges,
+        "assets": lineage_assets,
+    }
+    return {
+        "generated_at": str(manifest.get("generated_at", "") or ""),
+        "warehouse_root": str(manifest.get("warehouse_root", "") or ""),
+        "summary": {
+            "asset_count": int(len(asset_rows)),
+            "lineage_edge_count": int(len(edges)),
+            **quality["summary"],
+        },
+        "lineage": lineage,
+        "quality": quality,
+    }
+
+
+def _format_asset_refs(asset_refs: list[dict[str, str]], *, limit: int = 12) -> str:
+    if not asset_refs:
+        return "none"
+    labels = [f"`{row['layer']}.{row['asset_name']}`" for row in asset_refs[:limit]]
+    if len(asset_refs) > limit:
+        labels.append(f"+{len(asset_refs) - limit} more")
+    return ", ".join(labels)
+
+
+def _write_warehouse_lineage_markdown(path: Path, report: dict[str, object]) -> None:
+    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    quality = report.get("quality", {}) if isinstance(report.get("quality"), dict) else {}
+    lineage = report.get("lineage", {}) if isinstance(report.get("lineage"), dict) else {}
+    empty_assets = quality.get("empty_assets", []) if isinstance(quality.get("empty_assets"), list) else []
+    rebuilt_assets = quality.get("rebuilt_assets", []) if isinstance(quality.get("rebuilt_assets"), list) else []
+    reused_assets = quality.get("reused_assets", []) if isinstance(quality.get("reused_assets"), list) else []
+    anomalies = (
+        quality.get("row_count_anomalies", [])
+        if isinstance(quality.get("row_count_anomalies"), list)
+        else []
+    )
+    freshness_assets = (
+        quality.get("branch_backed_artifact_freshness", [])
+        if isinstance(quality.get("branch_backed_artifact_freshness"), list)
+        else []
+    )
+
+    markdown_lines = [
+        "# Analytics Warehouse Lineage + Quality",
+        "",
+        f"- Generated at: `{report.get('generated_at', '')}`",
+        f"- Warehouse root: `{report.get('warehouse_root', '')}`",
+        f"- Assets: `{summary.get('asset_count', 0)}`",
+        f"- Lineage edges: `{summary.get('lineage_edge_count', 0)}`",
+        "",
+        "## Quality Summary",
+        "",
+        f"- Empty assets: `{len(empty_assets)}` ({_format_asset_refs(empty_assets)})",
+        f"- Rebuilt assets: `{len(rebuilt_assets)}` ({_format_asset_refs(rebuilt_assets)})",
+        f"- Reused assets: `{len(reused_assets)}` ({_format_asset_refs(reused_assets)})",
+        f"- Row-count anomalies: `{len(anomalies)}`",
+        f"- Branch-backed freshness: `{summary.get('branch_backed_freshness_status_counts', {})}`",
+        "",
+        "## Lineage Edges",
+        "",
+        "| Upstream | Downstream |",
+        "| --- | --- |",
+    ]
+    for edge in lineage.get("edges", []) if isinstance(lineage.get("edges"), list) else []:
+        markdown_lines.append(
+            "| `{upstream_layer}.{upstream_asset}` | `{downstream_layer}.{downstream_asset}` |".format(
+                upstream_layer=edge["upstream_layer"],
+                upstream_asset=edge["upstream_asset"],
+                downstream_layer=edge["downstream_layer"],
+                downstream_asset=edge["downstream_asset"],
+            )
+        )
+
+    markdown_lines.extend(
+        [
+            "",
+            "## Row-Count Anomalies",
+            "",
+            "| Asset | Type | Previous | Current | Upstream rows |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+    )
+    if anomalies:
+        for anomaly in anomalies:
+            markdown_lines.append(
+                "| `{layer}.{asset_name}` | `{type}` | {previous_rows} | {current_rows} | {upstream_rows} |".format(
+                    layer=anomaly.get("layer", ""),
+                    asset_name=anomaly.get("asset_name", ""),
+                    type=anomaly.get("type", ""),
+                    previous_rows=anomaly.get("previous_rows", ""),
+                    current_rows=anomaly.get("current_rows", ""),
+                    upstream_rows=anomaly.get("upstream_rows", ""),
+                )
+            )
+    else:
+        markdown_lines.append("| none |  |  |  |  |")
+
+    markdown_lines.extend(
+        [
+            "",
+            "## Branch Freshness",
+            "",
+            "| Asset | Status | Sources | Missing sources | Signals |",
+            "| --- | --- | ---: | ---: | --- |",
+        ]
+    )
+    for asset in freshness_assets:
+        status_counts = asset.get("freshness_status_counts", {})
+        markdown_lines.append(
+            "| `{layer}.{asset_name}` | `{status}` | {source_count} | {missing_source_count} | `{signals}` |".format(
+                layer=asset.get("layer", ""),
+                asset_name=asset.get("asset_name", ""),
+                status=asset.get("status", ""),
+                source_count=asset.get("source_count", 0),
+                missing_source_count=asset.get("missing_source_count", 0),
+                signals=json.dumps(status_counts, sort_keys=True),
+            )
+        )
+    write_markdown(path, markdown_lines)
 
 
 def _prepare_experiment_history_frame(path: Path) -> pd.DataFrame:
@@ -1984,6 +2591,9 @@ def build_analytics_warehouse_bundle(
     }
 
     warehouse_root = output_dir / "analytics" / "warehouse"
+    asset_inputs: dict[str, list[Path]] = {}
+    asset_inputs.update(_creator_market_asset_inputs(output_dir))
+    asset_inputs.update(_research_platform_asset_inputs(output_dir))
     manifest = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "data_dir": str(data_dir.resolve()),
@@ -2005,9 +2615,27 @@ def build_analytics_warehouse_bundle(
                 if not bronze_research_platform_maturity_snapshot.empty
                 else None
             ),
+            "branch_backed_assets": int(len(asset_inputs)),
             "latest_control_room_run_id": (
                 bronze_control_room.iloc[0]["latest_run_id"] if not bronze_control_room.empty else None
             ),
+        },
+        "refresh_policy": {
+            "mode": "content_hash_reuse",
+            "rebuild_when": [
+                "asset missing from previous manifest",
+                "parquet output missing on disk",
+                "normalized asset content hash changes",
+            ],
+            "reuse_when": [
+                "previous manifest exists",
+                "target parquet already exists",
+                "normalized asset content hash matches the prior run",
+            ],
+        },
+        "asset_inputs": {
+            asset_name: [str(path.expanduser().resolve()) for path in paths]
+            for asset_name, paths in asset_inputs.items()
         },
         "lineage": [
             "bronze captures locally prepared raw history, run artifacts, control-room snapshots, creator report-family exports, creator-market branch outputs, and research-platform branch outputs.",
@@ -2022,6 +2650,23 @@ def build_analytics_warehouse_bundle(
         gold=gold,
         manifest=manifest,
     )
+
+
+def _manifest_asset_lookup(manifest: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    layers = manifest.get("layers", {})
+    if not isinstance(layers, dict):
+        return lookup
+    for layer_name, assets in layers.items():
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            asset_name = str(asset.get("name", "") or "")
+            if asset_name:
+                lookup[(str(layer_name), asset_name)] = asset
+    return lookup
 
 
 def load_analytics_warehouse_manifest(warehouse_root: Path) -> dict[str, Any]:
@@ -2040,6 +2685,15 @@ def warehouse_manifest_frames(warehouse_root: Path) -> tuple[pd.DataFrame, pd.Da
         "expected_column_count",
         "expected_columns_json",
         "schema_json",
+        "content_hash",
+        "refresh_status",
+        "refresh_reason",
+        "branch_backed",
+        "source_paths_json",
+        "source_fingerprint",
+        "source_path_statuses_json",
+        "branch_freshness_status",
+        "branch_freshness_json",
     ]
     column_columns = [
         "manifest_generated_at",
@@ -2070,6 +2724,9 @@ def warehouse_manifest_frames(warehouse_root: Path) -> tuple[pd.DataFrame, pd.Da
             schema = asset.get("schema", [])
             schema_records = [record for record in schema if isinstance(record, dict)] if isinstance(schema, list) else []
             expected_columns = [str(record.get("name", "") or "") for record in schema_records]
+            branch_freshness = asset.get("branch_freshness", {})
+            if not isinstance(branch_freshness, dict):
+                branch_freshness = {}
             asset_rows.append(
                 {
                     "manifest_generated_at": generated_at,
@@ -2081,6 +2738,15 @@ def warehouse_manifest_frames(warehouse_root: Path) -> tuple[pd.DataFrame, pd.Da
                     "expected_column_count": int(asset.get("column_count", 0) or 0),
                     "expected_columns_json": json.dumps(expected_columns),
                     "schema_json": json.dumps(schema_records),
+                    "content_hash": str(asset.get("content_hash", "") or ""),
+                    "refresh_status": str(asset.get("refresh_status", "") or ""),
+                    "refresh_reason": str(asset.get("refresh_reason", "") or ""),
+                    "branch_backed": bool(asset.get("branch_backed", False)),
+                    "source_paths_json": json.dumps(asset.get("source_paths", [])),
+                    "source_fingerprint": str(asset.get("source_fingerprint", "") or ""),
+                    "source_path_statuses_json": json.dumps(asset.get("source_path_statuses", [])),
+                    "branch_freshness_status": str(branch_freshness.get("status", "") or ""),
+                    "branch_freshness_json": json.dumps(branch_freshness),
                 }
             )
             for record in schema_records:
@@ -2119,6 +2785,9 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
         row_count_match = False
         column_match = False
         logical_type_match = False
+        refresh_status = str(asset.get("refresh_status", "") or "")
+        refresh_reason = str(asset.get("refresh_reason", "") or "")
+        branch_backed = bool(asset.get("branch_backed", False))
 
         try:
             frame = pd.read_parquet(parquet_path)
@@ -2146,12 +2815,25 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
                 "expected_logical_types": expected_logical_types,
                 "actual_logical_types": actual_logical_types,
                 "logical_type_match": logical_type_match,
+                "content_hash": str(asset.get("content_hash", "") or ""),
+                "refresh_status": refresh_status,
+                "refresh_reason": refresh_reason,
+                "branch_backed": branch_backed,
+                "source_fingerprint": str(asset.get("source_fingerprint", "") or ""),
                 "status": status,
                 "error": error_message,
             }
         )
         if status != "pass":
             failures.append(asset_name)
+
+    built_assets = int(sum(1 for row in results if row.get("refresh_status") == "built"))
+    rebuilt_assets = int(sum(1 for row in results if row.get("refresh_status") == "rebuilt"))
+    reused_assets = int(sum(1 for row in results if row.get("refresh_status") == "reused"))
+    branch_backed_assets = int(sum(1 for row in results if row.get("branch_backed")))
+    branch_backed_reused_assets = int(
+        sum(1 for row in results if row.get("branch_backed") and row.get("refresh_status") == "reused")
+    )
 
     verification_payload = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -2161,6 +2843,13 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
             "checked_assets": int(len(results)),
             "passed_assets": int(sum(1 for row in results if row["status"] == "pass")),
             "failed_assets": int(sum(1 for row in results if row["status"] != "pass")),
+        },
+        "refresh": {
+            "built_assets": built_assets,
+            "rebuilt_assets": rebuilt_assets,
+            "reused_assets": reused_assets,
+            "branch_backed_assets": branch_backed_assets,
+            "branch_backed_reused_assets": branch_backed_reused_assets,
         },
         "results": results,
     }
@@ -2172,14 +2861,17 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
         f"- Generated at: `{verification_payload['generated_at']}`",
         f"- Warehouse root: `{verification_payload['warehouse_root']}`",
         f"- Status: `{verification_payload['status']}`",
+        f"- Refresh summary: built `{built_assets}`, rebuilt `{rebuilt_assets}`, reused `{reused_assets}`",
+        f"- Branch-backed reused assets: `{branch_backed_reused_assets}/{branch_backed_assets}`",
         "",
-        "| Asset | Rows | Columns | Logical types | Status |",
-        "| --- | --- | --- | --- | --- |",
+        "| Asset | Refresh | Rows | Columns | Logical types | Status |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in results:
         markdown_lines.append(
-            "| `{asset_name}` | {row_count_match} | {column_match} | {logical_type_match} | `{status}` |".format(
+            "| `{asset_name}` | `{refresh_status}` | {row_count_match} | {column_match} | {logical_type_match} | `{status}` |".format(
                 asset_name=row["asset_name"],
+                refresh_status=row["refresh_status"],
                 row_count_match="pass" if row["row_count_match"] else "fail",
                 column_match="pass" if row["column_match"] else "fail",
                 logical_type_match="pass" if row["logical_type_match"] else "fail",
@@ -2205,7 +2897,22 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
 
 def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Path:
     bundle.root.mkdir(parents=True, exist_ok=True)
+    previous_manifest = load_analytics_warehouse_manifest(bundle.root)
+    previous_asset_lookup = _manifest_asset_lookup(previous_manifest)
+    manifest = dict(bundle.manifest)
+    asset_input_lookup = (
+        manifest.get("asset_inputs", {})
+        if isinstance(manifest.get("asset_inputs", {}), dict)
+        else {}
+    )
     layer_payloads: dict[str, list[dict[str, object]]] = {}
+    refresh_counts = {
+        "built_assets": 0,
+        "rebuilt_assets": 0,
+        "reused_assets": 0,
+        "branch_backed_assets": 0,
+        "branch_backed_reused_assets": 0,
+    }
     for layer_name, assets in [
         ("bronze", bundle.bronze),
         ("silver", bundle.silver),
@@ -2217,8 +2924,42 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
         for asset_name, df in assets.items():
             asset_path = layer_dir / f"{asset_name}.parquet"
             storage_df = _normalize_frame_for_storage(df)
-            storage_df.to_parquet(asset_path, index=False)
             schema = _schema_records(storage_df)
+            content_hash = _frame_content_hash(storage_df)
+            source_paths_raw = asset_input_lookup.get(asset_name, [])
+            source_paths, source_fingerprint, source_path_statuses = _fingerprint_paths(
+                tuple(Path(str(path)) for path in source_paths_raw)
+            )
+            branch_backed = bool(source_paths)
+            branch_freshness = _branch_freshness_metadata(storage_df, source_path_statuses)
+            if branch_backed:
+                refresh_counts["branch_backed_assets"] += 1
+            previous_entry = previous_asset_lookup.get((layer_name, asset_name), {})
+            previous_content_hash = str(previous_entry.get("content_hash", "") or "")
+            previous_source_fingerprint = str(previous_entry.get("source_fingerprint", "") or "")
+            if not previous_entry:
+                refresh_status = "built"
+                refresh_reason = "new_asset"
+            elif not asset_path.exists():
+                refresh_status = "rebuilt"
+                refresh_reason = "missing_existing_parquet"
+            elif previous_content_hash == content_hash:
+                refresh_status = "reused"
+                refresh_reason = (
+                    "content_hash_match_after_input_change"
+                    if previous_source_fingerprint
+                    and source_fingerprint
+                    and previous_source_fingerprint != source_fingerprint
+                    else "content_hash_match"
+                )
+            else:
+                refresh_status = "rebuilt"
+                refresh_reason = "content_hash_changed"
+            if refresh_status != "reused":
+                storage_df.to_parquet(asset_path, index=False)
+            refresh_counts[f"{refresh_status}_assets"] += 1
+            if branch_backed and refresh_status == "reused":
+                refresh_counts["branch_backed_reused_assets"] += 1
             layer_entries.append(
                 {
                     "name": asset_name,
@@ -2227,13 +2968,31 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
                     "column_count": int(len(storage_df.columns)),
                     "columns": [str(column) for column in storage_df.columns],
                     "schema": schema,
+                    "content_hash": content_hash,
+                    "refresh_status": refresh_status,
+                    "refresh_reason": refresh_reason,
+                    "branch_backed": branch_backed,
+                    "source_paths": source_paths,
+                    "source_fingerprint": source_fingerprint,
+                    "source_path_statuses": source_path_statuses,
+                    "branch_freshness": branch_freshness,
                 }
             )
         layer_payloads[layer_name] = layer_entries
 
-    manifest = dict(bundle.manifest)
     manifest["layers"] = layer_payloads
+    manifest["refresh"] = {
+        "built_assets": int(refresh_counts["built_assets"]),
+        "rebuilt_assets": int(refresh_counts["rebuilt_assets"]),
+        "reused_assets": int(refresh_counts["reused_assets"]),
+        "branch_backed_assets": int(refresh_counts["branch_backed_assets"]),
+        "branch_backed_reused_assets": int(refresh_counts["branch_backed_reused_assets"]),
+    }
+    lineage_report = _build_warehouse_lineage_report(manifest, layer_payloads, previous_asset_lookup)
+    manifest["lineage_graph"] = lineage_report["lineage"]
+    manifest["quality"] = lineage_report["quality"]
     write_json(bundle.root / "warehouse_manifest.json", manifest, sort_keys=False)
+    write_json(bundle.root / "warehouse_lineage.json", lineage_report, sort_keys=False)
 
     markdown_lines = [
         "# Analytics Warehouse",
@@ -2241,6 +3000,10 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
         f"- Generated at: `{manifest['generated_at']}`",
         f"- Data dir: `{manifest['data_dir']}`",
         f"- Output dir: `{manifest['output_dir']}`",
+        f"- Refresh summary: built `{refresh_counts['built_assets']}`, rebuilt `{refresh_counts['rebuilt_assets']}`, reused `{refresh_counts['reused_assets']}`",
+        f"- Branch-backed reused assets: `{refresh_counts['branch_backed_reused_assets']}/{refresh_counts['branch_backed_assets']}`",
+        f"- Empty assets: `{lineage_report['quality']['summary']['empty_asset_count']}`",
+        f"- Row-count anomalies: `{lineage_report['quality']['summary']['row_count_anomaly_count']}`",
         "",
         "## Lineage",
         "",
@@ -2253,15 +3016,16 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
                 "",
                 f"## {layer_name.title()}",
                 "",
-                "| Asset | Rows | Columns | Path |",
-                "| --- | ---: | ---: | --- |",
+                "| Asset | Refresh | Rows | Columns | Branch-backed | Path |",
+                "| --- | --- | ---: | ---: | --- | --- |",
             ]
         )
         for asset in layer_payloads.get(layer_name, []):
             markdown_lines.append(
-                f"| `{asset['name']}` | {asset['rows']} | {asset['column_count']} | `{Path(str(asset['path'])).name}` |"
+                f"| `{asset['name']}` | `{asset['refresh_status']}` | {asset['rows']} | {asset['column_count']} | `{asset['branch_backed']}` | `{Path(str(asset['path'])).name}` |"
             )
     write_markdown(bundle.root / "warehouse_manifest.md", markdown_lines)
+    _write_warehouse_lineage_markdown(bundle.root / "warehouse_lineage.md", lineage_report)
     verify_analytics_warehouse_artifacts(bundle.root, logger=logger)
     logger.info("Analytics warehouse refreshed: %s", bundle.root)
     return bundle.root

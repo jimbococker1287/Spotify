@@ -58,6 +58,9 @@ This writes:
 - `outputs/analysis/quant_decision_lab/scenario_sensitivity.json`
 - `outputs/analysis/quant_decision_lab/archetype_decision_bridge.json`
 - `outputs/analysis/quant_decision_lab/archetype_decision_bridge.md`
+- `outputs/analysis/quant_decision_lab/scenario_utility_simulation.csv`
+- `outputs/analysis/quant_decision_lab/scenario_utility_simulation.json`
+- `outputs/analysis/quant_decision_lab/scenario_utility_simulation.md`
 - `outputs/analysis/quant_decision_lab/quant_decision_brief.json`
 - `outputs/analysis/quant_decision_lab/quant_decision_brief.md`
 
@@ -66,8 +69,10 @@ Use it to answer:
 - which models are efficient under quality, utility, uncertainty, and speed together
 - which policies survive stress tradeoffs instead of only looking good on one metric
 - which scenarios create the most decision pressure
+- which model / policy / scenario combinations have the strongest transparent utility score
 - whether the serving model is still efficient once risk and cost are included
 - how dominant, high-skip, and exploratory listener archetypes should map onto model, policy, and scenario lanes
+- where high-skip or lifecycle-drift listener contexts should add notes before promotion
 
 ## Recommended Workflow
 
@@ -94,6 +99,7 @@ make quant-decision-lab
 - archetypes define the behavioral slices worth studying
 - quant frontier defines the models and policies worth trusting inside those slices
 - archetype decision bridge turns those two views into concrete evaluation lanes without changing downstream consumers yet
+- scenario utility simulation ranks concrete model / policy / scenario combinations and carries high-skip or high-drift caveats into the local review artifact
 
 5. Review the current recommendation set in the control room:
 
