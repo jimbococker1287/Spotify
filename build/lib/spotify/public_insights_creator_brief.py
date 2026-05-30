@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
@@ -15,6 +16,88 @@ import pandas as pd
 from .creator_label_intelligence import build_creator_label_intelligence, prepare_creator_intelligence_inputs
 from .run_artifacts import write_csv_rows as _shared_write_csv_rows
 from .run_artifacts import write_json, write_markdown
+
+
+_CREATOR_REPORT_FAMILY_VIEW_SPECS: dict[str, dict[str, object]] = {
+    "ranking_comparison": {
+        "label": "Ranking Comparison",
+        "view_group": "comparison",
+        "markdown_filename": "ranking_view.md",
+        "legacy_markdown_filenames": ("ranking_comparison.md",),
+        "csv_filename": "ranking_comparison.csv",
+    },
+    "scene_comparison": {
+        "label": "Scene Comparison",
+        "view_group": "comparison",
+        "markdown_filename": "scene_view.md",
+        "legacy_markdown_filenames": ("scene_comparison.md",),
+        "csv_filename": "scene_comparison.csv",
+    },
+    "seed_comparison": {
+        "label": "Seed Comparison",
+        "view_group": "comparison",
+        "markdown_filename": "seed_view.md",
+        "legacy_markdown_filenames": ("seed_comparison.md",),
+        "csv_filename": "seed_comparison.csv",
+    },
+    "scene_seed_comparison": {
+        "label": "Scene Vs Seed Comparison",
+        "view_group": "comparison",
+        "markdown_filename": "scene_seed_view.md",
+        "legacy_markdown_filenames": ("scene_seed_comparison.md",),
+        "csv_filename": "scene_seed_comparison.csv",
+    },
+    "opportunity_lane_comparison": {
+        "label": "Opportunity-Lane Comparison",
+        "view_group": "comparison",
+        "markdown_filename": "opportunity_lane_view.md",
+        "legacy_markdown_filenames": ("opportunity_lane_comparison.md",),
+        "csv_filename": "opportunity_lane_comparison.csv",
+    },
+    "priority_shortlist": {
+        "label": "Priority Shortlist",
+        "view_group": "brief",
+        "markdown_filename": "",
+        "legacy_markdown_filenames": (),
+        "csv_filename": "priority_shortlist.csv",
+    },
+    "migration_watch": {
+        "label": "Migration Watch",
+        "view_group": "brief",
+        "markdown_filename": "",
+        "legacy_markdown_filenames": (),
+        "csv_filename": "migration_watch.csv",
+    },
+    "release_watch": {
+        "label": "Release Watch",
+        "view_group": "brief",
+        "markdown_filename": "",
+        "legacy_markdown_filenames": (),
+        "csv_filename": "release_watch.csv",
+    },
+    "scene_strategy_watch": {
+        "label": "Scene Strategy Watch",
+        "view_group": "brief",
+        "markdown_filename": "scene_strategy_watch.md",
+        "legacy_markdown_filenames": (),
+        "csv_filename": "scene_strategy_watch.csv",
+    },
+}
+_CREATOR_REPORT_FAMILY_READING_ORDER = (
+    "primary_report",
+    "ranking_comparison",
+    "opportunity_lane_comparison",
+    "scene_comparison",
+    "scene_strategy_watch",
+    "seed_comparison",
+    "scene_seed_comparison",
+    "migration_watch",
+    "release_watch",
+)
+_CREATOR_REPORT_FAMILY_REFRESH_ANCHORS = {
+    "opportunity_lane": "opportunity_lane_comparison",
+    "scene_strategy": "scene_strategy_watch",
+}
 
 
 def _slugify(value: str) -> str:
@@ -51,6 +134,290 @@ def _write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> Path | None:
         fieldnames=fieldnames,
         value_serializer=lambda value: json.dumps(value, ensure_ascii=True) if isinstance(value, (list, dict)) else value,
     )
+
+
+def _coerce_manifest_map(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw_value in value.items():
+        key_text = str(key).strip()
+        value_text = str(raw_value).strip()
+        if key_text and value_text:
+            out[key_text] = value_text
+    return out
+
+
+def _existing_report_path(report_dir: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = report_dir / path
+    return path.resolve() if path.exists() else None
+
+
+def _basename_reanchor_path(report_dir: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    filename = Path(text).name.strip()
+    if not filename:
+        return None
+    candidate = (report_dir / filename).resolve()
+    return candidate if candidate.exists() else None
+
+
+def _artifact_modified_at(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _creator_report_family_artifact_candidates(
+    report_dir: Path,
+    stem: str,
+    view_key: str,
+    *,
+    artifact_kind: str,
+) -> list[Path]:
+    spec = _CREATOR_REPORT_FAMILY_VIEW_SPECS.get(view_key, {})
+    if artifact_kind == "markdown":
+        names = [
+            str(spec.get("markdown_filename", "")).strip(),
+            *[str(item).strip() for item in spec.get("legacy_markdown_filenames", ()) if str(item).strip()],
+        ]
+    else:
+        names = [str(spec.get("csv_filename", "")).strip()]
+    return [report_dir / f"{stem}_{name}" for name in names if name]
+
+
+def _resolve_report_artifact_path(
+    report_dir: Path,
+    raw_path: object,
+    candidates: list[Path],
+) -> tuple[str | None, str]:
+    existing_path = _existing_report_path(report_dir, raw_path)
+    if existing_path is not None:
+        return str(existing_path), "manifest_reference"
+    basename_path = _basename_reanchor_path(report_dir, raw_path)
+    if basename_path is not None:
+        return str(basename_path), "basename_reanchor"
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve()), "conventional_filename"
+    return None, "missing"
+
+
+def normalize_creator_report_family_manifest(
+    manifest: dict[str, Any],
+    *,
+    report_dir: Path,
+    stem: str,
+    refreshed_at: str | None = None,
+    refresh_source: str | None = None,
+) -> dict[str, Any]:
+    normalized = dict(manifest)
+    known_comparison_keys = {
+        key
+        for key, spec in _CREATOR_REPORT_FAMILY_VIEW_SPECS.items()
+        if str(spec.get("view_group", "")) == "comparison"
+    }
+    known_brief_keys = {
+        key
+        for key, spec in _CREATOR_REPORT_FAMILY_VIEW_SPECS.items()
+        if str(spec.get("view_group", "")) == "brief"
+    }
+    comparison_md = _coerce_manifest_map(manifest.get("comparison_view_markdown"))
+    comparison_csv = _coerce_manifest_map(manifest.get("comparison_view_csv"))
+    brief_md = _coerce_manifest_map(manifest.get("brief_view_markdown"))
+    brief_csv = _coerce_manifest_map(manifest.get("brief_view_csv"))
+
+    primary_report_path, primary_report_source = _resolve_report_artifact_path(
+        report_dir,
+        manifest.get("primary_report"),
+        [report_dir / f"{stem}.md"],
+    )
+    primary_report_json, primary_report_json_source = _resolve_report_artifact_path(
+        report_dir,
+        manifest.get("primary_report_json"),
+        [report_dir / f"{stem}.json"],
+    )
+    artifact_index_markdown, artifact_index_source = _resolve_report_artifact_path(
+        report_dir,
+        manifest.get("artifact_index_markdown"),
+        [report_dir / f"{stem}_report_family.md"],
+    )
+    if primary_report_path:
+        normalized["primary_report"] = primary_report_path
+    else:
+        normalized.pop("primary_report", None)
+    if primary_report_json:
+        normalized["primary_report_json"] = primary_report_json
+    else:
+        normalized.pop("primary_report_json", None)
+    if artifact_index_markdown:
+        normalized["artifact_index_markdown"] = artifact_index_markdown
+    else:
+        normalized.pop("artifact_index_markdown", None)
+
+    normalized_comparison_md = {key: value for key, value in comparison_md.items() if key not in known_comparison_keys}
+    normalized_comparison_csv = {key: value for key, value in comparison_csv.items() if key not in known_comparison_keys}
+    normalized_brief_md = {key: value for key, value in brief_md.items() if key not in known_brief_keys}
+    normalized_brief_csv = {key: value for key, value in brief_csv.items() if key not in known_brief_keys}
+    view_inventory: dict[str, dict[str, object]] = {}
+    reanchored_reference_count = 0
+    conventional_recovery_count = 0
+
+    for view_key, spec in _CREATOR_REPORT_FAMILY_VIEW_SPECS.items():
+        view_group = str(spec.get("view_group", "")).strip()
+        markdown_lookup = comparison_md if view_group == "comparison" else brief_md
+        csv_lookup = comparison_csv if view_group == "comparison" else brief_csv
+        markdown_path, markdown_source = _resolve_report_artifact_path(
+            report_dir,
+            markdown_lookup.get(view_key),
+            _creator_report_family_artifact_candidates(report_dir, stem, view_key, artifact_kind="markdown"),
+        )
+        csv_path, csv_source = _resolve_report_artifact_path(
+            report_dir,
+            csv_lookup.get(view_key),
+            _creator_report_family_artifact_candidates(report_dir, stem, view_key, artifact_kind="csv"),
+        )
+        if markdown_path:
+            if view_group == "comparison":
+                normalized_comparison_md[view_key] = markdown_path
+            else:
+                normalized_brief_md[view_key] = markdown_path
+        if csv_path:
+            if view_group == "comparison":
+                normalized_comparison_csv[view_key] = csv_path
+            else:
+                normalized_brief_csv[view_key] = csv_path
+
+        if markdown_source == "basename_reanchor":
+            reanchored_reference_count += 1
+        elif markdown_source == "conventional_filename":
+            conventional_recovery_count += 1
+        if csv_source == "basename_reanchor":
+            reanchored_reference_count += 1
+        elif csv_source == "conventional_filename":
+            conventional_recovery_count += 1
+
+        markdown_resolved = _existing_report_path(report_dir, markdown_path)
+        csv_resolved = _existing_report_path(report_dir, csv_path)
+        view_inventory[view_key] = {
+            "label": str(spec.get("label", view_key.replace("_", " ").title())),
+            "view_group": view_group,
+            "markdown_path": markdown_path,
+            "csv_path": csv_path,
+            "markdown_resolution_source": markdown_source,
+            "csv_resolution_source": csv_source,
+            "markdown_modified_at": _artifact_modified_at(markdown_resolved),
+            "csv_modified_at": _artifact_modified_at(csv_resolved),
+            "ready": bool(markdown_path and csv_path),
+            "canonical_markdown_filename": (
+                f"{stem}_{str(spec.get('markdown_filename', '')).strip()}"
+                if str(spec.get("markdown_filename", "")).strip()
+                else None
+            ),
+            "canonical_csv_filename": f"{stem}_{str(spec.get('csv_filename', '')).strip()}",
+        }
+        legacy_filenames = [str(item).strip() for item in spec.get("legacy_markdown_filenames", ()) if str(item).strip()]
+        if legacy_filenames:
+            view_inventory[view_key]["legacy_markdown_filenames"] = [f"{stem}_{name}" for name in legacy_filenames]
+
+    normalized["comparison_view_markdown"] = normalized_comparison_md
+    normalized["comparison_view_csv"] = normalized_comparison_csv
+    normalized["brief_view_markdown"] = normalized_brief_md
+    normalized["brief_view_csv"] = normalized_brief_csv
+
+    existing_order = manifest.get("reading_order")
+    ordered_candidates = (
+        [str(item).strip() for item in existing_order if str(item).strip()]
+        if isinstance(existing_order, list)
+        else list(_CREATOR_REPORT_FAMILY_READING_ORDER)
+    )
+    available_markdown_keys = set(normalized_comparison_md) | set(normalized_brief_md)
+    reading_order: list[str] = []
+    for item in ordered_candidates:
+        if item == "primary_report":
+            if primary_report_path and item not in reading_order:
+                reading_order.append(item)
+            continue
+        if item in _CREATOR_REPORT_FAMILY_VIEW_SPECS:
+            if item in available_markdown_keys and item not in reading_order:
+                reading_order.append(item)
+            continue
+        if item not in reading_order:
+            reading_order.append(item)
+    for item in _CREATOR_REPORT_FAMILY_READING_ORDER:
+        if item == "primary_report":
+            if primary_report_path and item not in reading_order:
+                reading_order.append(item)
+            continue
+        if item in available_markdown_keys and item not in reading_order:
+            reading_order.append(item)
+    normalized["reading_order"] = reading_order
+
+    anchor_views: dict[str, dict[str, object]] = {}
+    for anchor_name, view_key in _CREATOR_REPORT_FAMILY_REFRESH_ANCHORS.items():
+        inventory = view_inventory.get(view_key, {})
+        anchor_views[anchor_name] = {
+            "view_key": view_key,
+            "label": inventory.get("label"),
+            "view_group": inventory.get("view_group"),
+            "markdown_path": inventory.get("markdown_path"),
+            "csv_path": inventory.get("csv_path"),
+            "markdown_modified_at": inventory.get("markdown_modified_at"),
+            "csv_modified_at": inventory.get("csv_modified_at"),
+            "ready": bool(inventory.get("ready")),
+        }
+
+    existing_packaging = manifest.get("packaging_metadata", {})
+    packaging_metadata = dict(existing_packaging) if isinstance(existing_packaging, dict) else {}
+    packaging_metadata.update(
+        {
+            "version": 2,
+            "primary_report_stem": stem,
+            "reading_order": list(reading_order),
+            "comparison_view_markdown_count": len(normalized_comparison_md),
+            "comparison_view_csv_count": len(normalized_comparison_csv),
+            "brief_view_markdown_count": len(normalized_brief_md),
+            "brief_view_csv_count": len(normalized_brief_csv),
+            "refresh_anchor_keys": list(_CREATOR_REPORT_FAMILY_REFRESH_ANCHORS.values()),
+            "refresh_anchor_ready": all(bool(row.get("ready")) for row in anchor_views.values()),
+            "anchor_views": anchor_views,
+            "view_inventory": view_inventory,
+            "repair_summary": {
+                "primary_report_resolution_source": primary_report_source,
+                "primary_report_json_resolution_source": primary_report_json_source,
+                "artifact_index_resolution_source": artifact_index_source,
+                "reanchored_reference_count": reanchored_reference_count
+                + int(primary_report_source == "basename_reanchor")
+                + int(primary_report_json_source == "basename_reanchor")
+                + int(artifact_index_source == "basename_reanchor"),
+                "conventional_recovery_count": conventional_recovery_count
+                + int(primary_report_source == "conventional_filename")
+                + int(primary_report_json_source == "conventional_filename")
+                + int(artifact_index_source == "conventional_filename"),
+            },
+        }
+    )
+    if refreshed_at:
+        packaging_metadata["normalized_at"] = refreshed_at
+    elif str(packaging_metadata.get("normalized_at", "")).strip():
+        packaging_metadata["normalized_at"] = str(packaging_metadata.get("normalized_at")).strip()
+    else:
+        packaging_metadata.pop("normalized_at", None)
+    if refresh_source:
+        packaging_metadata["refresh_source"] = refresh_source
+    elif str(packaging_metadata.get("refresh_source", "")).strip():
+        packaging_metadata["refresh_source"] = str(packaging_metadata.get("refresh_source")).strip()
+    else:
+        packaging_metadata.pop("refresh_source", None)
+    normalized["packaging_metadata"] = packaging_metadata
+    return normalized
 
 
 def _resolve_multimodal_artifact(
@@ -898,17 +1265,7 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 "release_watch",
                 "scene_strategy_watch",
             ],
-            "reading_order": [
-                "primary_report",
-                "ranking_comparison",
-                "opportunity_lane_comparison",
-                "scene_comparison",
-                "scene_strategy_watch",
-                "seed_comparison",
-                "scene_seed_comparison",
-                "migration_watch",
-                "release_watch",
-            ],
+            "reading_order": list(_CREATOR_REPORT_FAMILY_READING_ORDER),
         }
 
         markdown_lines = [
@@ -1221,6 +1578,20 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             for label, path in csv_paths.items()
             if label in {"priority_shortlist", "migration_watch", "release_watch", "scene_strategy_watch"} and path is not None
         }
+        packaged_at = datetime.now(timezone.utc).isoformat()
+        family_manifest = normalize_creator_report_family_manifest(
+            family_manifest,
+            report_dir=report_dir,
+            stem=stem,
+            refreshed_at=packaged_at,
+            refresh_source="creator_label_intelligence_write",
+        )
+        packaging_metadata = (
+            family_manifest.get("packaging_metadata", {})
+            if isinstance(family_manifest.get("packaging_metadata"), dict)
+            else {}
+        )
+        anchor_views = packaging_metadata.get("anchor_views", {}) if isinstance(packaging_metadata, dict) else {}
         family_manifest_md_path = _write_markdown_lines(
             report_dir / f"{stem}_report_family.md",
             [
@@ -1229,10 +1600,11 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 f"- Primary report: `{md_path.name}`",
                 f"- Primary report JSON: `{json_path.name}`",
                 f"- Packaging mode: `{payload['report_family']['mode']}`",
+                f"- Packaging refreshed: `{packaging_metadata.get('normalized_at', '')}`",
                 "",
                 "## Reading Order",
                 "",
-                *[f"- `{item}`" for item in payload["report_family"]["reading_order"]],
+                *[f"- `{item}`" for item in family_manifest["reading_order"]],
                 "",
                 "## Comparison Views",
                 "",
@@ -1257,6 +1629,18 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                 *[
                     f"- `{label}`: `{Path(str(path)).name}`"
                     for label, path in family_manifest["brief_view_csv"].items()
+                ],
+                "",
+                "## Refresh Anchors",
+                "",
+                *[
+                    (
+                        f"- `{anchor_name}`: key `{row.get('view_key', '')}`, ready `{row.get('ready', False)}`, "
+                        f"markdown `{Path(str(row.get('markdown_path', ''))).name if str(row.get('markdown_path', '')).strip() else 'missing'}`, "
+                        f"csv `{Path(str(row.get('csv_path', ''))).name if str(row.get('csv_path', '')).strip() else 'missing'}`"
+                    )
+                    for anchor_name, row in anchor_views.items()
+                    if isinstance(row, dict)
                 ],
             ],
         )
@@ -1294,4 +1678,5 @@ __all__ = [
     "_creator_brief_scene_seed_comparison",
     "_creator_brief_seed_comparison",
     "build_creator_label_intelligence_handler",
+    "normalize_creator_report_family_manifest",
 ]

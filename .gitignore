@@ -15,6 +15,7 @@ __pycache__/
 .env.local
 
 # Pipeline outputs
+build/
 outputs/*
 !outputs/.gitkeep
 mlruns/

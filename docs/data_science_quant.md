@@ -108,3 +108,12 @@ make control-room
 ```
 
 - when `outputs/analysis/quant_decision_lab/archetype_decision_bridge.json` exists, the control-room markdown surfaces a concise DS/quant bridge block tied to the current review anchor
+
+6. Roll the DS/quant lane into the four-branch development queue:
+
+```bash
+make scope-expansion-lab
+```
+
+- `outputs/analysis/scope_expansion/branch_expansion_scorecard.md` shows whether the quant branch is ready, attention, blocked, or missing based on frontier, policy, scenario, and archetype-bridge artifacts.
+- `outputs/analysis/scope_expansion/branch_expansion_implementation_queue.md` ranks the next quant implementation against analytics, creator-market, and research-platform work.

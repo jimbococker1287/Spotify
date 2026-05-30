@@ -20,6 +20,17 @@ from .taste_os_demo_core import _target_alignment
 from .taste_os_demo_core import build_taste_os_demo_payload
 from .taste_os_demo_core import write_taste_os_demo_artifacts
 
+__all__ = [
+    "MODE_CONFIGS",
+    "SCENARIOS",
+    "_percentile_ranks",
+    "_surface_reranked_indices",
+    "_target_alignment",
+    "build_taste_os_demo_payload",
+    "main",
+    "write_taste_os_demo_artifacts",
+]
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

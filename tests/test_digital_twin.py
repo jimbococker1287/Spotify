@@ -168,3 +168,57 @@ def test_simulate_rollout_uses_post_choice_sequence_for_risk_scoring() -> None:
     assert transition_heavy["planned_sequence"][0] == 0
     assert novelty_heavy["planned_sequence"][0] == 2
     assert transition_heavy["mean_end_risk"] < novelty_heavy["mean_end_risk"]
+
+
+def test_stable_stress_policy_reduces_modeled_skip_risk() -> None:
+    twin = ListenerDigitalTwinArtifact(
+        artist_labels=["A", "B", "C"],
+        transition_matrix=np.array(
+            [
+                [0.10, 0.80, 0.10],
+                [0.20, 0.10, 0.70],
+                [0.60, 0.30, 0.10],
+            ],
+            dtype="float32",
+        ),
+        end_estimator=_StaticEndEstimator(),
+        context_features=["hour", "offline"],
+        average_track_seconds=180.0,
+    )
+    space = MultimodalArtistSpace(
+        artist_labels=["A", "B", "C"],
+        feature_names=["f0", "f1"],
+        raw_features=np.zeros((3, 2), dtype="float32"),
+        embeddings=np.eye(3, 2, dtype="float32"),
+        popularity=np.array([0.6, 0.3, 0.1], dtype="float32"),
+        energy=np.array([0.4, 0.5, 0.7], dtype="float32"),
+        danceability=np.array([0.5, 0.6, 0.8], dtype="float32"),
+        tempo=np.array([100.0, 110.0, 130.0], dtype="float32"),
+    )
+    sequence = np.array([0, 1], dtype="int32")
+    context = np.array([20.0, 0.0], dtype="float32")
+
+    baseline = simulate_rollout(
+        twin=twin,
+        multimodal_space=space,
+        causal_artifact=None,
+        start_sequence=sequence,
+        start_context=context,
+        horizon=3,
+        policy_weights={"transition": 1.1, "continuity": 0.1, "novelty": 0.0, "repeat": 0.8},
+        scenario={"hour_shift": 8.0},
+        rng=np.random.default_rng(5),
+    )
+    stable = simulate_rollout(
+        twin=twin,
+        multimodal_space=space,
+        causal_artifact=None,
+        start_sequence=sequence,
+        start_context=context,
+        horizon=3,
+        policy_weights={"transition": 0.3, "continuity": 1.35, "novelty": 0.0, "repeat": 2.05},
+        scenario={"hour_shift": 8.0},
+        rng=np.random.default_rng(5),
+    )
+
+    assert stable["mean_skip_risk"] < baseline["mean_skip_risk"]

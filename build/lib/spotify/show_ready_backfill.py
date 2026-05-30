@@ -18,6 +18,7 @@ from .phase_readiness import (
     write_weeks_1_16_readiness_report,
 )
 from .portfolio_artifacts import load_portfolio_artifact_bundle
+from .public_insights_creator_brief import normalize_creator_report_family_manifest
 from .research_artifacts import _write_safety_platform_contract
 from .benchmark_contract import describe_canonical_benchmark_contract
 from .run_artifacts import write_json, write_markdown
@@ -36,6 +37,16 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return _coerce_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
+def _existing_manifest_path(report_dir: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = report_dir / path
+    return path.resolve() if path.exists() else None
+
+
 def _creator_reading_order(manifest: dict[str, Any]) -> list[tuple[str, str]]:
     label_map = {
         "ranking_comparison": "Ranking Comparison",
@@ -45,19 +56,26 @@ def _creator_reading_order(manifest: dict[str, Any]) -> list[tuple[str, str]]:
         "opportunity_lane_comparison": "Opportunity-Lane Comparison",
         "scene_strategy_watch": "Scene Strategy Watch",
     }
-    order = [
-        "ranking_comparison",
-        "scene_comparison",
-        "seed_comparison",
-        "scene_seed_comparison",
-        "opportunity_lane_comparison",
-        "scene_strategy_watch",
-    ]
+    configured_order = manifest.get("reading_order")
+    order = (
+        [str(item).strip() for item in configured_order if str(item).strip()]
+        if isinstance(configured_order, list)
+        else [
+            "ranking_comparison",
+            "scene_comparison",
+            "seed_comparison",
+            "scene_seed_comparison",
+            "opportunity_lane_comparison",
+            "scene_strategy_watch",
+        ]
+    )
     available = []
     comparison_md = _coerce_dict(manifest.get("comparison_view_markdown"))
     brief_md = _coerce_dict(manifest.get("brief_view_markdown"))
     merged = {**comparison_md, **brief_md}
     for key in order:
+        if key == "primary_report":
+            continue
         raw_path = str(merged.get(key, "")).strip()
         if raw_path:
             available.append((key, label_map.get(key, key.replace("_", " ").title())))
@@ -66,18 +84,55 @@ def _creator_reading_order(manifest: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _backfill_creator_report_family_index(manifest_path: Path) -> dict[str, object]:
     manifest = _read_manifest(manifest_path)
-    current_index = str(manifest.get("artifact_index_markdown", "")).strip()
+    stem = manifest_path.name.removesuffix("_report_family.json")
+    report_dir = manifest_path.parent
+    normalized_manifest = normalize_creator_report_family_manifest(
+        manifest,
+        report_dir=report_dir,
+        stem=stem,
+    )
+    packaging_normalized = normalized_manifest != manifest
+    packaging_metadata = _coerce_dict(normalized_manifest.get("packaging_metadata"))
+    anchor_views = _coerce_dict(packaging_metadata.get("anchor_views"))
+    refresh_anchor_ready = bool(packaging_metadata.get("refresh_anchor_ready"))
+    repair_summary = _coerce_dict(packaging_metadata.get("repair_summary"))
+
+    current_index = str(normalized_manifest.get("artifact_index_markdown", "")).strip()
     if current_index:
-        current_path = Path(current_index).expanduser()
-        if current_path.exists():
+        current_path = _existing_manifest_path(report_dir, current_index)
+        if current_path is not None:
+            if packaging_normalized:
+                normalized_manifest = normalize_creator_report_family_manifest(
+                    manifest,
+                    report_dir=report_dir,
+                    stem=stem,
+                    refreshed_at=datetime.now(timezone.utc).isoformat(),
+                    refresh_source="show_ready_backfill",
+                )
+                normalized_manifest["artifact_index_markdown"] = str(current_path.resolve())
+                manifest_path.write_text(json.dumps(normalized_manifest, indent=2), encoding="utf-8")
             return {
                 "manifest": str(manifest_path.resolve()),
                 "status": "already_present",
                 "artifact_index_markdown": str(current_path.resolve()),
+                "packaging_normalized": packaging_normalized,
+                "refresh_anchor_ready": refresh_anchor_ready,
+                "anchor_views": anchor_views,
+                "repair_summary": repair_summary,
             }
 
-    stem = manifest_path.name.removesuffix("_report_family.json")
-    report_dir = manifest_path.parent
+    normalized_at = datetime.now(timezone.utc).isoformat()
+    manifest = normalize_creator_report_family_manifest(
+        manifest,
+        report_dir=report_dir,
+        stem=stem,
+        refreshed_at=normalized_at,
+        refresh_source="show_ready_backfill",
+    )
+    packaging_metadata = _coerce_dict(manifest.get("packaging_metadata"))
+    anchor_views = _coerce_dict(packaging_metadata.get("anchor_views"))
+    refresh_anchor_ready = bool(packaging_metadata.get("refresh_anchor_ready"))
+    repair_summary = _coerce_dict(packaging_metadata.get("repair_summary"))
     primary_report = str(manifest.get("primary_report", "")).strip()
     reading_order = _creator_reading_order(manifest)
     lines = [
@@ -85,6 +140,10 @@ def _backfill_creator_report_family_index(manifest_path: Path) -> dict[str, obje
         "",
         f"- Manifest: `{manifest_path.resolve()}`",
         f"- Primary report: `{primary_report}`",
+        f"- Packaging normalized: `{packaging_normalized}`",
+        f"- Refresh anchors ready: `{refresh_anchor_ready}`",
+        f"- Reanchored stale paths: `{repair_summary.get('reanchored_reference_count', 0)}`",
+        f"- Recovered conventional paths: `{repair_summary.get('conventional_recovery_count', 0)}`",
         "",
         "## Reading Order",
         "",
@@ -94,16 +153,35 @@ def _backfill_creator_report_family_index(manifest_path: Path) -> dict[str, obje
         if key not in source_group:
             source_group = _coerce_dict(manifest.get("brief_view_markdown"))
         lines.append(f"- `{label}`: `{source_group.get(key, '')}`")
-    lines.extend(["", "## Packaging Mode", "", "- Backfilled index for legacy report-family manifests so the Day-90 package can point at a shareable reading order."])
+    lines.extend(["", "## Refresh Anchors", ""])
+    for anchor_name, row in anchor_views.items():
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"- `{anchor_name}`: key `{row.get('view_key', '')}`, ready `{row.get('ready', False)}`, "
+            f"markdown `{row.get('markdown_path', '')}`, csv `{row.get('csv_path', '')}`"
+        )
+    lines.extend(
+        [
+            "",
+            "## Packaging Mode",
+            "",
+            "- Backfilled index for legacy report-family manifests so the Day-90 package can point at a shareable reading order.",
+        ]
+    )
     md_path = report_dir / f"{stem}_report_family.md"
     write_markdown(md_path, lines)
     manifest["artifact_index_markdown"] = str(md_path.resolve())
-    manifest["backfilled_artifact_index_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["backfilled_artifact_index_at"] = normalized_at
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return {
         "manifest": str(manifest_path.resolve()),
         "status": "backfilled",
         "artifact_index_markdown": str(md_path.resolve()),
+        "packaging_normalized": packaging_normalized,
+        "refresh_anchor_ready": refresh_anchor_ready,
+        "anchor_views": anchor_views,
+        "repair_summary": repair_summary,
     }
 
 
@@ -219,6 +297,18 @@ def backfill_show_ready_artifacts(
 
     creator_backfilled = sum(1 for row in creator_results if str(row.get("status", "")) == "backfilled")
     creator_present = sum(1 for row in creator_results if str(row.get("status", "")) == "already_present")
+    creator_normalized = sum(1 for row in creator_results if bool(row.get("packaging_normalized")))
+    creator_anchor_ready = sum(1 for row in creator_results if bool(row.get("refresh_anchor_ready")))
+    creator_reanchored = sum(
+        int(_coerce_dict(row.get("repair_summary")).get("reanchored_reference_count", 0) or 0)
+        for row in creator_results
+        if isinstance(row, dict)
+    )
+    creator_recovered = sum(
+        int(_coerce_dict(row.get("repair_summary")).get("conventional_recovery_count", 0) or 0)
+        for row in creator_results
+        if isinstance(row, dict)
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(output_root),
@@ -226,6 +316,10 @@ def backfill_show_ready_artifacts(
             "manifest_count": len(creator_results),
             "backfilled_count": creator_backfilled,
             "already_present_count": creator_present,
+            "normalized_count": creator_normalized,
+            "refresh_anchor_ready_count": creator_anchor_ready,
+            "reanchored_reference_count": creator_reanchored,
+            "conventional_recovery_count": creator_recovered,
             "results": creator_results,
         },
         "safety_platform_contract": safety_result,
@@ -254,6 +348,10 @@ def write_show_ready_backfill_report(
         f"- Creator manifests: `{creator.get('manifest_count', 0)}`",
         f"- Creator indexes backfilled: `{creator.get('backfilled_count', 0)}`",
         f"- Creator indexes already present: `{creator.get('already_present_count', 0)}`",
+        f"- Creator manifests normalized: `{creator.get('normalized_count', 0)}`",
+        f"- Creator refresh anchors ready: `{creator.get('refresh_anchor_ready_count', 0)}`",
+        f"- Creator stale paths reanchored: `{creator.get('reanchored_reference_count', 0)}`",
+        f"- Creator conventional recoveries: `{creator.get('conventional_recovery_count', 0)}`",
         f"- Safety-platform contract status: `{safety.get('status', '')}`",
         "",
         "## Creator Report-Family Results",
@@ -264,6 +362,14 @@ def write_show_ready_backfill_report(
             continue
         lines.append(f"- `{row.get('status', '')}` `{row.get('manifest', '')}`")
         lines.append(f"Artifact index: `{row.get('artifact_index_markdown', '')}`")
+        lines.append(f"Packaging normalized: `{row.get('packaging_normalized', False)}`")
+        lines.append(f"Refresh anchors ready: `{row.get('refresh_anchor_ready', False)}`")
+        lines.append(
+            f"Reanchored stale paths: `{_coerce_dict(row.get('repair_summary')).get('reanchored_reference_count', 0)}`"
+        )
+        lines.append(
+            f"Recovered conventional paths: `{_coerce_dict(row.get('repair_summary')).get('conventional_recovery_count', 0)}`"
+        )
     lines.extend(["", "## Safety Contract", ""])
     lines.append(f"- Status: `{safety.get('status', '')}`")
     if str(safety.get("run_id", "")).strip():

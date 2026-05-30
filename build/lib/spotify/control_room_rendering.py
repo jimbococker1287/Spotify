@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from .control_room_business import build_ds_quant_review_block
+
 
 def _mapping(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
@@ -68,6 +70,10 @@ def build_control_room_markdown_lines(
     ops_trends = _mapping(report.get("ops_trends", {}))
     weekly_summary = _mapping(report.get("weekly_ops_summary", {}))
     leaderboards = _mapping(report.get("leaderboards", {}))
+    ds_quant_review = build_ds_quant_review_block(
+        output_dir=report.get("output_dir", ""),
+        latest_run=latest_run,
+    )
 
     review_actions = report.get("review_actions", [])
     review_actions = review_actions if isinstance(review_actions, list) else []
@@ -179,6 +185,27 @@ def build_control_room_markdown_lines(
             f"- Stress scenario: `{qoe.get('stress_worst_skip_scenario', '')}` skip_risk=`{format_metric(qoe.get('stress_worst_skip_risk'))}`",
             f"- Standing stress benchmark: `{qoe.get('stress_benchmark_scenario', '')}` selected_policy=`{qoe.get('stress_benchmark_selected_policy_name') or qoe.get('stress_benchmark_policy_name', '')}` requested=`{qoe.get('stress_benchmark_requested_policy_name', '')}` family=`{qoe.get('stress_benchmark_policy_family') or qoe.get('stress_benchmark_canonical_policy_name', '')}` skip_risk=`{format_metric(qoe.get('stress_benchmark_skip_risk'))}` delta_vs_reference=`{format_metric(qoe.get('stress_benchmark_skip_delta_vs_reference'))}`",
             f"- Standing stress gate: `{qoe.get('stress_benchmark_gate_status', '')}` threshold=`{format_metric(qoe.get('stress_benchmark_gate_threshold'))}` margin=`{format_metric(qoe.get('stress_benchmark_gate_margin'))}` target=`{format_metric(qoe.get('stress_benchmark_target_threshold'))}`",
+        ]
+    )
+    if str(ds_quant_review.get("status", "")).strip().lower() == "ok":
+        lines.extend(
+            [
+                "",
+                "## DS / Quant Insight",
+                "",
+            ]
+        )
+        for item in ds_quant_review.get("summary", []):
+            lines.append(f"- {item}")
+        for item in ds_quant_review.get("recommendations", []):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- {item.get('title', '')}: `{item.get('archetype_label', '')}` -> model=`{item.get('model_name', '')}` policy=`{item.get('policy_name', '')}` scenario=`{item.get('scenario', '')}`"
+            )
+
+    lines.extend(
+        [
             "",
             "## Since Last Strong Run",
             "",

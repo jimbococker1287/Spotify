@@ -85,6 +85,8 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
     bundle = load_portfolio_artifact_bundle(output_root)
     branch_report = build_branch_portfolio_report(output_root, artifact_bundle=bundle)
     branch_lookup = _branch_lookup(branch_report)
+    creator_branch = _coerce_dict(branch_lookup.get("creator_intelligence"))
+    creator_market_layer = _coerce_dict(creator_branch.get("market_layer"))
 
     selected_artifacts = {
         "taste_os": {
@@ -98,7 +100,7 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
             "status": str(branch_lookup.get("control_room", {}).get("status", "")),
         },
         "creator_intelligence": {
-            "label": "Creator-intelligence strategy brief",
+            "label": "Creator strategy and market brief package",
             "source_md": (
                 str(bundle.creator_primary_report_path.resolve())
                 if bundle.creator_primary_report_path and bundle.creator_primary_report_path.exists()
@@ -124,7 +126,11 @@ def build_outward_package_report(output_dir: Path | str = "outputs") -> dict[str
                 and bundle.creator_brief_markdown_paths["scene_strategy_watch"].exists()
                 else ""
             ),
-            "status": str(branch_lookup.get("creator_intelligence", {}).get("status", "")),
+            "creator_market_brief_md": str(creator_market_layer.get("brief_md", "")),
+            "creator_scene_market_pulse_csv": str(creator_market_layer.get("scene_market_pulse_csv", "")),
+            "creator_opportunity_lane_atlas_csv": str(creator_market_layer.get("opportunity_lane_atlas_csv", "")),
+            "creator_market_status": str(creator_market_layer.get("status", "")),
+            "status": str(creator_branch.get("status", "")),
         },
         "safety_research": {
             "label": "Safety and research showcase",
@@ -243,6 +249,24 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
             else None,
             package_root / "creator_intelligence" / "scene_strategy_watch.md",
         ),
+        "creator_market_brief_md": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_market_brief_md", "")))
+            if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_market_brief_md")
+            else None,
+            package_root / "creator_intelligence" / "creator_market_brief.md",
+        ),
+        "creator_scene_market_pulse_csv": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_scene_market_pulse_csv", "")))
+            if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_scene_market_pulse_csv")
+            else None,
+            package_root / "creator_intelligence" / "scene_market_pulse.csv",
+        ),
+        "creator_opportunity_lane_atlas_csv": _copy_if_exists(
+            Path(str(_coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_opportunity_lane_atlas_csv", "")))
+            if _coerce_dict(selected_artifacts.get("creator_intelligence")).get("creator_opportunity_lane_atlas_csv")
+            else None,
+            package_root / "creator_intelligence" / "opportunity_lane_atlas.csv",
+        ),
         "research_claims_md": _copy_if_exists(
             Path(str(_coerce_dict(selected_artifacts.get("safety_research")).get("source_md", "")))
             if _coerce_dict(selected_artifacts.get("safety_research")).get("source_md")
@@ -355,6 +379,9 @@ def write_outward_package_artifacts(report: dict[str, object], *, output_dir: Pa
     lines.append(f"- Creator report-family index: `{copied_artifacts['creator_report_family_md']}`")
     lines.append(f"- Creator supporting view: `{copied_artifacts['creator_scene_seed_md']}`")
     lines.append(f"- Creator scene strategy watch: `{copied_artifacts['creator_strategy_md']}`")
+    lines.append(f"- Creator market brief: `{copied_artifacts['creator_market_brief_md']}`")
+    lines.append(f"- Creator scene market pulse: `{copied_artifacts['creator_scene_market_pulse_csv']}`")
+    lines.append(f"- Creator opportunity lane atlas: `{copied_artifacts['creator_opportunity_lane_atlas_csv']}`")
     lines.append(f"- Research claims: `{copied_artifacts['research_claims_md']}`")
     lines.append(f"- Safety platform contract: `{copied_artifacts['safety_platform_contract_md']}`")
     lines.append(f"- Benchmark manifest: `{copied_artifacts['benchmark_manifest_md']}`")

@@ -34,3 +34,4 @@ Suggested use:
 3. Review `creator_market_trend_deltas.md` when multiple report families exist to separate repeated market patterns from one-off family-specific signals.
 4. Feed the strongest scenes, bridges, and migration routes into creator strategy, cultural analysis, or outward packages.
 5. Treat `creator_market_brief.md`, `scene_market_pulse.csv`, `opportunity_lane_atlas.csv`, and `creator_market_trend_deltas.csv` as the default downstream handoff set for branch-portfolio and outward-package surfaces when you want the creator branch to read as a repeatable market story instead of a single report family.
+6. Run `make scope-expansion-lab` to compare creator-market readiness against the analytics, DS/quant, and research branches and surface the next creator-market implementation card in the shared queue.

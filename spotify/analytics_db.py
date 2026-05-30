@@ -66,15 +66,23 @@ WAREHOUSE_CONSISTENCY_TARGETS: tuple[dict[str, object], ...] = (
     {"expected_asset_name": "model_run_summary", "object_name": "model_run_summary", "object_kind": "table"},
     {"expected_asset_name": "creator_market_scene_summary", "object_name": "creator_market_scene_summary", "object_kind": "table"},
     {"expected_asset_name": "research_platform_status_summary", "object_name": "research_platform_status_summary", "object_kind": "table"},
+    {"expected_asset_name": "scope_expansion_strategy_cards", "object_name": "scope_expansion_strategy_cards", "object_kind": "table"},
+    {"expected_asset_name": "scope_expansion_branch_health", "object_name": "scope_expansion_branch_health", "object_kind": "table"},
     {"expected_asset_name": "mart_run_quality", "object_name": "mart_run_quality", "object_kind": "table"},
     {"expected_asset_name": "mart_model_registry", "object_name": "mart_model_registry", "object_kind": "table"},
     {"expected_asset_name": "mart_ops_overview", "object_name": "mart_ops_overview", "object_kind": "table"},
     {"expected_asset_name": "mart_creator_market_watchlist", "object_name": "mart_creator_market_watchlist", "object_kind": "table"},
     {"expected_asset_name": "mart_research_platform_status", "object_name": "mart_research_platform_status", "object_kind": "table"},
+    {"expected_asset_name": "mart_scope_expansion_health", "object_name": "mart_scope_expansion_health", "object_kind": "table"},
     {"expected_asset_name": "mart_ops_overview", "object_name": "latest_ops_overview", "object_kind": "view"},
     {
         "expected_asset_name": "mart_research_platform_status",
         "object_name": "latest_research_platform_status",
+        "object_kind": "view",
+    },
+    {
+        "expected_asset_name": "mart_scope_expansion_health",
+        "object_name": "scope_expansion_priority_queue",
         "object_kind": "view",
     },
 )
@@ -313,6 +321,7 @@ def refresh_analytics_database(
         mart_creator_market_watchlist_columns = asset_columns_lookup.get("mart_creator_market_watchlist", set())
         mart_research_platform_status_columns = asset_columns_lookup.get("mart_research_platform_status", set())
         mart_research_claim_watchlist_columns = asset_columns_lookup.get("mart_research_claim_watchlist", set())
+        mart_scope_expansion_health_columns = asset_columns_lookup.get("mart_scope_expansion_health", set())
 
         if {"run_id", "run_timestamp"}.issubset(run_manifests_columns) and {"run_id"}.issubset(run_results_columns):
             con.execute(
@@ -546,6 +555,25 @@ def refresh_analytics_database(
                   CAST(watchlist_score AS DOUBLE) DESC NULLS LAST,
                   CAST(missing_check_count AS BIGINT) DESC NULLS LAST,
                   claim_key
+                """
+            )
+        if {
+            "branch_key",
+            "branch_posture",
+            "queue_rank",
+            "risk_reduction_score",
+            "next_command",
+        }.issubset(mart_scope_expansion_health_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW scope_expansion_priority_queue AS
+                SELECT *
+                FROM mart_scope_expansion_health
+                ORDER BY
+                  CAST(queue_rank AS BIGINT) ASC NULLS LAST,
+                  CAST(risk_reduction_score AS DOUBLE) DESC NULLS LAST,
+                  CAST(risk_score AS DOUBLE) DESC NULLS LAST,
+                  branch_key
                 """
             )
         verify_analytics_duckdb_consistency(con, logger=logger)

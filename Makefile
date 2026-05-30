@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence research-platform-lab athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-deep-benchmark-low-ram deep-benchmark-finalize train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence research-platform-lab scope-expansion-lab project-health athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -53,6 +53,14 @@ train-classical:
 train-deep:
 	mkdir -p outputs
 	$(RUN_PY) -m spotify --profile $(PROFILE) --no-classical-models $(EXTRA_ARGS)
+
+train-deep-benchmark-low-ram:
+	mkdir -p outputs
+	bash scripts/run_deep_benchmark_low_ram.sh $(RUN_NAME) $(EXTRA_ARGS)
+
+deep-benchmark-finalize:
+	mkdir -p outputs
+	$(RUN_PY) -m spotify.deep_benchmark_finalizer $(EXTRA_ARGS)
 
 train-elite:
 	mkdir -p outputs
@@ -146,6 +154,13 @@ creator-market-intelligence:
 
 research-platform-lab:
 	$(RUN_PY) -m spotify.research_platform_lab $(EXTRA_ARGS)
+
+scope-expansion-lab:
+	$(RUN_PY) -m spotify.scope_expansion_lab $(EXTRA_ARGS)
+
+project-health:
+	mkdir -p outputs
+	$(RUN_PY) -m spotify.project_health $(EXTRA_ARGS)
 
 athena-export:
 	PYTHONPATH=. $(RUN_PY) scripts/export_athena_bundle.py $(EXTRA_ARGS)

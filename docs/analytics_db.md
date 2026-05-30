@@ -86,6 +86,10 @@ Raw-ish prepared assets for local analytics:
 - `research_platform_claim_registry`
 - `research_platform_maturity_snapshot`
 - `research_platform_manifest_snapshot`
+- `scope_expansion_scorecard`
+- `scope_expansion_implementation_queue`
+- `scope_expansion_strategy_cards`
+- `scope_expansion_manifest_snapshot`
 
 ### Silver
 
@@ -97,6 +101,7 @@ Curated modeling and business-analysis tables:
 - `creator_report_family_summary`
 - `creator_market_scene_summary`
 - `research_platform_status_summary`
+- `scope_expansion_branch_health`
 
 ### Gold
 
@@ -110,6 +115,7 @@ Semantic marts for decision work:
 - `mart_creator_market_watchlist`
 - `mart_research_platform_status`
 - `mart_research_claim_watchlist`
+- `mart_scope_expansion_health`
 
 ## DuckDB Surface
 
@@ -126,6 +132,7 @@ Useful base tables:
 - `model_run_summary`
 - `creator_market_scene_summary`
 - `research_platform_status_summary`
+- `scope_expansion_branch_health`
 - `mart_run_quality`
 - `mart_model_registry`
 - `mart_ops_overview`
@@ -134,6 +141,7 @@ Useful base tables:
 - `mart_creator_market_watchlist`
 - `mart_research_platform_status`
 - `mart_research_claim_watchlist`
+- `mart_scope_expansion_health`
 - `warehouse_asset_manifest`
 - `warehouse_asset_columns`
 - `warehouse_consistency_checks`
@@ -154,6 +162,7 @@ Useful views:
 - `creator_market_priority_now`
 - `latest_research_platform_status`
 - `research_platform_blocked_claims`
+- `scope_expansion_priority_queue`
 
 ## Example Queries
 
@@ -238,9 +247,19 @@ from research_platform_blocked_claims
 order by watchlist_score desc nulls last;
 ```
 
+Scope-expansion branch queue:
+
+```sql
+select branch_key, branch_posture, development_mode, queue_rank, next_initiative, validation_command
+from scope_expansion_priority_queue
+order by queue_rank asc nulls last, risk_reduction_score desc nulls last;
+```
+
 ## Recommended Workflow
 
 1. Run `make analytics-db` after a major training or reporting refresh.
 2. Open `outputs/analytics/spotify_analytics.duckdb` in DuckDB tooling or query it directly from Python.
 3. Use the warehouse Parquet assets when you want a stable, file-based local data pipeline.
-4. Treat the gold marts as the default starting point for notebooks, dashboards, and experimental branch work, including the creator-market and research-platform branches.
+4. Treat the gold marts as the default starting point for notebooks, dashboards, and experimental branch work, including the creator-market, research-platform, and scope-expansion branch portfolio.
+5. Run `make scope-expansion-lab` after the warehouse and branch artifacts are fresh to generate a four-branch scorecard and implementation queue under `outputs/analysis/scope_expansion/`.
+6. Run `make analytics-db` again after `make scope-expansion-lab` when you want `mart_scope_expansion_health` and `scope_expansion_priority_queue` refreshed inside DuckDB.

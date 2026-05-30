@@ -221,6 +221,18 @@ Run deep only:
 make train-deep PROFILE=small
 ```
 
+Run the all-14 deep benchmark with lower peak RAM and no classical / Optuna / retrieval / backtest tail work:
+
+```bash
+bash scripts/run_deep_benchmark_low_ram.sh
+```
+
+If a long all-deep run finishes model training but exits before the full pipeline wrap-up, finalize the deep comparison artifacts directly:
+
+```bash
+make deep-benchmark-finalize EXTRA_ARGS="--outputs-dir outputs --run-name <run-name>"
+```
+
 Run elite stack:
 
 ```bash
@@ -562,7 +574,10 @@ make listener-archetypes
 make quant-decision-lab
 make creator-market-intelligence
 make research-platform-lab
+make scope-expansion-lab
 ```
+
+`make scope-expansion-lab` writes a four-branch scorecard, ranked implementation queue, branch development cockpit, and per-branch strategy cards under `outputs/analysis/scope_expansion/`, covering analytics engineering, DS/quant, creator-market intelligence, and the research platform.
 
 Those commands now write local-first behavioral clustering, decision-frontier, creator-market, and research-platform artifacts under:
 

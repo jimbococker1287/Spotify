@@ -36,6 +36,7 @@ spotify/data.py
 spotify/data_preparation.py
 spotify/data_quality.py
 spotify/day_90_launch.py
+spotify/deep_benchmark_finalizer.py
 spotify/deployment_registry.py
 spotify/digital_twin.py
 spotify/drift.py
@@ -126,6 +127,7 @@ spotify/portfolio_artifacts.py
 spotify/predict_next.py
 spotify/predict_service.py
 spotify/probability_bundles.py
+spotify/project_health.py
 spotify/public_catalog.py
 spotify/public_insights.py
 spotify/public_insights_cli.py
@@ -165,6 +167,7 @@ spotify/run_timing.py
 spotify/runtime.py
 spotify/safe_policy.py
 spotify/safety_platform.py
+spotify/scope_expansion_lab.py
 spotify/service_api.py
 spotify/service_auth.py
 spotify/serving.py
@@ -219,6 +222,7 @@ tests/test_creator_market_intelligence.py
 tests/test_data_discovery.py
 tests/test_data_quality_gate.py
 tests/test_day_90_launch.py
+tests/test_deep_benchmark_finalizer.py
 tests/test_deploy_manifests.py
 tests/test_deployment_registry.py
 tests/test_digital_twin.py
@@ -246,6 +250,7 @@ tests/test_predict_next_context.py
 tests/test_predict_service_cli_smoke.py
 tests/test_predict_service_validation.py
 tests/test_profiles_and_ensemble.py
+tests/test_project_health.py
 tests/test_public_catalog.py
 tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
@@ -267,6 +272,7 @@ tests/test_run_timing.py
 tests/test_runtime_acceleration.py
 tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
+tests/test_scope_expansion_lab.py
 tests/test_service_api.py
 tests/test_service_api_cli_smoke.py
 tests/test_serving_analytics_and_session_knn.py

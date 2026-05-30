@@ -672,6 +672,250 @@ def _write_minimal_research_platform_branch(output_dir: Path) -> None:
     )
 
 
+def _write_minimal_scope_expansion_branch(output_dir: Path) -> None:
+    base_dir = output_dir / "analysis" / "scope_expansion"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    generated_at = "2026-01-01T01:00:00+00:00"
+
+    pd.DataFrame(
+        [
+            {
+                "branch_key": "analytics_engineering",
+                "branch_name": "Data Engineering + Analytics Engineering",
+                "scope_lane": "local warehouse",
+                "audience": "operator",
+                "status": "ready",
+                "readiness_score": 0.88,
+                "evidence_score": 1.0,
+                "freshness_score": 0.9,
+                "risk_score": 0.12,
+                "primary_metric_name": "warehouse_asset_count",
+                "primary_metric_value": 42.0,
+                "artifact_count": 4,
+                "artifact_root": str((output_dir / "analytics" / "warehouse").resolve()),
+                "top_signal": "Warehouse assets are queryable.",
+                "top_gap": "Need dashboard-facing branch queue.",
+                "recommended_next_step": "Publish branch-health mart.",
+                "proof_artifacts": json.dumps(["warehouse_manifest.json"]),
+            },
+            {
+                "branch_key": "data_science_quant",
+                "branch_name": "Data Science + Quant",
+                "scope_lane": "decision science",
+                "audience": "researcher",
+                "status": "attention",
+                "readiness_score": 0.81,
+                "evidence_score": 1.0,
+                "freshness_score": 1.0,
+                "risk_score": 0.62,
+                "primary_metric_name": "top_scenario_utility",
+                "primary_metric_value": 0.79,
+                "artifact_count": 5,
+                "artifact_root": str((output_dir / "analysis" / "quant_decision_lab").resolve()),
+                "top_signal": "Policy frontier has enough signal for notebooks.",
+                "top_gap": "Need repeated benchmark linkage.",
+                "recommended_next_step": "Connect quant decisions to research locks.",
+                "proof_artifacts": json.dumps(["scenario_policy_frontier.csv"]),
+            },
+            {
+                "branch_key": "creator_market_intelligence",
+                "branch_name": "Creator / Market Intelligence",
+                "scope_lane": "market intelligence",
+                "audience": "creator strategist",
+                "status": "attention",
+                "readiness_score": 0.86,
+                "evidence_score": 0.84,
+                "freshness_score": 0.8,
+                "risk_score": 0.37,
+                "primary_metric_name": "report_family_count",
+                "primary_metric_value": 1.0,
+                "artifact_count": 5,
+                "artifact_root": str((output_dir / "analysis" / "creator_market_intelligence").resolve()),
+                "top_signal": "Creator-market watchlist is populated.",
+                "top_gap": "Need multi-family market breadth.",
+                "recommended_next_step": "Backfill additional creator families.",
+                "proof_artifacts": json.dumps(["creator_market_brief.json"]),
+            },
+            {
+                "branch_key": "research_platform",
+                "branch_name": "Research Platform",
+                "scope_lane": "evidence platform",
+                "audience": "reviewer",
+                "status": "attention",
+                "readiness_score": 0.54,
+                "evidence_score": 0.43,
+                "freshness_score": 1.0,
+                "risk_score": 0.76,
+                "primary_metric_name": "blocked_claim_count",
+                "primary_metric_value": 1.0,
+                "artifact_count": 5,
+                "artifact_root": str((output_dir / "analysis" / "research_platform_lab").resolve()),
+                "top_signal": "Research registry is present.",
+                "top_gap": "Blocked claims still prevent external packaging.",
+                "recommended_next_step": "Resolve research-platform blockers.",
+                "proof_artifacts": json.dumps(["research_platform_maturity.json"]),
+            },
+        ]
+    ).to_csv(base_dir / "branch_expansion_scorecard.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "branch_key": "research_platform",
+                "branch_name": "Research Platform",
+                "initiative": "Close blocked research claims",
+                "why_now": "Evidence blockers hold back all downstream branch narratives.",
+                "success_metric": "claim_blocked_count == 0",
+                "required_artifacts": json.dumps(["research_claim_registry.csv"]),
+                "command": "make research-platform-lab",
+                "effort": "medium",
+                "impact_score": 0.93,
+                "risk_reduction_score": 0.88,
+                "dependencies": json.dumps(["benchmark lock"]),
+            },
+            {
+                "rank": 2,
+                "branch_key": "data_science_quant",
+                "branch_name": "Data Science + Quant",
+                "initiative": "Tie scenario frontier to benchmark evidence",
+                "why_now": "Quant work is useful but needs stronger proof loops.",
+                "success_metric": "frontier rows linked to benchmark ids",
+                "required_artifacts": json.dumps(["scenario_policy_frontier.csv"]),
+                "command": "make quant-decision-lab",
+                "effort": "medium",
+                "impact_score": 0.87,
+                "risk_reduction_score": 0.7,
+                "dependencies": json.dumps(["research platform"]),
+            },
+            {
+                "rank": 3,
+                "branch_key": "analytics_engineering",
+                "branch_name": "Data Engineering + Analytics Engineering",
+                "initiative": "Expose branch health in DuckDB",
+                "why_now": "The local warehouse should be the branch cockpit.",
+                "success_metric": "scope_expansion_priority_queue view passes consistency checks",
+                "required_artifacts": json.dumps(["mart_scope_expansion_health.parquet"]),
+                "command": "make analytics-db",
+                "effort": "small",
+                "impact_score": 0.82,
+                "risk_reduction_score": 0.55,
+                "dependencies": json.dumps(["scope expansion lab"]),
+            },
+            {
+                "rank": 4,
+                "branch_key": "creator_market_intelligence",
+                "branch_name": "Creator / Market Intelligence",
+                "initiative": "Increase market family breadth",
+                "why_now": "Creator intelligence needs repeated scenes, lanes, and whitespace signals.",
+                "success_metric": "report_family_count >= 3",
+                "required_artifacts": json.dumps(["creator_market_trend_deltas.csv"]),
+                "command": "make creator-market-intelligence",
+                "effort": "medium",
+                "impact_score": 0.76,
+                "risk_reduction_score": 0.49,
+                "dependencies": json.dumps(["creator ranking families"]),
+            },
+        ]
+    ).to_csv(base_dir / "branch_expansion_implementation_queue.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "branch_key": "research_platform",
+                "branch_name": "Research Platform",
+                "development_mode": "stabilize",
+                "status": "attention",
+                "readiness_score": 0.54,
+                "risk_score": 0.76,
+                "sprint_objective": "Reduce the highest research risk.",
+                "next_initiative": "Close blocked research claims",
+                "why_now": "Evidence blockers hold back all downstream branch narratives.",
+                "success_metric": "claim_blocked_count == 0",
+                "primary_command": "make research-platform-lab",
+                "validation_command": ".venv/bin/python -m pytest tests/test_research_platform_lab.py",
+                "required_artifacts": json.dumps(["research_claim_registry.csv"]),
+                "proof_artifacts": json.dumps(["research_platform_maturity.json"]),
+                "decision_rule": "Do not expand until blocked evidence falls.",
+                "handoff_summary": "Research Platform is in stabilize mode.",
+            },
+            {
+                "branch_key": "data_science_quant",
+                "branch_name": "Data Science + Quant",
+                "development_mode": "extend",
+                "status": "attention",
+                "readiness_score": 0.81,
+                "risk_score": 0.62,
+                "sprint_objective": "Deepen quant decision evidence.",
+                "next_initiative": "Tie scenario frontier to benchmark evidence",
+                "why_now": "Quant work is useful but needs stronger proof loops.",
+                "success_metric": "frontier rows linked to benchmark ids",
+                "primary_command": "make quant-decision-lab",
+                "validation_command": ".venv/bin/python -m pytest tests/test_quant_decision_lab.py",
+                "required_artifacts": json.dumps(["scenario_policy_frontier.csv"]),
+                "proof_artifacts": json.dumps(["scenario_policy_frontier.csv"]),
+                "decision_rule": "Extend if the generated artifacts prove the frontier.",
+                "handoff_summary": "Data Science + Quant is in extend mode.",
+            },
+            {
+                "branch_key": "analytics_engineering",
+                "branch_name": "Data Engineering + Analytics Engineering",
+                "development_mode": "scale",
+                "status": "ready",
+                "readiness_score": 0.88,
+                "risk_score": 0.12,
+                "sprint_objective": "Turn branch health into a reusable cockpit.",
+                "next_initiative": "Expose branch health in DuckDB",
+                "why_now": "The local warehouse should be the branch cockpit.",
+                "success_metric": "scope_expansion_priority_queue view passes consistency checks",
+                "primary_command": "make analytics-db",
+                "validation_command": ".venv/bin/python -m pytest tests/test_analytics_warehouse.py",
+                "required_artifacts": json.dumps(["mart_scope_expansion_health.parquet"]),
+                "proof_artifacts": json.dumps(["warehouse_manifest.json"]),
+                "decision_rule": "Scale if the warehouse contract passes.",
+                "handoff_summary": "Analytics Engineering is in scale mode.",
+            },
+            {
+                "branch_key": "creator_market_intelligence",
+                "branch_name": "Creator / Market Intelligence",
+                "development_mode": "extend",
+                "status": "attention",
+                "readiness_score": 0.86,
+                "risk_score": 0.37,
+                "sprint_objective": "Convert market signals into strategy cards.",
+                "next_initiative": "Increase market family breadth",
+                "why_now": "Creator intelligence needs repeated scenes, lanes, and whitespace signals.",
+                "success_metric": "report_family_count >= 3",
+                "primary_command": "make creator-market-intelligence",
+                "validation_command": ".venv/bin/python -m pytest tests/test_creator_market_intelligence.py",
+                "required_artifacts": json.dumps(["creator_market_trend_deltas.csv"]),
+                "proof_artifacts": json.dumps(["creator_market_brief.json"]),
+                "decision_rule": "Extend if trend deltas become repeated strategy signals.",
+                "handoff_summary": "Creator / Market Intelligence is in extend mode.",
+            },
+        ]
+    ).to_csv(base_dir / "branch_strategy_cards.csv", index=False)
+    (base_dir / "scope_expansion_manifest.json").write_text(
+        json.dumps(
+            {
+                "generated_at": generated_at,
+                "artifact_root": str(base_dir.resolve()),
+                "branch_count": 4,
+                "ready_branch_count": 1,
+                "attention_branch_count": 3,
+                "blocked_branch_count": 0,
+                "missing_branch_count": 0,
+                "queue_count": 4,
+                "strategy_card_count": 4,
+                "top_queue_item": {
+                    "branch_key": "research_platform",
+                    "initiative": "Close blocked research claims",
+                    "command": "make research-platform-lab",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _build_minimal_workspace(tmp_path: Path) -> tuple[Path, Path]:
     data_dir = tmp_path / "data" / "raw"
     output_dir = tmp_path / "outputs"
@@ -681,6 +925,7 @@ def _build_minimal_workspace(tmp_path: Path) -> tuple[Path, Path]:
     _write_minimal_creator_family(output_dir)
     _write_minimal_creator_market_branch(output_dir)
     _write_minimal_research_platform_branch(output_dir)
+    _write_minimal_scope_expansion_branch(output_dir)
     return data_dir, output_dir
 
 
@@ -734,12 +979,16 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert (warehouse_root / "bronze" / "control_room_snapshot.parquet").exists()
     assert (warehouse_root / "bronze" / "creator_market_scene_pulse.parquet").exists()
     assert (warehouse_root / "bronze" / "research_platform_run_registry.parquet").exists()
+    assert (warehouse_root / "bronze" / "scope_expansion_scorecard.parquet").exists()
+    assert (warehouse_root / "bronze" / "scope_expansion_strategy_cards.parquet").exists()
     assert (warehouse_root / "silver" / "model_run_summary.parquet").exists()
     assert (warehouse_root / "silver" / "creator_market_scene_summary.parquet").exists()
     assert (warehouse_root / "silver" / "research_platform_status_summary.parquet").exists()
+    assert (warehouse_root / "silver" / "scope_expansion_branch_health.parquet").exists()
     assert (warehouse_root / "gold" / "mart_creator_opportunities.parquet").exists()
     assert (warehouse_root / "gold" / "mart_creator_market_watchlist.parquet").exists()
     assert (warehouse_root / "gold" / "mart_research_platform_status.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_scope_expansion_health.parquet").exists()
 
     control_room_snapshot = pd.read_parquet(warehouse_root / "bronze" / "control_room_snapshot.parquet")
     assert control_room_snapshot.loc[0, "selected_run_id"] == "run_a"
@@ -767,6 +1016,17 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     research_platform_mart = pd.read_parquet(warehouse_root / "gold" / "mart_research_platform_status.parquet")
     assert research_platform_mart.loc[0, "status_posture"] == "blocked"
 
+    scope_branch_health = pd.read_parquet(warehouse_root / "silver" / "scope_expansion_branch_health.parquet")
+    assert scope_branch_health.loc[0, "branch_key"] == "research_platform"
+    assert scope_branch_health.loc[0, "next_command"] == "make research-platform-lab"
+    assert scope_branch_health.loc[0, "development_mode"] == "stabilize"
+    assert "test_research_platform_lab.py" in scope_branch_health.loc[0, "validation_command"]
+
+    scope_health_mart = pd.read_parquet(warehouse_root / "gold" / "mart_scope_expansion_health.parquet")
+    assert scope_health_mart.loc[0, "branch_key"] == "research_platform"
+    assert scope_health_mart.loc[0, "branch_posture"] == "blocked"
+    assert scope_health_mart.loc[0, "sprint_objective"] == "Reduce the highest research risk."
+
     manifest = _load_manifest(warehouse_root)
     manifest_assets = _manifest_asset_lookup(manifest)
     assert manifest["refresh"]["built_assets"] >= 1
@@ -777,6 +1037,10 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert manifest_assets["mart_research_platform_status"]["branch_backed"]
     assert manifest_assets["mart_research_platform_status"]["source_fingerprint"]
     assert manifest_assets["research_platform_claim_registry"]["branch_freshness"]["status"] == "attention"
+    assert manifest_assets["mart_scope_expansion_health"]["branch_backed"]
+    assert manifest_assets["mart_scope_expansion_health"]["source_fingerprint"]
+    assert manifest_assets["scope_expansion_branch_health"]["rows"] == 4
+    assert manifest_assets["scope_expansion_strategy_cards"]["rows"] == 4
 
     lineage_report = json.loads((warehouse_root / "warehouse_lineage.json").read_text(encoding="utf-8"))
     lineage_edges = {
@@ -791,11 +1055,15 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert ("bronze", "raw_streaming_history", "silver", "listener_daily_activity") in lineage_edges
     assert ("silver", "creator_market_scene_summary", "gold", "mart_creator_market_watchlist") in lineage_edges
     assert ("silver", "research_platform_status_summary", "gold", "mart_research_platform_status") in lineage_edges
+    assert ("bronze", "scope_expansion_scorecard", "silver", "scope_expansion_branch_health") in lineage_edges
+    assert ("bronze", "scope_expansion_strategy_cards", "silver", "scope_expansion_branch_health") in lineage_edges
+    assert ("silver", "scope_expansion_branch_health", "gold", "mart_scope_expansion_health") in lineage_edges
     assert lineage_report["quality"]["summary"]["empty_asset_count"] >= 1
     assert "bronze.optuna_history" in _asset_refs_by_name(lineage_report["quality"]["empty_assets"])
     assert lineage_report["quality"]["summary"]["row_count_anomaly_count"] == 0
     freshness_refs = _asset_refs_by_name(lineage_report["quality"]["branch_backed_artifact_freshness"])
     assert "bronze.research_platform_claim_registry" in freshness_refs
+    assert "gold.mart_scope_expansion_health" in freshness_refs
 
     verification = json.loads((warehouse_root / "warehouse_verification.json").read_text(encoding="utf-8"))
     assert verification["status"] == "pass"
@@ -818,8 +1086,10 @@ def test_build_analytics_warehouse_reuses_unchanged_branch_backed_assets(tmp_pat
     )
     creator_parquet = warehouse_root / "bronze" / "creator_market_release_whitespace_atlas.parquet"
     research_parquet = warehouse_root / "gold" / "mart_research_platform_status.parquet"
+    scope_parquet = warehouse_root / "gold" / "mart_scope_expansion_health.parquet"
     creator_mtime_first = creator_parquet.stat().st_mtime_ns
     research_mtime_first = research_parquet.stat().st_mtime_ns
+    scope_mtime_first = scope_parquet.stat().st_mtime_ns
 
     time.sleep(0.05)
     warehouse_root = build_analytics_warehouse(
@@ -830,15 +1100,18 @@ def test_build_analytics_warehouse_reuses_unchanged_branch_backed_assets(tmp_pat
     )
     creator_mtime_second = creator_parquet.stat().st_mtime_ns
     research_mtime_second = research_parquet.stat().st_mtime_ns
+    scope_mtime_second = scope_parquet.stat().st_mtime_ns
     manifest_second = _load_manifest(warehouse_root)
     assets_second = _manifest_asset_lookup(manifest_second)
 
     assert creator_mtime_second == creator_mtime_first
     assert research_mtime_second == research_mtime_first
+    assert scope_mtime_second == scope_mtime_first
     assert manifest_second["refresh"]["reused_assets"] >= 1
     assert manifest_second["refresh"]["branch_backed_reused_assets"] >= 1
     assert assets_second["creator_market_release_whitespace_atlas"]["refresh_status"] == "reused"
     assert assets_second["mart_research_platform_status"]["refresh_status"] == "reused"
+    assert assets_second["mart_scope_expansion_health"]["refresh_status"] == "reused"
 
     creator_market_dir = output_dir / "analysis" / "creator_market_intelligence"
     whitespace_path = creator_market_dir / "release_whitespace_atlas.csv"
@@ -855,15 +1128,18 @@ def test_build_analytics_warehouse_reuses_unchanged_branch_backed_assets(tmp_pat
     )
     creator_mtime_third = creator_parquet.stat().st_mtime_ns
     research_mtime_third = research_parquet.stat().st_mtime_ns
+    scope_mtime_third = scope_parquet.stat().st_mtime_ns
     manifest_third = _load_manifest(warehouse_root)
     assets_third = _manifest_asset_lookup(manifest_third)
 
     assert creator_mtime_third > creator_mtime_second
     assert research_mtime_third == research_mtime_second
+    assert scope_mtime_third == scope_mtime_second
     assert assets_third["creator_market_release_whitespace_atlas"]["refresh_status"] == "rebuilt"
     assert assets_third["creator_market_release_whitespace_atlas"]["refresh_reason"] == "content_hash_changed"
     assert assets_third["mart_creator_market_watchlist"]["refresh_status"] == "rebuilt"
     assert assets_third["mart_research_platform_status"]["refresh_status"] == "reused"
+    assert assets_third["mart_scope_expansion_health"]["refresh_status"] == "reused"
     assert manifest_third["refresh"]["rebuilt_assets"] >= 1
 
 
@@ -951,6 +1227,14 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
             ORDER BY watchlist_score DESC
             """
         ).fetchone()
+        scope_queue_row = con.execute(
+            """
+            SELECT branch_key, branch_posture, next_command
+            FROM scope_expansion_priority_queue
+            ORDER BY queue_rank
+            LIMIT 1
+            """
+        ).fetchone()
         consistency_rows = con.execute(
             """
             SELECT object_name, row_count_match, column_match, logical_type_match
@@ -961,8 +1245,12 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
               'mart_creator_market_watchlist',
               'mart_ops_overview',
               'mart_research_platform_status',
+              'mart_scope_expansion_health',
               'latest_ops_overview',
-              'latest_research_platform_status'
+              'latest_research_platform_status',
+              'scope_expansion_branch_health',
+              'scope_expansion_strategy_cards',
+              'scope_expansion_priority_queue'
             )
             ORDER BY object_name
             """
@@ -986,6 +1274,7 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
     assert creator_market_row == ("Artist X", "scene-1", 2)
     assert research_status_row == ("run_a", "blocked", "internal_review")
     assert blocked_claim_row == ("claim_gap", True)
+    assert scope_queue_row == ("research_platform", "blocked", "make research-platform-lab")
     assert consistency_rows == [
         ("control_room_snapshot", True, True, True),
         ("creator_market_scene_summary", True, True, True),
@@ -994,6 +1283,10 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
         ("mart_creator_market_watchlist", True, True, True),
         ("mart_ops_overview", True, True, True),
         ("mart_research_platform_status", True, True, True),
+        ("mart_scope_expansion_health", True, True, True),
+        ("scope_expansion_branch_health", True, True, True),
+        ("scope_expansion_priority_queue", True, True, True),
+        ("scope_expansion_strategy_cards", True, True, True),
     ]
     assert metadata_row is not None
     assert metadata_row[0] == 1

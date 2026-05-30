@@ -74,6 +74,7 @@ if [[ -z "${DEEP_ALL:-}" ]]; then
   fi
 fi
 EPOCHS="${EPOCHS:-12}"
+BATCH_SIZE="${BATCH_SIZE:-}"
 OPTUNA_TRIALS="${OPTUNA_TRIALS:-10}"
 OPTUNA_TIMEOUT_SECONDS="${OPTUNA_TIMEOUT_SECONDS:-600}"
 BACKTEST_FOLDS="${BACKTEST_FOLDS:-4}"
@@ -234,10 +235,16 @@ fi
 
 export LOKY_MAX_CPU_COUNT="${LOKY_MAX_CPU_COUNT:-$LOGICAL_CPUS}"
 
+batch_args=()
+if [[ -n "$BATCH_SIZE" ]]; then
+  batch_args=(--batch "$BATCH_SIZE")
+fi
+
 exec "$PYTHON_CMD" -m spotify \
   --profile full \
   --run-name "$RUN_NAME" \
   --epochs "$EPOCHS" \
+  "${batch_args[@]}" \
   --models "$DEEP_ALL" \
   --mlflow \
   --optuna \

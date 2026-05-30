@@ -57,6 +57,14 @@ def _write_csv_rows(path: Path, rows: list[dict[str, object]]) -> Path | None:
     return path
 
 
+def _coerce_dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
+
+
 def _analysis_prefix_for_model_type(model_type: str) -> str | None:
     normalized = str(model_type).strip().lower()
     if normalized == "deep":
@@ -123,6 +131,127 @@ def _load_benchmark_bundle(manifest_path: Path | None) -> dict[str, object]:
         "summary_rows": summary_rows,
         "significance_rows": significance_rows,
     }
+
+
+def _existing_research_claims_path(output_root: Path) -> Path:
+    return output_root / "analysis" / "research_claims" / "research_claims.json"
+
+
+def _portable_path(path: Path, *, output_root: Path) -> tuple[str, bool, str]:
+    resolved = path.expanduser().resolve()
+    try:
+        return str(resolved.relative_to(output_root)), True, "output_relative"
+    except ValueError:
+        return str(resolved), False, "absolute_external"
+
+
+def _artifact_records(paths: list[object], *, output_root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for raw in paths:
+        raw_text = str(raw).strip()
+        if not raw_text:
+            continue
+        candidate = Path(raw_text).expanduser()
+        resolved = candidate.resolve()
+        portable_path, portable, scope = _portable_path(candidate, output_root=output_root)
+        records.append(
+            {
+                "absolute_path": str(resolved),
+                "portable_path": portable_path,
+                "portable": portable,
+                "path_scope": scope,
+                "exists": resolved.exists(),
+            }
+        )
+    return records
+
+
+def _artifact_portability_summary(claims: list[dict[str, object]]) -> dict[str, object]:
+    records = [
+        record
+        for claim in claims
+        if isinstance(claim, dict)
+        for record in claim.get("supporting_artifact_records", [])
+        if isinstance(record, dict)
+    ]
+    total = len(records)
+    portable = sum(1 for record in records if bool(record.get("portable")))
+    existing = sum(1 for record in records if bool(record.get("exists")))
+    non_portable_examples = [
+        str(record.get("absolute_path", "")).strip()
+        for record in records
+        if not bool(record.get("portable")) and str(record.get("absolute_path", "")).strip()
+    ]
+    return {
+        "path_mode": "relative_to_output_dir_when_possible",
+        "total_supporting_artifact_count": int(total),
+        "portable_supporting_artifact_count": int(portable),
+        "existing_supporting_artifact_count": int(existing),
+        "non_portable_supporting_artifact_count": int(total - portable),
+        "missing_supporting_artifact_count": int(total - existing),
+        "all_supporting_artifacts_portable": bool(total > 0 and portable == total),
+        "all_supporting_artifacts_present": bool(total > 0 and existing == total),
+        "non_portable_examples": non_portable_examples[:5],
+    }
+
+
+def _resolve_report_run_dir(existing_report: dict[str, object], *, output_root: Path) -> Path | None:
+    run_payload = _coerce_dict(existing_report.get("run"))
+    portable = str(run_payload.get("run_dir_portable", "")).strip()
+    if portable:
+        candidate = (output_root / portable).resolve()
+        if candidate.exists():
+            return candidate
+    absolute = str(run_payload.get("run_dir", "")).strip()
+    if absolute:
+        candidate = Path(absolute).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+    run_id = str(run_payload.get("run_id", "")).strip()
+    if run_id:
+        candidate = (output_root / "runs" / run_id).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_report_benchmark_manifest(existing_report: dict[str, object], *, output_root: Path) -> Path | None:
+    benchmark_payload = _coerce_dict(existing_report.get("benchmark_lock"))
+    portable = str(benchmark_payload.get("manifest_path_portable", "")).strip()
+    if portable:
+        candidate = (output_root / portable).resolve()
+        if candidate.exists():
+            return candidate
+    absolute = str(benchmark_payload.get("manifest_path", "")).strip()
+    if absolute:
+        candidate = Path(absolute).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+    return _latest_benchmark_manifest(output_root)
+
+
+def _enrich_claim_artifacts(
+    claim: dict[str, object],
+    *,
+    output_root: Path,
+) -> dict[str, object]:
+    enriched = dict(claim)
+    raw_paths = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    records = _artifact_records(raw_paths, output_root=output_root)
+    portability_ready = bool(records) and all(bool(record.get("portable")) for record in records)
+    artifact_pack_ready = bool(records) and all(bool(record.get("exists")) for record in records)
+    enriched["supporting_artifacts"] = [str(record.get("absolute_path", "")).strip() for record in records]
+    enriched["supporting_artifacts_portable"] = [str(record.get("portable_path", "")).strip() for record in records]
+    enriched["supporting_artifact_records"] = records
+    enriched["supporting_artifact_summary"] = {
+        "path_mode": "relative_to_output_dir_when_possible",
+        "artifact_count": int(len(records)),
+        "portable_artifact_count": int(sum(1 for record in records if bool(record.get("portable")))),
+        "existing_artifact_count": int(sum(1 for record in records if bool(record.get("exists")))),
+        "portability_status": "ready" if portability_ready else "attention" if records else "missing",
+        "artifact_pack_status": "ready" if artifact_pack_ready else "attention" if records else "missing",
+    }
+    return enriched
 
 
 def _median_metric(values: list[float]) -> float:
@@ -271,6 +400,11 @@ def _best_benchmark_row(rows: list[dict[str, object]], *, predicate) -> dict[str
     )
 
 
+def _benchmark_comparator_guard(benchmark_manifest: dict[str, object]) -> dict[str, object]:
+    payload = benchmark_manifest.get("comparator_guard", {})
+    return payload if isinstance(payload, dict) else {}
+
+
 def _claim_candidate_ranking(
     *,
     run_dir: Path,
@@ -300,6 +434,7 @@ def _claim_candidate_ranking(
     significance_rows = significance_rows if isinstance(significance_rows, list) else []
     benchmark_manifest = benchmark_bundle.get("manifest", {})
     benchmark_manifest = benchmark_manifest if isinstance(benchmark_manifest, dict) else {}
+    comparator_guard = _benchmark_comparator_guard(benchmark_manifest)
     lock_retrieval = next(
         (
             row
@@ -326,7 +461,14 @@ def _claim_candidate_ranking(
         else float("nan")
     )
     benchmark_ready = bool(benchmark_manifest.get("comparison_ready"))
-    retrieval_benchmark_ready = benchmark_ready and int(float(lock_retrieval.get("run_count", 0) or 0)) >= 3
+    requires_deep_comparator = bool(comparator_guard.get("requires_deep_comparator"))
+    deep_comparator_ready = bool(comparator_guard.get("deep_comparator_ready"))
+    deep_comparator_detail = str(comparator_guard.get("detail", "")).strip()
+    retrieval_benchmark_ready = (
+        benchmark_ready
+        and int(float(lock_retrieval.get("run_count", 0) or 0)) >= 3
+        and (not requires_deep_comparator or deep_comparator_ready)
+    )
     retrieval_vs_deep_significance = next(
         (
             row
@@ -384,9 +526,15 @@ def _claim_candidate_ranking(
             f"Repeated-seed significance vs `{lock_deep.get('model_name', '')}` is `{int(float(retrieval_vs_deep_significance.get('significant_at_95', 0) or 0))}` "
             f"with mean val_top1 diff `{_format_metric(retrieval_vs_deep_significance.get('mean_diff_val_top1'))}`."
         )
+    if requires_deep_comparator and not deep_comparator_ready and deep_comparator_detail:
+        evidence.append(f"Benchmark comparator guard: {deep_comparator_detail}")
 
     missing_checks = []
-    if not benchmark_ready:
+    if requires_deep_comparator and not deep_comparator_ready:
+        missing_checks.append(
+            "Benchmark lock is not comparison-ready because the research-grade comparator guard did not observe a repeated deep comparator."
+        )
+    elif not benchmark_ready:
         missing_checks.append("Finish the repeated-seed benchmark lock with at least 3 runs and a complete manifest artifact pack.")
     if not lock_retrieval:
         missing_checks.append("Add retrieval and reranker models to the benchmark-lock script so the main claim is repeated-seed, not single-run only.")
@@ -405,7 +553,8 @@ def _claim_candidate_ranking(
         "status": status,
         "summary": (
             f"Retrieval/reranking or ensemble-style candidate surfaces show a live test-top1 lift of `{_format_metric(live_delta)}` "
-            f"over the best deep baseline, but the benchmark-lock evidence is `{('ready' if benchmark_ready else 'not ready')}`."
+            f"over the best deep baseline, but the benchmark-lock evidence is "
+            f"`{('missing repeated deep comparator evidence' if requires_deep_comparator and not deep_comparator_ready else ('ready' if benchmark_ready else 'not ready'))}`."
         ),
         "evidence": evidence,
         "metrics": {
@@ -421,6 +570,10 @@ def _claim_candidate_ranking(
             "benchmark_comparison_ready": benchmark_ready,
             "benchmark_retrieval_ready": retrieval_benchmark_ready,
             "benchmark_significant_lift": significant_retrieval_lift,
+            "benchmark_requires_deep_comparator": requires_deep_comparator,
+            "benchmark_deep_comparator_ready": deep_comparator_ready,
+            "benchmark_deep_comparator_detail": deep_comparator_detail,
+            "benchmark_model_class_mix": benchmark_manifest.get("model_class_mix", {}),
         },
         "missing_checks": missing_checks,
         "supporting_artifacts": [
@@ -704,6 +857,7 @@ def _publication_outline(primary_claim: dict[str, object], backup_claim: dict[st
             "notes": [
                 "Call out any benchmark-contract failures directly instead of burying them.",
                 "Explain which claims are single-run, which are repeated-seed, and which still depend on operator-facing diagnostics.",
+                "Keep supporting artifact references portable by preferring paths relative to the output bundle over workspace-absolute paths.",
             ],
         },
     ]
@@ -728,6 +882,11 @@ def _claim_support_row(
     metrics = claim.get("metrics", {})
     metrics = metrics if isinstance(metrics, dict) else {}
     supporting_artifacts = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    supporting_artifact_records = [
+        dict(item)
+        for item in claim.get("supporting_artifact_records", [])
+        if isinstance(item, dict)
+    ]
     missing_checks = [str(item).strip() for item in claim.get("missing_checks", []) if str(item).strip()]
     claim_key = str(claim.get("key", "")).strip()
 
@@ -761,9 +920,19 @@ def _claim_support_row(
         risk_ready = math.isfinite(_safe_float(metrics.get("test_mean_delta")))
         benchmark_status = _evidence_status(None)
 
-    artifact_count = len(supporting_artifacts)
-    existing_artifacts = _existing_artifact_count(supporting_artifacts)
+    artifact_count = len(supporting_artifact_records) if supporting_artifact_records else len(supporting_artifacts)
+    existing_artifacts = (
+        sum(1 for item in supporting_artifact_records if bool(item.get("exists")))
+        if supporting_artifact_records
+        else _existing_artifact_count(supporting_artifacts)
+    )
+    portable_artifacts = (
+        sum(1 for item in supporting_artifact_records if bool(item.get("portable")))
+        if supporting_artifact_records
+        else 0
+    )
     artifact_pack_ready = artifact_count > 0 and existing_artifacts == artifact_count
+    artifact_portability_ready = artifact_count > 0 and portable_artifacts == artifact_count
     live_signal_ready = _STATUS_RANK.get(str(claim.get("status", "")), 0) >= 1
 
     return {
@@ -776,8 +945,10 @@ def _claim_support_row(
         "slice_evidence_status": _evidence_status(slice_ready),
         "risk_evidence_status": _evidence_status(risk_ready),
         "artifact_pack_status": _evidence_status(artifact_pack_ready),
+        "artifact_portability_status": _evidence_status(artifact_portability_ready),
         "supporting_artifact_count": artifact_count,
         "existing_artifact_count": existing_artifacts,
+        "portable_artifact_count": portable_artifacts,
         "missing_check_count": len(missing_checks),
         "next_gate": missing_checks[0] if missing_checks else "ready_to_package",
     }
@@ -801,6 +972,16 @@ def _build_submission_readiness(
     benchmark_table = evaluation_tables.get("benchmark_lock", [])
     run_leaderboard = run_leaderboard if isinstance(run_leaderboard, list) else []
     benchmark_table = benchmark_table if isinstance(benchmark_table, list) else []
+    primary_missing_checks = [
+        str(item).strip()
+        for item in primary_claim.get("missing_checks", [])
+        if str(item).strip()
+    ]
+    backup_missing_checks = [
+        str(item).strip()
+        for item in backup_claim.get("missing_checks", [])
+        if str(item).strip()
+    ]
 
     checks = [
         {
@@ -825,6 +1006,22 @@ def _build_submission_readiness(
             ),
         },
         {
+            "key": "primary_claim_blockers",
+            "status": "pass" if not primary_missing_checks else "attention",
+            "detail": (
+                "Primary claim blockers: "
+                f"`{primary_missing_checks[0] if primary_missing_checks else 'none'}`."
+            ),
+        },
+        {
+            "key": "backup_claim_blockers",
+            "status": "pass" if not backup_missing_checks else "attention",
+            "detail": (
+                "Backup claim blockers: "
+                f"`{backup_missing_checks[0] if backup_missing_checks else 'none'}`."
+            ),
+        },
+        {
             "key": "evaluation_tables",
             "status": "pass" if bool(run_leaderboard) and bool(benchmark_table) and bool(claim_support_matrix) else "fail",
             "detail": (
@@ -846,15 +1043,29 @@ def _build_submission_readiness(
             ),
         },
         {
+            "key": "artifact_portability",
+            "status": (
+                "pass"
+                if str(primary_row.get("artifact_portability_status", "")) == "ready"
+                and str(backup_row.get("artifact_portability_status", "")) in {"ready", "n/a", ""}
+                else "attention"
+            ),
+            "detail": (
+                f"Primary artifact portability is `{primary_row.get('artifact_portability_status', 'gap')}` and backup portability is "
+                f"`{backup_row.get('artifact_portability_status', 'gap')}`."
+            ),
+        },
+        {
             "key": "open_gaps",
-            "status": "pass" if len(claim_gaps) <= 2 else "attention",
+            "status": "pass" if len(claim_gaps) == 0 else "attention" if len(claim_gaps) <= 2 else "fail",
             "detail": f"Open claim gaps: `{len(claim_gaps)}`.",
         },
     ]
 
-    if primary_rank >= 4 and benchmark_ready and all(check["status"] == "pass" for check in checks):
+    has_open_checks = any(str(check.get("status", "")) != "pass" for check in checks)
+    if primary_rank >= 4 and benchmark_ready and not has_open_checks:
         status = "submission_candidate"
-    elif primary_rank >= 3 and backup_rank >= 1:
+    elif primary_rank >= 3 and backup_rank >= 1 and benchmark_ready and not has_open_checks:
         status = "analysis_ready"
     elif primary_rank >= 2:
         status = "promising_but_unlocked"
@@ -873,16 +1084,39 @@ def _build_submission_readiness(
     summary = [
         f"Primary claim is `{primary_claim.get('status', 'unknown')}` and backup claim is `{backup_claim.get('status', 'unknown')}`.",
         f"Benchmark lock is `{('ready' if benchmark_ready else 'not ready')}` with `{len(claim_gaps)}` open claim gaps.",
+        (
+            "Supporting artifacts are portable enough for packaging."
+            if str(primary_row.get("artifact_portability_status", "")) == "ready"
+            else "Supporting artifact paths still depend on workspace-specific references or missing files."
+        ),
         f"Submission-readiness state is `{status}`.",
     ]
 
     return {
         "status": status,
-        "ready_for_external_review": status in {"analysis_ready", "submission_candidate", "promising_but_unlocked"},
+        "ready_for_external_review": status in {"analysis_ready", "submission_candidate"} and not has_open_checks and benchmark_ready,
         "checks": checks,
         "blockers": blockers[:6],
         "summary": summary,
     }
+
+
+def _benchmark_table_rows(summary_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "model_name": str(row.get("model_name", "")),
+            "model_type": str(row.get("model_type", "")),
+            "run_count": int(float(row.get("run_count", 0) or 0)),
+            "val_top1_mean": _safe_float(row.get("val_top1_mean")),
+            "test_top1_mean": _safe_float(row.get("test_top1_mean")),
+            "val_top1_ci95": _safe_float(row.get("val_top1_ci95")),
+        }
+        for row in sorted(
+            summary_rows,
+            key=lambda row: _safe_float(row.get("val_top1_mean")),
+            reverse=True,
+        )[:8]
+    ]
 
 
 def build_research_claims_report(
@@ -920,6 +1154,7 @@ def build_research_claims_report(
         _claim_friction_counterfactual(run_dir=resolved_run_dir),
         _claim_risk_aware_abstention(run_dir=resolved_run_dir, run_results=run_results),
     ]
+    claims = [_enrich_claim_artifacts(claim, output_root=output_root) for claim in claims if isinstance(claim, dict)]
     claims.sort(key=_claim_sort_key, reverse=True)
     primary_claim = claims[0] if claims else {}
     backup_claim = claims[1] if len(claims) > 1 else {}
@@ -935,21 +1170,7 @@ def build_research_claims_report(
     ]
     benchmark_summary_rows = benchmark_bundle.get("summary_rows", [])
     benchmark_summary_rows = benchmark_summary_rows if isinstance(benchmark_summary_rows, list) else []
-    benchmark_table = [
-        {
-            "model_name": str(row.get("model_name", "")),
-            "model_type": str(row.get("model_type", "")),
-            "run_count": int(float(row.get("run_count", 0) or 0)),
-            "val_top1_mean": _safe_float(row.get("val_top1_mean")),
-            "test_top1_mean": _safe_float(row.get("test_top1_mean")),
-            "val_top1_ci95": _safe_float(row.get("val_top1_ci95")),
-        }
-        for row in sorted(
-            benchmark_summary_rows,
-            key=lambda row: _safe_float(row.get("val_top1_mean")),
-            reverse=True,
-        )[:8]
-    ]
+    benchmark_table = _benchmark_table_rows(benchmark_summary_rows)
 
     claim_gaps = []
     for claim in claims:
@@ -964,11 +1185,23 @@ def build_research_claims_report(
             "profile": str(run_manifest.get("profile", "")),
             "timestamp": str(run_manifest.get("timestamp", "")),
             "run_dir": str(resolved_run_dir),
+            "run_dir_portable": _portable_path(resolved_run_dir, output_root=output_root)[0],
         },
         "benchmark_lock": {
             "manifest_path": str(benchmark_bundle.get("manifest_path", "")),
+            "manifest_path_portable": (
+                _portable_path(Path(str(benchmark_bundle.get("manifest_path", ""))), output_root=output_root)[0]
+                if str(benchmark_bundle.get("manifest_path", "")).strip()
+                else ""
+            ),
             "benchmark_id": str((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("benchmark_id", "")),
             "comparison_ready": bool((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparison_ready")),
+            "model_class_mix": dict((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("model_class_mix", {}))
+            if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("model_class_mix", {}), dict)
+            else {},
+            "comparator_guard": dict((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparator_guard", {}))
+            if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("comparator_guard", {}), dict)
+            else {},
             "summary": list((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("summary", []))
             if isinstance((benchmark_bundle.get("manifest", {}) if isinstance(benchmark_bundle.get("manifest", {}), dict) else {}).get("summary", []), list)
             else [],
@@ -978,6 +1211,7 @@ def build_research_claims_report(
         "backup_claim": backup_claim,
         "believable_submission_path": _STATUS_RANK.get(str(primary_claim.get("status", "")), 0) >= 2
         and _STATUS_RANK.get(str(backup_claim.get("status", "")), 0) >= 1,
+        "artifact_portability": _artifact_portability_summary(claims),
         "evaluation_tables": {
             "run_leaderboard": top_model_rows,
             "benchmark_lock": benchmark_table,
@@ -1008,6 +1242,204 @@ def build_research_claims_report(
         claim_gaps=report["claim_gaps"],
     )
     return report
+
+
+def _repair_existing_research_claims_report(
+    existing_report: dict[str, object],
+    *,
+    output_root: Path,
+    run_dir: Path | None,
+    benchmark_manifest_path: Path | None,
+) -> dict[str, object]:
+    claims = [
+        _enrich_claim_artifacts(dict(claim), output_root=output_root)
+        for claim in _coerce_list(existing_report.get("claims"))
+        if isinstance(claim, dict)
+    ]
+    benchmark_bundle = _load_benchmark_bundle(benchmark_manifest_path)
+    benchmark_summary_rows = benchmark_bundle.get("summary_rows", [])
+    benchmark_summary_rows = benchmark_summary_rows if isinstance(benchmark_summary_rows, list) else []
+    benchmark_manifest = _coerce_dict(benchmark_bundle.get("manifest"))
+    benchmark_lock = {
+        "manifest_path": str(benchmark_bundle.get("manifest_path", "")),
+        "manifest_path_portable": (
+            _portable_path(Path(str(benchmark_bundle.get("manifest_path", ""))), output_root=output_root)[0]
+            if str(benchmark_bundle.get("manifest_path", "")).strip()
+            else str(_coerce_dict(existing_report.get("benchmark_lock")).get("manifest_path_portable", "")).strip()
+        ),
+        "benchmark_id": str(benchmark_manifest.get("benchmark_id", _coerce_dict(existing_report.get("benchmark_lock")).get("benchmark_id", ""))).strip(),
+        "comparison_ready": bool(
+            benchmark_manifest.get(
+                "comparison_ready",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparison_ready", False),
+            )
+        ),
+        "model_class_mix": dict(
+            benchmark_manifest.get(
+                "model_class_mix",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("model_class_mix", {}),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "model_class_mix",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("model_class_mix", {}),
+            ),
+            dict,
+        )
+        else {},
+        "comparator_guard": dict(
+            benchmark_manifest.get(
+                "comparator_guard",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparator_guard", {}),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "comparator_guard",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("comparator_guard", {}),
+            ),
+            dict,
+        )
+        else {},
+        "summary": list(
+            benchmark_manifest.get(
+                "summary",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("summary", []),
+            )
+        )
+        if isinstance(
+            benchmark_manifest.get(
+                "summary",
+                _coerce_dict(existing_report.get("benchmark_lock")).get("summary", []),
+            ),
+            list,
+        )
+        else [],
+    }
+
+    run_payload = _coerce_dict(existing_report.get("run"))
+    if run_dir is not None and run_dir.exists():
+        run_manifest = _coerce_dict(safe_read_json(run_dir / "run_manifest.json", default={}))
+        run_payload = {
+            "run_id": str(run_manifest.get("run_id", run_payload.get("run_id", run_dir.name))).strip(),
+            "profile": str(run_manifest.get("profile", run_payload.get("profile", ""))).strip(),
+            "timestamp": str(run_manifest.get("timestamp", run_payload.get("timestamp", ""))).strip(),
+            "run_dir": str(run_dir.resolve()),
+            "run_dir_portable": _portable_path(run_dir, output_root=output_root)[0],
+        }
+
+    primary_key = str(_coerce_dict(existing_report.get("primary_claim")).get("key", "")).strip()
+    backup_key = str(_coerce_dict(existing_report.get("backup_claim")).get("key", "")).strip()
+    claims_by_key = {
+        str(claim.get("key", "")).strip(): claim
+        for claim in claims
+        if isinstance(claim, dict) and str(claim.get("key", "")).strip()
+    }
+    sorted_claims = sorted(claims, key=_claim_sort_key, reverse=True)
+    primary_claim = claims_by_key.get(primary_key, sorted_claims[0] if sorted_claims else {})
+    backup_claim = claims_by_key.get(
+        backup_key,
+        next(
+            (
+                claim
+                for claim in sorted_claims
+                if str(claim.get("key", "")).strip() != str(primary_claim.get("key", "")).strip()
+            ),
+            {},
+        ),
+    )
+
+    claim_gaps: list[str] = []
+    for claim in claims:
+        for item in claim.get("missing_checks", []):
+            text = str(item).strip()
+            if text and text not in claim_gaps:
+                claim_gaps.append(text)
+
+    evaluation_tables = _coerce_dict(existing_report.get("evaluation_tables"))
+    evaluation_tables["benchmark_lock"] = _benchmark_table_rows(benchmark_summary_rows) or [
+        row
+        for row in _coerce_list(evaluation_tables.get("benchmark_lock"))
+        if isinstance(row, dict)
+    ]
+
+    report = {
+        "run": run_payload,
+        "benchmark_lock": benchmark_lock,
+        "claims": claims,
+        "primary_claim": primary_claim,
+        "backup_claim": backup_claim,
+        "believable_submission_path": _STATUS_RANK.get(str(primary_claim.get("status", "")), 0) >= 2
+        and _STATUS_RANK.get(str(backup_claim.get("status", "")), 0) >= 1,
+        "artifact_portability": _artifact_portability_summary(claims),
+        "evaluation_tables": evaluation_tables,
+        "claim_gaps": claim_gaps[:8],
+        "publication_outline": _publication_outline(primary_claim, backup_claim),
+    }
+    role_map = {
+        str(primary_claim.get("key", "")): "primary",
+        str(backup_claim.get("key", "")): "backup",
+    }
+    claim_support_matrix = [
+        _claim_support_row(
+            claim,
+            role=role_map.get(str(claim.get("key", "")), "supporting"),
+            benchmark_ready=bool(report["benchmark_lock"]["comparison_ready"]),
+        )
+        for claim in claims
+        if isinstance(claim, dict)
+    ]
+    report["claim_support_matrix"] = claim_support_matrix
+    report["submission_readiness"] = _build_submission_readiness(
+        primary_claim=primary_claim,
+        backup_claim=backup_claim,
+        benchmark_lock=report["benchmark_lock"],
+        evaluation_tables=report["evaluation_tables"],
+        claim_support_matrix=claim_support_matrix,
+        claim_gaps=report["claim_gaps"],
+    )
+    return report
+
+
+def refresh_research_claims_report(
+    output_dir: Path,
+    *,
+    existing_report_path: Path | None = None,
+    run_dir: Path | None = None,
+    benchmark_manifest_path: Path | None = None,
+) -> dict[str, object]:
+    output_root = output_dir.expanduser().resolve()
+    resolved_report_path = (
+        existing_report_path.expanduser().resolve()
+        if existing_report_path is not None
+        else _existing_research_claims_path(output_root).resolve()
+    )
+    if not resolved_report_path.exists():
+        raise FileNotFoundError(f"Existing research-claims report not found: {resolved_report_path}")
+    existing_report = _coerce_dict(safe_read_json(resolved_report_path, default={}))
+    resolved_run_dir = (
+        run_dir.expanduser().resolve()
+        if run_dir is not None
+        else _resolve_report_run_dir(existing_report, output_root=output_root)
+    )
+    resolved_benchmark_manifest = (
+        benchmark_manifest_path.expanduser().resolve()
+        if benchmark_manifest_path is not None
+        else _resolve_report_benchmark_manifest(existing_report, output_root=output_root)
+    )
+    if resolved_run_dir is not None and resolved_run_dir.exists():
+        return build_research_claims_report(
+            output_root,
+            run_dir=resolved_run_dir,
+            benchmark_manifest_path=resolved_benchmark_manifest,
+        )
+    return _repair_existing_research_claims_report(
+        existing_report,
+        output_root=output_root,
+        run_dir=resolved_run_dir,
+        benchmark_manifest_path=resolved_benchmark_manifest,
+    )
 
 
 def write_research_claims_report(
@@ -1046,6 +1478,8 @@ def write_research_claims_report(
         artifact_dir / "claim_support_matrix.csv",
         [row for row in claim_support_matrix if isinstance(row, dict)],
     )
+    artifact_portability = report.get("artifact_portability", {})
+    artifact_portability = artifact_portability if isinstance(artifact_portability, dict) else {}
 
     lines = [
         "# Research Claims",
@@ -1054,6 +1488,7 @@ def write_research_claims_report(
         f"- Profile: `{(report.get('run', {}) if isinstance(report.get('run', {}), dict) else {}).get('profile', '')}`",
         f"- Benchmark lock ready: `{benchmark_lock.get('comparison_ready', False)}`",
         f"- Believable submission path: `{report.get('believable_submission_path', False)}`",
+        f"- Artifact path mode: `{artifact_portability.get('path_mode', '')}`",
         "",
         "## Primary Claim",
         "",
@@ -1079,11 +1514,26 @@ def write_research_claims_report(
     for item in backup_claim.get("evidence", []):
         lines.append(f"- {item}")
 
+    lines.extend(["", "## Artifact Portability", ""])
+    lines.append(
+        f"- Portable supporting artifacts: `{artifact_portability.get('portable_supporting_artifact_count', 0)}` / `{artifact_portability.get('total_supporting_artifact_count', 0)}`"
+    )
+    lines.append(
+        f"- Existing supporting artifacts: `{artifact_portability.get('existing_supporting_artifact_count', 0)}` / `{artifact_portability.get('total_supporting_artifact_count', 0)}`"
+    )
+    if artifact_portability.get("non_portable_examples"):
+        lines.append(
+            f"- Non-portable examples: `{', '.join(str(item) for item in artifact_portability.get('non_portable_examples', []))}`"
+        )
+
     lines.extend(["", "## Claim Matrix", ""])
     for claim in report.get("claims", []):
         if not isinstance(claim, dict):
             continue
-        lines.append(f"- `{claim.get('status', '')}` {claim.get('title', '')}")
+        lines.append(
+            f"- `{claim.get('status', '')}` {claim.get('title', '')} "
+            f"(artifacts `{(claim.get('supporting_artifact_summary', {}) if isinstance(claim.get('supporting_artifact_summary', {}), dict) else {}).get('portability_status', 'missing')}`)"
+        )
 
     lines.extend(["", "## Evaluation Tables", "", "### Run Leaderboard", ""])
     for row in (report.get("evaluation_tables", {}) if isinstance(report.get("evaluation_tables", {}), dict) else {}).get("run_leaderboard", []):
@@ -1111,7 +1561,8 @@ def write_research_claims_report(
             f"- `{row.get('role', '')}` `{row.get('claim_key', '')}` [{row.get('status', '')}] "
             f"live=`{row.get('live_signal_status', '')}` benchmark=`{row.get('benchmark_evidence_status', '')}` "
             f"repeated=`{row.get('repeated_evidence_status', '')}` slice=`{row.get('slice_evidence_status', '')}` "
-            f"risk=`{row.get('risk_evidence_status', '')}` artifacts=`{row.get('artifact_pack_status', '')}`"
+            f"risk=`{row.get('risk_evidence_status', '')}` artifacts=`{row.get('artifact_pack_status', '')}` "
+            f"portability=`{row.get('artifact_portability_status', '')}`"
         )
 
     lines.extend(["", "## Submission Readiness", ""])
@@ -1163,7 +1614,8 @@ def write_research_claims_report(
         claim_support_md_lines.append(
             f"- `{row.get('role', '')}` `{row.get('claim_key', '')}`: benchmark `{row.get('benchmark_evidence_status', '')}`, "
             f"repeated `{row.get('repeated_evidence_status', '')}`, slice `{row.get('slice_evidence_status', '')}`, "
-            f"risk `{row.get('risk_evidence_status', '')}`, artifacts `{row.get('artifact_pack_status', '')}`."
+            f"risk `{row.get('risk_evidence_status', '')}`, artifacts `{row.get('artifact_pack_status', '')}`, "
+            f"portability `{row.get('artifact_portability_status', '')}`."
         )
         claim_support_md_lines.append(f"Next gate: {row.get('next_gate', '')}")
     claim_support_md = artifact_dir / "claim_support_matrix.md"
@@ -1217,16 +1669,37 @@ def main() -> int:
         default=None,
         help="Explicit outputs/history/benchmark_lock_<id>_manifest.json file.",
     )
+    parser.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Refresh or repair an existing research-claim pack from the local outputs tree without retraining.",
+    )
+    parser.add_argument(
+        "--existing-report",
+        type=str,
+        default=None,
+        help="Explicit outputs/analysis/research_claims/research_claims.json file to refresh or repair.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
     benchmark_manifest = Path(args.benchmark_manifest).expanduser().resolve() if args.benchmark_manifest else None
+    existing_report = Path(args.existing_report).expanduser().resolve() if args.existing_report else None
 
-    report = build_research_claims_report(
-        output_dir,
-        run_dir=run_dir,
-        benchmark_manifest_path=benchmark_manifest,
+    report = (
+        refresh_research_claims_report(
+            output_dir,
+            existing_report_path=existing_report,
+            run_dir=run_dir,
+            benchmark_manifest_path=benchmark_manifest,
+        )
+        if args.refresh_existing
+        else build_research_claims_report(
+            output_dir,
+            run_dir=run_dir,
+            benchmark_manifest_path=benchmark_manifest,
+        )
     )
     paths = write_research_claims_report(report, output_dir=output_dir)
     primary_claim = report.get("primary_claim", {})
@@ -1243,11 +1716,14 @@ def main() -> int:
     print(f"backup_claim={backup_claim.get('key', '')}")
     print(f"backup_status={backup_claim.get('status', '')}")
     print(f"believable_submission_path={report.get('believable_submission_path', False)}")
+    if args.refresh_existing:
+        print("refresh_existing=true")
     return 0
 
 
 __all__ = [
     "build_research_claims_report",
+    "refresh_research_claims_report",
     "write_research_claims_report",
     "main",
 ]

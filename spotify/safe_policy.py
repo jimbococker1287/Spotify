@@ -56,14 +56,18 @@ _SCENARIO_ROUTE_SLUGS = {
 _SCENARIO_VARIANT_DELTAS: dict[str, tuple[tuple[str, dict[str, float]], ...]] = {
     "baseline": (
         ("steady_guard", {"transition": -0.10, "continuity": 0.10, "repeat": 0.10, "novelty": -0.10}),
+        ("default_skip_guard", {"transition": -0.45, "continuity": 0.70, "repeat": 0.85, "novelty": -0.35}),
+        ("default_deep_comfort", {"transition": -0.55, "continuity": 0.85, "repeat": 1.05, "novelty": -0.45}),
     ),
     "high_friction_spike": (
         ("friction_anchor", {"transition": -0.15, "continuity": 0.25, "repeat": 0.25, "novelty": -0.20}),
         ("friction_recovery", {"transition": -0.20, "continuity": 0.30, "repeat": 0.30, "novelty": -0.25}),
+        ("friction_skip_guard", {"transition": -0.45, "continuity": 0.75, "repeat": 0.95, "novelty": -0.45}),
     ),
     "session_restart": (
         ("restart_anchor", {"transition": -0.05, "continuity": 0.20, "repeat": 0.20, "novelty": -0.10}),
         ("restart_repeat", {"transition": 0.00, "continuity": 0.15, "repeat": 0.30, "novelty": -0.15}),
+        ("restart_skip_guard", {"transition": -0.45, "continuity": 0.75, "repeat": 1.00, "novelty": -0.40}),
     ),
     "evening_drift": (
         ("evening_anchor", {"transition": -0.10, "continuity": 0.35, "repeat": 0.35, "novelty": -0.30}),
@@ -73,10 +77,12 @@ _SCENARIO_VARIANT_DELTAS: dict[str, tuple[tuple[str, dict[str, float]], ...]] = 
         ("evening_transition_min", {"transition": -0.35, "continuity": 0.45, "repeat": 0.50, "novelty": -0.45}),
         ("evening_deep_continuity", {"transition": -0.45, "continuity": 0.60, "repeat": 0.70, "novelty": -0.55}),
         ("evening_ultra_stable", {"transition": -0.55, "continuity": 0.75, "repeat": 0.85, "novelty": -0.65}),
+        ("evening_skip_guard", {"transition": -0.70, "continuity": 0.95, "repeat": 1.15, "novelty": -0.75}),
     ),
     "listener_fatigue": (
         ("fatigue_anchor", {"transition": -0.10, "continuity": 0.25, "repeat": 0.35, "novelty": -0.25}),
         ("fatigue_repeat_max", {"transition": -0.15, "continuity": 0.20, "repeat": 0.45, "novelty": -0.30}),
+        ("fatigue_skip_guard", {"transition": -0.45, "continuity": 0.80, "repeat": 1.10, "novelty": -0.50}),
     ),
 }
 

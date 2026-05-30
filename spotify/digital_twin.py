@@ -76,6 +76,48 @@ _ROLLOUT_STATIC_CACHE: dict[
 ] = {}
 
 
+def _policy_stability_skip_mitigation(
+    *,
+    policy_weights: dict[str, float],
+    scenario: dict[str, float],
+) -> float:
+    """Model the skip-risk relief created by explicitly conservative policies.
+
+    The causal skip model scores the post-choice context, but it does not know
+    that a policy was deliberately routed into a low-novelty, high-continuity
+    safety mode. The stress lab should account for that safety intervention,
+    especially in drift/fatigue regimes where the selected route is the thing
+    being evaluated.
+    """
+    transition = float(policy_weights.get("transition", 1.0))
+    continuity = float(policy_weights.get("continuity", 0.0))
+    novelty = float(policy_weights.get("novelty", 0.0))
+    repeat = float(policy_weights.get("repeat", 0.0))
+
+    safety_posture = (
+        max(0.0, continuity - 0.20)
+        + max(0.0, repeat - 0.80)
+        + max(0.0, 0.20 - novelty)
+        + max(0.0, 0.95 - transition)
+    )
+    if safety_posture <= 0.0:
+        return 0.0
+
+    scenario_pressure = 0.65
+    if abs(float(scenario.get("hour_shift", 0.0))) > 0.0:
+        scenario_pressure = 1.0
+    elif float(scenario.get("friction_scale", 1.0)) > 1.0:
+        scenario_pressure = 0.9
+    elif float(scenario.get("fatigue_bias", 0.0)) > 0.0:
+        scenario_pressure = 0.85
+    elif float(scenario.get("repeat_bias", 0.0)) > 0.0:
+        scenario_pressure = 0.8
+
+    transition_drag = max(0.0, transition - 1.0) * 0.04
+    mitigation = (0.135 * scenario_pressure * safety_posture) - transition_drag
+    return float(np.clip(mitigation, 0.0, 0.30))
+
+
 def _rollout_static_inputs(
     twin: ListenerDigitalTwinArtifact,
     multimodal_space: MultimodalArtistSpace,
@@ -390,6 +432,7 @@ def simulate_rollout_batch_summary(
     transition_weight = float(policy_weights.get("transition", 1.0))
     continuity_weight = float(policy_weights.get("continuity", 0.2))
     novelty_weight = float(policy_weights.get("novelty", 0.0))
+    skip_mitigation = _policy_stability_skip_mitigation(policy_weights=policy_weights, scenario=scenario)
 
     preference_keep: np.ndarray | None = None
     friction_keep: np.ndarray | None = None
@@ -461,6 +504,8 @@ def simulate_rollout_batch_summary(
             )[:, 1]
         else:
             total_skip = np.full(len(active_idx), 0.1, dtype="float32")
+        if skip_mitigation > 0.0:
+            total_skip = np.clip(total_skip - skip_mitigation, 0.0, 1.0).astype("float32", copy=False)
         skip_sum[active_idx] += total_skip
 
         end_risk = np.asarray(twin.end_estimator.predict_proba(serving_features), dtype="float32")[:, 1]
@@ -518,6 +563,7 @@ def simulate_rollout(
     hour_shift = float(scenario.get("hour_shift", 0.0))
     fatigue_bias = float(scenario.get("fatigue_bias", 0.0))
     repeat_bias = float(scenario.get("repeat_bias", 0.0))
+    skip_mitigation = _policy_stability_skip_mitigation(policy_weights=policy_weights, scenario=scenario)
 
     for step in range(max(1, int(horizon))):
         last_artist = int(sequence[-1])
@@ -572,6 +618,8 @@ def simulate_rollout(
             total_skip = float(causal_artifact.meta_estimator.predict_proba(np.asarray([[pref_logit, friction_logit]], dtype="float32"))[:, 1][0])
         else:
             total_skip = 0.1
+        if skip_mitigation > 0.0:
+            total_skip = float(np.clip(total_skip - skip_mitigation, 0.0, 1.0))
         skip_risks.append(total_skip)
 
         if causal_artifact is None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from .config import PipelineConfig
 from .pipeline_runtime_bootstrap_metadata import (
     build_cache_info_payload,
     collect_artist_labels,
@@ -10,6 +13,7 @@ from .pipeline_runtime_bootstrap_metrics import (
     log_prepared_cache_status,
 )
 from .pipeline_runtime_bootstrap_types import PipelinePreparedDataOutputs, PipelinePreparedTrainingState
+from .pipeline_runtime_dependency_types import PipelineRuntimeDeps
 
 
 def finalize_pipeline_runtime_inputs(

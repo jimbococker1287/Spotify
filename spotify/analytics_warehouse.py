@@ -334,6 +334,22 @@ def _research_platform_asset_inputs(output_dir: Path) -> dict[str, list[Path]]:
     }
 
 
+def _scope_expansion_asset_inputs(output_dir: Path) -> dict[str, list[Path]]:
+    base_dir = output_dir / "analysis" / "scope_expansion"
+    scorecard = base_dir / "branch_expansion_scorecard.csv"
+    queue = base_dir / "branch_expansion_implementation_queue.csv"
+    strategy_cards = base_dir / "branch_strategy_cards.csv"
+    manifest = base_dir / "scope_expansion_manifest.json"
+    return {
+        "scope_expansion_scorecard": [scorecard],
+        "scope_expansion_implementation_queue": [queue],
+        "scope_expansion_strategy_cards": [strategy_cards],
+        "scope_expansion_manifest_snapshot": [manifest],
+        "scope_expansion_branch_health": [scorecard, queue, strategy_cards, manifest],
+        "mart_scope_expansion_health": [scorecard, queue, strategy_cards, manifest],
+    }
+
+
 WAREHOUSE_LINEAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "listener_daily_activity": ("raw_streaming_history",),
     "model_run_summary": ("run_manifests", "run_results", "backtest_history"),
@@ -359,6 +375,12 @@ WAREHOUSE_LINEAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "research_platform_claim_registry",
         "research_platform_maturity_snapshot",
     ),
+    "scope_expansion_branch_health": (
+        "scope_expansion_scorecard",
+        "scope_expansion_implementation_queue",
+        "scope_expansion_strategy_cards",
+        "scope_expansion_manifest_snapshot",
+    ),
     "mart_run_quality": ("model_run_summary",),
     "mart_model_registry": ("model_run_summary",),
     "mart_ops_overview": ("ops_review_snapshot", "control_room_history"),
@@ -373,6 +395,7 @@ WAREHOUSE_LINEAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "research_platform_claim_registry",
         "research_platform_status_summary",
     ),
+    "mart_scope_expansion_health": ("scope_expansion_branch_health",),
 }
 
 WAREHOUSE_LAYER_ORDER = {"bronze": 0, "silver": 1, "gold": 2}
@@ -1488,6 +1511,109 @@ def _research_platform_snapshot_frames(
     return run_registry, benchmark_lock_atlas, claim_registry, maturity_snapshot, manifest_snapshot
 
 
+def _scope_expansion_snapshot_frames(output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    scorecard_columns = [
+        "branch_key",
+        "branch_name",
+        "scope_lane",
+        "audience",
+        "status",
+        "readiness_score",
+        "evidence_score",
+        "freshness_score",
+        "risk_score",
+        "primary_metric_name",
+        "primary_metric_value",
+        "artifact_count",
+        "artifact_root",
+        "top_signal",
+        "top_gap",
+        "recommended_next_step",
+        "proof_artifacts",
+    ]
+    queue_columns = [
+        "rank",
+        "branch_key",
+        "branch_name",
+        "initiative",
+        "why_now",
+        "success_metric",
+        "required_artifacts",
+        "command",
+        "effort",
+        "impact_score",
+        "risk_reduction_score",
+        "dependencies",
+    ]
+    strategy_card_columns = [
+        "branch_key",
+        "branch_name",
+        "development_mode",
+        "status",
+        "readiness_score",
+        "risk_score",
+        "sprint_objective",
+        "next_initiative",
+        "why_now",
+        "success_metric",
+        "primary_command",
+        "validation_command",
+        "required_artifacts",
+        "proof_artifacts",
+        "decision_rule",
+        "handoff_summary",
+    ]
+    manifest_columns = [
+        "generated_at",
+        "artifact_root",
+        "branch_count",
+        "ready_branch_count",
+        "attention_branch_count",
+        "blocked_branch_count",
+        "missing_branch_count",
+        "queue_count",
+        "top_queue_branch_key",
+        "top_queue_initiative",
+        "top_queue_command",
+        "raw_json",
+    ]
+    base_dir = output_dir / "analysis" / "scope_expansion"
+    scorecard = _load_analysis_table_frame(base_dir / "branch_expansion_scorecard.csv", scorecard_columns)
+    queue = _load_analysis_table_frame(base_dir / "branch_expansion_implementation_queue.csv", queue_columns)
+    strategy_cards = _load_analysis_table_frame(base_dir / "branch_strategy_cards.csv", strategy_card_columns)
+
+    manifest_payload = safe_read_json(base_dir / "scope_expansion_manifest.json", default={})
+    if isinstance(manifest_payload, dict):
+        top_queue = (
+            manifest_payload.get("top_queue_item", {})
+            if isinstance(manifest_payload.get("top_queue_item"), dict)
+            else {}
+        )
+        manifest_snapshot = pd.DataFrame(
+            [
+                {
+                    "generated_at": manifest_payload.get("generated_at"),
+                    "artifact_root": manifest_payload.get("artifact_root"),
+                    "branch_count": manifest_payload.get("branch_count"),
+                    "ready_branch_count": manifest_payload.get("ready_branch_count"),
+                    "attention_branch_count": manifest_payload.get("attention_branch_count"),
+                    "blocked_branch_count": manifest_payload.get("blocked_branch_count"),
+                    "missing_branch_count": manifest_payload.get("missing_branch_count"),
+                    "queue_count": manifest_payload.get("queue_count"),
+                    "top_queue_branch_key": top_queue.get("branch_key"),
+                    "top_queue_initiative": top_queue.get("initiative"),
+                    "top_queue_command": top_queue.get("command"),
+                    "raw_json": _json_string(manifest_payload),
+                }
+            ],
+            columns=manifest_columns,
+        )
+    else:
+        manifest_snapshot = _empty_frame(manifest_columns)
+
+    return scorecard, queue, strategy_cards, manifest_snapshot
+
+
 def _build_listener_daily_activity(raw_streaming_history: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "played_date",
@@ -1974,6 +2100,106 @@ def _build_research_platform_status_summary(
     return pd.DataFrame([row], columns=columns)
 
 
+def _build_scope_expansion_branch_health(
+    scope_expansion_scorecard: pd.DataFrame,
+    scope_expansion_implementation_queue: pd.DataFrame,
+    scope_expansion_strategy_cards: pd.DataFrame,
+    scope_expansion_manifest_snapshot: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = [
+        "branch_key",
+        "branch_name",
+        "status",
+        "readiness_score",
+        "evidence_score",
+        "freshness_score",
+        "risk_score",
+        "artifact_count",
+        "top_signal",
+        "top_gap",
+        "recommended_next_step",
+        "queue_rank",
+        "next_initiative",
+        "next_command",
+        "next_effort",
+        "impact_score",
+        "risk_reduction_score",
+        "development_mode",
+        "sprint_objective",
+        "validation_command",
+        "decision_rule",
+        "handoff_summary",
+        "generated_at",
+    ]
+    if scope_expansion_scorecard.empty:
+        return _empty_frame(columns)
+    health = scope_expansion_scorecard.copy()
+    for column in ["readiness_score", "evidence_score", "freshness_score", "risk_score", "artifact_count"]:
+        health[column] = _to_numeric(health.get(column, pd.Series(index=health.index)))
+    if not scope_expansion_implementation_queue.empty and "branch_key" in scope_expansion_implementation_queue.columns:
+        queue = scope_expansion_implementation_queue.copy()
+        for column in ["rank", "impact_score", "risk_reduction_score"]:
+            queue[column] = _to_numeric(queue.get(column, pd.Series(index=queue.index)))
+        queue = (
+            queue.sort_values(["branch_key", "rank"], ascending=[True, True])
+            .drop_duplicates(subset=["branch_key"], keep="first")
+            .rename(
+                columns={
+                    "rank": "queue_rank",
+                    "initiative": "next_initiative",
+                    "command": "next_command",
+                    "effort": "next_effort",
+                }
+            )
+        )
+        health = health.merge(
+            queue[
+                [
+                    "branch_key",
+                    "queue_rank",
+                    "next_initiative",
+                    "next_command",
+                    "next_effort",
+                    "impact_score",
+                    "risk_reduction_score",
+                ]
+            ],
+            on="branch_key",
+            how="left",
+        )
+    if not scope_expansion_strategy_cards.empty and "branch_key" in scope_expansion_strategy_cards.columns:
+        strategy_cards = scope_expansion_strategy_cards.copy()
+        strategy_columns = [
+            column
+            for column in [
+                "branch_key",
+                "development_mode",
+                "sprint_objective",
+                "validation_command",
+                "decision_rule",
+                "handoff_summary",
+            ]
+            if column in strategy_cards.columns
+        ]
+        if strategy_columns:
+            health = health.merge(
+                strategy_cards[strategy_columns].drop_duplicates(subset=["branch_key"], keep="first"),
+                on="branch_key",
+                how="left",
+            )
+    generated_at = None
+    if not scope_expansion_manifest_snapshot.empty:
+        generated_at = scope_expansion_manifest_snapshot.iloc[0].get("generated_at")
+    health["generated_at"] = generated_at
+    for column in columns:
+        if column not in health.columns:
+            health[column] = None
+    return health[columns].sort_values(
+        ["risk_score", "readiness_score", "branch_key"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+
 def _build_mart_run_quality(model_run_summary: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "run_id",
@@ -2446,6 +2672,61 @@ def _build_mart_research_claim_watchlist(
     ).reset_index(drop=True)
 
 
+def _build_mart_scope_expansion_health(scope_expansion_branch_health: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "branch_key",
+        "branch_name",
+        "branch_posture",
+        "readiness_score",
+        "evidence_score",
+        "freshness_score",
+        "risk_score",
+        "queue_rank",
+        "next_initiative",
+        "next_command",
+        "next_effort",
+        "impact_score",
+        "risk_reduction_score",
+        "development_mode",
+        "sprint_objective",
+        "validation_command",
+        "decision_rule",
+        "handoff_summary",
+        "top_signal",
+        "top_gap",
+        "recommended_next_step",
+        "generated_at",
+    ]
+    if scope_expansion_branch_health.empty:
+        return _empty_frame(columns)
+    health = scope_expansion_branch_health.copy()
+    for column in [
+        "readiness_score",
+        "evidence_score",
+        "freshness_score",
+        "risk_score",
+        "queue_rank",
+        "impact_score",
+        "risk_reduction_score",
+    ]:
+        health[column] = _to_numeric(health.get(column, pd.Series(index=health.index)))
+    status = health.get("status", pd.Series(index=health.index, dtype="object")).astype(str).str.lower()
+    health["branch_posture"] = "attention"
+    health.loc[status.eq("ready") & health["risk_score"].le(0.30), "branch_posture"] = "ready"
+    health.loc[status.isin({"blocked", "missing"}) | health["risk_score"].ge(0.70), "branch_posture"] = "blocked"
+    health.loc[
+        status.eq("attention") & health["readiness_score"].ge(0.75) & health["risk_score"].lt(0.70),
+        "branch_posture",
+    ] = "watch"
+    for column in columns:
+        if column not in health.columns:
+            health[column] = None
+    return health[columns].sort_values(
+        ["branch_posture", "risk_reduction_score", "risk_score", "queue_rank"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+
+
 def build_analytics_warehouse_bundle(
     *,
     data_dir: Path,
@@ -2491,6 +2772,12 @@ def build_analytics_warehouse_bundle(
         bronze_research_platform_maturity_snapshot,
         bronze_research_platform_manifest_snapshot,
     ) = _research_platform_snapshot_frames(output_dir)
+    (
+        bronze_scope_expansion_scorecard,
+        bronze_scope_expansion_implementation_queue,
+        bronze_scope_expansion_strategy_cards,
+        bronze_scope_expansion_manifest_snapshot,
+    ) = _scope_expansion_snapshot_frames(output_dir)
 
     bronze = {
         "raw_streaming_history": bronze_raw_streaming,
@@ -2522,6 +2809,10 @@ def build_analytics_warehouse_bundle(
         "research_platform_claim_registry": bronze_research_platform_claim_registry,
         "research_platform_maturity_snapshot": bronze_research_platform_maturity_snapshot,
         "research_platform_manifest_snapshot": bronze_research_platform_manifest_snapshot,
+        "scope_expansion_scorecard": bronze_scope_expansion_scorecard,
+        "scope_expansion_implementation_queue": bronze_scope_expansion_implementation_queue,
+        "scope_expansion_strategy_cards": bronze_scope_expansion_strategy_cards,
+        "scope_expansion_manifest_snapshot": bronze_scope_expansion_manifest_snapshot,
     }
 
     silver_listener_daily = _build_listener_daily_activity(bronze_raw_streaming)
@@ -2552,6 +2843,12 @@ def build_analytics_warehouse_bundle(
         bronze_research_platform_claim_registry,
         bronze_research_platform_maturity_snapshot,
     )
+    silver_scope_expansion_branch_health = _build_scope_expansion_branch_health(
+        bronze_scope_expansion_scorecard,
+        bronze_scope_expansion_implementation_queue,
+        bronze_scope_expansion_strategy_cards,
+        bronze_scope_expansion_manifest_snapshot,
+    )
 
     silver = {
         "listener_daily_activity": silver_listener_daily,
@@ -2560,6 +2857,7 @@ def build_analytics_warehouse_bundle(
         "creator_report_family_summary": silver_creator_report_summary,
         "creator_market_scene_summary": silver_creator_market_scene_summary,
         "research_platform_status_summary": silver_research_platform_status_summary,
+        "scope_expansion_branch_health": silver_scope_expansion_branch_health,
     }
 
     gold_run_quality = _build_mart_run_quality(silver_model_run_summary)
@@ -2578,6 +2876,7 @@ def build_analytics_warehouse_bundle(
         bronze_research_platform_claim_registry,
         silver_research_platform_status_summary,
     )
+    gold_scope_expansion_health = _build_mart_scope_expansion_health(silver_scope_expansion_branch_health)
 
     gold = {
         "mart_run_quality": gold_run_quality,
@@ -2588,12 +2887,14 @@ def build_analytics_warehouse_bundle(
         "mart_creator_market_watchlist": gold_creator_market_watchlist,
         "mart_research_platform_status": gold_research_platform_status,
         "mart_research_claim_watchlist": gold_research_claim_watchlist,
+        "mart_scope_expansion_health": gold_scope_expansion_health,
     }
 
     warehouse_root = output_dir / "analytics" / "warehouse"
     asset_inputs: dict[str, list[Path]] = {}
     asset_inputs.update(_creator_market_asset_inputs(output_dir))
     asset_inputs.update(_research_platform_asset_inputs(output_dir))
+    asset_inputs.update(_scope_expansion_asset_inputs(output_dir))
     manifest = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "data_dir": str(data_dir.resolve()),
@@ -2614,6 +2915,12 @@ def build_analytics_warehouse_bundle(
                 bronze_research_platform_maturity_snapshot.iloc[0]["anchor_run_id"]
                 if not bronze_research_platform_maturity_snapshot.empty
                 else None
+            ),
+            "scope_expansion_branch_count": (
+                int(bronze_scope_expansion_manifest_snapshot.iloc[0]["branch_count"])
+                if not bronze_scope_expansion_manifest_snapshot.empty
+                and pd.notna(bronze_scope_expansion_manifest_snapshot.iloc[0]["branch_count"])
+                else 0
             ),
             "branch_backed_assets": int(len(asset_inputs)),
             "latest_control_room_run_id": (
@@ -2638,9 +2945,9 @@ def build_analytics_warehouse_bundle(
             for asset_name, paths in asset_inputs.items()
         },
         "lineage": [
-            "bronze captures locally prepared raw history, run artifacts, control-room snapshots, creator report-family exports, creator-market branch outputs, and research-platform branch outputs.",
-            "silver standardizes listener behavior, per-model run summaries, ops review status, creator family summaries, creator-market scene rollups, and research-platform status rollups.",
-            "gold exposes analytics marts for run quality, model registry, ops overview, creator opportunity pressure, creator-market watchlists, and research-platform status tracking.",
+            "bronze captures locally prepared raw history, run artifacts, control-room snapshots, creator report-family exports, creator-market branch outputs, research-platform branch outputs, and scope-expansion scorecards and strategy cards.",
+            "silver standardizes listener behavior, per-model run summaries, ops review status, creator family summaries, creator-market scene rollups, research-platform status rollups, and scope-expansion branch health.",
+            "gold exposes analytics marts for run quality, model registry, ops overview, creator opportunity pressure, creator-market watchlists, research-platform status tracking, and four-branch scope health.",
         ],
     }
     return AnalyticsWarehouseBundle(

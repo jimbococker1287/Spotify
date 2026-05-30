@@ -38,3 +38,4 @@ Suggested use:
 2. Run this branch to compare the latest research pack against historical runs and benchmark locks.
 3. Use `research_next_experiments.md` as the short execution plan for the next run or repair pass.
 4. Use the atlas outputs to decide whether a new result is merely interesting, actually benchmark-worthy, or still blocked by incomplete comparator evidence.
+5. Run `make scope-expansion-lab` to let research blockers compete directly against analytics, quant, and creator-market work in one ranked implementation queue.
