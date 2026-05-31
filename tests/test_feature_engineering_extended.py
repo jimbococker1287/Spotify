@@ -8,6 +8,7 @@ import pandas as pd
 
 from spotify.data import (
     CONTEXT_FEATURES,
+    _recent_artist_unique_ratio,
     _rolling_artist_counts,
     _rolling_artist_counts_multi,
     append_technical_log_features,
@@ -70,8 +71,28 @@ def test_rolling_artist_counts_multi_matches_individual_windows() -> None:
 
     counts_25, counts_45 = _rolling_artist_counts_multi(ts_seconds, artists, window_seconds=(25, 45))
 
-    assert np.allclose(counts_25, _rolling_artist_counts(ts_seconds, artists, window_seconds=25))
-    assert np.allclose(counts_45, _rolling_artist_counts(ts_seconds, artists, window_seconds=45))
+    assert np.allclose(counts_25, np.array([0, 0, 1, 1, 0, 1], dtype="float32"))
+    assert np.allclose(counts_45, np.array([0, 0, 1, 2, 1, 2], dtype="float32"))
+
+
+def test_rolling_artist_counts_include_boundary_events() -> None:
+    ts_seconds = np.array([0, 10, 25, 26], dtype="int64")
+    artists = np.array([1, 1, 1, 1], dtype="int32")
+
+    counts = _rolling_artist_counts(ts_seconds, artists, window_seconds=25)
+
+    assert np.allclose(counts, np.array([0, 1, 2, 2], dtype="float32"))
+
+
+def test_recent_artist_unique_ratio_uses_prior_window_only() -> None:
+    artists = np.array([1, 2, 1, 3, 2, 4], dtype="int32")
+
+    ratio = _recent_artist_unique_ratio(artists, 3, chunk_rows=2)
+
+    assert np.allclose(
+        ratio,
+        np.array([0.0, 1.0, 1.0, 2.0 / 3.0, 1.0, 1.0], dtype="float32"),
+    )
 
 
 def test_prepare_training_data_builds_expected_sequences(tmp_path) -> None:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import time
 
 import joblib
 import numpy as np
@@ -157,23 +157,57 @@ def _rolling_artist_counts_multi(
 ) -> tuple[np.ndarray, ...]:
     normalized_windows = tuple(max(1, int(window)) for window in window_seconds)
     counts = tuple(np.zeros(len(artists), dtype="float32") for _ in normalized_windows)
-    buffers: dict[object, list[deque[int]]] = {}
+    if len(artists) == 0 or not normalized_windows:
+        return counts
 
-    for idx, (ts_value, artist_key) in enumerate(zip(ts_seconds, artists)):
-        artist_buffers = buffers.get(artist_key)
-        if artist_buffers is None:
-            artist_buffers = [deque() for _ in normalized_windows]
-            buffers[artist_key] = artist_buffers
+    ts_values = np.asarray(ts_seconds, dtype="int64")
+    artist_codes = pd.factorize(artists, sort=False)[0].astype("int32", copy=False)
+    order = np.argsort(artist_codes, kind="mergesort")
+    ordered_codes = artist_codes[order]
+    boundaries = np.concatenate(
+        (
+            np.array([0], dtype="int64"),
+            np.flatnonzero(ordered_codes[1:] != ordered_codes[:-1]).astype("int64") + 1,
+            np.array([len(order)], dtype="int64"),
+        )
+    )
 
-        ts_int = int(ts_value)
-        for out, bucket, window in zip(counts, artist_buffers, normalized_windows):
-            threshold = ts_int - window
-            while bucket and bucket[0] < threshold:
-                bucket.popleft()
-            out[idx] = float(len(bucket))
-            bucket.append(ts_int)
+    for start, stop in zip(boundaries[:-1], boundaries[1:]):
+        positions = order[start:stop]
+        group_ts = ts_values[positions]
+        group_index = np.arange(len(group_ts), dtype="int64")
+        for out, window in zip(counts, normalized_windows):
+            left = np.searchsorted(group_ts, group_ts - int(window), side="left")
+            out[positions] = (group_index - left).astype("float32", copy=False)
 
     return counts
+
+
+def _recent_artist_unique_ratio(artists: np.ndarray, width: int, *, chunk_rows: int = 250_000) -> np.ndarray:
+    artist_codes = pd.factorize(artists, sort=False)[0].astype("int32", copy=False)
+    n_rows = len(artist_codes)
+    window = max(1, int(width))
+    out = np.zeros(n_rows, dtype="float32")
+    if n_rows <= 1:
+        return out
+
+    sentinel = np.int32(-2)
+    history = np.concatenate((np.full(window, sentinel, dtype="int32"), artist_codes))
+    windows = sliding_window_view(history, window)[:n_rows]
+    denominators = np.minimum(np.arange(n_rows, dtype="int32"), window)
+    chunk_size = max(1, int(chunk_rows))
+
+    for start in range(0, n_rows, chunk_size):
+        stop = min(n_rows, start + chunk_size)
+        sorted_windows = np.sort(windows[start:stop], axis=1)
+        valid = sorted_windows != sentinel
+        changed = np.ones(sorted_windows.shape, dtype=bool)
+        if sorted_windows.shape[1] > 1:
+            changed[:, 1:] = sorted_windows[:, 1:] != sorted_windows[:, :-1]
+        unique_counts = np.sum(valid & changed, axis=1).astype("float32", copy=False)
+        denom = denominators[start:stop].astype("float32", copy=False)
+        np.divide(unique_counts, denom, out=out[start:stop], where=denom > 0)
+    return out
 
 
 def _ensure_time_sorted(df: pd.DataFrame) -> pd.DataFrame:
@@ -599,6 +633,8 @@ def engineer_features(
     logger,
     artist_classes: list[str] | tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
+    start_time = time.perf_counter()
+    input_rows = len(df)
     _ensure_column(df, "ts", pd.NaT)
     _ensure_column(df, "master_metadata_album_artist_name", None)
     _ensure_column(df, "platform", "unknown")
@@ -774,40 +810,8 @@ def engineer_features(
 
     recent_skip_rate_5 = _trailing_mean_before(skip_values, 5)
     recent_skip_rate_20 = _trailing_mean_before(skip_values, 20)
-    recent_artist_unique_ratio_5 = np.zeros(len(df), dtype="float32")
-    recent_artist_unique_ratio_20 = np.zeros(len(df), dtype="float32")
-    recent_artist_window_5: deque[int] = deque(maxlen=5)
-    recent_artist_window_20: deque[int] = deque(maxlen=20)
-    recent_artist_counts_5: dict[int, int] = {}
-    recent_artist_counts_20: dict[int, int] = {}
-    for idx, artist_label in enumerate(artist_labels):
-        artist_key = int(artist_label)
-        recent_artist_unique_ratio_5[idx] = (
-            float(len(recent_artist_counts_5) / len(recent_artist_window_5)) if recent_artist_window_5 else 0.0
-        )
-        recent_artist_unique_ratio_20[idx] = (
-            float(len(recent_artist_counts_20) / len(recent_artist_window_20)) if recent_artist_window_20 else 0.0
-        )
-
-        if len(recent_artist_window_5) == recent_artist_window_5.maxlen:
-            evicted_5 = recent_artist_window_5.popleft()
-            next_count_5 = recent_artist_counts_5[evicted_5] - 1
-            if next_count_5 <= 0:
-                del recent_artist_counts_5[evicted_5]
-            else:
-                recent_artist_counts_5[evicted_5] = next_count_5
-        recent_artist_window_5.append(artist_key)
-        recent_artist_counts_5[artist_key] = recent_artist_counts_5.get(artist_key, 0) + 1
-
-        if len(recent_artist_window_20) == recent_artist_window_20.maxlen:
-            evicted_20 = recent_artist_window_20.popleft()
-            next_count_20 = recent_artist_counts_20[evicted_20] - 1
-            if next_count_20 <= 0:
-                del recent_artist_counts_20[evicted_20]
-            else:
-                recent_artist_counts_20[evicted_20] = next_count_20
-        recent_artist_window_20.append(artist_key)
-        recent_artist_counts_20[artist_key] = recent_artist_counts_20.get(artist_key, 0) + 1
+    recent_artist_unique_ratio_5 = _recent_artist_unique_ratio(artist_labels, 5)
+    recent_artist_unique_ratio_20 = _recent_artist_unique_ratio(artist_labels, 20)
 
     df["recent_skip_rate_5"] = recent_skip_rate_5
     df["recent_skip_rate_20"] = recent_skip_rate_20
@@ -836,6 +840,17 @@ def engineer_features(
         len(top_artists),
         df.shape,
     )
+    elapsed = max(time.perf_counter() - start_time, 1e-9)
+    df.attrs["spotify_feature_stats"] = {
+        "input_rows": int(input_rows),
+        "output_rows": int(len(df)),
+        "max_artists": int(max_artists),
+        "artist_class_count": int(len(top_artists)),
+        "engineer_seconds": round(elapsed, 6),
+        "rows_per_second": round(float(input_rows) / elapsed, 3),
+        "vectorized_rolling_artist_counts": True,
+        "vectorized_recent_artist_unique_ratio": True,
+    }
 
     return df
 

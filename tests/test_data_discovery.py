@@ -143,6 +143,8 @@ def test_prepared_cache_metadata_records_ingestion_stats(tmp_path, monkeypatch) 
     metadata = json.loads(cache_info.metadata_path.read_text(encoding="utf-8"))
     assert metadata["load_stats"]["record_count"] == len(rows)
     assert metadata["load_stats"]["file_count"] == 1
+    assert metadata["feature_stats"]["input_rows"] == len(rows)
+    assert metadata["feature_stats"]["vectorized_recent_artist_unique_ratio"] is True
 
 
 def test_discover_technical_log_files_supports_nested_export_folder(tmp_path) -> None:

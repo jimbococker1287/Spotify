@@ -846,3 +846,21 @@ Expected impact:
 - Larger Spotify exports with multiple `Streaming_History_Audio_*.json` shards can now overlap file reads and JSON parsing instead of loading every shard serially.
 - The loader no longer builds one global `all_records` list before DataFrame construction, which lowers peak Python-list pressure on larger exports.
 - Every cold data-prep run now carries ingestion throughput metrics so future optimization passes can compare real row/sec and source MB/sec instead of guessing.
+
+### Vectorized Artist Window Features
+
+Scope:
+- Replaced the per-row rolling artist-count deques with per-artist vectorized `searchsorted` windows.
+- Replaced the recent artist uniqueness loop with a chunked NumPy sliding-window implementation for the 5-play and 20-play context ratios.
+- Added feature-engineering throughput telemetry to `df.attrs["spotify_feature_stats"]` and prepared-cache metadata:
+  - input rows
+  - output rows
+  - artist cap / class count
+  - feature-engineering seconds
+  - rows per second
+  - vectorized-window flags
+
+Expected impact:
+- `artist_play_count_24h`, `artist_play_count_7d`, `recent_artist_unique_ratio_5`, and `recent_artist_unique_ratio_20` now scale with vectorized blocks instead of one Python dictionary/deque update per listening row.
+- The recent uniqueness path is chunked so larger histories avoid a single large temporary allocation.
+- Cold prepared-data builds now preserve both ingestion and feature-engineering throughput metrics for later scale comparisons.

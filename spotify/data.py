@@ -16,6 +16,7 @@ from .data_preparation import SKEW_CONTEXT_FEATURES
 from .data_preparation import TECHNICAL_LOG_FILENAMES
 from .data_preparation import PreparedData
 from .data_preparation import _load_json_records
+from .data_preparation import _recent_artist_unique_ratio
 from .data_preparation import _rolling_artist_counts
 from .data_preparation import _rolling_artist_counts_multi
 from .data_preparation import append_audio_features as _append_audio_features_impl
@@ -34,6 +35,7 @@ __all__ = [
     "SKEW_CONTEXT_FEATURES",
     "TECHNICAL_LOG_FILENAMES",
     "_load_json_records",
+    "_recent_artist_unique_ratio",
     "_rolling_artist_counts",
     "_rolling_artist_counts_multi",
     "append_audio_features",
@@ -390,6 +392,7 @@ def _save_prepared_cache(
     scaler_path: Path,
     fingerprint_payload: dict[str, object],
     load_stats: dict[str, object] | None,
+    feature_stats: dict[str, object] | None,
     logger,
 ) -> None:
     try:
@@ -404,6 +407,7 @@ def _save_prepared_cache(
                     "created_at_epoch_s": int(time.time()),
                     "fingerprint_payload": fingerprint_payload,
                     "load_stats": load_stats or {},
+                    "feature_stats": feature_stats or {},
                 },
                 indent=2,
             ),
@@ -455,6 +459,8 @@ def load_or_prepare_training_data(
     raw_load_stats = df.attrs.get("spotify_load_stats", {})
     load_stats = dict(raw_load_stats) if isinstance(raw_load_stats, dict) else {}
     df = engineer_features(df, max_artists, logger)
+    raw_feature_stats = df.attrs.get("spotify_feature_stats", {})
+    feature_stats = dict(raw_feature_stats) if isinstance(raw_feature_stats, dict) else {}
     df = append_technical_log_features(df, data_dir=data_dir, logger=logger, technical_files=technical_files)
     df = append_audio_features(df, enable_spotify_features, logger)
     prepared = prepare_training_data(
@@ -471,6 +477,7 @@ def load_or_prepare_training_data(
             scaler_path=scaler_path,
             fingerprint_payload=fingerprint_payload,
             load_stats=load_stats,
+            feature_stats=feature_stats,
             logger=logger,
         )
 

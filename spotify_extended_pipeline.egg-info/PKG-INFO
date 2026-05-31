@@ -528,7 +528,7 @@ Global history (`outputs/history/`):
 Prepared-data cache:
 
 - `outputs/cache/prepared_data/<fingerprint>/prepared_bundle.joblib`
-- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json` (includes streaming ingestion throughput stats for cold data-prep runs)
+- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json` (includes streaming ingestion and feature-engineering throughput stats for cold data-prep runs)
 
 Champion alias:
 
