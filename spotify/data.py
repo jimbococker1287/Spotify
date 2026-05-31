@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -62,6 +63,15 @@ class PreparedDataCachePaths:
     cache_dir: Path
     bundle_path: Path
     metadata_path: Path
+
+
+@dataclass(frozen=True)
+class StreamingHistoryFileLoad:
+    path: Path
+    frame: pd.DataFrame
+    record_count: int
+    size_bytes: int
+    elapsed_seconds: float
 
 
 def _select_preferred_grouped_files(
@@ -160,7 +170,6 @@ def discover_technical_log_files(data_dir: Path, logger) -> list[Path]:
 
 def load_streaming_history(data_dir: Path, include_video: bool, logger) -> pd.DataFrame:
     files = discover_streaming_files(data_dir, include_video, logger)
-    all_records: list[dict] = []
     fast_json = None
     try:
         import orjson as fast_json  # type: ignore
@@ -168,17 +177,115 @@ def load_streaming_history(data_dir: Path, include_video: bool, logger) -> pd.Da
     except Exception:
         fast_json = None
 
-    for path in files:
-        records = _load_json_records(path, fast_json)
-        logger.info("Loaded %s with %d records", path.name, len(records))
-        all_records.extend(records)
+    worker_count = _resolve_history_load_workers(files)
+    start = time.perf_counter()
+    loaded_files = _load_streaming_file_frames(
+        files=files,
+        fast_json=fast_json,
+        worker_count=worker_count,
+        logger=logger,
+    )
+    frames = [loaded.frame for loaded in loaded_files if not loaded.frame.empty]
+    total_records = sum(loaded.record_count for loaded in loaded_files)
+    total_bytes = sum(loaded.size_bytes for loaded in loaded_files)
 
-    if not all_records:
+    if not frames or total_records <= 0:
         raise RuntimeError("Streaming history files were found, but no records were loaded.")
 
-    df = pd.DataFrame(all_records)
-    logger.info("Concatenated data shape: %s", df.shape)
+    df = pd.concat(frames, ignore_index=True, sort=False, copy=False)
+    elapsed = max(time.perf_counter() - start, 1e-9)
+    dataframe_memory_bytes = int(df.memory_usage(index=True, deep=False).sum())
+    load_stats = {
+        "file_count": len(files),
+        "record_count": int(total_records),
+        "total_source_bytes": int(total_bytes),
+        "json_engine": "orjson" if fast_json is not None else "stdlib_json",
+        "worker_count": int(worker_count),
+        "load_seconds": round(elapsed, 6),
+        "rows_per_second": round(float(total_records) / elapsed, 3),
+        "source_mb_per_second": round((float(total_bytes) / 1_000_000.0) / elapsed, 3),
+        "dataframe_memory_bytes": dataframe_memory_bytes,
+        "files": [
+            {
+                "name": loaded.path.name,
+                "record_count": int(loaded.record_count),
+                "size_bytes": int(loaded.size_bytes),
+                "load_seconds": round(float(loaded.elapsed_seconds), 6),
+            }
+            for loaded in loaded_files
+        ],
+    }
+    df.attrs["spotify_load_stats"] = load_stats
+    logger.info(
+        "Concatenated data shape: %s | files=%d records=%d workers=%d rows/s=%.1f source_mb/s=%.2f",
+        df.shape,
+        len(files),
+        total_records,
+        worker_count,
+        float(load_stats["rows_per_second"]),
+        float(load_stats["source_mb_per_second"]),
+    )
     return df
+
+
+def _resolve_history_load_workers(files: list[Path]) -> int:
+    file_count = len(files)
+    if file_count <= 1:
+        return 1
+
+    raw = os.getenv("SPOTIFY_HISTORY_LOAD_WORKERS", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(file_count, cpu_count, 4))
+    if raw in {"0", "1", "false", "no", "off"}:
+        return 1
+    try:
+        return max(1, min(file_count, int(raw)))
+    except ValueError:
+        return 1
+
+
+def _load_streaming_file_frame(path: Path, fast_json) -> StreamingHistoryFileLoad:
+    start = time.perf_counter()
+    records = _load_json_records(path, fast_json)
+    frame = pd.DataFrame.from_records(records) if records else pd.DataFrame()
+    elapsed = time.perf_counter() - start
+    try:
+        size_bytes = int(path.stat().st_size)
+    except OSError:
+        size_bytes = 0
+    return StreamingHistoryFileLoad(
+        path=path,
+        frame=frame,
+        record_count=len(records),
+        size_bytes=size_bytes,
+        elapsed_seconds=elapsed,
+    )
+
+
+def _load_streaming_file_frames(
+    *,
+    files: list[Path],
+    fast_json,
+    worker_count: int,
+    logger,
+) -> list[StreamingHistoryFileLoad]:
+    worker_count = max(1, min(int(worker_count), max(1, len(files))))
+    if worker_count > 1:
+        logger.info("Loading %d streaming-history files with %d worker threads.", len(files), worker_count)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="spotify-history-load") as executor:
+            loaded_files = list(executor.map(lambda path: _load_streaming_file_frame(path, fast_json), files))
+    else:
+        loaded_files = [_load_streaming_file_frame(path, fast_json) for path in files]
+
+    for loaded in loaded_files:
+        logger.info(
+            "Loaded %s with %d records in %.3fs",
+            loaded.path.name,
+            loaded.record_count,
+            loaded.elapsed_seconds,
+        )
+    return loaded_files
 
 
 def _cache_enabled_from_env() -> bool:
@@ -282,6 +389,7 @@ def _save_prepared_cache(
     prepared: PreparedData,
     scaler_path: Path,
     fingerprint_payload: dict[str, object],
+    load_stats: dict[str, object] | None,
     logger,
 ) -> None:
     try:
@@ -295,6 +403,7 @@ def _save_prepared_cache(
                     "schema_version": CACHE_SCHEMA_VERSION,
                     "created_at_epoch_s": int(time.time()),
                     "fingerprint_payload": fingerprint_payload,
+                    "load_stats": load_stats or {},
                 },
                 indent=2,
             ),
@@ -343,6 +452,8 @@ def load_or_prepare_training_data(
             return cached
 
     df = raw_df.copy() if raw_df is not None else load_streaming_history(data_dir, include_video, logger)
+    raw_load_stats = df.attrs.get("spotify_load_stats", {})
+    load_stats = dict(raw_load_stats) if isinstance(raw_load_stats, dict) else {}
     df = engineer_features(df, max_artists, logger)
     df = append_technical_log_features(df, data_dir=data_dir, logger=logger, technical_files=technical_files)
     df = append_audio_features(df, enable_spotify_features, logger)
@@ -359,6 +470,7 @@ def load_or_prepare_training_data(
             prepared=prepared,
             scaler_path=scaler_path,
             fingerprint_payload=fingerprint_payload,
+            load_stats=load_stats,
             logger=logger,
         )
 

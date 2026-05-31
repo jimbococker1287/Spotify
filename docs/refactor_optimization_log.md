@@ -821,3 +821,28 @@ Validation gate:
 - `python3 -m py_compile` passed on `spotify/pipeline_artifact_cache.py`, `spotify/pipeline_runtime_analysis_artifacts.py`, `spotify/pipeline_postrun_reporting.py`, `spotify/pipeline_postrun_stages.py`, and the new tests.
 - `.venv/bin/ruff check` passed on the touched Python files and tests.
 - `PYTHONPATH=/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify .venv/bin/pytest -q tests/test_pipeline_runtime_analysis_artifacts.py tests/test_reporting_and_evaluation.py tests/test_pipeline_runtime_experiments.py tests/test_pipeline_runtime_shortlists.py` passed.
+
+### Parallel Streaming-History Ingestion
+
+Scope:
+- Reworked `spotify.data.load_streaming_history(...)` so each Spotify JSON history shard is parsed into a per-file frame and concatenated after loading.
+- Added `SPOTIFY_HISTORY_LOAD_WORKERS`:
+  - `auto` uses up to 4 worker threads across available history shards.
+  - `1`, `0`, `false`, or `off` force the original serial loading shape.
+  - An explicit integer caps the worker count for memory-constrained machines.
+- Added load telemetry to `df.attrs["spotify_load_stats"]`:
+  - file count
+  - record count
+  - source bytes
+  - JSON engine
+  - worker count
+  - load seconds
+  - rows per second
+  - source MB per second
+  - dataframe memory bytes
+  - per-file load timings
+
+Expected impact:
+- Larger Spotify exports with multiple `Streaming_History_Audio_*.json` shards can now overlap file reads and JSON parsing instead of loading every shard serially.
+- The loader no longer builds one global `all_records` list before DataFrame construction, which lowers peak Python-list pressure on larger exports.
+- Every cold data-prep run now carries ingestion throughput metrics so future optimization passes can compare real row/sec and source MB/sec instead of guessing.

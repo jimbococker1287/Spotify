@@ -324,6 +324,7 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_TF_PREFETCH` (default `auto`; TensorFlow prefetch buffer)
 - `SPOTIFY_DISTRIBUTION_STRATEGY` (`auto`, `mirrored`, `default`)
 - `SPOTIFY_ISOLATE_MPL_CACHE` (default `0`; shared matplotlib cache for faster startup)
+- `SPOTIFY_HISTORY_LOAD_WORKERS` (default `auto`; parallel JSON shard loading for larger Spotify exports, set `1` to force serial loading)
 - `SPOTIFY_CACHE_PREPARED` (default `1`; reuses preprocessed arrays when raw files/config fingerprint is unchanged)
 - `SPOTIFY_OPTUNA_PRUNER` (default `median`; use `none` to disable pruning)
 - `SPOTIFY_OPTUNA_PRUNING_FIDELITIES` (default `0.25,0.60,1.0`)
@@ -488,7 +489,7 @@ Global history (`outputs/history/`):
 Prepared-data cache:
 
 - `outputs/cache/prepared_data/<fingerprint>/prepared_bundle.joblib`
-- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json`
+- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json` (includes streaming ingestion throughput stats for cold data-prep runs)
 
 Champion alias:
 
