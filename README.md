@@ -783,6 +783,19 @@ python -m spotify.service_api \
   --require-serving-bundle
 ```
 
+Before promoting or handing off a channel, write a release-readiness smoke bundle that checks alias resolution, champion-gate status, serving bundle manifests, deployment registry agreement, and deploy template readiness:
+
+```bash
+python -m spotify.release_readiness \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --registry-root outputs/deployments/registry \
+  --channel stable \
+  --require-registry \
+  --strict
+```
+
+That writes `outputs/analysis/release_readiness/release_readiness_smoke.json`, `.md`, and `release_readiness_checks.csv`.
+
 If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
 
 To publish the copied release artifacts directly to a remote target, add `--publish-artifacts`. Supported targets are:
@@ -1112,6 +1125,12 @@ Publish a promoted run into the deployment registry:
 
 ```bash
 make deploy-release EXTRA_ARGS='--run-dir outputs/runs/<run_id> --registry-root outputs/deployments/registry --channel stable'
+```
+
+Verify the promoted channel before handoff:
+
+```bash
+make release-readiness EXTRA_ARGS='--run-dir outputs/deployments/registry/channels/stable --registry-root outputs/deployments/registry --channel stable --require-registry --strict'
 ```
 
 Keep the outward-facing package current after Day 90:

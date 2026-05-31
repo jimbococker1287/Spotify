@@ -139,6 +139,7 @@ spotify/public_insights_index.py
 spotify/quant_decision_lab.py
 spotify/ranking.py
 spotify/recommender_safety.py
+spotify/release_readiness.py
 spotify/reporting.py
 spotify/research_artifacts.py
 spotify/research_claims.py
@@ -259,6 +260,7 @@ tests/test_quant_decision_lab.py
 tests/test_ranking_metrics.py
 tests/test_recommender_safety_platform.py
 tests/test_regression_alert.py
+tests/test_release_readiness.py
 tests/test_reporting_and_evaluation.py
 tests/test_research_claims.py
 tests/test_research_claims_cli_smoke.py

@@ -18,6 +18,7 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-predict-api"] == "spotify.service_api:main_predict"
     assert scripts["spotify-taste-os-api"] == "spotify.service_api:main_taste_os"
     assert scripts["spotify-deploy-release"] == "spotify.deployment_registry:main"
+    assert scripts["spotify-release-readiness"] == "spotify.release_readiness:main"
     assert scripts["spotify-public-insights"] == "spotify.public_insights:main"
     assert scripts["spotify-compare-public"] == "spotify.compare_public:main"
     assert scripts["spotify-control-room"] == "spotify.control_room:main"
@@ -37,6 +38,7 @@ def test_console_scripts_are_exposed() -> None:
     assert scripts["spotify-quant-decision-lab"] == "spotify.quant_decision_lab:main"
     assert scripts["spotify-creator-market-intelligence"] == "spotify.creator_market_intelligence:main"
     assert scripts["spotify-research-platform-lab"] == "spotify.research_platform_lab:main"
+    assert scripts["spotify-project-health"] == "spotify.project_health:main"
 
 
 def test_built_wheel_excludes_backup_modules_and_ds_store(tmp_path: Path) -> None:

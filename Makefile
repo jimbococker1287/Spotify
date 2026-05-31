@@ -13,7 +13,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-deep-benchmark-low-ram deep-benchmark-finalize train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence research-platform-lab scope-expansion-lab project-health athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-deep-benchmark-low-ram deep-benchmark-finalize train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release release-readiness control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence research-platform-lab scope-expansion-lab project-health athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -133,6 +133,10 @@ refresh-champion-gate:
 
 deploy-release:
 	$(RUN_PY) -m spotify.deployment_registry $(EXTRA_ARGS)
+
+release-readiness:
+	mkdir -p outputs
+	$(RUN_PY) -m spotify.release_readiness $(EXTRA_ARGS)
 
 control-room-guard:
 	$(RUN_PY) scripts/control_room_guard.py $(EXTRA_ARGS)

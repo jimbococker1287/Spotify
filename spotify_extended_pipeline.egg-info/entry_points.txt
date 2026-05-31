@@ -17,6 +17,7 @@ spotify-project-health = spotify.project_health:main
 spotify-public-insights = spotify.public_insights:main
 spotify-quant-decision-lab = spotify.quant_decision_lab:main
 spotify-refresh-champion-gate = spotify.champion_gate_refresh:main
+spotify-release-readiness = spotify.release_readiness:main
 spotify-research-claims = spotify.research_claims:main
 spotify-research-platform-lab = spotify.research_platform_lab:main
 spotify-scope-expansion-lab = spotify.scope_expansion_lab:main

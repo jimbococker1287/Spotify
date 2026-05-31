@@ -214,6 +214,7 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
             "spotify/serving.py",
             "spotify/serving_bundle.py",
             "spotify/deployment_registry.py",
+            "spotify/release_readiness.py",
         ),
         tests=(
             "tests/test_service_api.py",
@@ -221,15 +222,20 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
             "tests/test_predict_service_cli_smoke.py",
             "tests/test_deploy_manifests.py",
             "tests/test_deployment_registry.py",
+            "tests/test_release_readiness.py",
         ),
         docs=("deploy/README.md", "deploy/local/README.md", "deploy/kubernetes/README.md", "deploy/ecs/README.md"),
-        commands=("spotify-serve-api", "spotify-predict-api", "spotify-build-serving-bundle", "spotify-deploy-release"),
-        make_targets=("serve-api", "serve-predict", "build-serving-bundle", "deploy-release"),
+        commands=("spotify-serve-api", "spotify-predict-api", "spotify-build-serving-bundle", "spotify-deploy-release", "spotify-release-readiness"),
+        make_targets=("serve-api", "serve-predict", "build-serving-bundle", "deploy-release", "release-readiness"),
         artifacts=(
             "models/champion/alias.json",
-            ("releases/deployment_registry.json", "analysis/day_90_launch/canonical_artifact_manifest.json"),
+            (
+                "analysis/release_readiness/release_readiness_smoke.json",
+                "releases/deployment_registry.json",
+                "analysis/day_90_launch/canonical_artifact_manifest.json",
+            ),
         ),
-        expansion="Add release-readiness smoke bundles that prove API, alias, and deployment metadata agree before promotion.",
+        expansion="Record live production-smoke readiness and latency evidence from both ASGI services after registry promotion.",
     ),
 )
 
@@ -496,7 +502,7 @@ def _queue_rows(scorecard: list[dict[str, object]], hygiene: dict[str, object]) 
         elif surface_key == "analytics_quant":
             validation = "python -m pytest tests/test_analytics_warehouse.py tests/test_scope_expansion_lab.py"
         elif surface_key == "serving_deployment":
-            validation = "python -m pytest tests/test_service_api.py tests/test_deploy_manifests.py"
+            validation = "python -m pytest tests/test_service_api.py tests/test_deploy_manifests.py tests/test_deployment_registry.py tests/test_release_readiness.py"
 
         rows.append(
             {
