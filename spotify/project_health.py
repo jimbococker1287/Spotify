@@ -12,6 +12,8 @@ from typing import Sequence
 
 from .run_artifacts import write_csv_rows, write_json, write_markdown
 
+ArtifactRequirement = str | tuple[str, ...]
+
 
 @dataclass(frozen=True)
 class ProjectSurface:
@@ -24,7 +26,7 @@ class ProjectSurface:
     docs: tuple[str, ...]
     commands: tuple[str, ...] = ()
     make_targets: tuple[str, ...] = ()
-    artifacts: tuple[str, ...] = ()
+    artifacts: tuple[ArtifactRequirement, ...] = ()
     expansion: str = ""
 
 
@@ -57,7 +59,10 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         ),
         commands=("spotify-taste-os-demo", "spotify-taste-os-serve"),
         make_targets=("taste-os-demo", "taste-os-showcase", "serve-taste-os"),
-        artifacts=("analysis/taste_os_demo/taste_os_demo.json", "analysis/taste_os_showcase/taste_os_showcase.json"),
+        artifacts=(
+            ("analysis/taste_os_demo/taste_os_demo.json", "analysis/taste_os_demo/taste_os_demo_focus_steady.json"),
+            ("analysis/taste_os_showcase/taste_os_showcase.json", "analysis/taste_os_demo/showcase/taste_os_showcase.json"),
+        ),
         expansion="Productize mode-specific steering loops and make why-this-next copy the default explanation layer.",
     ),
     ProjectSurface(
@@ -106,7 +111,7 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         docs=("docs/control_room_operating_rhythm.md", "docs/project_threads.md"),
         commands=("spotify-control-room",),
         make_targets=("control-room", "control-room-guard", "regression-alert"),
-        artifacts=("analytics/control_room.json", "analytics/control_room.md", "history/control_room_history.csv"),
+        artifacts=("analytics/control_room.json", "analytics/control_room.md", "analytics/control_room_history.csv"),
         expansion="Make control-room output the default post-run cockpit and connect next bets to concrete validation commands.",
     ),
     ProjectSurface(
@@ -132,7 +137,10 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         commands=("spotify-public-insights", "spotify-creator-market-intelligence"),
         make_targets=("public-insights", "creator-market-intelligence"),
         artifacts=(
-            "analysis/public_spotify/public_insights_index.json",
+            (
+                "analysis/public_spotify/public_insights_index.json",
+                "analysis/public_spotify/summary/public_insights_summary.json",
+            ),
             "analysis/creator_market_intelligence/creator_market_manifest.json",
         ),
         expansion="Promote repeated report families into strategy cards for scenes, release lanes, and label concentration.",
@@ -162,7 +170,7 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         artifacts=(
             "analysis/research_platform_lab/research_claim_registry.csv",
             "analysis/research_platform_lab/research_next_experiments.json",
-            "analysis/research_claims/research_claims_report.json",
+            ("analysis/research_claims/research_claims_report.json", "analysis/research_claims/research_claims.json"),
         ),
         expansion="Run repeated benchmark-lock evidence for the claims that still block publication-grade confidence.",
     ),
@@ -217,7 +225,10 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         docs=("deploy/README.md", "deploy/local/README.md", "deploy/kubernetes/README.md", "deploy/ecs/README.md"),
         commands=("spotify-serve-api", "spotify-predict-api", "spotify-build-serving-bundle", "spotify-deploy-release"),
         make_targets=("serve-api", "serve-predict", "build-serving-bundle", "deploy-release"),
-        artifacts=("models/champion/alias.json", "releases/deployment_registry.json"),
+        artifacts=(
+            "models/champion/alias.json",
+            ("releases/deployment_registry.json", "analysis/day_90_launch/canonical_artifact_manifest.json"),
+        ),
         expansion="Add release-readiness smoke bundles that prove API, alias, and deployment metadata agree before promotion.",
     ),
 )
@@ -277,6 +288,17 @@ def _ratio(found: int, total: int) -> float:
 
 def _existing_relative_paths(root: Path, paths: Sequence[str]) -> list[str]:
     return [path for path in paths if (root / path).exists()]
+
+
+def _existing_artifact_paths(root: Path, requirements: Sequence[ArtifactRequirement]) -> list[str]:
+    found: list[str] = []
+    for requirement in requirements:
+        candidates = (requirement,) if isinstance(requirement, str) else requirement
+        for candidate in candidates:
+            if (root / candidate).exists():
+                found.append(candidate)
+                break
+    return found
 
 
 def _read_text(path: Path) -> str:
@@ -347,7 +369,7 @@ def _score_surface(
     proof_modules = _existing_relative_paths(project_root, surface.modules)
     proof_tests = _existing_relative_paths(project_root, surface.tests)
     proof_docs = _existing_relative_paths(project_root, surface.docs)
-    proof_artifacts = _existing_relative_paths(output_dir, surface.artifacts)
+    proof_artifacts = _existing_artifact_paths(output_dir, surface.artifacts)
     command_count = sum(1 for command in surface.commands if command in scripts)
     make_target_count = sum(1 for target in surface.make_targets if target in make_targets)
 
@@ -427,8 +449,8 @@ def _repo_hygiene(project_root: Path) -> dict[str, object]:
     gitignore_mentions_build = bool(re.search(r"(^|\n)build/?(\n|$)", gitignore_text))
 
     actions: list[str] = []
-    if build_python_files:
-        actions.append("Decide whether `build/lib` should be removed from version control; keep Ruff excluding it while it remains.")
+    if tracked_build_files:
+        actions.append("Remove tracked `build/lib` generated source from version control; keep Ruff excluding it while it remains ignored.")
     if tracked_ds_store_files:
         actions.append("Remove tracked `.DS_Store` files from the repository index.")
     if not gitignore_mentions_build:
@@ -449,6 +471,7 @@ def _repo_hygiene(project_root: Path) -> dict[str, object]:
         "ruff_excludes_build": ruff_excludes_build,
         "gitignore_mentions_build": gitignore_mentions_build,
         "risk_score": risk_score,
+        "efficiency_score": _bounded(1.0 - risk_score),
         "recommended_actions": actions,
         "tracked_ds_store_files": tracked_ds_store_files[:20],
         "tracked_build_file_examples": tracked_build_files[:20],
@@ -545,6 +568,7 @@ def _scorecard_markdown(scorecard: list[dict[str, object]], queue: list[dict[str
         f"- Surfaces reviewed: {len(scorecard)}",
         f"- Ready surfaces: {ready_count}",
         f"- Average health score: {average_health}",
+        f"- Repository efficiency score: {hygiene.get('efficiency_score', 0.0)}",
         f"- Repository hygiene risk: {hygiene.get('risk_score', 0.0)}",
         "",
         "## Surface Scorecard",
@@ -617,6 +641,7 @@ def build_project_health(
         "surface_count": len(scorecard),
         "ready_surface_count": sum(1 for row in scorecard if row["status"] == "ready"),
         "average_health_score": average_health,
+        "repository_efficiency_score": hygiene.get("efficiency_score", 0.0),
         "scorecard": scorecard,
         "development_queue": queue,
         "repository_hygiene": hygiene,
@@ -633,6 +658,7 @@ def build_project_health(
         "generated_at": generated_at,
         "surface_count": len(scorecard),
         "average_health_score": average_health,
+        "repository_efficiency_score": hygiene.get("efficiency_score", 0.0),
         "top_queue_item": queue[0] if queue else None,
         "paths": paths,
     }

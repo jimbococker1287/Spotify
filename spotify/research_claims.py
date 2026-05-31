@@ -237,6 +237,21 @@ def _enrich_claim_artifacts(
 ) -> dict[str, object]:
     enriched = dict(claim)
     raw_paths = [str(item).strip() for item in claim.get("supporting_artifacts", []) if str(item).strip()]
+    portable_paths = [
+        str(item).strip()
+        for item in claim.get("supporting_artifacts_portable", [])
+        if str(item).strip()
+    ]
+    if portable_paths:
+        repaired_paths: list[str] = []
+        for portable_path in portable_paths:
+            candidate = Path(portable_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = output_root / candidate
+            repaired_paths.append(str(candidate))
+        if len(raw_paths) > len(repaired_paths):
+            repaired_paths.extend(raw_paths[len(repaired_paths) :])
+        raw_paths = repaired_paths
     records = _artifact_records(raw_paths, output_root=output_root)
     portability_ready = bool(records) and all(bool(record.get("portable")) for record in records)
     artifact_pack_ready = bool(records) and all(bool(record.get("exists")) for record in records)

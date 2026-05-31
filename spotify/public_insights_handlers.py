@@ -40,6 +40,16 @@ class PublicInsightsHandlerDeps:
     slugify: Callable[[str], str]
 
 
+def _as_of_timestamp(args: argparse.Namespace) -> pd.Timestamp:
+    raw_value = str(getattr(args, "as_of_date", "") or "").strip()
+    if not raw_value:
+        return pd.Timestamp.now(tz="UTC")
+    timestamp = pd.Timestamp(raw_value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
 def _playlist_item_rows(
     client: Any,
     *,
@@ -320,7 +330,8 @@ def _handle_release_tracker(
 ) -> int:
     artists = deps.resolve_artists(args, logger, history_top_n=args.top_n, history_lookback_days=args.lookback_days)
     include_groups = ",".join(deps.split_csv_list(args.include_groups))
-    cutoff_ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max(1, int(args.since_days)))
+    as_of_ts = _as_of_timestamp(args)
+    cutoff_ts = as_of_ts - pd.Timedelta(days=max(1, int(args.since_days)))
 
     artist_rows: list[dict[str, Any]] = []
     total_releases = 0
@@ -381,6 +392,7 @@ def _handle_release_tracker(
         "command": "release-tracker",
         "market": str(args.spotify_market).upper(),
         "since_days": int(args.since_days),
+        "as_of_date": as_of_ts.date().isoformat(),
         "include_groups": include_groups,
         "artists": artist_rows,
     }
@@ -1704,7 +1716,8 @@ def _handle_release_inbox(
 ) -> int:
     artists = deps.resolve_artists(args, logger, history_top_n=args.top_n, history_lookback_days=args.lookback_days)
     include_groups = ",".join(deps.split_csv_list(args.include_groups))
-    cutoff_ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max(1, int(args.since_days)))
+    as_of_ts = _as_of_timestamp(args)
+    cutoff_ts = as_of_ts - pd.Timedelta(days=max(1, int(args.since_days)))
     state_key = (
         deps.slugify("explicit-" + "-".join(artists))
         if getattr(args, "artists", None)
@@ -1755,6 +1768,7 @@ def _handle_release_inbox(
     payload = {
         "command": "release-inbox",
         "since_days": int(args.since_days),
+        "as_of_date": as_of_ts.date().isoformat(),
         "artists": artists,
         "new_releases": [row for row in inbox_rows if row["is_new_since_last_run"]],
         "all_recent_releases": inbox_rows,
@@ -1806,7 +1820,8 @@ def _handle_personal_release_radar(
     coverage_index = _history_catalog_coverage_index(history_df, lookback_days=int(args.lookback_days))
     include_groups = ",".join(deps.split_csv_list(args.include_groups))
     market = str(args.spotify_market).upper()
-    cutoff_ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max(1, int(args.since_days)))
+    as_of_ts = _as_of_timestamp(args)
+    cutoff_ts = as_of_ts - pd.Timedelta(days=max(1, int(args.since_days)))
     output_dir = Path(args.output_dir).expanduser().resolve()
     state_key = (
         deps.slugify("explicit-" + "-".join(seed_artists))
@@ -1894,7 +1909,7 @@ def _handle_personal_release_radar(
                 int(artist_album_names.get((_normalized_catalog_text(name), _normalized_catalog_text(album.get("name"))), 0))
                 for name in album_artist_names
             )
-            days_old = max(0, int((pd.Timestamp.now(tz="UTC") - release_ts).days))
+            days_old = max(0, int((as_of_ts - release_ts).days))
             is_new_since_last_run = album_id not in seen_release_ids
             already_heard = local_album_hits > 0
             source_boost = 0.35 if artist["source"] == "seed" else 0.18
@@ -1973,6 +1988,7 @@ def _handle_personal_release_radar(
         "command": "personal-release-radar",
         "market": market,
         "since_days": int(args.since_days),
+        "as_of_date": as_of_ts.date().isoformat(),
         "include_groups": include_groups,
         "seed_artists": seed_artists,
         "candidate_artists": list(candidates.values()),

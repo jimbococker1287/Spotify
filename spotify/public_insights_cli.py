@@ -24,6 +24,7 @@ def _configure_release_tracker(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", type=int, default=10, help="Number of history-derived artists to track.")
     parser.add_argument("--lookback-days", type=int, default=365, help="History window for deriving top artists.")
     parser.add_argument("--since-days", type=int, default=120, help="Only include releases from the last N days.")
+    parser.add_argument("--as-of-date", type=str, default=None, help="Optional YYYY-MM-DD anchor date for recency windows.")
     parser.add_argument(
         "--include-groups",
         type=str,
@@ -153,6 +154,7 @@ def _configure_release_inbox(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", type=int, default=10, help="Number of history-derived artists to track.")
     parser.add_argument("--lookback-days", type=int, default=365, help="History window for deriving seed artists.")
     parser.add_argument("--since-days", type=int, default=120, help="Only include releases from the last N days.")
+    parser.add_argument("--as-of-date", type=str, default=None, help="Optional YYYY-MM-DD anchor date for recency windows.")
     parser.add_argument("--include-groups", type=str, default="album,single", help="Album groups to include.")
     parser.add_argument("--per-artist-limit", type=int, default=10, help="Maximum releases per artist in the inbox.")
 
@@ -202,6 +204,7 @@ def _configure_personal_release_radar(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", type=int, default=10, help="Number of history-derived seed artists.")
     parser.add_argument("--lookback-days", type=int, default=365, help="History window for deriving seed artists.")
     parser.add_argument("--since-days", type=int, default=120, help="Only include releases from the last N days.")
+    parser.add_argument("--as-of-date", type=str, default=None, help="Optional YYYY-MM-DD anchor date for recency windows.")
     parser.add_argument("--include-groups", type=str, default="album,single", help="Album groups to include.")
     parser.add_argument("--per-artist-limit", type=int, default=10, help="Maximum releases to inspect per artist.")
     parser.add_argument("--include-related", action="store_true", help="Also inspect related public artists.")

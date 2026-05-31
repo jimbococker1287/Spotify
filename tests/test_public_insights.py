@@ -809,6 +809,8 @@ def test_personal_release_radar_ranks_new_unheard_releases(tmp_path) -> None:
             "Artist A",
             "--since-days",
             "30",
+            "--as-of-date",
+            "2026-05-01",
             "--include-related",
             "--related-limit",
             "1",

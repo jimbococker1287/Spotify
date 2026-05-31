@@ -24,6 +24,9 @@ def test_build_project_health_writes_scorecard_queue_and_hygiene(tmp_path: Path)
 [project.scripts]
 spotify-taste-os-demo = "spotify.taste_os_demo:main"
 spotify-taste-os-serve = "spotify.taste_os_service:main"
+
+[tool.ruff]
+exclude = ["build"]
 """,
     )
     _touch(
@@ -58,8 +61,8 @@ serve-taste-os:
     ):
         _touch(project_root, relative_path)
 
-    _touch(output_dir, "analysis/taste_os_demo/taste_os_demo.json", "{}")
-    _touch(output_dir, "analysis/taste_os_showcase/taste_os_showcase.json", "{}")
+    _touch(output_dir, "analysis/taste_os_demo/taste_os_demo_focus_steady.json", "{}")
+    _touch(output_dir, "analysis/taste_os_demo/showcase/taste_os_showcase.json", "{}")
 
     payload = build_project_health(project_root=project_root, output_dir=output_dir)
     result_root = output_dir / "analysis" / "project_health"
@@ -71,12 +74,16 @@ serve-taste-os:
     taste_os = next(row for row in scorecard if row["surface_key"] == "taste_os")
     assert payload["surface_count"] == len(scorecard)
     assert taste_os["status"] == "ready"
+    assert taste_os["artifact_score"] == 1.0
+    assert "taste_os_demo_focus_steady.json" in taste_os["proof_artifacts"]
     assert taste_os["top_gap"] == "No anchor gap; next gap is depth, freshness, and repeated evidence."
     assert queue[0]["rank"] == 1
-    assert any(row["surface_key"] == "repo_hygiene" for row in queue)
+    assert not any(row["surface_key"] == "repo_hygiene" for row in queue)
     assert hygiene["build_lib_python_count"] == 1
     assert hygiene["ds_store_count"] == 1
+    assert hygiene["efficiency_score"] == 1.0
     assert "Project Health Review" in review
+    assert "Repository efficiency score: 1.0" in review
 
 
 def test_project_health_main_prints_summary(tmp_path: Path, capsys) -> None:
