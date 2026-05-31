@@ -127,6 +127,7 @@ spotify/portfolio_artifacts.py
 spotify/predict_next.py
 spotify/predict_service.py
 spotify/probability_bundles.py
+spotify/production_smoke.py
 spotify/project_health.py
 spotify/public_catalog.py
 spotify/public_insights.py
@@ -250,6 +251,7 @@ tests/test_predict_cli_smoke.py
 tests/test_predict_next_context.py
 tests/test_predict_service_cli_smoke.py
 tests/test_predict_service_validation.py
+tests/test_production_smoke.py
 tests/test_profiles_and_ensemble.py
 tests/test_project_health.py
 tests/test_public_catalog.py

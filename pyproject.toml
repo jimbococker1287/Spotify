@@ -57,6 +57,7 @@ spotify-predict-api = "spotify.service_api:main_predict"
 spotify-taste-os-api = "spotify.service_api:main_taste_os"
 spotify-deploy-release = "spotify.deployment_registry:main"
 spotify-release-readiness = "spotify.release_readiness:main"
+spotify-production-smoke = "spotify.production_smoke:main"
 spotify-public-insights = "spotify.public_insights:main"
 spotify-compare-public = "spotify.compare_public:main"
 spotify-control-room = "spotify.control_room:main"
@@ -116,6 +117,7 @@ files = [
   "spotify/taste_os_state.py",
   "spotify/deployment_registry.py",
   "spotify/release_readiness.py",
+  "spotify/production_smoke.py",
   "spotify/governance.py",
 ]
 ignore_missing_imports = true

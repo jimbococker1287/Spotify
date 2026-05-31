@@ -835,6 +835,16 @@ python -m spotify.release_readiness \
 
 That writes `outputs/analysis/release_readiness/release_readiness_smoke.json`, `.md`, and `release_readiness_checks.csv`.
 
+After the release metadata agrees, run the production smoke pass. It builds both ASGI apps in-process from the active channel, calls `/v1/readyz`, `/v1/metrics`, one prediction request, and one Taste OS session request, then records status codes, latency, request IDs, readiness checks, and blockers:
+
+```bash
+python -m spotify.production_smoke \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --strict
+```
+
+That writes `outputs/analysis/production_smoke/production_smoke.json`, `.md`, `production_smoke_checks.csv`, and `production_smoke_requests.csv`.
+
 If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
 
 To publish the copied release artifacts directly to a remote target, add `--publish-artifacts`. Supported targets are:
@@ -1170,6 +1180,12 @@ Verify the promoted channel before handoff:
 
 ```bash
 make release-readiness EXTRA_ARGS='--run-dir outputs/deployments/registry/channels/stable --registry-root outputs/deployments/registry --channel stable --require-registry --strict'
+```
+
+Exercise both ASGI services and capture latency/readiness evidence:
+
+```bash
+make production-smoke EXTRA_ARGS='--run-dir outputs/deployments/registry/channels/stable --strict'
 ```
 
 Keep the outward-facing package current after Day 90:
