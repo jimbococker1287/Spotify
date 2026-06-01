@@ -239,13 +239,15 @@ PROJECT_SURFACES: tuple[ProjectSurface, ...] = (
         artifacts=(
             "models/champion/alias.json",
             (
+                "analysis/production_smoke/production_smoke_trend.json",
+                "history/production_smoke_history.csv",
                 "analysis/production_smoke/production_smoke.json",
                 "analysis/release_readiness/release_readiness_smoke.json",
                 "releases/deployment_registry.json",
                 "analysis/day_90_launch/canonical_artifact_manifest.json",
             ),
         ),
-        expansion="Trend production-smoke latency and readiness outcomes across releases so deploy handoffs have history.",
+        expansion="Pair in-process smoke history with deployed-service checks from the local compose stack or cloud target.",
     ),
 )
 

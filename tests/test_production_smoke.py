@@ -13,9 +13,9 @@ from spotify.deployment_registry import publish_deployment_release
 from spotify.digital_twin import ListenerDigitalTwinArtifact
 from spotify.multimodal import MultimodalArtistSpace
 from spotify.predict_next import PredictionInputContext
-from spotify.production_smoke import build_production_smoke, main
+from spotify.production_smoke import HISTORY_COLUMNS, build_production_smoke, main
+from spotify.run_artifacts import safe_read_json, write_csv_rows
 from spotify.safe_policy import SafeBanditPolicyArtifact
-from spotify.run_artifacts import safe_read_json
 
 
 class _PredictStub:
@@ -157,6 +157,34 @@ def test_production_smoke_exercises_both_asgi_services(tmp_path: Path, monkeypat
     run_dir = outputs_dir / "runs" / "20260502_demo_run"
     registry_root = outputs_dir / "deployments" / "registry"
     _write_run_artifacts(run_dir)
+    write_csv_rows(
+        outputs_dir / "history" / "production_smoke_history.csv",
+        [
+            {
+                "generated_at": "2026-05-01T00:00:00+00:00",
+                "release_id": "20260501_old_run",
+                "run_dir": str(outputs_dir / "runs" / "20260501_old_run"),
+                "requested_run_dir": str(registry_root / "channels" / "stable"),
+                "model_name": "retrieval_reranker",
+                "status": "pass",
+                "production_ready": True,
+                "check_count": 12,
+                "pass_count": 12,
+                "warning_count": 0,
+                "fail_count": 0,
+                "request_count": 6,
+                "successful_request_count": 6,
+                "max_latency_ms": 25.0,
+                "average_latency_ms": 8.0,
+                "predict_readyz_status": "pass",
+                "predict_metrics_status": "pass",
+                "taste_os_readyz_status": "pass",
+                "taste_os_metrics_status": "pass",
+                "blocker_count": 0,
+            }
+        ],
+        fieldnames=HISTORY_COLUMNS,
+    )
     publish_deployment_release(
         run_dir=run_dir,
         outputs_dir=outputs_dir,
@@ -206,8 +234,18 @@ def test_production_smoke_exercises_both_asgi_services(tmp_path: Path, monkeypat
     assert endpoints == {"/v1/readyz", "/v1/metrics", "/v1/predict", "/v1/taste-os/session"}
     assert all(str(row["request_id"]) for row in payload["requests"])  # type: ignore[index]
     assert (outputs_dir / "analysis" / "production_smoke" / "production_smoke.json").exists()
+    assert (outputs_dir / "history" / "production_smoke_history.csv").exists()
+    trend = safe_read_json(outputs_dir / "analysis" / "production_smoke" / "production_smoke_trend.json", default={})
+    assert trend["history_run_count"] == 2
+    assert trend["latest"]["release_id"] == "20260502_demo_run"
+    assert trend["previous"]["release_id"] == "20260501_old_run"
+    assert payload["trend_summary"]["history_run_count"] == 2  # type: ignore[index]
+    assert payload["paths"]["history_csv"].endswith("production_smoke_history.csv")  # type: ignore[index]
+    trend_report = (outputs_dir / "analysis" / "production_smoke" / "production_smoke_trend.md").read_text(encoding="utf-8")
+    assert "Production Smoke Trend" in trend_report
     report = (outputs_dir / "analysis" / "production_smoke" / "production_smoke.md").read_text(encoding="utf-8")
     assert "Production Smoke" in report
+    assert "History runs tracked: 2" in report
 
 
 def test_production_smoke_cli_writes_failure_artifact_for_missing_channel(tmp_path: Path, capsys) -> None:
@@ -231,4 +269,5 @@ def test_production_smoke_cli_writes_failure_artifact_for_missing_channel(tmp_pa
     payload = safe_read_json(outputs_dir / "analysis" / "production_smoke" / "production_smoke.json", default={})
     assert result == 1
     assert "production_smoke_status=fail" in captured.out
+    assert "production_smoke_history=" in captured.out
     assert payload["summary"]["fail_count"] >= 1

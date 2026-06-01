@@ -7,7 +7,7 @@ This directory now has four layers plus the serving smoke gates:
 - `terraform/aws/`: AWS-first infrastructure baseline for VPC, ECS, ALB, EFS, Postgres, Redis, ECR, and secrets
 - `local/`: local production-smoke stack with Postgres + Redis + both APIs
 - `make release-readiness`: artifact-level verification that the active channel alias, release manifest, serving bundles, and deploy templates agree
-- `make production-smoke`: in-process ASGI evidence for `/v1/readyz`, `/v1/metrics`, prediction, and Taste OS session requests
+- `make production-smoke`: in-process ASGI evidence for `/v1/readyz`, `/v1/metrics`, prediction, Taste OS session requests, and cross-run latency/readiness trends
 
 Recommended order:
 

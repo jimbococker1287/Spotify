@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -41,6 +42,28 @@ REQUEST_COLUMNS = [
     "request_id",
     "trace_id",
     "error",
+]
+HISTORY_COLUMNS = [
+    "generated_at",
+    "release_id",
+    "run_dir",
+    "requested_run_dir",
+    "model_name",
+    "status",
+    "production_ready",
+    "check_count",
+    "pass_count",
+    "warning_count",
+    "fail_count",
+    "request_count",
+    "successful_request_count",
+    "max_latency_ms",
+    "average_latency_ms",
+    "predict_readyz_status",
+    "predict_metrics_status",
+    "taste_os_readyz_status",
+    "taste_os_metrics_status",
+    "blocker_count",
 ]
 
 
@@ -120,6 +143,16 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
         except ValueError:
             return default
     return default
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "pass", "ready"}
+    return False
 
 
 def _request_summary(body: object, *, endpoint: str) -> dict[str, object]:
@@ -330,9 +363,195 @@ def _request_csv_rows(requests: list[dict[str, object]]) -> list[dict[str, objec
     return [{column: row.get(column, "") for column in REQUEST_COLUMNS} for row in requests]
 
 
+def _check_status(checks: list[object], *, service: str, check_key: str) -> str:
+    for row in checks:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("service", "")) == service and str(row.get("check_key", "")) == check_key:
+            return str(row.get("status", ""))
+    return ""
+
+
+def _history_row(payload: dict[str, object]) -> dict[str, object]:
+    summary = payload.get("summary", {})
+    summary_dict = summary if isinstance(summary, dict) else {}
+    checks = payload.get("checks", [])
+    check_rows = checks if isinstance(checks, list) else []
+    blockers = payload.get("blockers", [])
+    blocker_rows = blockers if isinstance(blockers, list) else []
+    run_dir = str(payload.get("run_dir", ""))
+    return {
+        "generated_at": str(payload.get("generated_at", "")),
+        "release_id": Path(run_dir).name if run_dir else "",
+        "run_dir": run_dir,
+        "requested_run_dir": str(payload.get("requested_run_dir", "")),
+        "model_name": str(payload.get("model_name", "")),
+        "status": str(summary_dict.get("status", "")),
+        "production_ready": bool(summary_dict.get("production_ready", False)),
+        "check_count": _coerce_int(summary_dict.get("check_count", 0)),
+        "pass_count": _coerce_int(summary_dict.get("pass_count", 0)),
+        "warning_count": _coerce_int(summary_dict.get("warning_count", 0)),
+        "fail_count": _coerce_int(summary_dict.get("fail_count", 0)),
+        "request_count": _coerce_int(summary_dict.get("request_count", 0)),
+        "successful_request_count": _coerce_int(summary_dict.get("successful_request_count", 0)),
+        "max_latency_ms": round(_coerce_float(summary_dict.get("max_latency_ms", 0.0)), 3),
+        "average_latency_ms": round(_coerce_float(summary_dict.get("average_latency_ms", 0.0)), 3),
+        "predict_readyz_status": _check_status(check_rows, service="predict", check_key="readyz_status_ready"),
+        "predict_metrics_status": _check_status(check_rows, service="predict", check_key="metrics_readiness_ready"),
+        "taste_os_readyz_status": _check_status(check_rows, service="taste-os", check_key="readyz_status_ready"),
+        "taste_os_metrics_status": _check_status(check_rows, service="taste-os", check_key="metrics_readiness_ready"),
+        "blocker_count": len(blocker_rows),
+    }
+
+
+def _read_history_rows(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as infile:
+            return [dict(row) for row in csv.DictReader(infile)]
+    except Exception:
+        return []
+
+
+def _trend_row(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "generated_at": str(row.get("generated_at", "")),
+        "release_id": str(row.get("release_id", "")),
+        "run_dir": str(row.get("run_dir", "")),
+        "model_name": str(row.get("model_name", "")),
+        "status": str(row.get("status", "")),
+        "production_ready": _coerce_bool(row.get("production_ready", False)),
+        "fail_count": _coerce_int(row.get("fail_count", 0)),
+        "blocker_count": _coerce_int(row.get("blocker_count", 0)),
+        "max_latency_ms": round(_coerce_float(row.get("max_latency_ms", 0.0)), 3),
+        "average_latency_ms": round(_coerce_float(row.get("average_latency_ms", 0.0)), 3),
+        "predict_readyz_status": str(row.get("predict_readyz_status", "")),
+        "taste_os_readyz_status": str(row.get("taste_os_readyz_status", "")),
+    }
+
+
+def _trend_summary(rows: list[dict[str, object]], *, window_size: int = 20) -> dict[str, object]:
+    recent = [_trend_row(row) for row in rows[-max(1, int(window_size)) :]]
+    latest = recent[-1] if recent else {}
+    previous = recent[-2] if len(recent) > 1 else {}
+    status_counts: dict[str, int] = {}
+    for row in recent:
+        status = str(row.get("status", "")).strip() or "unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    denominator = max(len(recent), 1)
+    latest_max = _coerce_float(latest.get("max_latency_ms", 0.0)) if latest else 0.0
+    previous_max = _coerce_float(previous.get("max_latency_ms", 0.0)) if previous else 0.0
+    ready_count = sum(1 for row in recent if _coerce_bool(row.get("production_ready", False)))
+    both_ready_count = sum(
+        1
+        for row in recent
+        if str(row.get("predict_readyz_status", "")) == "pass"
+        and str(row.get("taste_os_readyz_status", "")) == "pass"
+    )
+    return {
+        "history_run_count": len(rows),
+        "window_size": len(recent),
+        "latest": latest,
+        "previous": previous,
+        "status_counts": status_counts,
+        "production_ready_rate": round(ready_count / denominator, 4),
+        "both_services_ready_rate": round(both_ready_count / denominator, 4),
+        "average_max_latency_ms": round(
+            sum(_coerce_float(row.get("max_latency_ms", 0.0)) for row in recent) / denominator,
+            3,
+        ),
+        "latency_delta_ms": round(latest_max - previous_max, 3) if previous else 0.0,
+        "recent_runs": recent,
+    }
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("\n", " ").replace("|", "/")
+
+
+def _trend_markdown(trend: dict[str, object], *, history_csv: Path) -> list[str]:
+    latest = trend.get("latest", {})
+    latest_dict = latest if isinstance(latest, dict) else {}
+    recent = trend.get("recent_runs", [])
+    recent_rows = recent if isinstance(recent, list) else []
+    lines = [
+        "# Production Smoke Trend",
+        "",
+        f"History CSV: `{history_csv}`",
+        f"Runs tracked: {trend.get('history_run_count', 0)}",
+        f"Window size: {trend.get('window_size', 0)}",
+        f"Latest status: `{latest_dict.get('status', '')}`",
+        f"Latest max latency ms: {latest_dict.get('max_latency_ms', 0.0)}",
+        f"Delta vs previous max latency ms: {trend.get('latency_delta_ms', 0.0)}",
+        f"Production-ready rate: {trend.get('production_ready_rate', 0.0)}",
+        f"Both-services-ready rate: {trend.get('both_services_ready_rate', 0.0)}",
+        "",
+        "## Recent Runs",
+        "",
+        "| Generated At | Release | Status | Ready | Max Latency ms | Failures | Blockers |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in recent_rows[-10:]:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            "| "
+            + " | ".join(
+                _markdown_cell(row.get(column, ""))
+                for column in (
+                    "generated_at",
+                    "release_id",
+                    "status",
+                    "production_ready",
+                    "max_latency_ms",
+                    "fail_count",
+                    "blocker_count",
+                )
+            )
+            + " |"
+        )
+    return lines
+
+
+def _write_history_artifacts(
+    *,
+    payload: dict[str, object],
+    outputs_dir: Path,
+    output_root: Path,
+) -> tuple[dict[str, str], dict[str, object]]:
+    history_csv = outputs_dir / "history" / "production_smoke_history.csv"
+    rows = [
+        {column: row.get(column, "") for column in HISTORY_COLUMNS}
+        for row in _read_history_rows(history_csv)
+    ]
+    rows.append(_history_row(payload))
+    write_csv_rows(history_csv, rows, fieldnames=HISTORY_COLUMNS)
+
+    trend = _trend_summary(rows)
+    trend_json = output_root / "production_smoke_trend.json"
+    trend_md = output_root / "production_smoke_trend.md"
+    write_json(
+        trend_json,
+        {
+            "generated_at": str(payload.get("generated_at", "")),
+            "history_csv": str(history_csv),
+            **trend,
+        },
+        sort_keys=True,
+    )
+    write_markdown(trend_md, _trend_markdown(trend, history_csv=history_csv))
+    return {"history_csv": str(history_csv), "trend_json": str(trend_json), "trend_md": str(trend_md)}, trend
+
+
 def _markdown(payload: dict[str, object]) -> list[str]:
     summary = payload.get("summary", {})
     summary_dict = summary if isinstance(summary, dict) else {}
+    trend = payload.get("trend_summary", {})
+    trend_dict = trend if isinstance(trend, dict) else {}
+    latest = trend_dict.get("latest", {})
+    latest_dict = latest if isinstance(latest, dict) else {}
     blockers = payload.get("blockers", [])
     blocker_rows = blockers if isinstance(blockers, list) else []
     requests = payload.get("requests", [])
@@ -353,6 +572,10 @@ def _markdown(payload: dict[str, object]) -> list[str]:
         f"- Failed: {summary_dict.get('fail_count', 0)}",
         f"- Requests: {summary_dict.get('successful_request_count', 0)} / {summary_dict.get('request_count', 0)} succeeded",
         f"- Max latency ms: {summary_dict.get('max_latency_ms', 0.0)}",
+        f"- History runs tracked: {trend_dict.get('history_run_count', 0)}",
+        f"- Production-ready rate: {trend_dict.get('production_ready_rate', 0.0)}",
+        f"- Latest trend max latency ms: {latest_dict.get('max_latency_ms', summary_dict.get('max_latency_ms', 0.0))}",
+        f"- Max latency delta vs previous ms: {trend_dict.get('latency_delta_ms', 0.0)}",
         "",
         "## Requests",
         "",
@@ -745,17 +968,21 @@ def build_production_smoke(
         "checks": [check.as_dict() for check in checks],
         "requests": requests,
     }
+    history_paths, trend_summary = _write_history_artifacts(payload=payload, outputs_dir=outputs_dir, output_root=output_root)
+    payload["trend_summary"] = trend_summary
     paths = {
         "json": str(write_json(output_root / "production_smoke.json", payload, sort_keys=True)),
         "md": str(write_markdown(output_root / "production_smoke.md", _markdown(payload))),
         "checks_csv": str(write_csv_rows(output_root / "production_smoke_checks.csv", [check.as_dict() for check in checks], fieldnames=CHECK_COLUMNS)),
         "requests_csv": str(write_csv_rows(output_root / "production_smoke_requests.csv", _request_csv_rows(requests), fieldnames=REQUEST_COLUMNS)),
+        **history_paths,
     }
     manifest = {
         "generated_at": generated_at,
         "status": summary["status"],
         "production_ready": summary["production_ready"],
         "paths": paths,
+        "trend_summary": trend_summary,
     }
     paths["manifest_json"] = str(write_json(output_root / "production_smoke_manifest.json", manifest, sort_keys=True))
     payload["paths"] = paths
@@ -839,6 +1066,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"production_smoke_status={summary_dict.get('status', '')}")
         print(f"production_ready={summary_dict.get('production_ready', False)}")
         print(f"production_smoke_report={paths_dict.get('md', '')}")
+        print(f"production_smoke_history={paths_dict.get('history_csv', '')}")
     if args.strict and summary_dict.get("status") != "pass":
         return 1
     return 0
