@@ -26,6 +26,7 @@ The control room now includes:
 - explicit fast and full cadence status
 - a recommended next scheduled command
 - an async handoff section with the headline, share pack, and next step
+- a run tradeoff dossier covering quality, safety, runtime, phase regressions, and currently retained storage against the promoted baseline
 
 ## Triage Flow
 

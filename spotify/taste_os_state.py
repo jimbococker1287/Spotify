@@ -6,7 +6,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import Column, Index, Integer, MetaData, String, Table, Text, create_engine, event, func, select, text
+from sqlalchemy import (
+    Column,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    func,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 
 
@@ -102,6 +116,23 @@ def _redact_database_url(database_url: str) -> str:
         user = auth.split(":", 1)[0].strip()
         netloc = f"{user}:***@{host}" if user else f"***@{host}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+class ActiveSessionNotFoundError(LookupError):
+    pass
+
+
+class StaleSessionVersionError(RuntimeError):
+    def __init__(self, *, expected_version: int, current_version: int) -> None:
+        self.expected_version = int(expected_version)
+        self.current_version = int(current_version)
+        super().__init__(
+            f"Session version {self.expected_version} is stale; current version is {self.current_version}."
+        )
+
+
+class SessionEventConflictError(RuntimeError):
+    pass
 
 
 class TasteOSStateStore:
@@ -200,6 +231,36 @@ class TasteOSStateStore:
             Column("used_feedback_memory", Integer, nullable=False, default=0),
             Column("persisted", Integer, nullable=False, default=0),
             Index("idx_session_history_created_at", "created_at"),
+        )
+        self.active_sessions = Table(
+            "active_sessions",
+            self.metadata,
+            Column("session_id", String(256), primary_key=True),
+            Column("created_at", String(64), nullable=False),
+            Column("updated_at", String(64), nullable=False),
+            Column("version", Integer, nullable=False, default=0),
+            Column("request_json", Text, nullable=False),
+            Column("plan_json", Text, nullable=False),
+            Column("adaptation_json", Text, nullable=False, default="{}"),
+            Index("idx_active_sessions_updated_at", "updated_at"),
+        )
+        self.session_events = Table(
+            "session_events",
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("session_id", String(256), nullable=False),
+            Column("event_id", String(256), nullable=False),
+            Column("timestamp", String(64), nullable=False),
+            Column("event_type", String(64), nullable=False),
+            Column("artist_name", String(512), nullable=False),
+            Column("expected_version", Integer, nullable=False),
+            Column("resulting_version", Integer, nullable=False),
+            Column("request_json", Text, nullable=False),
+            Column("response_json", Text, nullable=False),
+            Column("durable_feedback", Integer, nullable=False, default=0),
+            UniqueConstraint("session_id", "event_id", name="uq_session_events_session_event"),
+            Index("idx_session_events_session_id", "session_id"),
+            Index("idx_session_events_timestamp", "timestamp"),
         )
 
         self._initialize()
@@ -423,8 +484,103 @@ class TasteOSStateStore:
             )
         return result
 
-    def record_feedback(
+    @staticmethod
+    def _decode_json_object(raw: object) -> dict[str, object]:
+        try:
+            parsed = json.loads(str(raw or "{}"))
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _json_text(payload: dict[str, object]) -> str:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def active_session(self, session_id: str) -> dict[str, object]:
+        normalized_session_id = str(session_id).strip()
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    self.active_sessions.c.session_id,
+                    self.active_sessions.c.created_at,
+                    self.active_sessions.c.updated_at,
+                    self.active_sessions.c.version,
+                    self.active_sessions.c.request_json,
+                    self.active_sessions.c.plan_json,
+                    self.active_sessions.c.adaptation_json,
+                ).where(self.active_sessions.c.session_id == normalized_session_id)
+            ).mappings().first()
+        if row is None:
+            raise ActiveSessionNotFoundError(f"Active Taste OS session not found: {normalized_session_id}")
+        return {
+            "session_id": str(row["session_id"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "version": int(row["version"] or 0),
+            "request": self._decode_json_object(row["request_json"]),
+            "plan": self._decode_json_object(row["plan_json"]),
+            "adaptation": self._decode_json_object(row["adaptation_json"]),
+        }
+
+    def create_active_session(
         self,
+        *,
+        session_id: str,
+        created_at: str,
+        request: dict[str, object],
+        plan: dict[str, object],
+        adaptation: dict[str, object],
+    ) -> dict[str, object]:
+        normalized_session_id = str(session_id).strip()
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.active_sessions.insert().values(
+                    session_id=normalized_session_id,
+                    created_at=str(created_at),
+                    updated_at=str(created_at),
+                    version=0,
+                    request_json=self._json_text(request),
+                    plan_json=self._json_text(plan),
+                    adaptation_json=self._json_text(adaptation),
+                )
+            )
+        return self.active_session(normalized_session_id)
+
+    def session_event(self, *, session_id: str, event_id: str) -> dict[str, object] | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(
+                    self.session_events.c.session_id,
+                    self.session_events.c.event_id,
+                    self.session_events.c.event_type,
+                    self.session_events.c.artist_name,
+                    self.session_events.c.expected_version,
+                    self.session_events.c.resulting_version,
+                    self.session_events.c.request_json,
+                    self.session_events.c.response_json,
+                    self.session_events.c.durable_feedback,
+                ).where(
+                    self.session_events.c.session_id == str(session_id).strip(),
+                    self.session_events.c.event_id == str(event_id).strip(),
+                )
+            ).mappings().first()
+        if row is None:
+            return None
+        return {
+            "session_id": str(row["session_id"]),
+            "event_id": str(row["event_id"]),
+            "event_type": str(row["event_type"]),
+            "artist_name": str(row["artist_name"]),
+            "expected_version": int(row["expected_version"]),
+            "resulting_version": int(row["resulting_version"]),
+            "request": self._decode_json_object(row["request_json"]),
+            "response": self._decode_json_object(row["response_json"]),
+            "durable_feedback": bool(row["durable_feedback"]),
+        }
+
+    def _record_feedback_in_transaction(
+        self,
+        conn: Any,
         *,
         timestamp: str,
         session_id: str,
@@ -436,55 +592,53 @@ class TasteOSStateStore:
         normalized_signal = str(signal).strip().lower()
         counter_name = f"{normalized_signal}_count"
         artist_row_key = _artist_key(normalized_artist_name)
-        with self.engine.begin() as conn:
+        conn.execute(
+            self.feedback_events.insert().values(
+                timestamp=str(timestamp),
+                session_id=str(session_id),
+                artist_name=normalized_artist_name,
+                signal=normalized_signal,
+                notes=str(notes or ""),
+            )
+        )
+        row = conn.execute(
+            select(
+                self.feedback_artist_stats.c.like_count,
+                self.feedback_artist_stats.c.repeat_count,
+                self.feedback_artist_stats.c.skip_count,
+                self.feedback_artist_stats.c.dislike_count,
+            ).where(self.feedback_artist_stats.c.artist_key == artist_row_key)
+        ).mappings().first()
+        counts = {
+            "like_count": int((row["like_count"] if row is not None else 0) or 0),
+            "repeat_count": int((row["repeat_count"] if row is not None else 0) or 0),
+            "skip_count": int((row["skip_count"] if row is not None else 0) or 0),
+            "dislike_count": int((row["dislike_count"] if row is not None else 0) or 0),
+        }
+        counts[counter_name] = int(counts.get(counter_name, 0)) + 1
+        values = {
+            "artist_name": normalized_artist_name,
+            "like_count": int(counts["like_count"]),
+            "repeat_count": int(counts["repeat_count"]),
+            "skip_count": int(counts["skip_count"]),
+            "dislike_count": int(counts["dislike_count"]),
+            "last_signal": normalized_signal,
+            "last_session_id": str(session_id),
+            "updated_at": str(timestamp),
+        }
+        if row is None:
             conn.execute(
-                self.feedback_events.insert().values(
-                    timestamp=str(timestamp),
-                    session_id=str(session_id),
-                    artist_name=normalized_artist_name,
-                    signal=normalized_signal,
-                    notes=str(notes or ""),
+                self.feedback_artist_stats.insert().values(
+                    artist_key=artist_row_key,
+                    **values,
                 )
             )
-            row = conn.execute(
-                select(
-                    self.feedback_artist_stats.c.like_count,
-                    self.feedback_artist_stats.c.repeat_count,
-                    self.feedback_artist_stats.c.skip_count,
-                    self.feedback_artist_stats.c.dislike_count,
-                ).where(self.feedback_artist_stats.c.artist_key == artist_row_key)
-            ).mappings().first()
-            counts = {
-                "like_count": int((row["like_count"] if row is not None else 0) or 0),
-                "repeat_count": int((row["repeat_count"] if row is not None else 0) or 0),
-                "skip_count": int((row["skip_count"] if row is not None else 0) or 0),
-                "dislike_count": int((row["dislike_count"] if row is not None else 0) or 0),
-            }
-            counts[counter_name] = int(counts.get(counter_name, 0)) + 1
-            values = {
-                "artist_name": normalized_artist_name,
-                "like_count": int(counts["like_count"]),
-                "repeat_count": int(counts["repeat_count"]),
-                "skip_count": int(counts["skip_count"]),
-                "dislike_count": int(counts["dislike_count"]),
-                "last_signal": normalized_signal,
-                "last_session_id": str(session_id),
-                "updated_at": str(timestamp),
-            }
-            if row is None:
-                conn.execute(
-                    self.feedback_artist_stats.insert().values(
-                        artist_key=artist_row_key,
-                        **values,
-                    )
-                )
-            else:
-                conn.execute(
-                    self.feedback_artist_stats.update()
-                    .where(self.feedback_artist_stats.c.artist_key == artist_row_key)
-                    .values(**values)
-                )
-        self.sync_legacy_snapshots()
+        else:
+            conn.execute(
+                self.feedback_artist_stats.update()
+                .where(self.feedback_artist_stats.c.artist_key == artist_row_key)
+                .values(**values)
+            )
         return {
             "timestamp": str(timestamp),
             "session_id": str(session_id),
@@ -492,6 +646,135 @@ class TasteOSStateStore:
             "signal": normalized_signal,
             "notes": str(notes or ""),
         }
+
+    def apply_session_event(
+        self,
+        *,
+        timestamp: str,
+        session_id: str,
+        event_id: str,
+        event_type: str,
+        artist_name: str,
+        expected_version: int,
+        request: dict[str, object],
+        response: dict[str, object],
+        updated_request: dict[str, object],
+        adaptation: dict[str, object],
+        durable_feedback: bool,
+    ) -> tuple[dict[str, object], bool]:
+        normalized_session_id = str(session_id).strip()
+        normalized_event_id = str(event_id).strip()
+        normalized_event_type = str(event_type).strip().lower()
+        normalized_artist_name = str(artist_name).strip()
+        request_text = self._json_text(request)
+
+        with self.engine.begin() as conn:
+            existing_event = conn.execute(
+                select(
+                    self.session_events.c.event_type,
+                    self.session_events.c.artist_name,
+                    self.session_events.c.expected_version,
+                    self.session_events.c.request_json,
+                    self.session_events.c.response_json,
+                ).where(
+                    self.session_events.c.session_id == normalized_session_id,
+                    self.session_events.c.event_id == normalized_event_id,
+                )
+            ).mappings().first()
+            if existing_event is not None:
+                if str(existing_event["request_json"]) != request_text:
+                    raise SessionEventConflictError(
+                        f"event_id {normalized_event_id!r} was already used with a different payload."
+                    )
+                return self._decode_json_object(existing_event["response_json"]), True
+
+            current_version = conn.execute(
+                select(self.active_sessions.c.version).where(
+                    self.active_sessions.c.session_id == normalized_session_id
+                )
+            ).scalar_one_or_none()
+            if current_version is None:
+                raise ActiveSessionNotFoundError(f"Active Taste OS session not found: {normalized_session_id}")
+            if int(current_version) != int(expected_version):
+                raise StaleSessionVersionError(
+                    expected_version=int(expected_version),
+                    current_version=int(current_version),
+                )
+
+            resulting_version = int(expected_version) + 1
+            update_result = conn.execute(
+                self.active_sessions.update()
+                .where(
+                    self.active_sessions.c.session_id == normalized_session_id,
+                    self.active_sessions.c.version == int(expected_version),
+                )
+                .values(
+                    updated_at=str(timestamp),
+                    version=resulting_version,
+                    request_json=self._json_text(updated_request),
+                    plan_json=self._json_text(response),
+                    adaptation_json=self._json_text(adaptation),
+                )
+            )
+            if update_result.rowcount != 1:
+                latest_version = conn.execute(
+                    select(self.active_sessions.c.version).where(
+                        self.active_sessions.c.session_id == normalized_session_id
+                    )
+                ).scalar_one()
+                raise StaleSessionVersionError(
+                    expected_version=int(expected_version),
+                    current_version=int(latest_version),
+                )
+
+            conn.execute(
+                self.session_events.insert().values(
+                    session_id=normalized_session_id,
+                    event_id=normalized_event_id,
+                    timestamp=str(timestamp),
+                    event_type=normalized_event_type,
+                    artist_name=normalized_artist_name,
+                    expected_version=int(expected_version),
+                    resulting_version=resulting_version,
+                    request_json=request_text,
+                    response_json=self._json_text(response),
+                    durable_feedback=1 if durable_feedback else 0,
+                )
+            )
+            if durable_feedback:
+                self._record_feedback_in_transaction(
+                    conn,
+                    timestamp=timestamp,
+                    session_id=normalized_session_id,
+                    artist_name=normalized_artist_name,
+                    signal=normalized_event_type,
+                    notes=f"Live session event {normalized_event_id}",
+                )
+
+        if durable_feedback:
+            self.sync_legacy_snapshots()
+        return response, False
+
+    def record_feedback(
+        self,
+        *,
+        timestamp: str,
+        session_id: str,
+        artist_name: str,
+        signal: str,
+        notes: str | None,
+    ) -> dict[str, object]:
+        with self.engine.begin() as conn:
+            event_row = self._record_feedback_in_transaction(
+                conn,
+                timestamp=timestamp,
+                session_id=session_id,
+                artist_name=artist_name,
+                signal=signal,
+                notes=notes,
+            )
+        self.sync_legacy_snapshots()
+        return event_row
 
     def record_session_history(self, row: dict[str, object]) -> None:
         session_id = str(row.get("session_id", ""))

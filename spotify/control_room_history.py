@@ -116,6 +116,14 @@ def _snapshot_sort_frame(history_df: pd.DataFrame) -> pd.DataFrame:
         "strategic_high_priority_review_actions",
         "medium_priority_review_actions",
         "next_bet_count",
+        "tradeoff_comparable",
+        "tradeoff_blocker_count",
+        "tradeoff_runtime_delta_seconds",
+        "tradeoff_runtime_delta_percent",
+        "tradeoff_storage_delta_bytes",
+        "tradeoff_storage_delta_percent",
+        "tradeoff_phase_regression_count",
+        "tradeoff_quality_safety_worse_count",
     ):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -152,6 +160,18 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
     baseline = baseline if isinstance(baseline, dict) else {}
     baseline_run = baseline.get("baseline_run", {})
     baseline_run = baseline_run if isinstance(baseline_run, dict) else {}
+    run_tradeoffs = report.get("run_tradeoffs", {})
+    run_tradeoffs = run_tradeoffs if isinstance(run_tradeoffs, dict) else {}
+    tradeoff_comparability = run_tradeoffs.get("comparability", {})
+    tradeoff_comparability = tradeoff_comparability if isinstance(tradeoff_comparability, dict) else {}
+    tradeoff_runtime = run_tradeoffs.get("runtime", {})
+    tradeoff_runtime = tradeoff_runtime if isinstance(tradeoff_runtime, dict) else {}
+    tradeoff_storage = run_tradeoffs.get("storage", {})
+    tradeoff_storage = tradeoff_storage if isinstance(tradeoff_storage, dict) else {}
+    tradeoff_baseline_run = run_tradeoffs.get("baseline_run", {})
+    tradeoff_baseline_run = tradeoff_baseline_run if isinstance(tradeoff_baseline_run, dict) else {}
+    phase_regressions = run_tradeoffs.get("largest_phase_regressions", [])
+    phase_regressions = phase_regressions if isinstance(phase_regressions, list) else []
 
     areas = sorted(
         {
@@ -215,6 +235,20 @@ def _control_room_snapshot_row(report: dict[str, object]) -> dict[str, object]:
         "medium_priority_review_actions": int(medium_count),
         "review_action_areas": "|".join(areas),
         "baseline_run_id": str(baseline_run.get("run_id", "")),
+        "tradeoff_baseline_run_id": str(tradeoff_baseline_run.get("run_id", "")),
+        "tradeoff_status": str(run_tradeoffs.get("status", "")),
+        "tradeoff_verdict": str(run_tradeoffs.get("verdict", "")),
+        "tradeoff_comparable": int(bool(tradeoff_comparability.get("comparable"))),
+        "tradeoff_blocker_count": _safe_int(tradeoff_comparability.get("blocker_count"), default=0),
+        "tradeoff_runtime_delta_seconds": _safe_float(tradeoff_runtime.get("delta_seconds")),
+        "tradeoff_runtime_delta_percent": _safe_float(tradeoff_runtime.get("delta_percent")),
+        "tradeoff_storage_delta_bytes": _safe_float(tradeoff_storage.get("delta_bytes")),
+        "tradeoff_storage_delta_percent": _safe_float(tradeoff_storage.get("delta_percent")),
+        "tradeoff_phase_regression_count": int(len(phase_regressions)),
+        "tradeoff_quality_safety_worse_count": _safe_int(
+            run_tradeoffs.get("quality_safety_worse_count"),
+            default=0,
+        ),
         "next_bet_count": int(len(report.get("next_bets", []))),
     }
 

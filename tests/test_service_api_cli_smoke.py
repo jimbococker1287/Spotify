@@ -19,6 +19,7 @@ def test_service_api_module_help_runs() -> None:
     assert "--state-db-url" in result.stdout
     assert "--auth-mode" in result.stdout
     assert "--jwks-url" in result.stdout
+    assert "--require-deployment-registry" in result.stdout
 
 
 def test_serving_bundle_module_help_runs() -> None:
@@ -46,3 +47,4 @@ def test_deployment_registry_module_help_runs() -> None:
     assert "--registry-root" in result.stdout
     assert "--channel" in result.stdout
     assert "--publish-artifacts" in result.stdout
+    assert "--skip-release-readiness" in result.stdout

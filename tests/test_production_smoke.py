@@ -98,7 +98,22 @@ def _safe_policy() -> SafeBanditPolicyArtifact:
     )
 
 
+def _write_project_deploy_templates(project_root: Path) -> None:
+    k8s_root = project_root / "deploy" / "kubernetes"
+    ecs_root = project_root / "deploy" / "ecs"
+    k8s_root.mkdir(parents=True, exist_ok=True)
+    ecs_root.mkdir(parents=True, exist_ok=True)
+    for name in ("predict-deployment.yaml", "taste-os-deployment.yaml"):
+        (k8s_root / name).write_text("readinessProbe:\n  httpGet:\n    path: /readyz\n", encoding="utf-8")
+    for name in ("predict-task-definition.json", "taste-os-task-definition.json"):
+        (ecs_root / name).write_text(
+            json.dumps({"mount": "/app/outputs/deployments/registry/channels/stable"}),
+            encoding="utf-8",
+        )
+
+
 def _write_run_artifacts(run_dir: Path) -> None:
+    _write_project_deploy_templates(run_dir.parents[2])
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "feature_metadata.json").write_text(
         json.dumps({"artist_labels": ["Artist A", "Artist B", "Artist C", "Artist D"], "sequence_length": 2}),
@@ -233,6 +248,9 @@ def test_production_smoke_exercises_both_asgi_services(tmp_path: Path, monkeypat
     endpoints = {str(row["endpoint"]) for row in payload["requests"]}  # type: ignore[index]
     assert endpoints == {"/v1/readyz", "/v1/metrics", "/v1/predict", "/v1/taste-os/session"}
     assert all(str(row["request_id"]) for row in payload["requests"])  # type: ignore[index]
+    check_keys = {str(row["check_key"]) for row in payload["checks"]}  # type: ignore[index]
+    assert "readyz_deployment_registry_release_model_matches_service" in check_keys
+    assert "readyz_deployment_registry_channel_alias_matches_service_run" in check_keys
     assert (outputs_dir / "analysis" / "production_smoke" / "production_smoke.json").exists()
     assert (outputs_dir / "history" / "production_smoke_history.csv").exists()
     trend = safe_read_json(outputs_dir / "analysis" / "production_smoke" / "production_smoke_trend.json", default={})

@@ -845,6 +845,7 @@ python -m spotify.production_smoke \
 ```
 
 That writes `outputs/analysis/production_smoke/production_smoke.json`, `.md`, `production_smoke_checks.csv`, and `production_smoke_requests.csv`.
+Each run also appends `outputs/history/production_smoke_history.csv` and refreshes `production_smoke_trend.json` / `.md` so release handoffs can compare readiness status and latency against earlier smoke runs.
 
 If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
 

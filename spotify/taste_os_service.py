@@ -24,7 +24,12 @@ from .predict_next import (
 )
 from .safe_policy import SafeBanditPolicyArtifact
 from .serving import load_predictor, resolve_model_row
-from .taste_os_state import TasteOSStateStore
+from .taste_os_state import (
+    ActiveSessionNotFoundError,
+    SessionEventConflictError,
+    StaleSessionVersionError,
+    TasteOSStateStore,
+)
 from .taste_os_demo import MODE_CONFIGS, SCENARIOS, _load_artifact, build_taste_os_demo_payload, write_taste_os_demo_artifacts
 from .taste_os_http import (
     DEFAULT_HISTORY_LIMIT,
@@ -33,6 +38,7 @@ from .taste_os_http import (
     build_taste_os_handler,
     normalize_taste_os_feedback_payload,
     normalize_taste_os_payload,
+    normalize_taste_os_session_event_payload,
     parse_taste_os_args,
     utc_now_iso as _utc_now_iso,
 )
@@ -43,6 +49,7 @@ __all__ = [
     "TasteOSService",
     "normalize_taste_os_feedback_payload",
     "normalize_taste_os_payload",
+    "normalize_taste_os_session_event_payload",
     "_taste_os_page_html",
 ]
 
@@ -118,6 +125,7 @@ class TasteOSService:
         self._context_lock = threading.Lock()
         self._plan_lock = threading.Lock()
         self._memory_lock = threading.Lock()
+        self._session_event_lock = threading.Lock()
         self._context_cache: dict[bool, _TasteOSContextCacheEntry] = {}
         self.feedback_memory_path = self.output_dir / "feedback_memory.json"
         self.feedback_event_log_path = self.output_dir / "feedback_events.jsonl"
@@ -389,6 +397,253 @@ class TasteOSService:
             "feedback_memory": summary,
         }
 
+    @staticmethod
+    def _mark_idempotent_replay(response: dict[str, object]) -> dict[str, object]:
+        replay = dict(response)
+        event = _mapping(replay.get("session_event", {}))
+        replay["session_event"] = {
+            **event,
+            "idempotent_replay": True,
+        }
+        return replay
+
+    @staticmethod
+    def _event_scenario(event_type: str) -> str:
+        return "repeat_request" if event_type in {"repeat", "like"} else "skip_recovery"
+
+    @staticmethod
+    def _why_session_changed(*, event_type: str, artist_name: str, durable_feedback: bool) -> str:
+        if event_type == "skip":
+            return (
+                f"You skipped {artist_name}, so this session moved away from that choice "
+                "and replanned toward nearby alternatives."
+            )
+        if event_type == "repeat":
+            return (
+                f"You repeated {artist_name}, so this session leaned into continuity "
+                "and more familiar choices."
+            )
+        if event_type == "like":
+            suffix = " The like was also saved to your durable taste feedback." if durable_feedback else ""
+            return f"You liked {artist_name}, so this session now uses it as a stronger anchor.{suffix}"
+        suffix = " The dislike was also saved to your durable taste feedback." if durable_feedback else ""
+        return f"You disliked {artist_name}, so this session moved away from it and replanned.{suffix}"
+
+    def _adapt_session_recent_artists(
+        self,
+        *,
+        active_session: dict[str, object],
+        event_type: str,
+        artist_name: str,
+        include_video: bool,
+    ) -> list[str]:
+        adaptation = _mapping(active_session.get("adaptation", {}))
+        current = adaptation.get("effective_recent_artists", [])
+        recent = [str(item).strip() for item in current if str(item).strip()] if isinstance(current, list) else []
+        artist_name_key = _artist_key(artist_name)
+        recent = [item for item in recent if _artist_key(item) != artist_name_key]
+
+        if event_type in {"repeat", "like"}:
+            recent.append(artist_name)
+        else:
+            previous_plan = _mapping(active_session.get("plan", {}))
+            adaptive = _mapping(previous_plan.get("adaptive_session", {}))
+            candidate_sources = [
+                adaptive.get("final_sequence_tail", []),
+                previous_plan.get("journey_plan", []),
+                previous_plan.get("top_candidates", []),
+            ]
+            for source in candidate_sources:
+                if not isinstance(source, list):
+                    continue
+                for item in source:
+                    candidate = str(item.get("artist_name", "")).strip() if isinstance(item, dict) else str(item).strip()
+                    if not candidate or _artist_key(candidate) == artist_name_key:
+                        continue
+                    if any(_artist_key(existing) == _artist_key(candidate) for existing in recent):
+                        continue
+                    recent.append(candidate)
+
+        context = self._get_prediction_context(include_video=include_video)
+        sequence_length = max(1, int(context.sequence_length))
+        return recent[-sequence_length:]
+
+    def apply_session_event(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+        event_type: str,
+        artist_name: str,
+        expected_version: int,
+    ) -> dict[str, object]:
+        event_request = normalize_taste_os_session_event_payload(
+            {
+                "session_id": session_id,
+                "event_id": event_id,
+                "event_type": event_type,
+                "artist_name": artist_name,
+                "expected_version": expected_version,
+            }
+        )
+        session_id = event_request["session_id"]
+        event_id = event_request["event_id"]
+        event_type = event_request["event_type"]
+        artist_name = event_request["artist_name"]
+        expected_version = event_request["expected_version"]
+        with self._session_event_lock:
+            existing_event = self.state_store.session_event(session_id=session_id, event_id=event_id)
+            if existing_event is not None:
+                if existing_event["request"] != event_request:
+                    raise RequestValidationError(
+                        status_code=409,
+                        code="event_id_conflict",
+                        message=f"event_id {event_id!r} was already used with a different payload.",
+                    )
+                return self._mark_idempotent_replay(_mapping(existing_event.get("response", {})))
+
+            try:
+                active_session = self.state_store.active_session(session_id)
+            except ActiveSessionNotFoundError as exc:
+                raise RequestValidationError(
+                    status_code=404,
+                    code="session_not_found",
+                    message=str(exc),
+                ) from exc
+
+            current_version = _coerce_int(active_session.get("version", 0))
+            if current_version != int(expected_version):
+                raise RequestValidationError(
+                    status_code=409,
+                    code="stale_session_version",
+                    message=f"Session version {expected_version} is stale; current version is {current_version}.",
+                    details={
+                        "expected_version": int(expected_version),
+                        "current_version": current_version,
+                    },
+                )
+
+            active_request = _mapping(active_session.get("request", {}))
+            include_video = bool(active_request.get("include_video", self.include_video))
+            adapted_recent_artists = self._adapt_session_recent_artists(
+                active_session=active_session,
+                event_type=event_type,
+                artist_name=artist_name,
+                include_video=include_video,
+            )
+            scenario = self._event_scenario(event_type)
+            resulting_version = int(expected_version) + 1
+            result = self.plan_session(
+                mode=str(active_request.get("mode", "focus")),
+                scenario=scenario,
+                top_k=max(1, _coerce_int(active_request.get("top_k", 5))),
+                recent_artists=adapted_recent_artists,
+                include_video=include_video,
+                persist_artifacts=bool(active_request.get("persist_artifacts", False)),
+                use_feedback_memory=False,
+                _session_id=session_id,
+                _created_at=str(active_session.get("created_at", "")),
+                _session_version=resulting_version,
+                _record_state=False,
+            )
+            durable_feedback = event_type in {"like", "dislike"}
+            why_this_changed = self._why_session_changed(
+                event_type=event_type,
+                artist_name=artist_name,
+                durable_feedback=durable_feedback,
+            )
+            result["why_this_changed"] = why_this_changed
+            result["session_event"] = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "artist_name": artist_name,
+                "expected_version": int(expected_version),
+                "resulting_version": resulting_version,
+                "durable_feedback": durable_feedback,
+                "idempotent_replay": False,
+            }
+            service_payload = _mapping(result.get("service", {}))
+            updated_at = _utc_now_iso()
+            result["service"] = {
+                **service_payload,
+                "session_id": session_id,
+                "created_at": str(active_session.get("created_at", "")),
+                "updated_at": updated_at,
+                "version": resulting_version,
+            }
+            updated_request = {
+                **active_request,
+                "scenario": scenario,
+                "recent_artists": adapted_recent_artists,
+                "use_feedback_memory": False,
+            }
+            previous_adaptation = _mapping(active_session.get("adaptation", {}))
+            previous_events = previous_adaptation.get("events", [])
+            adaptation_events = list(previous_events) if isinstance(previous_events, list) else []
+            adaptation_events.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "artist_name": artist_name,
+                    "version": resulting_version,
+                    "why_this_changed": why_this_changed,
+                }
+            )
+            adaptation: dict[str, object] = {
+                "effective_recent_artists": adapted_recent_artists,
+                "events": adaptation_events,
+            }
+            try:
+                stored_result, idempotent_replay = self.state_store.apply_session_event(
+                    timestamp=updated_at,
+                    session_id=session_id,
+                    event_id=event_id,
+                    event_type=event_type,
+                    artist_name=artist_name,
+                    expected_version=expected_version,
+                    request=event_request,
+                    response=result,
+                    updated_request=updated_request,
+                    adaptation=adaptation,
+                    durable_feedback=durable_feedback,
+                )
+            except ActiveSessionNotFoundError as exc:
+                raise RequestValidationError(
+                    status_code=404,
+                    code="session_not_found",
+                    message=str(exc),
+                ) from exc
+            except StaleSessionVersionError as exc:
+                concurrent_event = self.state_store.session_event(session_id=session_id, event_id=event_id)
+                if concurrent_event is not None and concurrent_event["request"] == event_request:
+                    return self._mark_idempotent_replay(_mapping(concurrent_event.get("response", {})))
+                raise RequestValidationError(
+                    status_code=409,
+                    code="stale_session_version",
+                    message=str(exc),
+                    details={
+                        "expected_version": exc.expected_version,
+                        "current_version": exc.current_version,
+                    },
+                ) from exc
+            except SessionEventConflictError as exc:
+                raise RequestValidationError(
+                    status_code=409,
+                    code="event_id_conflict",
+                    message=str(exc),
+                ) from exc
+
+            if idempotent_replay:
+                return self._mark_idempotent_replay(stored_result)
+            self._record_session_history(
+                result=stored_result,
+                session_id=session_id,
+                created_at=str(active_session.get("created_at", "")),
+                effective_recent_artists=adapted_recent_artists,
+                used_feedback_memory=False,
+            )
+            return stored_result
+
     def artifact_url(self, path: Path) -> str:
         try:
             relative = path.resolve().relative_to(self.output_dir.resolve())
@@ -478,6 +733,10 @@ class TasteOSService:
         include_video: bool,
         persist_artifacts: bool,
         use_feedback_memory: bool,
+        _session_id: str | None = None,
+        _created_at: str | None = None,
+        _session_version: int = 0,
+        _record_state: bool = True,
     ) -> dict[str, object]:
         context = self._get_prediction_context(include_video=include_video)
         feedback_store = self._load_feedback_store()
@@ -532,14 +791,15 @@ class TasteOSService:
             effective_recent_artists=effective_recent_artists,
         )
 
-        session_id = f"taste-os-{secrets.token_hex(6)}"
-        created_at = _utc_now_iso()
+        session_id = str(_session_id or f"taste-os-{secrets.token_hex(6)}")
+        created_at = str(_created_at or _utc_now_iso())
         result["service"] = {
             "run_dir": str(self.run_dir),
             "output_dir": str(self.output_dir),
             "persisted": False,
             "session_id": session_id,
             "created_at": created_at,
+            "version": int(_session_version),
         }
         if persist_artifacts:
             json_path, md_path = write_taste_os_demo_artifacts(result, output_dir=self.output_dir)
@@ -553,14 +813,37 @@ class TasteOSService:
                 "artifact_md_url": self.artifact_url(md_path),
                 "session_id": session_id,
                 "created_at": created_at,
+                "version": int(_session_version),
             }
-        self._record_session_history(
-            result=result,
-            session_id=session_id,
-            created_at=created_at,
-            effective_recent_artists=effective_recent_artists,
-            used_feedback_memory=bool(use_feedback_memory and not requested_recent_artists and effective_recent_artists),
-        )
+        if _record_state:
+            active_request = {
+                "mode": mode,
+                "scenario": scenario,
+                "top_k": int(top_k),
+                "recent_artists": requested_recent_artists,
+                "include_video": bool(include_video),
+                "persist_artifacts": bool(persist_artifacts),
+                "use_feedback_memory": bool(use_feedback_memory),
+            }
+            self.state_store.create_active_session(
+                session_id=session_id,
+                created_at=created_at,
+                request=active_request,
+                plan=result,
+                adaptation={
+                    "effective_recent_artists": effective_recent_artists,
+                    "events": [],
+                },
+            )
+            self._record_session_history(
+                result=result,
+                session_id=session_id,
+                created_at=created_at,
+                effective_recent_artists=effective_recent_artists,
+                used_feedback_memory=bool(
+                    use_feedback_memory and not requested_recent_artists and effective_recent_artists
+                ),
+            )
         return result
 
 

@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .creator_evidence_lab import build_creator_evidence_passports
 from .run_artifacts import safe_read_csv
 from .run_artifacts import safe_read_json
 from .run_artifacts import write_csv_rows
@@ -1261,6 +1262,7 @@ def _build_market_brief(
     seed_bridge_atlas: pd.DataFrame,
     whitespace_atlas: pd.DataFrame,
     trend_deltas: pd.DataFrame,
+    evidence_summary: dict[str, object],
 ) -> tuple[dict[str, Any], list[str]]:
     top_scene = scene_market_pulse.iloc[0].to_dict() if not scene_market_pulse.empty else {}
     top_lane = lane_atlas.iloc[0].to_dict() if not lane_atlas.empty else {}
@@ -1303,6 +1305,11 @@ def _build_market_brief(
         summary.append(
             f"Trend deltas add `{len(trend_deltas.index)}` cross-family highlights, led by `{top_trend.get('signal_type', '')}` for `{top_trend.get('signal_key', '')}`."
         )
+    summary.append(
+        "Evidence passports verify "
+        f"`{int(evidence_summary.get('verified_opportunity_count', 0) or 0)}` of "
+        f"`{int(evidence_summary.get('raw_opportunity_count', 0) or 0)}` raw saved opportunity rows for publication."
+    )
 
     actions = [
         "Use the scene market pulse to pick the next creator brief or strategy deck seed set.",
@@ -1319,6 +1326,12 @@ def _build_market_brief(
         "top_whitespace": top_whitespace,
         "top_trend_delta": top_trend,
         "trend_delta_counts": trend_delta_counts,
+        "raw_opportunity_count": int(evidence_summary.get("raw_opportunity_count", 0) or 0),
+        "verified_opportunity_count": int(evidence_summary.get("verified_opportunity_count", 0) or 0),
+        "evidence_passport_count": int(evidence_summary.get("passport_count", 0) or 0),
+        "verified_passport_count": int(evidence_summary.get("verified_passport_count", 0) or 0),
+        "evidence_grade_counts": dict(evidence_summary.get("grade_counts", {})),
+        "evidence_artifact_paths": dict(evidence_summary.get("artifact_paths", {})),
         "summary": summary,
         "actions": actions,
     }
@@ -1364,6 +1377,8 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         migration_df=migration_df,
         family_inventory=family_inventory,
     )
+    evidence_result = build_creator_evidence_passports(output_dir=output_dir, logger=logger)
+    evidence_summary = dict(evidence_result.get("manifest", {}))
     brief_payload, brief_markdown = _build_market_brief(
         report_family_count=int(family_counts["report_family_count"]),
         scene_market_pulse=scene_market_pulse,
@@ -1372,6 +1387,7 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         seed_bridge_atlas=seed_bridge_atlas,
         whitespace_atlas=whitespace_atlas,
         trend_deltas=trend_deltas,
+        evidence_summary=evidence_summary,
     )
 
     output_root = output_dir / "analysis" / "creator_market_intelligence"
@@ -1484,6 +1500,12 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         "complete_report_family_count": int(family_counts["complete_report_family_count"]),
         "partial_report_family_count": int(family_counts["partial_report_family_count"]),
         "partial_report_family_ids": list(family_counts["partial_report_family_ids"]),
+        "raw_opportunity_count": int(evidence_summary.get("raw_opportunity_count", 0) or 0),
+        "verified_opportunity_count": int(evidence_summary.get("verified_opportunity_count", 0) or 0),
+        "evidence_passport_count": int(evidence_summary.get("passport_count", 0) or 0),
+        "verified_passport_count": int(evidence_summary.get("verified_passport_count", 0) or 0),
+        "evidence_grade_counts": dict(evidence_summary.get("grade_counts", {})),
+        "evidence_artifact_paths": dict(evidence_summary.get("artifact_paths", {})),
         "artifact_root": str(output_root),
         "tables": {},
     }
@@ -1506,6 +1528,7 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
     brief_md = write_markdown(output_root / "creator_market_brief.md", brief_markdown)
     manifest_json = write_json(output_root / "creator_market_manifest.json", manifest_payload)
     paths.extend([brief_json, brief_md, manifest_json])
+    paths.extend(path for path in evidence_result.get("paths", []) if isinstance(path, Path))
     logger.info(
         "Built creator market intelligence with %d report families and %d scene rows.",
         int(brief_payload["report_family_count"]),

@@ -51,6 +51,14 @@ class TasteOSFeedbackPayload(TypedDict):
     notes: str | None
 
 
+class TasteOSSessionEventPayload(TypedDict):
+    session_id: str
+    event_id: str
+    event_type: str
+    artist_name: str
+    expected_version: int
+
+
 def parse_taste_os_args() -> argparse.Namespace:
     env_max_top_k_raw = os.getenv("SPOTIFY_TASTE_OS_MAX_TOP_K", str(DEFAULT_MAX_TOP_K)).strip()
     try:
@@ -431,6 +439,60 @@ def normalize_taste_os_feedback_payload(payload: dict[str, object]) -> TasteOSFe
     }
 
 
+def normalize_taste_os_session_event_payload(payload: dict[str, object]) -> TasteOSSessionEventPayload:
+    allowed_keys = {"session_id", "event_id", "event_type", "artist_name", "expected_version"}
+    unknown_keys = sorted(set(payload.keys()) - allowed_keys)
+    if unknown_keys:
+        raise RequestValidationError(
+            status_code=400,
+            code="unknown_fields",
+            message="Payload contains unknown fields.",
+            details={"fields": unknown_keys},
+        )
+
+    normalized_strings: dict[str, str] = {}
+    for field_name in ("session_id", "event_id", "artist_name"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise RequestValidationError(
+                status_code=422,
+                code=f"invalid_{field_name}",
+                message=f"{field_name} must be a non-empty string.",
+            )
+        normalized_strings[field_name] = value.strip()
+
+    event_type_raw = payload.get("event_type")
+    if not isinstance(event_type_raw, str):
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_event_type",
+            message="event_type must be a string.",
+        )
+    event_type = event_type_raw.strip().lower()
+    if event_type not in FEEDBACK_SIGNALS:
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_event_type",
+            message=f"event_type must be one of: {', '.join(sorted(FEEDBACK_SIGNALS))}.",
+        )
+
+    expected_version = payload.get("expected_version")
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+        raise RequestValidationError(
+            status_code=422,
+            code="invalid_expected_version",
+            message="expected_version must be a non-negative integer.",
+        )
+
+    return {
+        "session_id": normalized_strings["session_id"],
+        "event_id": normalized_strings["event_id"],
+        "event_type": event_type,
+        "artist_name": normalized_strings["artist_name"],
+        "expected_version": int(expected_version),
+    }
+
+
 def _extract_bearer_token(auth_header: str | None) -> str | None:
     if not auth_header:
         return None
@@ -562,7 +624,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
 
         def do_POST(self) -> None:  # noqa: N802
             request_path = self.path.rstrip("/")
-            if request_path not in {"/taste-os/session", "/taste-os/feedback"}:
+            if request_path not in {"/taste-os/session", "/taste-os/session/event", "/taste-os/feedback"}:
                 self._send_error(404, code="not_found", message="Resource not found.")
                 return
 
@@ -583,6 +645,8 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                         default_include_video=service.include_video,
                         max_top_k=service.max_top_k,
                     )
+                elif request_path == "/taste-os/session/event":
+                    normalized = normalize_taste_os_session_event_payload(payload)
                 else:
                     normalized = normalize_taste_os_feedback_payload(payload)
             except RequestValidationError as exc:
@@ -607,6 +671,16 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                         persist_artifacts=bool(session_request["persist_artifacts"]),
                         use_feedback_memory=bool(session_request["use_feedback_memory"]),
                     )
+                elif request_path == "/taste-os/session/event":
+                    event_request = normalized
+                    assert isinstance(event_request, dict)
+                    result = service.apply_session_event(
+                        session_id=str(event_request["session_id"]),
+                        event_id=str(event_request["event_id"]),
+                        event_type=str(event_request["event_type"]),
+                        artist_name=str(event_request["artist_name"]),
+                        expected_version=int(event_request["expected_version"]),
+                    )
                 else:
                     feedback_request = normalized
                     assert isinstance(feedback_request, dict)
@@ -617,6 +691,13 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                         notes=feedback_request["notes"],
                     )
                 self._send_json(200, result)
+            except RequestValidationError as exc:
+                self._send_error(
+                    exc.status_code,
+                    code=exc.code,
+                    message=exc.message,
+                    details=exc.details,
+                )
             except (RuntimeError, ValueError, FileNotFoundError) as exc:
                 self._send_error(
                     422,
@@ -640,6 +721,7 @@ __all__ = [
     "RequestValidationError",
     "TasteOSFeedbackPayload",
     "TasteOSRequestPayload",
+    "TasteOSSessionEventPayload",
     "append_jsonl",
     "artist_key",
     "build_taste_os_handler",
@@ -648,6 +730,7 @@ __all__ = [
     "load_json_document",
     "normalize_taste_os_feedback_payload",
     "normalize_taste_os_payload",
+    "normalize_taste_os_session_event_payload",
     "parse_taste_os_args",
     "read_jsonl_tail",
     "utc_now_iso",

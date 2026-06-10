@@ -233,6 +233,73 @@ def _update_registry_index(
     )
 
 
+def _release_readiness_record(payload: dict[str, object]) -> dict[str, object]:
+    summary = payload.get("summary", {})
+    summary_dict = summary if isinstance(summary, dict) else {}
+    paths = payload.get("paths", {})
+    paths_dict = paths if isinstance(paths, dict) else {}
+    checks = payload.get("checks", [])
+    check_rows = checks if isinstance(checks, list) else []
+    failed_checks = [
+        str(row.get("message", ""))
+        for row in check_rows
+        if isinstance(row, dict) and str(row.get("status", "")) == "fail"
+    ]
+    return {
+        "status": str(summary_dict.get("status", "")),
+        "release_ready": bool(summary_dict.get("release_ready", False)),
+        "check_count": int(summary_dict.get("check_count", 0) or 0),
+        "fail_count": int(summary_dict.get("fail_count", 0) or 0),
+        "warning_count": int(summary_dict.get("warning_count", 0) or 0),
+        "json": str(paths_dict.get("json", "")),
+        "markdown": str(paths_dict.get("md", "")),
+        "manifest_json": str(paths_dict.get("manifest_json", "")),
+        "failed_checks": failed_checks[:8],
+    }
+
+
+def _raise_if_readiness_failed(*, payload: dict[str, object], phase: str) -> None:
+    record = _release_readiness_record(payload)
+    if str(record.get("status", "")) == "pass":
+        return
+    failed = record.get("failed_checks", [])
+    failed_rows = failed if isinstance(failed, list) else []
+    suffix = f" First failures: {'; '.join(str(row) for row in failed_rows[:3])}" if failed_rows else ""
+    report = str(record.get("markdown", ""))
+    raise ValueError(
+        f"Release readiness {phase} failed with status={record.get('status')}. "
+        f"Report: {report or 'not written'}.{suffix}"
+    )
+
+
+def _build_release_readiness_bundle(
+    *,
+    project_root: Path,
+    outputs_dir: Path,
+    registry_root: Path,
+    release_dir: Path,
+    run_dir: Path,
+    channel: str,
+    release_id: str,
+    phase: str,
+    allow_pending_channel: bool,
+) -> dict[str, object]:
+    from .release_readiness import build_release_readiness_smoke
+
+    readiness_run_dir = registry_root / "channels" / channel if not allow_pending_channel else run_dir
+    return build_release_readiness_smoke(
+        project_root=project_root,
+        outputs_dir=outputs_dir,
+        run_dir=str(readiness_run_dir),
+        registry_root=registry_root,
+        channel=channel,
+        release_id=release_id,
+        output_dir=release_dir / "release_readiness" / phase,
+        require_registry=True,
+        allow_pending_channel=allow_pending_channel,
+    )
+
+
 def publish_deployment_release(
     *,
     run_dir: Path,
@@ -244,10 +311,14 @@ def publish_deployment_release(
     publish_artifacts: bool = False,
     allow_unpromoted: bool = False,
     activate_channel: bool = True,
+    project_root: Path | None = None,
+    write_release_readiness: bool = True,
+    require_release_readiness: bool = True,
 ) -> dict[str, object]:
     resolved_run_dir = run_dir.expanduser().resolve()
     resolved_outputs_dir = outputs_dir.expanduser().resolve()
     resolved_registry_root = registry_root.expanduser().resolve()
+    resolved_project_root = (project_root or resolved_outputs_dir.parent).expanduser().resolve()
     resolved_registry_root.mkdir(parents=True, exist_ok=True)
 
     gate_payload = safe_read_json(resolved_run_dir / "champion_gate.json", default={})
@@ -316,10 +387,30 @@ def publish_deployment_release(
             release_id=release_id,
         ),
         "activate_channel": bool(activate_channel),
+        "release_readiness": {},
     }
     release_manifest_path = write_json(release_dir / "deployment_release.json", release_manifest, sort_keys=True)
     available_bundles_obj = release_manifest.get("available_serving_bundles")
     available_bundles: list[object] = available_bundles_obj if isinstance(available_bundles_obj, list) else []
+
+    readiness_records: dict[str, object] = {}
+    if write_release_readiness:
+        pre_activation_payload = _build_release_readiness_bundle(
+            project_root=resolved_project_root,
+            outputs_dir=resolved_outputs_dir,
+            registry_root=resolved_registry_root,
+            release_dir=release_dir,
+            run_dir=resolved_run_dir,
+            channel=str(channel).strip().lower(),
+            release_id=release_id,
+            phase="pre_activation",
+            allow_pending_channel=True,
+        )
+        if require_release_readiness:
+            _raise_if_readiness_failed(payload=pre_activation_payload, phase="pre-activation")
+        readiness_records["pre_activation"] = _release_readiness_record(pre_activation_payload)
+        release_manifest["release_readiness"] = readiness_records
+        release_manifest_path = write_json(release_dir / "deployment_release.json", release_manifest, sort_keys=True)
 
     channel_alias_path = None
     channel_manifest_path = None
@@ -341,6 +432,7 @@ def publish_deployment_release(
             "source_promoted": promoted,
             "release_manifest_path": str(release_manifest_path.resolve()),
             "channel_alias_path": str(channel_alias_path.resolve()),
+            "release_readiness": readiness_records,
         }
         channel_manifest_path = write_json(channel_dir / "deployment_channel.json", channel_manifest, sort_keys=True)
         write_json(channel_dir / "release.json", release_manifest, sort_keys=True)
@@ -350,6 +442,39 @@ def publish_deployment_release(
             channel_manifest=channel_manifest,
             release_manifest=release_manifest,
         )
+        if write_release_readiness:
+            post_activation_payload = _build_release_readiness_bundle(
+                project_root=resolved_project_root,
+                outputs_dir=resolved_outputs_dir,
+                registry_root=resolved_registry_root,
+                release_dir=release_dir,
+                run_dir=resolved_run_dir,
+                channel=str(channel).strip().lower(),
+                release_id=release_id,
+                phase="post_activation",
+                allow_pending_channel=False,
+            )
+            if require_release_readiness:
+                _raise_if_readiness_failed(payload=post_activation_payload, phase="post-activation")
+            readiness_records["post_activation"] = _release_readiness_record(post_activation_payload)
+            release_manifest["release_readiness"] = readiness_records
+            channel_manifest["release_readiness"] = readiness_records
+            release_manifest_path = write_json(release_dir / "deployment_release.json", release_manifest, sort_keys=True)
+            channel_manifest_path = write_json(channel_dir / "deployment_channel.json", channel_manifest, sort_keys=True)
+            write_json(channel_dir / "release.json", release_manifest, sort_keys=True)
+            _update_registry_index(
+                registry_root=resolved_registry_root,
+                channel=str(channel).strip().lower(),
+                channel_manifest=channel_manifest,
+                release_manifest=release_manifest,
+            )
+
+    active_readiness_obj = (
+        readiness_records.get("post_activation", {})
+        if activate_channel
+        else readiness_records.get("pre_activation", {})
+    ) if readiness_records else {}
+    active_readiness = active_readiness_obj if isinstance(active_readiness_obj, dict) else {}
 
     return {
         "release_id": release_id,
@@ -365,6 +490,8 @@ def publish_deployment_release(
         "available_bundle_count": len(available_bundles),
         "previous_release_id": previous_release_id,
         "registry_root": str(resolved_registry_root),
+        "release_readiness_status": str(active_readiness.get("status", "")),
+        "release_readiness": readiness_records,
     }
 
 
@@ -415,6 +542,22 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Publish the release metadata without moving the rollout channel.",
     )
+    parser.add_argument(
+        "--skip-release-readiness",
+        action="store_true",
+        help="Do not write the release-readiness smoke bundles during publish.",
+    )
+    parser.add_argument(
+        "--allow-release-readiness-failures",
+        action="store_true",
+        help="Write release-readiness smoke bundles but do not fail publish when they report blockers.",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=str,
+        default="",
+        help="Repository root used to validate deploy manifests. Defaults to the parent of --outputs-dir.",
+    )
     return parser.parse_args()
 
 
@@ -433,8 +576,13 @@ def main() -> int:
         publish_artifacts=bool(args.publish_artifacts),
         allow_unpromoted=bool(args.allow_unpromoted),
         activate_channel=not bool(args.no_activate),
+        project_root=Path(args.project_root).expanduser().resolve() if str(args.project_root).strip() else None,
+        write_release_readiness=not bool(args.skip_release_readiness),
+        require_release_readiness=not bool(args.allow_release_readiness_failures),
     )
     print(f"release_id={result['release_id']} channel={result['channel']} promoted={result['promoted']}")
+    if str(result.get("release_readiness_status", "")).strip():
+        print(f"release_readiness_status={result['release_readiness_status']}")
     print(f"release_manifest={result['release_manifest_path']}")
     if str(result.get("channel_manifest_path", "")).strip():
         print(f"channel_manifest={result['channel_manifest_path']}")

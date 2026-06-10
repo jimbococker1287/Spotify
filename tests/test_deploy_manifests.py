@@ -29,6 +29,11 @@ def test_kubernetes_deploy_manifests_exist_and_reference_outputs_volume() -> Non
     assert "/app/outputs" in taste_os_deployment
     assert "spotify-outputs-pvc" in taste_os_deployment
 
+    predict_config = (k8s_root / "predict-configmap.example.yaml").read_text(encoding="utf-8")
+    taste_os_config = (k8s_root / "taste-os-configmap.example.yaml").read_text(encoding="utf-8")
+    assert 'REQUIRE_DEPLOYMENT_REGISTRY: "1"' in predict_config
+    assert 'REQUIRE_DEPLOYMENT_REGISTRY: "1"' in taste_os_config
+
 
 def test_ecs_task_definitions_exist_and_reference_registry_channel() -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -46,8 +51,10 @@ def test_ecs_task_definitions_exist_and_reference_registry_channel() -> None:
     taste_os_task = (ecs_root / "taste-os-task-definition.json").read_text(encoding="utf-8")
     assert "/app/outputs/deployments/registry/channels/stable" in predict_task
     assert "\"SERVICE_MODE\", \"value\": \"predict\"" in predict_task
+    assert "\"REQUIRE_DEPLOYMENT_REGISTRY\", \"value\": \"1\"" in predict_task
     assert "/app/outputs/deployments/registry/channels/stable" in taste_os_task
     assert "\"SERVICE_MODE\", \"value\": \"taste-os\"" in taste_os_task
+    assert "\"REQUIRE_DEPLOYMENT_REGISTRY\", \"value\": \"1\"" in taste_os_task
 
 
 def test_terraform_aws_baseline_exists_and_mentions_core_services() -> None:
@@ -91,4 +98,5 @@ def test_local_production_smoke_stack_exists() -> None:
     assert "redis:7" in compose_text
     assert "SERVICE_MODE: predict" in compose_text
     assert "SERVICE_MODE: taste-os" in compose_text
+    assert 'REQUIRE_DEPLOYMENT_REGISTRY: "1"' in compose_text
     assert "../../outputs:/app/outputs" in compose_text

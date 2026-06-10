@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import math
 from typing import Any
 
 from .control_room_business import build_ds_quant_review_block
@@ -8,6 +9,23 @@ from .control_room_business import build_ds_quant_review_block
 
 def _mapping(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
+
+
+def _format_bytes(value: object) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(size):
+        return "n/a"
+    if size < 0:
+        return f"-{_format_bytes(abs(size))}"
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return "n/a"
 
 
 def build_weekly_ops_summary_markdown_lines(payload: Mapping[str, Any]) -> list[str]:
@@ -66,6 +84,7 @@ def build_control_room_markdown_lines(
     ops_health = _mapping(report.get("ops_health", {}))
     async_handoff = _mapping(report.get("async_handoff", {}))
     baseline = _mapping(report.get("baseline_comparison", {}))
+    run_tradeoffs = _mapping(report.get("run_tradeoffs", {}))
     ops_history = _mapping(report.get("ops_history", {}))
     ops_trends = _mapping(report.get("ops_trends", {}))
     weekly_summary = _mapping(report.get("weekly_ops_summary", {}))
@@ -226,6 +245,74 @@ def build_control_room_markdown_lines(
     else:
         for item in baseline.get("summary", []):
             lines.append(f"- {item}")
+
+    tradeoff_comparability = _mapping(run_tradeoffs.get("comparability", {}))
+    tradeoff_runtime = _mapping(run_tradeoffs.get("runtime", {}))
+    tradeoff_storage = _mapping(run_tradeoffs.get("storage", {}))
+    tradeoff_runtime_selected = _mapping(tradeoff_runtime.get("selected", {}))
+    tradeoff_runtime_baseline = _mapping(tradeoff_runtime.get("baseline", {}))
+    tradeoff_storage_selected = _mapping(tradeoff_storage.get("selected", {}))
+    tradeoff_storage_baseline = _mapping(tradeoff_storage.get("baseline", {}))
+    lines.extend(
+        [
+            "",
+            "## Run Tradeoff Dossier",
+            "",
+            f"- Status: `{run_tradeoffs.get('status', '')}`",
+            f"- Verdict: `{run_tradeoffs.get('verdict', '')}`",
+            f"- Verdict summary: {run_tradeoffs.get('verdict_summary', 'n/a')}",
+            f"- Comparable: `{tradeoff_comparability.get('comparable', False)}` with `{safe_int(tradeoff_comparability.get('blocker_count'), default=0)}` blocker(s)",
+            (
+                f"- Runtime: baseline=`{format_metric(tradeoff_runtime_baseline.get('total_seconds'))}`s "
+                f"selected=`{format_metric(tradeoff_runtime_selected.get('total_seconds'))}`s "
+                f"delta=`{format_metric(tradeoff_runtime.get('delta_seconds'))}`s "
+                f"delta_pct=`{format_metric(tradeoff_runtime.get('delta_percent'))}%`"
+            ),
+            (
+                f"- Retained storage: baseline=`{_format_bytes(tradeoff_storage_baseline.get('retained_bytes'))}` "
+                f"selected=`{_format_bytes(tradeoff_storage_selected.get('retained_bytes'))}` "
+                f"delta=`{_format_bytes(tradeoff_storage.get('delta_bytes'))}` "
+                f"delta_pct=`{format_metric(tradeoff_storage.get('delta_percent'))}%`"
+            ),
+        ]
+    )
+    blockers = tradeoff_comparability.get("blockers", [])
+    blockers = blockers if isinstance(blockers, list) else []
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        lines.append(f"- Blocker `{blocker.get('code', '')}`: {blocker.get('detail', '')}")
+
+    phase_regressions = run_tradeoffs.get("largest_phase_regressions", [])
+    phase_regressions = phase_regressions if isinstance(phase_regressions, list) else []
+    if phase_regressions:
+        lines.extend(["", "### Largest Phase Regressions", ""])
+        for row in phase_regressions:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"- `{row.get('phase_name', '')}` baseline=`{format_metric(row.get('baseline_duration_seconds'))}`s "
+                f"selected=`{format_metric(row.get('selected_duration_seconds'))}`s "
+                f"delta=`{format_metric(row.get('delta_seconds'))}`s "
+                f"delta_pct=`{format_metric(row.get('delta_percent'))}%`"
+            )
+
+    quality_deltas = run_tradeoffs.get("quality_safety_deltas", [])
+    quality_deltas = quality_deltas if isinstance(quality_deltas, list) else []
+    known_quality_deltas = [
+        row
+        for row in quality_deltas
+        if isinstance(row, dict) and str(row.get("status", "")) != "unknown"
+    ]
+    if known_quality_deltas:
+        lines.extend(["", "### Quality And Safety Deltas", ""])
+        for row in known_quality_deltas:
+            lines.append(
+                f"- `{row.get('status', '')}` {row.get('label', '')}: "
+                f"baseline=`{format_metric(row.get('baseline'))}` "
+                f"selected=`{format_metric(row.get('current'))}` "
+                f"delta=`{format_metric(row.get('delta'))}`"
+            )
 
     lines.extend(
         [

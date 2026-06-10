@@ -8,13 +8,18 @@ from fastapi.testclient import TestClient
 import numpy as np
 
 import spotify.predict_service as predict_service
+from spotify.deployment_registry import publish_deployment_release
 from spotify.digital_twin import ListenerDigitalTwinArtifact
 from spotify.multimodal import MultimodalArtistSpace
 from spotify.predict_next import PredictionInputContext
 from spotify.predict_service import PredictionService
 from spotify.safe_policy import SafeBanditPolicyArtifact
 from spotify.service_auth import ApiAuthenticator, ApiAuthSettings
-from spotify.service_api import create_prediction_app, create_taste_os_app
+from spotify.service_api import (
+    build_service_deployment_readiness_provider,
+    create_prediction_app,
+    create_taste_os_app,
+)
 import spotify.taste_os_service as taste_os_service
 from spotify.taste_os_service import TasteOSService
 
@@ -119,6 +124,64 @@ def _taste_context() -> PredictionInputContext:
     )
 
 
+def _write_project_deploy_templates(project_root: Path) -> None:
+    k8s_root = project_root / "deploy" / "kubernetes"
+    ecs_root = project_root / "deploy" / "ecs"
+    k8s_root.mkdir(parents=True, exist_ok=True)
+    ecs_root.mkdir(parents=True, exist_ok=True)
+    for name in ("predict-deployment.yaml", "taste-os-deployment.yaml"):
+        (k8s_root / name).write_text("readinessProbe:\n  httpGet:\n    path: /readyz\n", encoding="utf-8")
+    for name in ("predict-task-definition.json", "taste-os-task-definition.json"):
+        (ecs_root / name).write_text(
+            json.dumps({"mount": "/app/outputs/deployments/registry/channels/stable"}),
+            encoding="utf-8",
+        )
+
+
+def _write_registry_run_artifacts(run_dir: Path) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps({"artist_labels": ["A", "B", "C"], "sequence_length": 2}),
+        encoding="utf-8",
+    )
+    (run_dir / "context_scaler.joblib").write_bytes(b"scaler")
+    serving_dir = run_dir / "analysis" / "serving"
+    serving_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = serving_dir / "prediction_input_context_audio.joblib"
+    bundle_path.write_bytes(b"bundle")
+    (serving_dir / "prediction_input_context_audio.manifest.json").write_text(
+        json.dumps({"signature": "abc"}),
+        encoding="utf-8",
+    )
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "champion_alias": {
+                    "model_name": "dummy",
+                    "model_type": "classical",
+                },
+                "champion_gate": {"promoted": True, "status": "pass"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "champion_gate.json").write_text(json.dumps({"promoted": True, "status": "pass"}), encoding="utf-8")
+    (run_dir / "run_results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "model_name": "dummy",
+                    "model_type": "classical",
+                    "val_top1": 0.44,
+                    "estimator_artifact_path": str(bundle_path),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_prediction_api_supports_auth_metrics_and_rate_limits(tmp_path: Path, monkeypatch) -> None:
     run_dir = tmp_path / "outputs" / "runs" / "run_a"
     run_dir.mkdir(parents=True)
@@ -192,6 +255,84 @@ def test_prediction_api_supports_auth_metrics_and_rate_limits(tmp_path: Path, mo
     prometheus = client.get("/v1/metrics/prometheus")
     assert prometheus.status_code == 200
     assert "spotify_service_request_total" in prometheus.text
+
+
+def test_prediction_api_readiness_tracks_deployment_registry_alignment(tmp_path: Path, monkeypatch) -> None:
+    project_root = tmp_path / "repo"
+    outputs_dir = project_root / "outputs"
+    run_dir = outputs_dir / "runs" / "run_a"
+    registry_root = outputs_dir / "deployments" / "registry"
+    _write_project_deploy_templates(project_root)
+    _write_registry_run_artifacts(run_dir)
+    publish_deployment_release(
+        run_dir=run_dir,
+        outputs_dir=outputs_dir,
+        registry_root=registry_root,
+        channel="stable",
+        project_root=project_root,
+    )
+
+    monkeypatch.setattr(
+        predict_service,
+        "resolve_model_row",
+        lambda run_dir, explicit_model_name, alias_model_name: {"model_name": "dummy", "model_type": "classical"},
+    )
+    monkeypatch.setattr(predict_service, "load_predictor", lambda run_dir, row, artist_labels: _PredictStub())
+    monkeypatch.setattr(
+        predict_service,
+        "load_prediction_input_context",
+        lambda run_dir, data_dir, include_video, logger, **kwargs: _prediction_context(),
+    )
+
+    logger = logging.getLogger("spotify.test.service_api.predict.registry")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    service = PredictionService(
+        run_dir=run_dir,
+        data_dir=None,
+        model_name="dummy",
+        include_video=False,
+        max_top_k=5,
+        auth_token=None,
+        logger=logger,
+        require_serving_bundle=False,
+    )
+    deployment_provider = build_service_deployment_readiness_provider(
+        requested_run_dir=registry_root / "channels" / "stable",
+        service=service,
+        require_registry=True,
+    )
+    app = create_prediction_app(
+        service=service,
+        logger=logger,
+        request_rate_limit=10,
+        deployment_readiness_provider=deployment_provider,
+    )
+    client = TestClient(app)
+
+    ready = client.get("/v1/readyz")
+    assert ready.status_code == 200
+    ready_payload = ready.json()
+    assert ready_payload["status"] == "ready"
+    assert ready_payload["deployment"]["release_id"] == "run_a"
+    check_names = {row["name"] for row in ready_payload["checks"]}
+    assert "deployment_registry_release_model_matches_service" in check_names
+
+    health = client.get("/v1/health")
+    assert health.status_code == 200
+    assert health.json()["deployment"]["status"] == "pass"
+
+    release_manifest_path = registry_root / "releases" / "run_a" / "deployment_release.json"
+    release_manifest = json.loads(release_manifest_path.read_text(encoding="utf-8"))
+    release_manifest["model_name"] = "different_model"
+    release_manifest_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+
+    drifted = client.get("/v1/readyz")
+    assert drifted.status_code == 200
+    drifted_payload = drifted.json()
+    assert drifted_payload["status"] == "not_ready"
+    drift_checks = {row["name"]: row for row in drifted_payload["checks"]}
+    assert drift_checks["deployment_registry_release_model_matches_service"]["ok"] is False
 
 
 def test_prediction_api_supports_jwt_auth_with_scope_checks(tmp_path: Path, monkeypatch) -> None:

@@ -131,6 +131,7 @@ spotify-public-insights --help
 spotify-compare-public --help
 spotify-control-room --help
 spotify-taste-os-demo --help
+spotify-creator-evidence-lab --help
 ```
 
 The existing `python -m spotify...` module entry points still work too.
@@ -515,6 +516,8 @@ make control-room
 
 The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
 
+It also includes an automatic run tradeoff dossier comparing the selected run with its promoted baseline across quality, safety, runtime, phase regressions, and currently retained storage. Profile, workload, cache, or artifact mismatches are reported as explicit comparability blockers.
+
 Build the local analytics SQL file and warehouse:
 
 ```bash
@@ -535,6 +538,7 @@ Data-science and quant branches now build on top of that local warehouse too:
 make listener-archetypes
 make quant-decision-lab
 make creator-market-intelligence
+make creator-evidence-lab
 make research-platform-lab
 make scope-expansion-lab
 ```
@@ -546,6 +550,7 @@ Those commands now write local-first behavioral clustering, decision-frontier, c
 - `outputs/analysis/listener_archetypes/`
 - `outputs/analysis/quant_decision_lab/`
 - `outputs/analysis/creator_market_intelligence/`
+- `outputs/analysis/creator_evidence_lab/`
 - `outputs/analysis/research_platform_lab/`
 
 See [docs/data_science_quant.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/data_science_quant.md), [docs/creator_market_intelligence.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/creator_market_intelligence.md), and [docs/research_platform_lab.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/research_platform_lab.md) for the local-lab workflow.
@@ -615,9 +620,12 @@ That service exposes a browser UI at `GET /taste-os`, plus:
 - `GET /taste-os/catalog`
 - `GET /taste-os/history`
 - `POST /taste-os/session`
+- `POST /taste-os/session/event`
 - `POST /taste-os/feedback`
 
-It persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and now stores feedback/session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
+`POST /taste-os/session/event` accepts an idempotent `event_id`, the current `expected_version`, and a `skip`, `repeat`, `like`, or `dislike` event. It returns a revised plan under the same session ID plus `why_this_changed`; the browser studio uses this path automatically. Likes and dislikes update durable taste memory, while skips and repeats only steer the active session.
+
+The service persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and stores feedback plus versioned active-session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
 
 For the production-style ASGI surface with versioned endpoints, request IDs, rate limiting, and metrics:
 

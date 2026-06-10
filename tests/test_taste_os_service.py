@@ -18,6 +18,7 @@ from spotify.taste_os_service import (
     _taste_os_page_html,
     normalize_taste_os_feedback_payload,
     normalize_taste_os_payload,
+    normalize_taste_os_session_event_payload,
 )
 
 
@@ -89,6 +90,57 @@ def _safe_policy() -> SafeBanditPolicyArtifact:
     )
 
 
+def _live_session_service(tmp_path: Path, monkeypatch) -> TasteOSService:
+    run_dir = tmp_path / "outputs" / "runs" / "run_live"
+    run_dir.mkdir(parents=True)
+    data_dir = tmp_path / "data" / "raw"
+    data_dir.mkdir(parents=True)
+    (data_dir / "Streaming_History_Audio_2024_0.json").write_text("[]", encoding="utf-8")
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps({"artist_labels": ["Artist A", "Artist B", "Artist C", "Artist D"], "sequence_length": 2}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        taste_os_service,
+        "resolve_model_row",
+        lambda run_dir, explicit_model_name, alias_model_name: {
+            "model_name": "dummy",
+            "model_type": "retrieval_reranker",
+        },
+    )
+    monkeypatch.setattr(taste_os_service, "load_predictor", lambda run_dir, row, artist_labels: _StubPredictor())
+    monkeypatch.setattr(
+        taste_os_service,
+        "load_prediction_input_context",
+        lambda run_dir, data_dir, include_video, logger, **kwargs: PredictionInputContext(
+            artist_labels=["Artist A", "Artist B", "Artist C", "Artist D"],
+            artist_to_label={"Artist A": 0, "Artist B": 1, "Artist C": 2, "Artist D": 3},
+            sequence_length=2,
+            latest_sequence_labels=np.array([0, 1], dtype="int32"),
+            latest_sequence_names=["Artist A", "Artist B"],
+            context_scaled=np.array([[8.0, 0.3, 0.0]], dtype="float32"),
+            context_raw=np.array([[8.0, 0.3, 0.0]], dtype="float32"),
+            context_features=["hour", "tech_playback_errors_24h", "offline"],
+        ),
+    )
+    logger = logging.getLogger("spotify.test.taste_os_service.live_session")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    return TasteOSService(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        output_dir=tmp_path / "outputs" / "analysis" / "taste_os_service",
+        model_name="dummy",
+        include_video=False,
+        max_top_k=5,
+        auth_token=None,
+        logger=logger,
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+    )
+
+
 def test_normalize_taste_os_payload_accepts_supported_fields() -> None:
     payload = {
         "mode": "discovery",
@@ -145,6 +197,38 @@ def test_normalize_taste_os_feedback_payload_rejects_unknown_signal() -> None:
         )
 
     assert exc.value.code == "invalid_signal"
+
+
+def test_normalize_taste_os_session_event_payload_validates_versioned_contract() -> None:
+    normalized = normalize_taste_os_session_event_payload(
+        {
+            "session_id": "taste-os-123",
+            "event_id": "event-123",
+            "event_type": "SKIP",
+            "artist_name": "Artist C",
+            "expected_version": 0,
+        }
+    )
+
+    assert normalized == {
+        "session_id": "taste-os-123",
+        "event_id": "event-123",
+        "event_type": "skip",
+        "artist_name": "Artist C",
+        "expected_version": 0,
+    }
+
+    with pytest.raises(RequestValidationError) as exc:
+        normalize_taste_os_session_event_payload(
+            {
+                "session_id": "taste-os-123",
+                "event_id": "event-124",
+                "event_type": "skip",
+                "artist_name": "Artist C",
+                "expected_version": True,
+            }
+        )
+    assert exc.value.code == "invalid_expected_version"
 
 
 def test_taste_os_service_plans_session_and_persists_artifacts(tmp_path: Path, monkeypatch) -> None:
@@ -332,6 +416,89 @@ def test_taste_os_service_feedback_memory_seeds_future_sessions(tmp_path: Path, 
     assert history["feedback_memory"]["top_affinities"][0]["artist_name"] == "Artist D"
 
 
+def test_taste_os_service_rescues_live_session_idempotently_and_rejects_stale_versions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _live_session_service(tmp_path, monkeypatch)
+    initial = service.plan_session(
+        mode="focus",
+        scenario="steady",
+        top_k=3,
+        recent_artists=["Artist A", "Artist B"],
+        include_video=False,
+        persist_artifacts=False,
+        use_feedback_memory=False,
+    )
+    session_id = str(initial["service"]["session_id"])
+
+    assert initial["service"]["version"] == 0
+    assert service.state_store.active_session(session_id)["version"] == 0
+
+    skipped = service.apply_session_event(
+        session_id=session_id,
+        event_id="event-skip",
+        event_type="skip",
+        artist_name="Artist C",
+        expected_version=0,
+    )
+
+    assert skipped["service"]["session_id"] == session_id
+    assert skipped["service"]["version"] == 1
+    assert skipped["request"]["scenario"] == "skip_recovery"
+    assert skipped["session_event"]["durable_feedback"] is False
+    assert skipped["session_event"]["idempotent_replay"] is False
+    assert "You skipped Artist C" in skipped["why_this_changed"]
+    assert service.state_store.feedback_store()["event_count"] == 0
+
+    replay = service.apply_session_event(
+        session_id=session_id,
+        event_id="event-skip",
+        event_type="skip",
+        artist_name="Artist C",
+        expected_version=0,
+    )
+    assert replay["service"]["version"] == 1
+    assert replay["session_event"]["idempotent_replay"] is True
+    assert service.state_store.active_session(session_id)["version"] == 1
+
+    with pytest.raises(RequestValidationError) as exc:
+        service.apply_session_event(
+            session_id=session_id,
+            event_id="event-skip",
+            event_type="skip",
+            artist_name="Artist D",
+            expected_version=0,
+        )
+    assert exc.value.code == "event_id_conflict"
+
+    with pytest.raises(RequestValidationError) as exc:
+        service.apply_session_event(
+            session_id=session_id,
+            event_id="event-stale",
+            event_type="repeat",
+            artist_name="Artist B",
+            expected_version=0,
+        )
+    assert exc.value.code == "stale_session_version"
+    assert exc.value.details["current_version"] == 1
+
+    liked = service.apply_session_event(
+        session_id=session_id,
+        event_id="event-like",
+        event_type="like",
+        artist_name="Artist D",
+        expected_version=1,
+    )
+    assert liked["service"]["session_id"] == session_id
+    assert liked["service"]["version"] == 2
+    assert liked["request"]["scenario"] == "repeat_request"
+    assert liked["session_event"]["durable_feedback"] is True
+    assert "saved to your durable taste feedback" in liked["why_this_changed"]
+    assert service.state_store.feedback_store()["event_count"] == 1
+    assert service.state_store.recent_feedback(limit=1)[0]["signal"] == "like"
+
+
 def test_taste_os_service_page_html_exposes_browser_surface(tmp_path: Path, monkeypatch) -> None:
     run_dir = tmp_path / "outputs" / "runs" / "run_a"
     run_dir.mkdir(parents=True)
@@ -386,8 +553,8 @@ def test_taste_os_service_page_html_exposes_browser_surface(tmp_path: Path, monk
 
     assert "Taste OS Session Studio" in html
     assert "/taste-os/session" in html
+    assert "/taste-os/session/event" in html
     assert "/taste-os/catalog" in html
     assert "/taste-os/history" in html
-    assert "/taste-os/feedback" in html
     assert "Generate Session" in html
     assert "Seed from feedback memory" in html

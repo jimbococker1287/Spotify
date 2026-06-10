@@ -221,6 +221,7 @@ def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Pa
     assert paths
     output_root = tmp_path / "outputs" / "analysis" / "creator_market_intelligence"
     scene_pulse = pd.read_csv(output_root / "scene_market_pulse.csv")
+    lane_atlas = pd.read_csv(output_root / "opportunity_lane_atlas.csv")
     migration_network = pd.read_csv(output_root / "market_migration_network.csv")
     whitespace_atlas = pd.read_csv(output_root / "release_whitespace_atlas.csv")
     manifest_payload = json.loads((output_root / "creator_market_manifest.json").read_text(encoding="utf-8"))
@@ -228,6 +229,8 @@ def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Pa
     brief_text = (output_root / "creator_market_brief.md").read_text(encoding="utf-8")
 
     assert scene_pulse.iloc[0]["scene_name"] == "scene-2"
+    seed_lane = lane_atlas.loc[lane_atlas["primary_driver"].eq("seed_adjacency")].iloc[0]
+    assert float(seed_lane["avg_opportunity_score"]) == 0.475
     assert migration_network.iloc[0]["target_artist"] in {"Artist 4", "Artist 2"}
     assert not whitespace_atlas.empty
     assert manifest_payload["report_family_count"] == 2
@@ -236,9 +239,17 @@ def test_build_creator_market_intelligence_rolls_up_report_families(tmp_path: Pa
     assert manifest_payload["complete_report_family_count"] == 0
     assert manifest_payload["partial_report_family_count"] == 2
     assert manifest_payload["partial_report_family_ids"] == [family_a, family_b]
+    assert manifest_payload["raw_opportunity_count"] == 3
+    assert manifest_payload["verified_opportunity_count"] == 0
+    assert manifest_payload["evidence_passport_count"] == 3
+    assert set(manifest_payload["evidence_artifact_paths"]) == {"csv", "json", "manifest", "markdown"}
+    assert all(Path(path).exists() for path in manifest_payload["evidence_artifact_paths"].values())
     assert brief_payload["report_family_count"] == 2
+    assert brief_payload["raw_opportunity_count"] == 3
+    assert brief_payload["verified_opportunity_count"] == 0
     assert "Creator Market Brief" in brief_text
     assert "aggregating `2` creator report families" in brief_text
+    assert "Evidence passports verify `0` of `3`" in brief_text
 
 
 def test_build_creator_market_intelligence_counts_complete_and_partial_families(tmp_path: Path) -> None:

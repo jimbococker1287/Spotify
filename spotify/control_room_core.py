@@ -37,6 +37,7 @@ from .run_artifacts import collect_run_manifests as _collect_run_manifests
 from .run_artifacts import safe_read_csv as _safe_read_csv
 from .run_artifacts import safe_read_json as _safe_read_json
 from .run_artifacts import write_json, write_markdown
+from .run_tradeoffs import build_run_tradeoff_dossier
 
 _OPERATIONAL_REVIEW_AREAS = frozenset({"instrumentation", "cadence"})
 _STRESS_BENCHMARK_GUARD_THRESHOLD = 0.45
@@ -691,6 +692,11 @@ def build_control_room_report(
         qoe=qoe,
         baseline_manifest=baseline_manifest,
     )
+    run_tradeoffs = build_run_tradeoff_dossier(
+        selected_manifest=latest_manifest,
+        baseline_manifest=baseline_manifest,
+        quality_safety_deltas=baseline_comparison.get("metric_deltas", []),
+    )
     review_actions = _build_review_actions(
         latest_run=latest_run,
         safety=safety,
@@ -733,6 +739,7 @@ def build_control_room_report(
             "backtest_top_models": _rank_models(backtest_history, metric_column="top1", top_n=top_n),
         },
         "baseline_comparison": baseline_comparison,
+        "run_tradeoffs": run_tradeoffs,
         "review_actions": review_actions,
         "review_ritual": [
             "Open this control room first after every meaningful run.",

@@ -141,7 +141,8 @@ def _release_manifest_path(
     channel_payload: dict[str, object],
 ) -> Path:
     manifest_hint = str(channel_payload.get("release_manifest_path", "")).strip()
-    if manifest_hint:
+    channel_release_id = str(channel_payload.get("current_release_id", "")).strip()
+    if manifest_hint and (not release_id or channel_release_id == release_id):
         hinted = Path(manifest_hint).expanduser()
         if hinted.exists():
             return hinted.resolve()
@@ -247,6 +248,7 @@ def build_release_readiness_smoke(
     output_dir: Path | None = None,
     require_registry: bool = False,
     require_serving_bundle: bool = True,
+    allow_pending_channel: bool = False,
 ) -> dict[str, object]:
     project_root = project_root.expanduser().resolve()
     outputs_dir = _resolve_path(outputs_dir, base=project_root)
@@ -344,6 +346,44 @@ def build_release_readiness_smoke(
                 observed=f"{model_name}:{model_type}",
             )
         )
+        global_alias_path = outputs_dir / "models" / "champion" / "alias.json"
+        if global_alias_path.exists():
+            try:
+                global_alias = read_champion_alias(global_alias_path)
+            except Exception as exc:
+                global_alias = None
+                checks.append(
+                    ReadinessCheck(
+                        check_key="global_champion_alias_valid",
+                        status="fail",
+                        severity="required",
+                        message=f"Global champion alias is invalid: {exc}",
+                        path=str(global_alias_path),
+                    )
+                )
+            if global_alias is not None:
+                checks.append(
+                    _bool_check(
+                        "global_champion_alias_matches_run",
+                        global_alias.run_dir.resolve() == run_dir_path.resolve(),
+                        pass_message="Global champion alias resolves to the release run.",
+                        fail_message="Global champion alias resolves to a different run.",
+                        path=global_alias_path,
+                        expected=str(run_dir_path),
+                        observed=str(global_alias.run_dir),
+                    )
+                )
+                checks.append(
+                    _bool_check(
+                        "global_champion_alias_matches_model",
+                        bool(model_name and global_alias.model_name == model_name),
+                        pass_message="Global champion alias model matches the release model.",
+                        fail_message="Global champion alias model does not match the release model.",
+                        path=global_alias_path,
+                        expected=model_name,
+                        observed=global_alias.model_name,
+                    )
+                )
 
         serving_bundles = _serving_bundle_rows(run_dir_path)
         checks.append(
@@ -379,8 +419,34 @@ def build_release_readiness_smoke(
     channel_manifest_path = channel_dir / "deployment_channel.json"
     channel_alias_path = channel_dir / "alias.json"
     registry_severity = "required" if require_registry else "advisory"
-    checks.append(_file_check("registry_channel_manifest_present", channel_manifest_path, severity=registry_severity, label="Registry channel manifest"))
-    checks.append(_file_check("registry_channel_alias_present", channel_alias_path, severity=registry_severity, label="Registry channel alias"))
+    if allow_pending_channel:
+        checks.append(
+            ReadinessCheck(
+                check_key="registry_channel_manifest_pending",
+                status="pass",
+                severity=registry_severity,
+                message="Registry channel manifest is pending activation; checking the candidate release manifest instead.",
+                path=str(channel_manifest_path),
+                expected="pending activation allowed",
+                observed="missing",
+            )
+        )
+    else:
+        checks.append(_file_check("registry_channel_manifest_present", channel_manifest_path, severity=registry_severity, label="Registry channel manifest"))
+    if allow_pending_channel:
+        checks.append(
+            ReadinessCheck(
+                check_key="registry_channel_alias_pending",
+                status="pass",
+                severity=registry_severity,
+                message="Registry channel alias is pending activation; checking the candidate release manifest instead.",
+                path=str(channel_alias_path),
+                expected="pending activation allowed",
+                observed="missing",
+            )
+        )
+    else:
+        checks.append(_file_check("registry_channel_alias_present", channel_alias_path, severity=registry_severity, label="Registry channel alias"))
 
     channel_payload = safe_read_json(channel_manifest_path, default={})
     channel_payload = channel_payload if isinstance(channel_payload, dict) else {}
@@ -453,7 +519,7 @@ def build_release_readiness_smoke(
             )
         )
 
-    if channel_alias_path.exists() and run_dir_path is not None:
+    if not allow_pending_channel and channel_alias_path.exists() and run_dir_path is not None:
         try:
             channel_run_dir, channel_model_name = resolve_prediction_run_dir(str(channel_dir), project_root=project_root)
             checks.append(
@@ -506,6 +572,7 @@ def build_release_readiness_smoke(
         "channel_manifest_path": str(channel_manifest_path),
         "require_registry": bool(require_registry),
         "require_serving_bundle": bool(require_serving_bundle),
+        "allow_pending_channel": bool(allow_pending_channel),
         "serving_bundles": serving_bundles,
         "available_serving_bundle_count": len(release_bundles_list),
         "summary": summary,
@@ -551,6 +618,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Downgrade missing serving bundles to an advisory warning.",
     )
     parser.add_argument("--strict", action="store_true", help="Return nonzero unless every readiness check passes.")
+    parser.add_argument(
+        "--allow-pending-channel",
+        action="store_true",
+        help="Allow missing channel alias/manifest while validating a candidate release before channel activation.",
+    )
     parser.add_argument("--stdout-format", choices=("summary", "json"), default="summary")
     return parser.parse_args(argv)
 
@@ -567,6 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=Path(args.output_dir) if args.output_dir else None,
         require_registry=bool(args.require_registry),
         require_serving_bundle=not bool(args.no_require_serving_bundle),
+        allow_pending_channel=bool(args.allow_pending_channel),
     )
     summary = payload.get("summary", {})
     summary_dict = summary if isinstance(summary, dict) else {}

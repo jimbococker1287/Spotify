@@ -10,6 +10,7 @@ data:
   REQUEST_RATE_LIMIT: "240"
   RATE_LIMIT_BACKEND: redis
   REDIS_URL: redis://spotify-redis:6379/0
+  REQUIRE_DEPLOYMENT_REGISTRY: "1"
   OTEL_ENABLED: "1"
   AUTH_MODE: token_or_jwt
   AUTH_SCOPE: all

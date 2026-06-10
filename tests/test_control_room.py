@@ -236,6 +236,43 @@ def _write_run_fixture(
     )
 
 
+def _write_run_timing_fixture(
+    output_dir: Path,
+    *,
+    run_id: str,
+    total_seconds: float,
+    measured_seconds: float,
+    phases: list[dict[str, object]],
+) -> None:
+    run_dir = output_dir / "runs" / run_id
+    timing_payload = {
+        "run_id": run_id,
+        "final_status": "FINISHED",
+        "total_seconds": total_seconds,
+        "measured_seconds": measured_seconds,
+        "unmeasured_overhead_seconds": total_seconds - measured_seconds,
+        "phase_count": len(phases),
+        "completed_phase_count": sum(1 for row in phases if row.get("status") == "ok"),
+        "non_skipped_phase_count": sum(1 for row in phases if row.get("status") != "skipped"),
+        "slowest_phase": max(phases, key=lambda row: float(row.get("duration_seconds", 0.0)), default={}),
+        "phases": phases,
+    }
+    timing_path = run_dir / "run_phase_timings.json"
+    timing_path.write_text(json.dumps(timing_payload, indent=2), encoding="utf-8")
+
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["phase_timings"] = {
+        "json_path": str(timing_path),
+        "total_seconds": total_seconds,
+        "measured_seconds": measured_seconds,
+        "unmeasured_overhead_seconds": total_seconds - measured_seconds,
+        "phase_count": len(phases),
+        "slowest_phase": timing_payload["slowest_phase"],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
 def test_build_control_room_report_summarizes_latest_run(tmp_path: Path) -> None:
     output_dir = tmp_path / "outputs"
     history_dir = output_dir / "history"
@@ -550,6 +587,102 @@ def test_control_room_compares_latest_run_to_last_promoted_baseline(tmp_path: Pa
         for action in report["review_actions"]
         if isinstance(action.get("inspect"), list)
     )
+
+
+def test_control_room_includes_run_tradeoff_dossier_and_history_snapshot(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-06-01T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.11,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.11,
+        stress_skip_risk=0.22,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-06-02T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.62,
+        test_top1=0.60,
+        gate_regression=-0.02,
+        drift_jsd=0.10,
+        ece=0.04,
+        selective_risk=0.12,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+    baseline_phases = [
+        {"phase_name": "data_loading", "status": "ok", "duration_seconds": 20.0, "metadata": {}},
+        {"phase_name": "training", "status": "ok", "duration_seconds": 60.0, "metadata": {}},
+        {"phase_name": "reporting", "status": "ok", "duration_seconds": 10.0, "metadata": {}},
+    ]
+    selected_phases = [
+        {"phase_name": "data_loading", "status": "ok", "duration_seconds": 25.0, "metadata": {}},
+        {"phase_name": "training", "status": "ok", "duration_seconds": 80.0, "metadata": {}},
+        {"phase_name": "reporting", "status": "ok", "duration_seconds": 10.0, "metadata": {}},
+    ]
+    _write_run_timing_fixture(
+        output_dir,
+        run_id="run_a",
+        total_seconds=100.0,
+        measured_seconds=90.0,
+        phases=baseline_phases,
+    )
+    _write_run_timing_fixture(
+        output_dir,
+        run_id="run_b",
+        total_seconds=125.0,
+        measured_seconds=115.0,
+        phases=selected_phases,
+    )
+    (output_dir / "runs" / "run_a" / "retained.bin").write_bytes(b"x" * 1024)
+    (output_dir / "runs" / "run_b" / "retained.bin").write_bytes(b"x" * 4096)
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    dossier = report["run_tradeoffs"]
+    assert dossier["status"] == "complete"
+    assert dossier["baseline_run"]["run_id"] == "run_a"
+    assert dossier["comparability"]["comparable"] is True
+    assert dossier["runtime"]["delta_seconds"] == 25.0
+    assert dossier["largest_phase_regressions"][0]["phase_name"] == "training"
+    assert dossier["quality_safety_worse_count"] == 0
+    assert dossier["verdict"] == "tradeoff_review"
+
+    json_path, md_path = write_control_room_report(output_dir, top_n=3)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["run_tradeoffs"]["verdict"] == "tradeoff_review"
+    markdown = md_path.read_text(encoding="utf-8")
+    assert "Run Tradeoff Dossier" in markdown
+    assert "Largest Phase Regressions" in markdown
+    assert "`training`" in markdown
+
+    history = pd.read_csv(output_dir / "analytics" / "control_room_history.csv")
+    row = history.loc[history["run_id"].astype(str) == "run_b"].iloc[0]
+    assert row["tradeoff_verdict"] == "tradeoff_review"
+    assert int(row["tradeoff_comparable"]) == 1
+    assert float(row["tradeoff_runtime_delta_seconds"]) == 25.0
+    assert int(row["tradeoff_phase_regression_count"]) == 2
 
 
 def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> None:

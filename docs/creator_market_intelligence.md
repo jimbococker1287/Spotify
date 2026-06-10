@@ -27,6 +27,20 @@ Main outputs:
 - `creator_market_brief.json/md`: short brief summarizing the strongest market signals and next uses.
 - `creator_market_manifest.json`: artifact index plus truthful report-family counts, including how many discovered families are still partial.
 
+Evidence pass:
+
+```bash
+make creator-evidence-lab
+```
+
+Or directly:
+
+```bash
+spotify-creator-evidence-lab --output-dir outputs
+```
+
+This writes conservative per-opportunity passports under `outputs/analysis/creator_evidence_lab/`. A signal is only `publishable` when support, recurrence, stability, metadata coverage, freshness, and claim-language gates all pass. Missing evidence becomes `watch_only` or `suppress`; raw opportunity scores remain unchanged.
+
 Suggested use:
 
 1. Generate or backfill a few creator report families with `make public-insights`.

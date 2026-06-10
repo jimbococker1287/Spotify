@@ -25,6 +25,7 @@
         { "name": "REQUEST_RATE_LIMIT", "value": "240" },
         { "name": "RATE_LIMIT_BACKEND", "value": "redis" },
         { "name": "REDIS_URL", "value": "redis://redis.internal:6379/0" },
+        { "name": "REQUIRE_DEPLOYMENT_REGISTRY", "value": "1" },
         { "name": "AUTH_MODE", "value": "token_or_jwt" },
         { "name": "AUTH_SCOPE", "value": "all" },
         { "name": "JWT_ALGORITHMS", "value": "RS256" },

@@ -331,7 +331,7 @@ def _json_error(
     return JSONResponse(status_code=status_code, content=payload, headers=headers)
 
 
-def _prediction_readiness(service: PredictionService) -> dict[str, object]:
+def _prediction_readiness(service: PredictionService, *, deployment_readiness_provider: Any | None = None) -> dict[str, object]:
     bundle_path = _prediction_serving_bundle_path(service.run_dir, include_video=service.include_video)
     bundle_ready = bundle_path.exists()
     input_ready = bundle_ready or service.data_dir is not None
@@ -359,13 +359,16 @@ def _prediction_readiness(service: PredictionService) -> dict[str, object]:
             "detail": str(service.model_name),
         },
     ]
+    deployment_checks, deployment_payload = _readiness_deployment_checks(deployment_readiness_provider)
+    checks.extend(deployment_checks)
     return {
         "status": "ready" if all(bool(check["ok"]) for check in checks) else "not_ready",
         "checks": checks,
+        "deployment": deployment_payload or {},
     }
 
 
-def _taste_os_readiness(service: TasteOSService) -> dict[str, object]:
+def _taste_os_readiness(service: TasteOSService, *, deployment_readiness_provider: Any | None = None) -> dict[str, object]:
     bundle_path = _prediction_serving_bundle_path(service.run_dir, include_video=service.include_video)
     bundle_ready = bundle_path.exists()
     input_ready = bundle_ready or service.data_dir is not None
@@ -395,9 +398,12 @@ def _taste_os_readiness(service: TasteOSService) -> dict[str, object]:
             "detail": str(service.model_name),
         },
     ]
+    deployment_checks, deployment_payload = _readiness_deployment_checks(deployment_readiness_provider)
+    checks.extend(deployment_checks)
     return {
         "status": "ready" if all(bool(check["ok"]) for check in checks) else "not_ready",
         "checks": checks,
+        "deployment": deployment_payload or {},
     }
 
 
@@ -439,6 +445,337 @@ def _int_metric(value: object) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _same_resolved_path(left: Path | None, right: Path | None) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return left.expanduser().resolve() == right.expanduser().resolve()
+    except Exception:
+        return False
+
+
+def _deployment_check(
+    name: str,
+    ok: bool,
+    *,
+    detail: str,
+    expected: object = "",
+    observed: object = "",
+    severity: str = "required",
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "ok": bool(ok),
+        "severity": str(severity),
+        "detail": str(detail),
+        "expected": str(expected),
+        "observed": str(observed),
+    }
+
+
+def _infer_registry_channel(requested_run_dir: Path | None) -> tuple[Path, str] | None:
+    if requested_run_dir is None:
+        return None
+    parts = requested_run_dir.parts
+    if len(parts) < 2 or parts[-2] != "channels":
+        return None
+    channel = requested_run_dir.name.strip().lower()
+    if not channel:
+        return None
+    return requested_run_dir.parent.parent, channel
+
+
+def _release_manifest_path(
+    *,
+    registry_root: Path,
+    release_id: str,
+    channel_payload: dict[str, object],
+) -> Path:
+    hinted = str(channel_payload.get("release_manifest_path", "")).strip()
+    if hinted:
+        return Path(hinted).expanduser()
+    return registry_root / "releases" / release_id / "deployment_release.json"
+
+
+def build_service_deployment_readiness(
+    *,
+    requested_run_dir: str | Path | None,
+    resolved_run_dir: Path,
+    model_name: str,
+    model_type: str,
+    require_registry: bool = False,
+) -> dict[str, object]:
+    requested_text = str(requested_run_dir or "").strip()
+    requested_path = Path(requested_text).expanduser() if requested_text else None
+    resolved_path = resolved_run_dir.expanduser().resolve()
+    service_model_name = str(model_name).strip()
+    service_model_type = str(model_type).strip().lower()
+    inferred = _infer_registry_channel(requested_path)
+    checks: list[dict[str, object]] = [
+        _deployment_check(
+            "service_model_identity_present",
+            bool(service_model_name and service_model_type),
+            detail="Service exposes a concrete model identity.",
+            expected="model_name and model_type",
+            observed=f"{service_model_name}:{service_model_type}",
+        )
+    ]
+
+    if inferred is None:
+        checks.append(
+            _deployment_check(
+                "registry_channel_configured",
+                not bool(require_registry),
+                detail=(
+                    "Service is running from a direct run/champion alias."
+                    if not require_registry
+                    else "Deployment registry channel is required but the requested run target is not channels/<name>."
+                ),
+                expected="registry channel target" if require_registry else "direct run allowed",
+                observed=requested_text or "default champion alias",
+            )
+        )
+        fail_count = sum(1 for check in checks if not bool(check.get("ok", False)))
+        return {
+            "status": "fail" if fail_count else "pass",
+            "deployment_ready": fail_count == 0,
+            "mode": "direct_run",
+            "requested_run_dir": requested_text,
+            "resolved_run_dir": str(resolved_path),
+            "model_name": service_model_name,
+            "model_type": service_model_type,
+            "registry_required": bool(require_registry),
+            "registry_root": "",
+            "channel": "",
+            "release_id": "",
+            "channel_manifest_path": "",
+            "release_manifest_path": "",
+            "checks": checks,
+        }
+
+    registry_root, channel = inferred
+    channel_dir = registry_root / "channels" / channel
+    channel_manifest_path = channel_dir / "deployment_channel.json"
+    channel_alias_path = channel_dir / "alias.json"
+    checks.append(
+        _deployment_check(
+            "registry_channel_manifest_present",
+            channel_manifest_path.exists(),
+            detail="Registry channel manifest is readable by the service.",
+            expected="exists",
+            observed="exists" if channel_manifest_path.exists() else "missing",
+        )
+    )
+    checks.append(
+        _deployment_check(
+            "registry_channel_alias_present",
+            channel_alias_path.exists(),
+            detail="Registry channel alias is readable by the service.",
+            expected="exists",
+            observed="exists" if channel_alias_path.exists() else "missing",
+        )
+    )
+    channel_payload = _read_json_object(channel_manifest_path)
+    release_id = str(channel_payload.get("current_release_id", "")).strip()
+    checks.append(
+        _deployment_check(
+            "registry_channel_release_id_present",
+            bool(release_id),
+            detail="Registry channel names the active release id.",
+            expected="current_release_id",
+            observed=release_id or "missing",
+        )
+    )
+
+    release_manifest_path = _release_manifest_path(
+        registry_root=registry_root,
+        release_id=release_id,
+        channel_payload=channel_payload,
+    )
+    checks.append(
+        _deployment_check(
+            "registry_release_manifest_present",
+            release_manifest_path.exists(),
+            detail="Registry release manifest is readable by the service.",
+            expected="exists",
+            observed="exists" if release_manifest_path.exists() else "missing",
+        )
+    )
+    release_payload = _read_json_object(release_manifest_path)
+    source_run_raw = str(release_payload.get("source_run_dir", "")).strip()
+    source_run_dir = Path(source_run_raw).expanduser() if source_run_raw else None
+    release_model_name = str(release_payload.get("model_name", "")).strip()
+    release_model_type = str(release_payload.get("model_type", "")).strip().lower()
+    checks.append(
+        _deployment_check(
+            "registry_release_matches_service_run",
+            _same_resolved_path(source_run_dir, resolved_path),
+            detail="Registry release source run matches the service run.",
+            expected=str(resolved_path),
+            observed=source_run_raw or "missing",
+        )
+    )
+    checks.append(
+        _deployment_check(
+            "registry_release_model_matches_service",
+            bool(
+                service_model_name
+                and service_model_type
+                and release_model_name == service_model_name
+                and release_model_type == service_model_type
+            ),
+            detail="Registry release model identity matches the loaded service model.",
+            expected=f"{service_model_name}:{service_model_type}",
+            observed=f"{release_model_name}:{release_model_type}",
+        )
+    )
+    checks.append(
+        _deployment_check(
+            "registry_channel_model_matches_service",
+            bool(
+                service_model_name
+                and service_model_type
+                and str(channel_payload.get("current_model_name", "")).strip() == service_model_name
+                and str(channel_payload.get("current_model_type", "")).strip().lower() == service_model_type
+            ),
+            detail="Registry channel model identity matches the loaded service model.",
+            expected=f"{service_model_name}:{service_model_type}",
+            observed=(
+                f"{str(channel_payload.get('current_model_name', '')).strip()}:"
+                f"{str(channel_payload.get('current_model_type', '')).strip().lower()}"
+            ),
+        )
+    )
+    try:
+        alias_run_dir, alias_model_name = resolve_prediction_run_dir(str(channel_dir))
+        checks.append(
+            _deployment_check(
+                "registry_channel_alias_matches_service_run",
+                alias_run_dir.resolve() == resolved_path,
+                detail="Registry channel alias resolves to the loaded service run.",
+                expected=str(resolved_path),
+                observed=str(alias_run_dir),
+            )
+        )
+        checks.append(
+            _deployment_check(
+                "registry_channel_alias_model_matches_service",
+                bool(alias_model_name and alias_model_name == service_model_name),
+                detail="Registry channel alias model matches the loaded service model.",
+                expected=service_model_name,
+                observed=alias_model_name or "",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            _deployment_check(
+                "registry_channel_alias_resolves",
+                False,
+                detail=f"Registry channel alias could not be resolved: {exc}",
+                expected="resolvable alias",
+                observed="unresolved",
+            )
+        )
+
+    fail_count = sum(1 for check in checks if not bool(check.get("ok", False)))
+    return {
+        "status": "fail" if fail_count else "pass",
+        "deployment_ready": fail_count == 0,
+        "mode": "registry_channel",
+        "requested_run_dir": str(requested_path) if requested_path is not None else "",
+        "resolved_run_dir": str(resolved_path),
+        "model_name": service_model_name,
+        "model_type": service_model_type,
+        "registry_required": bool(require_registry),
+        "registry_root": str(registry_root),
+        "channel": channel,
+        "release_id": release_id,
+        "channel_manifest_path": str(channel_manifest_path),
+        "release_manifest_path": str(release_manifest_path),
+        "checks": checks,
+    }
+
+
+def build_service_deployment_readiness_provider(
+    *,
+    requested_run_dir: str | Path | None,
+    service: Any,
+    require_registry: bool = False,
+) -> Any:
+    def _provider() -> dict[str, object]:
+        return build_service_deployment_readiness(
+            requested_run_dir=requested_run_dir,
+            resolved_run_dir=Path(getattr(service, "run_dir")),
+            model_name=str(getattr(service, "model_name", "")),
+            model_type=str(getattr(service, "model_type", "")),
+            require_registry=bool(require_registry),
+        )
+
+    return _provider
+
+
+def _safe_deployment_payload(provider: Any | None) -> dict[str, object] | None:
+    if provider is None:
+        return None
+    try:
+        payload = provider()
+    except Exception as exc:
+        return {
+            "status": "fail",
+            "deployment_ready": False,
+            "mode": "unknown",
+            "checks": [
+                _deployment_check(
+                    "deployment_readiness_provider",
+                    False,
+                    detail=f"Deployment readiness provider failed: {exc}",
+                )
+            ],
+        }
+    return payload if isinstance(payload, dict) else None
+
+
+def _readiness_deployment_checks(provider: Any | None) -> tuple[list[dict[str, object]], dict[str, object] | None]:
+    payload = _safe_deployment_payload(provider)
+    if payload is None:
+        return [], None
+    checks = payload.get("checks", [])
+    check_rows = checks if isinstance(checks, list) else []
+    readiness_rows: list[dict[str, object]] = []
+    for row in check_rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name", "")).strip() or "deployment"
+        readiness_rows.append(
+            {
+                "name": f"deployment_{name}",
+                "ok": bool(row.get("ok", False)),
+                "detail": str(row.get("detail", "")),
+                "severity": str(row.get("severity", "required")),
+                "expected": str(row.get("expected", "")),
+                "observed": str(row.get("observed", "")),
+            }
+        )
+    return readiness_rows, payload
+
+
+def _health_payload_with_deployment(health_provider: Any, deployment_provider: Any | None) -> dict[str, object]:
+    payload = health_provider()
+    payload = payload if isinstance(payload, dict) else {"status": "unknown"}
+    deployment = _safe_deployment_payload(deployment_provider)
+    if deployment is not None:
+        payload["deployment"] = deployment
+    return payload
 
 
 def _prometheus_metrics_payload(
@@ -770,6 +1107,7 @@ def create_prediction_app(
     redis_url: str | None = None,
     enable_otel: bool = True,
     authenticator: ApiAuthenticator | None = None,
+    deployment_readiness_provider: Any | None = None,
 ) -> FastAPI:
     effective_authenticator = authenticator or _legacy_token_authenticator(
         auth_token=getattr(service, "auth_token", None),
@@ -799,8 +1137,11 @@ def create_prediction_app(
     _register_common_service_routes(
         app=app,
         service_name="spotify.predict",
-        health_provider=service.health_payload,
-        readiness_provider=lambda: _prediction_readiness(service),
+        health_provider=lambda: _health_payload_with_deployment(service.health_payload, deployment_readiness_provider),
+        readiness_provider=lambda: _prediction_readiness(
+            service,
+            deployment_readiness_provider=deployment_readiness_provider,
+        ),
         telemetry=telemetry,
         rate_limiter=rate_limiter,
         authenticator=effective_authenticator,
@@ -874,6 +1215,7 @@ def create_taste_os_app(
     redis_url: str | None = None,
     enable_otel: bool = True,
     authenticator: ApiAuthenticator | None = None,
+    deployment_readiness_provider: Any | None = None,
 ) -> FastAPI:
     effective_authenticator = authenticator or _legacy_token_authenticator(
         auth_token=getattr(service, "auth_token", None),
@@ -903,8 +1245,11 @@ def create_taste_os_app(
     _register_common_service_routes(
         app=app,
         service_name="spotify.taste_os",
-        health_provider=service.health_payload,
-        readiness_provider=lambda: _taste_os_readiness(service),
+        health_provider=lambda: _health_payload_with_deployment(service.health_payload, deployment_readiness_provider),
+        readiness_provider=lambda: _taste_os_readiness(
+            service,
+            deployment_readiness_provider=deployment_readiness_provider,
+        ),
         telemetry=telemetry,
         rate_limiter=rate_limiter,
         authenticator=effective_authenticator,
@@ -1036,6 +1381,10 @@ def _parse_args() -> argparse.Namespace:
         env_rate_limit = DEFAULT_REQUEST_RATE_LIMIT
     env_rate_limit_backend = str(os.getenv("SPOTIFY_SERVICE_RATE_LIMIT_BACKEND", DEFAULT_RATE_LIMIT_BACKEND)).strip().lower()
     env_otel_enabled = _env_flag("SPOTIFY_SERVICE_OTEL_ENABLED", default=True)
+    env_require_registry = _env_flag(
+        "SPOTIFY_SERVICE_REQUIRE_DEPLOYMENT_REGISTRY",
+        default=_env_flag("REQUIRE_DEPLOYMENT_REGISTRY", default=False),
+    )
 
     parser = argparse.ArgumentParser(
         prog="python -m spotify.service_api",
@@ -1165,6 +1514,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail fast unless the run already has a materialized prediction serving bundle.",
     )
+    parser.add_argument(
+        "--require-deployment-registry",
+        action="store_true",
+        default=env_require_registry,
+        help="Mark readiness not-ready unless the service is running from a registry channels/<name> target.",
+    )
     return parser.parse_args()
 
 
@@ -1206,6 +1561,11 @@ def _build_service_from_args(args: argparse.Namespace, logger: logging.Logger) -
             logger=logger,
             require_serving_bundle=bool(args.require_serving_bundle),
         )
+        deployment_provider = build_service_deployment_readiness_provider(
+            requested_run_dir=args.run_dir,
+            service=predict_service_instance,
+            require_registry=bool(args.require_deployment_registry),
+        )
         app = create_prediction_app(
             service=predict_service_instance,
             logger=logger,
@@ -1214,6 +1574,7 @@ def _build_service_from_args(args: argparse.Namespace, logger: logging.Logger) -
             redis_url=redis_url,
             enable_otel=enable_otel,
             authenticator=authenticator,
+            deployment_readiness_provider=deployment_provider,
         )
         return "predict", app
 
@@ -1233,6 +1594,11 @@ def _build_service_from_args(args: argparse.Namespace, logger: logging.Logger) -
         state_database_url=state_db_url,
         require_serving_bundle=bool(args.require_serving_bundle),
     )
+    deployment_provider = build_service_deployment_readiness_provider(
+        requested_run_dir=args.run_dir,
+        service=taste_service,
+        require_registry=bool(args.require_deployment_registry),
+    )
     app = create_taste_os_app(
         service=taste_service,
         logger=logger,
@@ -1241,6 +1607,7 @@ def _build_service_from_args(args: argparse.Namespace, logger: logging.Logger) -
         redis_url=redis_url,
         enable_otel=enable_otel,
         authenticator=authenticator,
+        deployment_readiness_provider=deployment_provider,
     )
     return "taste-os", app
 

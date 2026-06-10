@@ -15,7 +15,11 @@ from urllib.parse import unquote, urlparse
 from .champion_alias import resolve_prediction_run_dir
 from .predict_service import PredictionService
 from .run_artifacts import write_csv_rows, write_json, write_markdown
-from .service_api import create_prediction_app, create_taste_os_app
+from .service_api import (
+    build_service_deployment_readiness_provider,
+    create_prediction_app,
+    create_taste_os_app,
+)
 from .taste_os_service import TasteOSService
 
 
@@ -628,6 +632,7 @@ def _service_startup_check(service: str, app: Any | None, exc: Exception | None)
 
 def _smoke_prediction_service(
     *,
+    requested_run_dir: Path,
     run_dir: Path,
     data_dir: Path | None,
     model_name: str,
@@ -654,7 +659,17 @@ def _smoke_prediction_service(
             logger=logger,
             require_serving_bundle=require_serving_bundle,
         )
-        app = create_prediction_app(service=service, logger=logger, request_rate_limit=120, enable_otel=False)
+        deployment_provider = build_service_deployment_readiness_provider(
+            requested_run_dir=requested_run_dir,
+            service=service,
+        )
+        app = create_prediction_app(
+            service=service,
+            logger=logger,
+            request_rate_limit=120,
+            enable_otel=False,
+            deployment_readiness_provider=deployment_provider,
+        )
     except Exception as exc:
         startup_exc = exc
     checks.append(_service_startup_check("predict", app, startup_exc))
@@ -734,6 +749,7 @@ def _smoke_prediction_service(
 
 def _smoke_taste_os_service(
     *,
+    requested_run_dir: Path,
     run_dir: Path,
     data_dir: Path | None,
     service_output_dir: Path,
@@ -768,7 +784,17 @@ def _smoke_taste_os_service(
             state_database_url=state_database_url,
             require_serving_bundle=require_serving_bundle,
         )
-        app = create_taste_os_app(service=service, logger=logger, request_rate_limit=120, enable_otel=False)
+        deployment_provider = build_service_deployment_readiness_provider(
+            requested_run_dir=requested_run_dir,
+            service=service,
+        )
+        app = create_taste_os_app(
+            service=service,
+            logger=logger,
+            request_rate_limit=120,
+            enable_otel=False,
+            deployment_readiness_provider=deployment_provider,
+        )
     except Exception as exc:
         startup_exc = exc
     checks.append(_service_startup_check("taste-os", app, startup_exc))
@@ -914,6 +940,7 @@ def build_production_smoke(
 
     if resolved_run_dir is not None:
         prediction_checks, prediction_requests = _smoke_prediction_service(
+            requested_run_dir=requested_run_dir,
             run_dir=resolved_run_dir,
             data_dir=data_root,
             model_name=effective_model_name,
@@ -929,6 +956,7 @@ def build_production_smoke(
         requests.extend(prediction_requests)
 
         taste_checks, taste_requests = _smoke_taste_os_service(
+            requested_run_dir=requested_run_dir,
             run_dir=resolved_run_dir,
             data_dir=data_root,
             service_output_dir=service_root,

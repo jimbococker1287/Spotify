@@ -598,6 +598,7 @@ def render_taste_os_page_html(service: Any) -> str:
       const topCandidates = Array.isArray(payload.top_candidates) ? payload.top_candidates : [];
       const journeyPlan = Array.isArray(payload.journey_plan) ? payload.journey_plan : [];
       const whyThisNext = Array.isArray(payload.why_this_next) ? payload.why_this_next : [];
+      const whyThisChanged = payload.why_this_changed || "";
       const transcript = Array.isArray(adaptive.transcript) ? adaptive.transcript : [];
       const effectiveRecentArtists = Array.isArray(memory.effective_recent_artists) ? memory.effective_recent_artists : [];
       const topAffinities = Array.isArray(memory.top_affinities) ? memory.top_affinities : [];
@@ -625,6 +626,7 @@ def render_taste_os_page_html(service: Any) -> str:
         <section class="result-card">
           <h3>Why This Next</h3>
           <ul>${{whyThisNext.map((line) => `<li>${{escapeHtml(line)}}</li>`).join("") || "<li>No rationale available.</li>"}}</ul>
+          ${{whyThisChanged ? `<div class="metric-line"><strong>Why this changed:</strong> ${{escapeHtml(whyThisChanged)}}</div>` : ""}}
         </section>
         <section class="result-card">
           <h3>Guardrails</h3>
@@ -701,6 +703,7 @@ def render_taste_os_page_html(service: Any) -> str:
           <div class="metric-line">Run dir: ${{escapeHtml(service.run_dir || config.runDir)}}</div>
           <div class="metric-line">Output dir: ${{escapeHtml(service.output_dir || config.outputDir)}}</div>
           <div class="metric-line">Session id: ${{escapeHtml(service.session_id || "n/a")}}</div>
+          <div class="metric-line">Session version: ${{escapeHtml(service.version ?? 0)}}</div>
           <div class="metric-line">Created at: ${{escapeHtml(service.created_at || "n/a")}}</div>
           ${{artifactBlock}}
         </section>
@@ -747,31 +750,35 @@ def render_taste_os_page_html(service: Any) -> str:
         setStatus("Generate a session before recording feedback.", true);
         return;
       }}
-      setStatus(`Recording ${{signal}} for ${{artistName}}...`);
-      const response = await fetch("/taste-os/feedback", {{
+      const currentVersion = Number(state.payload?.service?.version ?? 0);
+      const eventId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `event-${{Date.now()}}-${{Math.random().toString(16).slice(2)}}`;
+      setStatus(`Applying ${{signal}} for ${{artistName}} and replanning...`);
+      const response = await fetch("/taste-os/session/event", {{
         method: "POST",
         headers: {{
           "Content-Type": "application/json",
         }},
         body: JSON.stringify({{
           session_id: sessionId,
+          event_id: eventId,
+          event_type: signal,
           artist_name: artistName,
-          signal,
+          expected_version: currentVersion,
         }}),
       }});
       const data = await response.json();
       if (!response.ok) {{
-        const message = data?.error?.message || `Feedback request failed with status ${{response.status}}`;
+        const message = data?.error?.message || `Session event failed with status ${{response.status}}`;
         setStatus(message, true);
         return;
       }}
+      state.payload = data;
+      renderSummary(data);
+      renderResults(data);
       await loadHistory();
-      if (state.payload) {{
-        state.payload.memory_summary = data.feedback_memory || state.payload.memory_summary;
-        renderSummary(state.payload);
-        renderResults(state.payload);
-      }}
-      setStatus(`Recorded ${{signal}} for ${{artistName}}.`);
+      setStatus(data.why_this_changed || `Applied ${{signal}} for ${{artistName}}.`);
     }}
 
     async function runSession() {{
