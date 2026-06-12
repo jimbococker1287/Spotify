@@ -18,7 +18,13 @@ from pandas.api.types import is_object_dtype
 from .aws_athena_export import _prepare_raw_streaming_history
 from .aws_athena_export import _prepare_run_manifests
 from .aws_athena_export import _prepare_run_results
+from .compare_public import (
+    build_daily_public_similarity_mart,
+    build_daily_spotify_wrapped_comparison,
+)
 from .data import load_streaming_history
+from .public_listening_narratives import build_public_listening_narratives
+from .public_listening_trends import build_public_listening_trends
 from .run_artifacts import collect_run_analysis_rows
 from .run_artifacts import rows_to_frame
 from .run_artifacts import safe_read_csv
@@ -223,12 +229,7 @@ def _hash_file(path: Path) -> str | None:
 
 
 def _fingerprint_paths(paths: list[Path] | tuple[Path, ...]) -> tuple[list[str], str | None, list[dict[str, object]]]:
-    normalized_paths = sorted(
-        {
-            str(path.expanduser().resolve())
-            for path in paths
-        }
-    )
+    normalized_paths = sorted({str(path.expanduser().resolve()) for path in paths})
     if not normalized_paths:
         return [], None, []
     records: list[dict[str, object]] = []
@@ -352,6 +353,17 @@ def _scope_expansion_asset_inputs(output_dir: Path) -> dict[str, list[Path]]:
 
 WAREHOUSE_LINEAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "listener_daily_activity": ("raw_streaming_history",),
+    "public_listening_daily_comparison": ("raw_streaming_history",),
+    "mart_public_listening_daily_similarity": ("public_listening_daily_comparison",),
+    "mart_public_listening_trends": ("mart_public_listening_daily_similarity",),
+    "mart_public_listening_daily_narratives": (
+        "public_listening_daily_comparison",
+        "mart_public_listening_daily_similarity",
+    ),
+    "mart_public_listening_weekly_narratives": (
+        "public_listening_daily_comparison",
+        "mart_public_listening_daily_similarity",
+    ),
     "model_run_summary": ("run_manifests", "run_results", "backtest_history"),
     "ops_review_snapshot": (
         "control_room_snapshot",
@@ -533,8 +545,7 @@ def _branch_freshness_metadata(
     count_columns = sorted(
         str(column)
         for column in df.columns
-        if "count" in str(column).lower()
-        and any(token in str(column).lower() for token in ("missing", "stale"))
+        if "count" in str(column).lower() and any(token in str(column).lower() for token in ("missing", "stale"))
     )
 
     status_counts: dict[str, int] = {}
@@ -583,8 +594,7 @@ def _row_count_anomalies(
     previous_asset_lookup: dict[tuple[str, str], dict[str, Any]],
 ) -> list[dict[str, object]]:
     asset_lookup = {
-        (str(asset.get("layer", "") or ""), str(asset.get("name", "") or "")): asset
-        for asset in asset_rows
+        (str(asset.get("layer", "") or ""), str(asset.get("name", "") or "")): asset for asset in asset_rows
     }
     upstream_lookup: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for edge in edges:
@@ -748,11 +758,7 @@ def _write_warehouse_lineage_markdown(path: Path, report: dict[str, object]) -> 
     empty_assets = quality.get("empty_assets", []) if isinstance(quality.get("empty_assets"), list) else []
     rebuilt_assets = quality.get("rebuilt_assets", []) if isinstance(quality.get("rebuilt_assets"), list) else []
     reused_assets = quality.get("reused_assets", []) if isinstance(quality.get("reused_assets"), list) else []
-    anomalies = (
-        quality.get("row_count_anomalies", [])
-        if isinstance(quality.get("row_count_anomalies"), list)
-        else []
-    )
+    anomalies = quality.get("row_count_anomalies", []) if isinstance(quality.get("row_count_anomalies"), list) else []
     freshness_assets = (
         quality.get("branch_backed_artifact_freshness", [])
         if isinstance(quality.get("branch_backed_artifact_freshness"), list)
@@ -990,9 +996,7 @@ def _control_room_snapshot_frames(output_dir: Path) -> tuple[pd.DataFrame, pd.Da
 
     latest_run = payload.get("latest_run", {}) if isinstance(payload.get("latest_run"), dict) else {}
     ops_health = payload.get("ops_health", {}) if isinstance(payload.get("ops_health"), dict) else {}
-    operating_rhythm = (
-        payload.get("operating_rhythm", {}) if isinstance(payload.get("operating_rhythm"), dict) else {}
-    )
+    operating_rhythm = payload.get("operating_rhythm", {}) if isinstance(payload.get("operating_rhythm"), dict) else {}
     safety = payload.get("safety", {}) if isinstance(payload.get("safety"), dict) else {}
     qoe = payload.get("qoe", {}) if isinstance(payload.get("qoe"), dict) else {}
     run_selection = payload.get("run_selection", {}) if isinstance(payload.get("run_selection"), dict) else {}
@@ -1044,9 +1048,7 @@ def _control_room_snapshot_frames(output_dir: Path) -> tuple[pd.DataFrame, pd.Da
                     "area": action.get("area"),
                     "title": action.get("title"),
                     "detail": action.get("detail"),
-                    "inspect_targets": "|".join(
-                        str(item).strip() for item in inspect_targets if str(item).strip()
-                    )
+                    "inspect_targets": "|".join(str(item).strip() for item in inspect_targets if str(item).strip())
                     if isinstance(inspect_targets, list)
                     else None,
                     "raw_json": _json_string(action),
@@ -1137,9 +1139,7 @@ def _load_creator_report_family_assets(
     family_df = pd.DataFrame(family_rows, columns=family_columns)
     ranking_df = pd.concat(ranking_frames, ignore_index=True, sort=False) if ranking_frames else pd.DataFrame()
     scene_df = pd.concat(scene_frames, ignore_index=True, sort=False) if scene_frames else pd.DataFrame()
-    scene_seed_df = (
-        pd.concat(scene_seed_frames, ignore_index=True, sort=False) if scene_seed_frames else pd.DataFrame()
-    )
+    scene_seed_df = pd.concat(scene_seed_frames, ignore_index=True, sort=False) if scene_seed_frames else pd.DataFrame()
     return family_df, ranking_df, scene_df, scene_seed_df
 
 
@@ -1662,7 +1662,9 @@ def _build_listener_daily_activity(raw_streaming_history: pd.DataFrame) -> pd.Da
         .mean()
         .reset_index(name="track_stream_share")
     )
-    merged = grouped.merge(platform_lookup, on="played_date", how="left").merge(track_share, on="played_date", how="left")
+    merged = grouped.merge(platform_lookup, on="played_date", how="left").merge(
+        track_share, on="played_date", how="left"
+    )
     return merged[columns].sort_values("played_date").reset_index(drop=True)
 
 
@@ -1733,16 +1735,15 @@ def _build_model_run_summary(
 
     model_summary["val_top1"] = _to_numeric(model_summary.get("val_top1", pd.Series(index=model_summary.index)))
     model_summary["test_top1"] = _to_numeric(model_summary.get("test_top1", pd.Series(index=model_summary.index)))
-    model_summary["val_rank_within_run"] = (
-        model_summary.groupby("run_id")["val_top1"].rank(method="dense", ascending=False)
+    model_summary["val_rank_within_run"] = model_summary.groupby("run_id")["val_top1"].rank(
+        method="dense", ascending=False
     )
-    model_summary["test_rank_within_run"] = (
-        model_summary.groupby("run_id")["test_top1"].rank(method="dense", ascending=False)
+    model_summary["test_rank_within_run"] = model_summary.groupby("run_id")["test_top1"].rank(
+        method="dense", ascending=False
     )
-    model_summary["is_serving_alias"] = (
-        model_summary.get("model_name", pd.Series(index=model_summary.index)).astype(str)
-        == model_summary.get("champion_alias_model_name", pd.Series(index=model_summary.index)).astype(str)
-    )
+    model_summary["is_serving_alias"] = model_summary.get("model_name", pd.Series(index=model_summary.index)).astype(
+        str
+    ) == model_summary.get("champion_alias_model_name", pd.Series(index=model_summary.index)).astype(str)
     for column in columns:
         if column not in model_summary.columns:
             model_summary[column] = None
@@ -1958,10 +1959,9 @@ def _build_creator_market_scene_summary(
             )
             .reset_index()
         )
-        lane_top = (
-            lane.sort_values(["scene_name", "lane_attractiveness_score"], ascending=[True, False])
-            .drop_duplicates(subset=["scene_name"], keep="first")[["scene_name", "representative_artist", "lane_posture"]]
-        )
+        lane_top = lane.sort_values(
+            ["scene_name", "lane_attractiveness_score"], ascending=[True, False]
+        ).drop_duplicates(subset=["scene_name"], keep="first")[["scene_name", "representative_artist", "lane_posture"]]
         summary = summary.merge(lane_grouped, on="scene_name", how="left").merge(lane_top, on="scene_name", how="left")
 
     report_family_count = None
@@ -1971,10 +1971,14 @@ def _build_creator_market_scene_summary(
     for column in columns:
         if column not in summary.columns:
             summary[column] = None
-    return summary[columns].sort_values(
-        ["momentum_score", "priority_now_count", "avg_opportunity_score"],
-        ascending=[False, False, False],
-    ).reset_index(drop=True)
+    return (
+        summary[columns]
+        .sort_values(
+            ["momentum_score", "priority_now_count", "avg_opportunity_score"],
+            ascending=[False, False, False],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def _build_research_platform_status_summary(
@@ -2012,7 +2016,9 @@ def _build_research_platform_status_summary(
     ):
         return _empty_frame(columns)
 
-    maturity = research_platform_maturity_snapshot.iloc[0].to_dict() if not research_platform_maturity_snapshot.empty else {}
+    maturity = (
+        research_platform_maturity_snapshot.iloc[0].to_dict() if not research_platform_maturity_snapshot.empty else {}
+    )
     anchor_run_id = str(maturity.get("anchor_run_id", "") or "").strip()
 
     anchor_profile = None
@@ -2043,7 +2049,9 @@ def _build_research_platform_status_summary(
         claims["benchmark_comparison_ready"] = _to_bool_series(
             claims.get("benchmark_comparison_ready", pd.Series(index=claims.index))
         )
-        live_status = claims.get("live_signal_status", pd.Series(index=claims.index, dtype="object")).astype(str).str.lower()
+        live_status = (
+            claims.get("live_signal_status", pd.Series(index=claims.index, dtype="object")).astype(str).str.lower()
+        )
         blocked_live_signal_count = int(
             (claims["blocked"].fillna(False) & live_status.isin({"ready", "live", "pass", "supported"})).sum()
         )
@@ -2052,7 +2060,11 @@ def _build_research_platform_status_summary(
         )
         if claim_ready_count is None:
             claim_ready_count = int(
-                claims.get("claim_readiness_status", pd.Series(index=claims.index, dtype="object")).astype(str).str.lower().isin({"ready", "pass"}).sum()
+                claims.get("claim_readiness_status", pd.Series(index=claims.index, dtype="object"))
+                .astype(str)
+                .str.lower()
+                .isin({"ready", "pass"})
+                .sum()
             )
         if claim_blocked_count is None:
             claim_blocked_count = int(claims["blocked"].fillna(False).sum())
@@ -2071,7 +2083,9 @@ def _build_research_platform_status_summary(
             benchmarks.get("benchmark_strength_score", pd.Series(index=benchmarks.index))
         )
         comparison_ready_benchmark_count = int(benchmarks["comparison_ready"].fillna(False).sum())
-        strongest = benchmarks.sort_values(["benchmark_strength_score", "benchmark_id"], ascending=[False, True]).iloc[0]
+        strongest = benchmarks.sort_values(["benchmark_strength_score", "benchmark_id"], ascending=[False, True]).iloc[
+            0
+        ]
         if not strongest_benchmark_id:
             strongest_benchmark_id = strongest.get("benchmark_id")
         strongest_benchmark_score = strongest.get("benchmark_strength_score")
@@ -2194,10 +2208,14 @@ def _build_scope_expansion_branch_health(
     for column in columns:
         if column not in health.columns:
             health[column] = None
-    return health[columns].sort_values(
-        ["risk_score", "readiness_score", "branch_key"],
-        ascending=[False, True, True],
-    ).reset_index(drop=True)
+    return (
+        health[columns]
+        .sort_values(
+            ["risk_score", "readiness_score", "branch_key"],
+            ascending=[False, True, True],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def _build_mart_run_quality(model_run_summary: pd.DataFrame) -> pd.DataFrame:
@@ -2240,11 +2258,7 @@ def _build_mart_run_quality(model_run_summary: pd.DataFrame) -> pd.DataFrame:
             }
         )
     )
-    run_counts = (
-        ranked.groupby("run_id", dropna=False)
-        .agg(models_evaluated=("model_name", "count"))
-        .reset_index()
-    )
+    run_counts = ranked.groupby("run_id", dropna=False).agg(models_evaluated=("model_name", "count")).reset_index()
     merged = best_rows.merge(run_counts, on="run_id", how="left")
     for column in columns:
         if column not in merged.columns:
@@ -2306,8 +2320,10 @@ def _build_mart_model_registry(model_run_summary: pd.DataFrame) -> pd.DataFrame:
     for column in columns:
         if column not in merged.columns:
             merged[column] = None
-    return merged[columns].sort_values(["mean_test_top1", "mean_val_top1"], ascending=[False, False]).reset_index(
-        drop=True
+    return (
+        merged[columns]
+        .sort_values(["mean_test_top1", "mean_val_top1"], ascending=[False, False])
+        .reset_index(drop=True)
     )
 
 
@@ -2426,8 +2442,10 @@ def _build_mart_creator_opportunities(creator_ranking_opportunities: pd.DataFram
     for column in columns:
         if column not in merged.columns:
             merged[column] = None
-    return merged[columns].sort_values(["max_opportunity_score", "appearance_count"], ascending=[False, False]).reset_index(
-        drop=True
+    return (
+        merged[columns]
+        .sort_values(["max_opportunity_score", "appearance_count"], ascending=[False, False])
+        .reset_index(drop=True)
     )
 
 
@@ -2453,9 +2471,7 @@ def _build_mart_creator_scene_pressure(creator_scene_summary: pd.DataFrame) -> p
     scene["scene_label_concentration"] = _to_numeric(
         scene.get("scene_label_concentration", pd.Series(index=scene.index))
     )
-    scene["scene_release_pressure"] = _to_numeric(
-        scene.get("scene_release_pressure", pd.Series(index=scene.index))
-    )
+    scene["scene_release_pressure"] = _to_numeric(scene.get("scene_release_pressure", pd.Series(index=scene.index)))
     grouped = (
         scene.groupby("scene_name", dropna=False)
         .agg(
@@ -2485,9 +2501,11 @@ def _build_mart_creator_scene_pressure(creator_scene_summary: pd.DataFrame) -> p
     for column in columns:
         if column not in merged.columns:
             merged[column] = None
-    return merged[columns].sort_values(
-        ["mean_opportunity_score", "family_count"], ascending=[False, False]
-    ).reset_index(drop=True)
+    return (
+        merged[columns]
+        .sort_values(["mean_opportunity_score", "family_count"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
 
 
 def _build_mart_creator_market_watchlist(
@@ -2552,10 +2570,14 @@ def _build_mart_creator_market_watchlist(
     for column in columns:
         if column not in watchlist.columns:
             watchlist[column] = None
-    return watchlist[columns].sort_values(
-        ["market_priority_score", "avg_opportunity_score", "max_days_since_latest_release"],
-        ascending=[False, False, False],
-    ).reset_index(drop=True)
+    return (
+        watchlist[columns]
+        .sort_values(
+            ["market_priority_score", "avg_opportunity_score", "max_days_since_latest_release"],
+            ascending=[False, False, False],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def _build_mart_research_platform_status(research_platform_status_summary: pd.DataFrame) -> pd.DataFrame:
@@ -2584,14 +2606,17 @@ def _build_mart_research_platform_status(research_platform_status_summary: pd.Da
     status = research_platform_status_summary.copy()
     ready = _to_bool_series(status.get("ready_for_external_review", pd.Series(index=status.index))).fillna(False)
     blocked_claims = _to_numeric(status.get("claim_blocked_count", pd.Series(index=status.index))).fillna(0.0)
-    incomplete_locks = _to_numeric(status.get("incomplete_benchmark_lock_count", pd.Series(index=status.index))).fillna(0.0)
-    stale_artifacts = (
-        _to_numeric(status.get("stale_claim_artifact_count", pd.Series(index=status.index))).fillna(0.0)
-        + _to_numeric(status.get("stale_benchmark_manifest_count", pd.Series(index=status.index))).fillna(0.0)
+    incomplete_locks = _to_numeric(status.get("incomplete_benchmark_lock_count", pd.Series(index=status.index))).fillna(
+        0.0
     )
+    stale_artifacts = _to_numeric(status.get("stale_claim_artifact_count", pd.Series(index=status.index))).fillna(
+        0.0
+    ) + _to_numeric(status.get("stale_benchmark_manifest_count", pd.Series(index=status.index))).fillna(0.0)
     status["status_posture"] = "attention"
     status.loc[(blocked_claims > 0) | (incomplete_locks > 0), "status_posture"] = "blocked"
-    status.loc[ready & (blocked_claims <= 0) & (incomplete_locks <= 0) & (stale_artifacts <= 0), "status_posture"] = "ready"
+    status.loc[ready & (blocked_claims <= 0) & (incomplete_locks <= 0) & (stale_artifacts <= 0), "status_posture"] = (
+        "ready"
+    )
     for column in columns:
         if column not in status.columns:
             status[column] = None
@@ -2666,10 +2691,14 @@ def _build_mart_research_claim_watchlist(
     for column in columns:
         if column not in watchlist.columns:
             watchlist[column] = None
-    return watchlist[columns].sort_values(
-        ["watchlist_score", "missing_check_count", "claim_key"],
-        ascending=[False, False, True],
-    ).reset_index(drop=True)
+    return (
+        watchlist[columns]
+        .sort_values(
+            ["watchlist_score", "missing_check_count", "claim_key"],
+            ascending=[False, False, True],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def _build_mart_scope_expansion_health(scope_expansion_branch_health: pd.DataFrame) -> pd.DataFrame:
@@ -2721,10 +2750,14 @@ def _build_mart_scope_expansion_health(scope_expansion_branch_health: pd.DataFra
     for column in columns:
         if column not in health.columns:
             health[column] = None
-    return health[columns].sort_values(
-        ["branch_posture", "risk_reduction_score", "risk_score", "queue_rank"],
-        ascending=[True, False, False, True],
-    ).reset_index(drop=True)
+    return (
+        health[columns]
+        .sort_values(
+            ["branch_posture", "risk_reduction_score", "risk_score", "queue_rank"],
+            ascending=[True, False, False, True],
+        )
+        .reset_index(drop=True)
+    )
 
 
 def build_analytics_warehouse_bundle(
@@ -2816,6 +2849,12 @@ def build_analytics_warehouse_bundle(
     }
 
     silver_listener_daily = _build_listener_daily_activity(bronze_raw_streaming)
+    silver_public_listening_daily = build_daily_spotify_wrapped_comparison(
+        raw_df,
+        edition=2025,
+        scopes=("global", "country"),
+        top_n=10,
+    )
     silver_model_run_summary = _build_model_run_summary(
         bronze_run_manifests,
         bronze_run_results,
@@ -2852,6 +2891,7 @@ def build_analytics_warehouse_bundle(
 
     silver = {
         "listener_daily_activity": silver_listener_daily,
+        "public_listening_daily_comparison": silver_public_listening_daily,
         "model_run_summary": silver_model_run_summary,
         "ops_review_snapshot": silver_ops_review_snapshot,
         "creator_report_family_summary": silver_creator_report_summary,
@@ -2869,16 +2909,26 @@ def build_analytics_warehouse_bundle(
         bronze_creator_market_release_whitespace_atlas,
         silver_creator_market_scene_summary,
     )
-    gold_research_platform_status = _build_mart_research_platform_status(
-        silver_research_platform_status_summary
-    )
+    gold_research_platform_status = _build_mart_research_platform_status(silver_research_platform_status_summary)
     gold_research_claim_watchlist = _build_mart_research_claim_watchlist(
         bronze_research_platform_claim_registry,
         silver_research_platform_status_summary,
     )
     gold_scope_expansion_health = _build_mart_scope_expansion_health(silver_scope_expansion_branch_health)
+    gold_public_listening_daily = build_daily_public_similarity_mart(silver_public_listening_daily)
+    gold_public_listening_trends = build_public_listening_trends(gold_public_listening_daily)
+    public_listening_narratives = build_public_listening_narratives(
+        silver_public_listening_daily,
+        gold_public_listening_daily,
+    )
+    gold_public_listening_daily_narratives = pd.DataFrame(public_listening_narratives["daily"])
+    gold_public_listening_weekly_narratives = pd.DataFrame(public_listening_narratives["weekly"])
 
     gold = {
+        "mart_public_listening_daily_similarity": gold_public_listening_daily,
+        "mart_public_listening_trends": gold_public_listening_trends,
+        "mart_public_listening_daily_narratives": gold_public_listening_daily_narratives,
+        "mart_public_listening_weekly_narratives": gold_public_listening_weekly_narratives,
         "mart_run_quality": gold_run_quality,
         "mart_model_registry": gold_model_registry,
         "mart_ops_overview": gold_ops_overview,
@@ -2946,8 +2996,8 @@ def build_analytics_warehouse_bundle(
         },
         "lineage": [
             "bronze captures locally prepared raw history, run artifacts, control-room snapshots, creator report-family exports, creator-market branch outputs, research-platform branch outputs, and scope-expansion scorecards and strategy cards.",
-            "silver standardizes listener behavior, per-model run summaries, ops review status, creator family summaries, creator-market scene rollups, research-platform status rollups, and scope-expansion branch health.",
-            "gold exposes analytics marts for run quality, model registry, ops overview, creator opportunity pressure, creator-market watchlists, research-platform status tracking, and four-branch scope health.",
+            "silver standardizes listener behavior, daily public-listening comparisons, per-model run summaries, ops review status, creator family summaries, creator-market scene rollups, research-platform status rollups, and scope-expansion branch health.",
+            "gold exposes analytics marts for daily global-versus-U.S. listening similarity, rolling trends and anomalies, daily and weekly explanations, run quality, model registry, ops overview, creator opportunity pressure, creator-market watchlists, research-platform status tracking, and four-branch scope health.",
         ],
     }
     return AnalyticsWarehouseBundle(
@@ -3029,7 +3079,9 @@ def warehouse_manifest_frames(warehouse_root: Path) -> tuple[pd.DataFrame, pd.Da
                 continue
             asset_name = str(asset.get("name", "") or "")
             schema = asset.get("schema", [])
-            schema_records = [record for record in schema if isinstance(record, dict)] if isinstance(schema, list) else []
+            schema_records = (
+                [record for record in schema if isinstance(record, dict)] if isinstance(schema, list) else []
+            )
             expected_columns = [str(record.get("name", "") or "") for record in schema_records]
             branch_freshness = asset.get("branch_freshness", {})
             if not isinstance(branch_freshness, dict):
@@ -3190,9 +3242,7 @@ def verify_analytics_warehouse_artifacts(warehouse_root: Path, *, logger) -> dic
     write_markdown(warehouse_root / "warehouse_verification.md", markdown_lines)
 
     if failures:
-        raise ValueError(
-            "Analytics warehouse verification failed for assets: " + ", ".join(sorted(set(failures)))
-        )
+        raise ValueError("Analytics warehouse verification failed for assets: " + ", ".join(sorted(set(failures))))
 
     logger.info(
         "Analytics warehouse artifacts verified: %s (%d assets)",
@@ -3207,11 +3257,7 @@ def write_analytics_warehouse(bundle: AnalyticsWarehouseBundle, *, logger) -> Pa
     previous_manifest = load_analytics_warehouse_manifest(bundle.root)
     previous_asset_lookup = _manifest_asset_lookup(previous_manifest)
     manifest = dict(bundle.manifest)
-    asset_input_lookup = (
-        manifest.get("asset_inputs", {})
-        if isinstance(manifest.get("asset_inputs", {}), dict)
-        else {}
-    )
+    asset_input_lookup = manifest.get("asset_inputs", {}) if isinstance(manifest.get("asset_inputs", {}), dict) else {}
     layer_payloads: dict[str, list[dict[str, object]]] = {}
     refresh_counts = {
         "built_assets": 0,

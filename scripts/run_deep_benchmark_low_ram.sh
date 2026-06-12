@@ -23,7 +23,7 @@ else
 fi
 LOG_FILE="outputs/logs/${RUN_NAME}.log"
 
-DEEP_ALL="${DEEP_ALL:-dense,gru,transformer,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist}"
+DEEP_ALL="${DEEP_ALL:-sasrec,bert4rec,srgnn,dense,gru,transformer,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist}"
 EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 EXPECTED_MODELS="$DEEP_ALL"

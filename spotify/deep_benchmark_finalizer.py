@@ -11,6 +11,9 @@ from .run_artifacts import safe_read_json, write_csv_rows, write_json, write_mar
 
 
 DEFAULT_DEEP_MODELS: tuple[str, ...] = (
+    "sasrec",
+    "bert4rec",
+    "srgnn",
     "dense",
     "gru",
     "transformer",

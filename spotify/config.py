@@ -7,6 +7,9 @@ import logging
 import sys
 
 DEFAULT_MODEL_NAMES: tuple[str, ...] = (
+    "sasrec",
+    "bert4rec",
+    "srgnn",
     "gru_artist",
     "memory_net_artist",
     "lstm",
@@ -25,6 +28,7 @@ DEFAULT_MODEL_NAMES: tuple[str, ...] = (
 
 CORE_DEEP_MODEL_NAMES: tuple[str, ...] = (
     "dense",
+    "sasrec",
     "gru_artist",
     "gru",
     "memory_net",
@@ -61,6 +65,8 @@ CORE_CLASSICAL_MODEL_NAMES: tuple[str, ...] = (
     "mlp",
     "session_knn",
     "catboost",
+    "lightgbm",
+    "xgboost",
 )
 FAST_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
     "logreg",

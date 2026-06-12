@@ -10,6 +10,7 @@ Requires-Dist: duckdb>=1.1
 Requires-Dist: fastapi>=0.115
 Requires-Dist: google-cloud-storage>=2.18
 Requires-Dist: joblib>=1.4
+Requires-Dist: lightgbm>=4.6
 Requires-Dist: matplotlib>=3.9
 Requires-Dist: numpy>=1.26
 Requires-Dist: opentelemetry-api>=1.36
@@ -26,6 +27,7 @@ Requires-Dist: tensorflow>=2.16
 Requires-Dist: mlflow>=2.17
 Requires-Dist: optuna>=3.6
 Requires-Dist: uvicorn>=0.30
+Requires-Dist: xgboost>=3.0
 Provides-Extra: extras
 Requires-Dist: spotipy>=2.24; extra == "extras"
 Requires-Dist: shap>=0.46; extra == "extras"
@@ -347,6 +349,9 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `PYTHON_BIN` (override Python executable)
 - `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
 - `SPOTIFY_TF_DEVICE_MODE` (`auto`, `cpu`, or `gpu`; `SPOTIFY_FORCE_CPU=1` takes precedence)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TTL_SECONDS` (default `300`; reuses a package-version-aware GPU visibility check)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TIMEOUT_SECONDS` (default `15`; bounds a cold TensorFlow device probe)
+- `SPOTIFY_RESOURCE_REFRESH_GPU_PROBE` (default `0`; set `1` to force a fresh GPU visibility check)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
 - `SPOTIFY_RUN_EAGER` (default `0` in launcher for faster graph execution)
 - `SPOTIFY_STEPS_PER_EXECUTION` (default `64` in launcher)
@@ -933,31 +938,75 @@ The deployment asset map lives in `deploy/README.md`.
 
 ## Public Comparison
 
-Spotify's developer policy does not allow building derived listenership metrics or benchmarking from Spotify public content, so the "compare my habits to the public" workflow uses Last.fm public charts instead.
+Compare your date-aligned listening history with Spotify's official 2025 Wrapped global and U.S. top lists:
 
-Compare your recent listening to public artist charts:
+```bash
+python -m spotify.compare_public \
+  --provider spotify-wrapped \
+  --year 2025 \
+  --scope both \
+  --top-n 10
+```
+
+The offline report covers:
+
+- artists and songs ranked by your stream counts
+- podcasts ranked by your listening duration
+- global-versus-U.S. ranked overlap and a closest-scope summary
+- your play and listening-time concentration on public-top entities
+- monthly alignment throughout the January-to-mid-November Wrapped window
+- distinctive personal entries and public entries that are new to you
+
+Spotify publishes the top rankings but not worldwide or U.S. duration distributions. The report therefore does not invent a population listening-time average: duration metrics show how much of your own time was spent on public-top artists, songs, and podcasts.
+
+Optional genre detail uses Last.fm community tags as a clearly labeled proxy. For example:
 
 ```bash
 LASTFM_API_KEY=... \
 python -m spotify.compare_public \
-  --scope country \
-  --country "United States" \
-  --lookback-days 180 \
-  --top-n 50
+  --provider spotify-wrapped \
+  --scope both \
+  --genre hip-hop
 ```
 
-Or use the Make target:
+This reports your tagged hip-hop play/time share and overlap with Last.fm's public hip-hop artist chart. It is not presented as a Spotify genre market-share estimate.
+
+The earlier rolling Last.fm artist comparison remains available:
 
 ```bash
-make compare-public EXTRA_ARGS='--scope global --lookback-days 90 --top-n 50'
+make compare-public EXTRA_ARGS='--provider lastfm --scope global --lookback-days 90 --top-n 50'
 ```
 
 Outputs are written under `outputs/analysis/public_compare/` as both JSON and Markdown summaries. The report highlights:
 
-- shared artists between your recent top artists and the public chart
-- how much of your recent listening is concentrated on public-top artists
-- your most distinctive recent artists
-- public-chart artists that are new to you
+- the exact personal-history and public-reference date coverage
+- per-dimension similarity, overlap, and time concentration
+- monthly changes in alignment
+- the methodological and data-availability boundaries
+
+Spotify's developer policy prohibits using Spotify Platform content to create derived listenership metrics or benchmarks. This workflow uses Spotify's separately published aggregate Wrapped lists and does not derive public metrics from Spotify API content.
+
+The analytics refresh also calculates the comparison for every date with listening history:
+
+- `public_listening_daily_comparison`: one row per date, public scope, and dimension
+- `mart_public_listening_daily_similarity`: global and U.S. scores side by side
+- `mart_public_listening_trends`: rolling 7/30-day signals, scope streaks, and anomaly flags
+- `mart_public_listening_daily_narratives`: deterministic explanations for each listening day
+- `mart_public_listening_weekly_narratives`: Monday-based weekly explanations
+- `public_listening_daily_trend`: ordered DuckDB view over the daily mart
+- `public_listening_similarity_anomalies`: DuckDB view containing flagged trend anomalies
+
+Dates inside January 1 through November 15, 2025 are marked `date_aligned`. Earlier and later dates are retained as explicitly labeled projections against the fixed 2025 benchmark.
+
+```sql
+SELECT *
+FROM public_listening_daily_trend
+ORDER BY listening_date DESC, dimension;
+```
+
+Additional extension modules support validated custom reference years, cached
+genre/tag comparisons, and read-only DuckDB/Parquet dashboard queries. See
+[`docs/listening_comparison_roadmap.md`](docs/listening_comparison_roadmap.md).
 
 ## Spotify Public Insights
 

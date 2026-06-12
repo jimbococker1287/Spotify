@@ -12,6 +12,7 @@ spotify/aws_athena_sql.py
 spotify/backtesting.py
 spotify/benchmark_contract.py
 spotify/benchmarks.py
+spotify/bert4rec_model.py
 spotify/branch_portfolio.py
 spotify/catalog_utils.py
 spotify/causal_friction.py
@@ -39,6 +40,7 @@ spotify/data_preparation.py
 spotify/data_quality.py
 spotify/day_90_launch.py
 spotify/deep_benchmark_finalizer.py
+spotify/deep_tuning.py
 spotify/deployment_registry.py
 spotify/digital_twin.py
 spotify/drift.py
@@ -52,7 +54,9 @@ spotify/governance.py
 spotify/group_auto_dj.py
 spotify/journey_planner.py
 spotify/lastfm.py
+spotify/lightgbm_model.py
 spotify/listener_archetypes.py
+spotify/model_loading.py
 spotify/model_types.py
 spotify/modeling.py
 spotify/monitoring.py
@@ -132,6 +136,7 @@ spotify/probability_bundles.py
 spotify/production_smoke.py
 spotify/project_health.py
 spotify/public_catalog.py
+spotify/public_genre_comparison.py
 spotify/public_insights.py
 spotify/public_insights_cli.py
 spotify/public_insights_core.py
@@ -139,6 +144,11 @@ spotify/public_insights_creator_brief.py
 spotify/public_insights_graph.py
 spotify/public_insights_handlers.py
 spotify/public_insights_index.py
+spotify/public_listening_narratives.py
+spotify/public_listening_reference.py
+spotify/public_listening_service.py
+spotify/public_listening_trends.py
+spotify/public_reference_catalog.py
 spotify/quant_decision_lab.py
 spotify/ranking.py
 spotify/recommender_safety.py
@@ -173,6 +183,7 @@ spotify/run_tradeoffs.py
 spotify/runtime.py
 spotify/safe_policy.py
 spotify/safety_platform.py
+spotify/sasrec_model.py
 spotify/scope_expansion_lab.py
 spotify/service_api.py
 spotify/service_auth.py
@@ -181,6 +192,7 @@ spotify/serving_bundle.py
 spotify/session_knn.py
 spotify/show_ready_backfill.py
 spotify/show_ready_maintenance.py
+spotify/srgnn_model.py
 spotify/storage_report.py
 spotify/stress_test.py
 spotify/taste_os_demo.py
@@ -195,7 +207,14 @@ spotify/training.py
 spotify/training_preflight.py
 spotify/tuning.py
 spotify/uncertainty.py
+spotify/xgboost_model.py
 spotify_extended_pipeline.egg-info/PKG-INFO
+spotify_extended_pipeline.egg-info/PKG-INFO 2
+spotify_extended_pipeline.egg-info/PKG-INFO 3
+spotify_extended_pipeline.egg-info/PKG-INFO 4
+spotify_extended_pipeline.egg-info/SOURCES 2.txt
+spotify_extended_pipeline.egg-info/SOURCES 3.txt
+spotify_extended_pipeline.egg-info/SOURCES 4.txt
 spotify_extended_pipeline.egg-info/SOURCES.txt
 spotify_extended_pipeline.egg-info/dependency_links.txt
 spotify_extended_pipeline.egg-info/entry_points.txt
@@ -208,6 +227,7 @@ tests/test_athena_export.py
 tests/test_audio_features.py
 tests/test_benchmark_contract.py
 tests/test_benchmarks_features.py
+tests/test_bert4rec_model.py
 tests/test_branch_portfolio.py
 tests/test_branch_portfolio_cli_smoke.py
 tests/test_champion_alias.py
@@ -231,6 +251,7 @@ tests/test_data_discovery.py
 tests/test_data_quality_gate.py
 tests/test_day_90_launch.py
 tests/test_deep_benchmark_finalizer.py
+tests/test_deep_tuning.py
 tests/test_deploy_manifests.py
 tests/test_deployment_registry.py
 tests/test_digital_twin.py
@@ -242,6 +263,7 @@ tests/test_front_door.py
 tests/test_front_door_cli_smoke.py
 tests/test_governance_gate.py
 tests/test_lastfm.py
+tests/test_lightgbm_model.py
 tests/test_listener_archetypes.py
 tests/test_moonshot_lab.py
 tests/test_outward_package.py
@@ -252,6 +274,7 @@ tests/test_pipeline_runtime_analysis_artifacts.py
 tests/test_pipeline_runtime_cleanup.py
 tests/test_pipeline_runtime_dependency_bundle.py
 tests/test_pipeline_runtime_experiments.py
+tests/test_pipeline_runtime_optuna_stage.py
 tests/test_pipeline_runtime_runner_setup.py
 tests/test_pipeline_runtime_shortlists.py
 tests/test_predict_cli_smoke.py
@@ -262,9 +285,15 @@ tests/test_production_smoke.py
 tests/test_profiles_and_ensemble.py
 tests/test_project_health.py
 tests/test_public_catalog.py
+tests/test_public_genre_comparison.py
 tests/test_public_insights.py
 tests/test_public_insights_cli_smoke.py
 tests/test_public_insights_creator_brief.py
+tests/test_public_listening_narratives.py
+tests/test_public_listening_reference.py
+tests/test_public_listening_service.py
+tests/test_public_listening_trends.py
+tests/test_public_reference_catalog.py
 tests/test_quant_decision_lab.py
 tests/test_ranking_metrics.py
 tests/test_recommender_safety_platform.py
@@ -285,6 +314,7 @@ tests/test_run_tradeoffs.py
 tests/test_runtime_acceleration.py
 tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
+tests/test_sasrec_model.py
 tests/test_scope_expansion_lab.py
 tests/test_service_api.py
 tests/test_service_api_cli_smoke.py
@@ -292,6 +322,7 @@ tests/test_serving_analytics_and_session_knn.py
 tests/test_shared_helpers.py
 tests/test_show_ready_backfill.py
 tests/test_show_ready_maintenance.py
+tests/test_srgnn_model.py
 tests/test_storage_report.py
 tests/test_stress_test.py
 tests/test_taste_os_demo.py
@@ -308,3 +339,4 @@ tests/test_training_helpers.py
 tests/test_tuning_cache.py
 tests/test_tuning_helpers.py
 tests/test_uncertainty.py
+tests/test_xgboost_model.py

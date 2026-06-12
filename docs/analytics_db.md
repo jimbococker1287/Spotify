@@ -206,6 +206,40 @@ order by played_date desc
 limit 30;
 ```
 
+Daily global-versus-U.S. public-listening similarity:
+
+```sql
+select
+  listening_date,
+  dimension,
+  reference_alignment,
+  closer_scope,
+  global_similarity,
+  united_states_similarity,
+  global_duration_share_on_public_top,
+  united_states_duration_share_on_public_top
+from public_listening_daily_trend
+order by listening_date desc, dimension;
+```
+
+The 2025 reference is date-aligned from January 1 through November 15, 2025. Other dates are labeled as historical or post-window projections against that fixed benchmark.
+
+Flagged daily similarity anomalies:
+
+```sql
+select listening_date, dimension, closer_scope, similarity_anomaly_flag
+from public_listening_similarity_anomalies
+order by listening_date desc, dimension;
+```
+
+Daily explanations:
+
+```sql
+select listening_date, headline, concise_summary, caveats
+from mart_public_listening_daily_narratives
+order by listening_date desc;
+```
+
 Creator whitespace:
 
 ```sql

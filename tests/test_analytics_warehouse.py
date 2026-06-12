@@ -507,7 +507,9 @@ def _write_minimal_research_platform_branch(output_dir: Path) -> None:
                 "research_artifact_ratio": 1.0,
                 "research_stage": "review_ready",
                 "claim_pack_attached": True,
-                "claim_pack_path": str((output_dir / "analysis" / "research_claims" / "research_claims.json").resolve()),
+                "claim_pack_path": str(
+                    (output_dir / "analysis" / "research_claims" / "research_claims.json").resolve()
+                ),
                 "claim_pack_freshness_status": "fresh",
                 "claim_pack_stale_source_path": "",
                 "claim_pack_stale_source_count": 0,
@@ -515,7 +517,9 @@ def _write_minimal_research_platform_branch(output_dir: Path) -> None:
                 "run_manifest_timestamp": "2026-01-01T00:04:00+00:00",
                 "run_manifest_age_hours": 1.0,
                 "benchmark_protocol_path": str((output_dir / "runs" / "run_a" / "benchmark_protocol.json").resolve()),
-                "safety_platform_contract_path": str((output_dir / "runs" / "run_a" / "safety_platform_contract.json").resolve()),
+                "safety_platform_contract_path": str(
+                    (output_dir / "runs" / "run_a" / "safety_platform_contract.json").resolve()
+                ),
                 "target_drift_jsd": 0.218,
                 "test_selective_risk": 0.372,
                 "test_abstention_rate": 0.241,
@@ -556,7 +560,9 @@ def _write_minimal_research_platform_branch(output_dir: Path) -> None:
                 "manifest_stale_source_count": 0,
                 "manifest_age_hours": 2.0,
                 "summary_path": str((output_dir / "history" / "benchmark_lock_smokebench_summary.csv").resolve()),
-                "significance_path": str((output_dir / "history" / "benchmark_lock_smokebench_significance.csv").resolve()),
+                "significance_path": str(
+                    (output_dir / "history" / "benchmark_lock_smokebench_significance.csv").resolve()
+                ),
                 "benchmark_strength_score": 0.73,
                 "manifest_path": str((output_dir / "history" / "benchmark_lock_smokebench_manifest.json").resolve()),
             }
@@ -951,11 +957,7 @@ def _manifest_asset_lookup(manifest: dict[str, object]) -> dict[str, dict[str, o
 
 
 def _asset_refs_by_name(rows: list[dict[str, object]]) -> set[str]:
-    return {
-        f"{row.get('layer')}.{row.get('asset_name')}"
-        for row in rows
-        if isinstance(row, dict)
-    }
+    return {f"{row.get('layer')}.{row.get('asset_name')}" for row in rows if isinstance(row, dict)}
 
 
 def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None:
@@ -982,6 +984,7 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert (warehouse_root / "bronze" / "scope_expansion_scorecard.parquet").exists()
     assert (warehouse_root / "bronze" / "scope_expansion_strategy_cards.parquet").exists()
     assert (warehouse_root / "silver" / "model_run_summary.parquet").exists()
+    assert (warehouse_root / "silver" / "public_listening_daily_comparison.parquet").exists()
     assert (warehouse_root / "silver" / "creator_market_scene_summary.parquet").exists()
     assert (warehouse_root / "silver" / "research_platform_status_summary.parquet").exists()
     assert (warehouse_root / "silver" / "scope_expansion_branch_health.parquet").exists()
@@ -989,12 +992,30 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
     assert (warehouse_root / "gold" / "mart_creator_market_watchlist.parquet").exists()
     assert (warehouse_root / "gold" / "mart_research_platform_status.parquet").exists()
     assert (warehouse_root / "gold" / "mart_scope_expansion_health.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_public_listening_daily_similarity.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_public_listening_trends.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_public_listening_daily_narratives.parquet").exists()
+    assert (warehouse_root / "gold" / "mart_public_listening_weekly_narratives.parquet").exists()
 
     control_room_snapshot = pd.read_parquet(warehouse_root / "bronze" / "control_room_snapshot.parquet")
     assert control_room_snapshot.loc[0, "selected_run_id"] == "run_a"
 
     model_run_summary = pd.read_parquet(warehouse_root / "silver" / "model_run_summary.parquet")
     assert model_run_summary.loc[0, "is_serving_alias"]
+
+    public_daily = pd.read_parquet(warehouse_root / "silver" / "public_listening_daily_comparison.parquet")
+    assert len(public_daily) == 6
+    assert set(public_daily["reference_alignment"]) == {"post_window_projection"}
+
+    public_daily_mart = pd.read_parquet(warehouse_root / "gold" / "mart_public_listening_daily_similarity.parquet")
+    assert len(public_daily_mart) == 3
+    public_trends = pd.read_parquet(warehouse_root / "gold" / "mart_public_listening_trends.parquet")
+    assert len(public_trends) == 3
+    assert "global_similarity_7d_mean" in public_trends.columns
+    daily_narratives = pd.read_parquet(warehouse_root / "gold" / "mart_public_listening_daily_narratives.parquet")
+    weekly_narratives = pd.read_parquet(warehouse_root / "gold" / "mart_public_listening_weekly_narratives.parquet")
+    assert len(daily_narratives) == 1
+    assert len(weekly_narratives) == 1
 
     ops_overview = pd.read_parquet(warehouse_root / "gold" / "mart_ops_overview.parquet")
     assert ops_overview.loc[0, "latest_run_id"] == "run_a"
@@ -1053,6 +1074,24 @@ def test_build_analytics_warehouse_writes_curated_layers(tmp_path: Path) -> None
         for edge in lineage_report["lineage"]["edges"]
     }
     assert ("bronze", "raw_streaming_history", "silver", "listener_daily_activity") in lineage_edges
+    assert (
+        "bronze",
+        "raw_streaming_history",
+        "silver",
+        "public_listening_daily_comparison",
+    ) in lineage_edges
+    assert (
+        "silver",
+        "public_listening_daily_comparison",
+        "gold",
+        "mart_public_listening_daily_similarity",
+    ) in lineage_edges
+    assert (
+        "gold",
+        "mart_public_listening_daily_similarity",
+        "gold",
+        "mart_public_listening_trends",
+    ) in lineage_edges
     assert ("silver", "creator_market_scene_summary", "gold", "mart_creator_market_watchlist") in lineage_edges
     assert ("silver", "research_platform_status_summary", "gold", "mart_research_platform_status") in lineage_edges
     assert ("bronze", "scope_expansion_scorecard", "silver", "scope_expansion_branch_health") in lineage_edges
@@ -1167,10 +1206,7 @@ def test_build_analytics_warehouse_reports_row_count_anomalies(tmp_path: Path) -
 
     lineage_report = json.loads((warehouse_root / "warehouse_lineage.json").read_text(encoding="utf-8"))
     anomalies = lineage_report["quality"]["row_count_anomalies"]
-    anomaly_keys = {
-        (row["layer"], row["asset_name"], row["type"])
-        for row in anomalies
-    }
+    anomaly_keys = {(row["layer"], row["asset_name"], row["type"]) for row in anomalies}
     assert lineage_report["quality"]["summary"]["row_count_anomaly_count"] >= 1
     assert (
         "bronze",
@@ -1268,6 +1304,9 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
             FROM control_room_snapshot
             """
         ).fetchone()
+        public_daily_count = con.execute("SELECT COUNT(*) FROM public_listening_daily_comparison").fetchone()
+        public_trend_count = con.execute("SELECT COUNT(*) FROM public_listening_daily_trend").fetchone()
+        public_narrative_count = con.execute("SELECT COUNT(*) FROM mart_public_listening_daily_narratives").fetchone()
 
     assert ops_row == ("run_a", "attention", "stale")
     assert creator_row == ("Artist X", 1)
@@ -1295,3 +1334,6 @@ def test_refresh_analytics_database_registers_warehouse_marts(tmp_path: Path) ->
     assert metadata_row[3] is True
     assert metadata_row[4]
     assert selected_run_row == ("run_a",)
+    assert public_daily_count == (6,)
+    assert public_trend_count == (3,)
+    assert public_narrative_count == (1,)

@@ -23,21 +23,70 @@ def run_deep_model_training(
         context.logger.info("Skipping deep models for this run.")
         return None
 
+    deep_optuna_models = tuple(
+        name
+        for name in context.config.model_names
+        if name in ("sasrec", "bert4rec", "srgnn")
+    )
+    deep_optuna_trials_raw = os.getenv("SPOTIFY_DEEP_OPTUNA_TRIALS", "").strip()
+    if deep_optuna_trials_raw:
+        try:
+            deep_optuna_trials = max(0, int(deep_optuna_trials_raw))
+        except ValueError:
+            deep_optuna_trials = 0
+    else:
+        deep_optuna_trials = (
+            2
+            if context.config.enable_optuna
+            and context.config.profile in ("experimental", "full")
+            and deep_optuna_models
+            else 0
+        )
+    deep_model_params: dict[str, dict[str, object]] = {}
+    if deep_optuna_trials > 0 and deep_optuna_models:
+        from .deep_tuning import run_deep_optuna_tuning
+
+        tuning_results = run_deep_optuna_tuning(
+            data=context.prepared,
+            selected_models=deep_optuna_models,
+            trials=deep_optuna_trials,
+            epochs=max(1, min(3, context.config.epochs)),
+            max_train_rows=int(os.getenv("SPOTIFY_DEEP_OPTUNA_TRAIN_ROWS", "12000")),
+            max_val_rows=int(os.getenv("SPOTIFY_DEEP_OPTUNA_VAL_ROWS", "4000")),
+            random_seed=context.config.random_seed,
+            output_dir=context.run_dir / "optuna",
+            logger=context.logger,
+        )
+        deep_model_params = {
+            result.model_name: dict(result.best_params)
+            for result in tuning_results
+        }
+        if tuning_results:
+            context.artifact_paths.append(context.run_dir / "optuna" / "deep_optuna_results.json")
+
     with context.phase_recorder.phase(
         "deep_model_training",
         model_names=list(context.config.model_names),
         batch_size=context.config.batch_size,
         epochs=context.config.epochs,
     ) as phase:
-        deep_model_names_to_build = tuple(deep_cache_plan.miss_model_names) if deep_cache_plan is not None else context.config.model_names
+        deep_tuning_active = bool(deep_model_params)
+        deep_model_names_to_build = (
+            context.config.model_names
+            if deep_tuning_active
+            else (tuple(deep_cache_plan.miss_model_names) if deep_cache_plan is not None else context.config.model_names)
+        )
         model_builders = None
         if deep_model_names_to_build:
-            model_builders = deps.build_model_builders(
-                sequence_length=context.config.sequence_length,
-                num_artists=context.prepared.num_artists,
-                num_ctx=context.prepared.num_ctx,
-                selected_names=deep_model_names_to_build,
-            )
+            builder_kwargs = {
+                "sequence_length": context.config.sequence_length,
+                "num_artists": context.prepared.num_artists,
+                "num_ctx": context.prepared.num_ctx,
+                "selected_names": deep_model_names_to_build,
+            }
+            if deep_model_params:
+                builder_kwargs["model_params_by_name"] = deep_model_params
+            model_builders = deps.build_model_builders(**builder_kwargs)
 
         disable_monitor = os.getenv("SPOTIFY_DISABLE_MONITOR", "auto").strip().lower()
         monitor_enabled = bool(deep_model_names_to_build)
@@ -59,10 +108,10 @@ def run_deep_model_training(
                 strategy=strategy,
                 logger=context.logger,
                 random_seed=context.config.random_seed,
-                cache_root=context.config.output_dir / "cache" / "deep_training",
-                cache_fingerprint=context.cache_fingerprint,
+                cache_root=(None if deep_tuning_active else context.config.output_dir / "cache" / "deep_training"),
+                cache_fingerprint=("" if deep_tuning_active else context.cache_fingerprint),
                 cache_stats_out=deep_cache_stats,
-                cache_plan=deep_cache_plan,
+                cache_plan=(None if deep_tuning_active else deep_cache_plan),
             )
         finally:
             if monitor is not None:
@@ -172,6 +221,8 @@ def run_deep_model_training(
             deep_cache_stats.get("screening_screened_out_model_names", [])
         )
         phase["reporting_cache_reused"] = bool(restored_reporting is not None)
+        phase["deep_optuna_trials"] = int(deep_optuna_trials)
+        phase["deep_optuna_models"] = list(deep_model_params)
         return model_builders
 
 

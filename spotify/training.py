@@ -273,6 +273,9 @@ def _deep_training_source_digest() -> str:
     sources = [
         Path(__file__).resolve(),
         Path(__file__).with_name("modeling.py").resolve(),
+        Path(__file__).with_name("sasrec_model.py").resolve(),
+        Path(__file__).with_name("bert4rec_model.py").resolve(),
+        Path(__file__).with_name("srgnn_model.py").resolve(),
     ]
     hasher = hashlib.sha256()
     for path in sources:
@@ -1114,6 +1117,53 @@ def train_and_evaluate_models(
             "ctx_input": np.ascontiguousarray(ctx_values, dtype="float32"),
         }
 
+    def _run_bert4rec_cloze_pretraining(model, model_name: str) -> None:
+        if model_name != "bert4rec":
+            return
+        from .bert4rec_model import build_cloze_pretraining_batch
+
+        max_source_rows = _parse_pos_int(os.getenv("SPOTIFY_BERT4REC_PRETRAIN_ROWS"), 20000)
+        pretrain_epochs = _parse_pos_int(os.getenv("SPOTIFY_BERT4REC_PRETRAIN_EPOCHS"), 2)
+        source_selector = _sample_rows(len(data.y_train), max_source_rows, seed_offset=41)
+        cloze = build_cloze_pretraining_batch(
+            data.X_seq_train[source_selector],
+            data.X_ctx_train[source_selector],
+            data.num_artists,
+            mask_probability=0.15,
+            seed=random_seed,
+        )
+        inputs = {
+            "seq_input": np.asarray(cloze.seq_input, dtype="int32"),
+            "ctx_input": np.asarray(cloze.ctx_input, dtype="float32"),
+        }
+        targets = np.asarray(cloze.artist_output, dtype="int32")
+        rng = np.random.default_rng(random_seed + 43)
+        logger.info(
+            "[%s] Cloze pretraining: source_rows=%d masked_examples=%d epochs=%d",
+            model_name,
+            len(source_selector),
+            len(targets),
+            pretrain_epochs,
+        )
+        for epoch in range(pretrain_epochs):
+            order = rng.permutation(len(targets))
+            losses: list[float] = []
+            for start in range(0, len(order), batch_size):
+                selector = order[start : start + batch_size]
+                metrics = model.train_on_batch(
+                    _slice_payload(inputs, selector),
+                    targets[selector],
+                    return_dict=True,
+                )
+                losses.append(float(np.asarray(metrics.get("loss", np.nan))))
+            logger.info(
+                "[%s] Cloze epoch %d/%d loss=%.4f",
+                model_name,
+                epoch + 1,
+                pretrain_epochs,
+                float(np.nanmean(losses)) if losses else float("nan"),
+            )
+
     def _slice_payload(payload, selector):
         if payload is None:
             return None
@@ -1401,7 +1451,9 @@ def train_and_evaluate_models(
                 )
                 monitor_metric = "val_artist_output_sparse_categorical_accuracy"
 
-            _load_warm_start_weights(model, name)
+            warm_started = _load_warm_start_weights(model, name)
+            if not warm_started:
+                _run_bert4rec_cloze_pretraining(model, name)
 
             checkpoint_path = output_dir / f"best_{name}.keras"
             cbs = [

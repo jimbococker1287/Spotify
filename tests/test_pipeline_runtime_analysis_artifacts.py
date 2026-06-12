@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import numpy as np
 
 from spotify.pipeline_runtime_analysis import PipelineAnalysisContext
 from spotify.pipeline_runtime_analysis_artifacts import run_analysis_artifacts
@@ -119,3 +122,110 @@ def test_run_analysis_artifacts_reuses_cached_phase_outputs(tmp_path: Path) -> N
     assert (second_run_dir / "analysis" / "robustness_summary.json").exists()
     assert (second_run_dir / "analysis" / "policy_simulation_summary.json").exists()
     assert (second_run_dir / "analysis" / "friction_summary.json").exists()
+
+
+def test_run_analysis_artifacts_reuses_cached_probability_ensemble(tmp_path: Path) -> None:
+    build_count = 0
+
+    def build_context(run_dir: Path) -> PipelineAnalysisContext:
+        bundle_path = run_dir / "prediction_bundles" / "classical_logreg.npz"
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            bundle_path,
+            val_proba=np.array([[0.7, 0.3]], dtype="float32"),
+            test_proba=np.array([[0.6, 0.4]], dtype="float32"),
+        )
+        fixed_timestamp_ns = 1_780_000_000_000_000_000
+        os.utime(bundle_path, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
+        return PipelineAnalysisContext(
+            artifact_paths=[],
+            artist_labels=["A", "B"],
+            backtest_rows=[],
+            cache_info_payload={"fingerprint": "prepared-ensemble"},
+            classical_feature_bundle=None,
+            config=SimpleNamespace(
+                output_dir=tmp_path / "outputs",
+                sequence_length=5,
+                random_seed=42,
+                enable_conformal=False,
+                conformal_alpha=0.10,
+                classical_max_train_samples=256,
+                enable_friction_analysis=False,
+                enable_moonshot_lab=False,
+            ),
+            history_dir=tmp_path / "outputs" / "history",
+            logger=_logger(f"ensemble-{run_dir.name}"),
+            manifest_path=run_dir / "run_manifest.json",
+            optuna_rows=[],
+            phase_recorder=RunPhaseRecorder(run_id=run_dir.name),
+            prepared=SimpleNamespace(),
+            raw_df=None,
+            result_rows=[
+                {
+                    "model_name": "logreg",
+                    "model_type": "classical",
+                    "val_top1": 0.7,
+                    "test_top1": 0.6,
+                    "prediction_bundle_path": str(bundle_path),
+                }
+            ],
+            run_classical_models=True,
+            run_dir=run_dir,
+            run_id=run_dir.name,
+        )
+
+    def _build_ensemble(*, run_dir: Path, **_kwargs):
+        nonlocal build_count
+        build_count += 1
+        bundle_path = _write_artifact(
+            run_dir / "prediction_bundles" / "ensemble_blended_ensemble.npz",
+            "ensemble",
+        )
+        summary_path = run_dir / "analysis" / "ensemble_blended_ensemble_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            f'{{"prediction_bundle_path": "{bundle_path}"}}',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            row={
+                "model_name": "blended_ensemble",
+                "model_type": "ensemble",
+                "val_top1": 0.8,
+                "test_top1": 0.75,
+                "fit_seconds": 12.0,
+                "prediction_bundle_path": str(bundle_path),
+            },
+            artifact_paths=[bundle_path, summary_path],
+        )
+
+    deps = SimpleNamespace(
+        build_probability_ensemble=_build_ensemble,
+        run_extended_evaluation=lambda **_kwargs: [],
+        run_drift_diagnostics=lambda **_kwargs: [],
+        run_robustness_slice_evaluation=lambda **_kwargs: [],
+        run_policy_simulation=lambda **_kwargs: [],
+        run_friction_proxy_analysis=lambda **_kwargs: [],
+        run_moonshot_lab=lambda **_kwargs: [],
+    )
+
+    first_context = build_context(tmp_path / "outputs" / "runs" / "run_a")
+    run_analysis_artifacts(context=first_context, deps=deps)
+    second_context = build_context(tmp_path / "outputs" / "runs" / "run_b")
+    run_analysis_artifacts(context=second_context, deps=deps)
+
+    assert build_count == 1
+    ensemble_row = next(
+        row for row in second_context.result_rows if row["model_name"] == "blended_ensemble"
+    )
+    expected_bundle_path = (
+        second_context.run_dir / "prediction_bundles" / "ensemble_blended_ensemble.npz"
+    )
+    assert ensemble_row["prediction_bundle_path"] == str(expected_bundle_path)
+    assert expected_bundle_path.exists()
+    phase_records = second_context.phase_recorder.summary(final_status="success")["phases"]
+    assert any(
+        phase["phase_name"] == "probability_ensemble"
+        and phase["metadata"].get("cache_hit") is True
+        for phase in phase_records
+    )

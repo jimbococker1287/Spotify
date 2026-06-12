@@ -11,6 +11,7 @@ import time
 import joblib
 import numpy as np
 import pandas as pd
+import pytest
 
 from spotify.analytics_db import refresh_analytics_database
 from spotify.governance import evaluate_champion_gate
@@ -359,3 +360,29 @@ def test_analytics_db_refresh_uses_fallback_db_when_primary_is_locked(tmp_path: 
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+
+
+def test_duckdb_connection_stops_retrying_on_external_lock(monkeypatch, tmp_path: Path) -> None:
+    import spotify.analytics_db as analytics_db
+
+    calls = 0
+
+    class _DuckDB:
+        @staticmethod
+        def connect(_path: str):
+            nonlocal calls
+            calls += 1
+            raise OSError("IO Error: Could not set lock on file; Conflicting lock is held")
+
+    monkeypatch.setattr(analytics_db.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(OSError, match="Could not set lock"):
+        analytics_db._connect_duckdb_with_retries(
+            duckdb=_DuckDB(),
+            target_path=tmp_path / "locked.duckdb",
+            retries=5,
+            sleep_seconds=1.0,
+            stop_on_lock=True,
+        )
+
+    assert calls == 1

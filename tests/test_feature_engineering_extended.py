@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -103,7 +104,7 @@ def test_prepare_training_data_builds_expected_sequences(tmp_path) -> None:
     rows = 10
     df = pd.DataFrame(
         {
-            "ts": pd.date_range("2026-01-01", periods=rows, freq="h"),
+            "ts": pd.date_range("2026-01-01", periods=rows, freq="15min"),
             "master_metadata_album_artist_name": [f"artist_{idx}" for idx in range(rows)],
             "artist_label": np.arange(rows, dtype="int32"),
             "skipped": np.array([0, 1] * 5, dtype="float32"),
@@ -122,10 +123,64 @@ def test_prepare_training_data_builds_expected_sequences(tmp_path) -> None:
     )
 
     total_sequences = len(prepared.X_seq_train) + len(prepared.X_seq_val) + len(prepared.X_seq_test)
-    assert total_sequences == 6
+    assert total_sequences == 7
     assert np.array_equal(prepared.X_seq_train[0], np.array([0, 1, 2], dtype="int32"))
     assert int(prepared.y_train[0]) == 3
     assert float(prepared.y_skip_train[0]) == 1.0
+
+
+def test_prepare_training_data_uses_pre_target_context_and_rejects_cross_session_windows(tmp_path) -> None:
+    logger = logging.getLogger("spotify.test.prepare-data.leakage")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    timestamps = pd.to_datetime(
+        [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+            "2026-01-01T00:10:00Z",
+            "2026-01-01T00:15:00Z",
+            "2026-01-01T02:00:00Z",
+            "2026-01-01T02:05:00Z",
+            "2026-01-01T02:10:00Z",
+            "2026-01-01T02:15:00Z",
+        ]
+    )
+    df = pd.DataFrame(
+        {
+            "ts": timestamps,
+            "master_metadata_album_artist_name": [f"artist_{idx}" for idx in range(8)],
+            "artist_label": np.arange(8, dtype="int32"),
+            "skipped": np.arange(8, dtype="float32") % 2,
+        }
+    )
+    for idx, column in enumerate(CONTEXT_FEATURES):
+        if column in df.columns:
+            continue
+        df[column] = np.arange(8, dtype="float32") + float(idx)
+    df["hour"] = np.arange(8, dtype="float32")
+
+    prepared = prepare_training_data(
+        df=df,
+        sequence_length=2,
+        scaler_path=tmp_path / "context_scaler.joblib",
+        logger=logger,
+    )
+
+    all_sequences = np.concatenate(
+        [prepared.X_seq_train, prepared.X_seq_val, prepared.X_seq_test],
+        axis=0,
+    )
+    assert all_sequences.tolist() == [[0, 1], [1, 2], [4, 5], [5, 6]]
+
+    scaler = joblib.load(tmp_path / "context_scaler.joblib")
+    hour_idx = list(CONTEXT_FEATURES).index("hour")
+    all_context = np.concatenate(
+        [prepared.X_ctx_train, prepared.X_ctx_val, prepared.X_ctx_test],
+        axis=0,
+    )
+    restored_context = scaler.inverse_transform(all_context)
+    assert restored_context[:, hour_idx].tolist() == [1.0, 2.0, 5.0, 6.0]
 
 
 def test_append_technical_log_features_zero_fills_when_export_missing(tmp_path) -> None:

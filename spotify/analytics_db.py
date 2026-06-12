@@ -47,7 +47,17 @@ def _duckdb_logical_type(value: object) -> str:
         return "boolean"
     if any(
         token in normalized
-        for token in ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT")
+        for token in (
+            "TINYINT",
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            "HUGEINT",
+            "UTINYINT",
+            "USMALLINT",
+            "UINTEGER",
+            "UBIGINT",
+        )
     ):
         return "integer"
     if any(token in normalized for token in ("DECIMAL", "DOUBLE", "FLOAT", "REAL")):
@@ -62,18 +72,65 @@ WAREHOUSE_CONSISTENCY_TARGETS: tuple[dict[str, object], ...] = (
     {"expected_asset_name": "run_manifests", "object_name": "run_manifests", "object_kind": "table"},
     {"expected_asset_name": "run_results", "object_name": "run_results", "object_kind": "table"},
     {"expected_asset_name": "control_room_snapshot", "object_name": "control_room_snapshot", "object_kind": "table"},
-    {"expected_asset_name": "listener_daily_activity", "object_name": "listener_daily_activity", "object_kind": "table"},
+    {
+        "expected_asset_name": "listener_daily_activity",
+        "object_name": "listener_daily_activity",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "public_listening_daily_comparison",
+        "object_name": "public_listening_daily_comparison",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "mart_public_listening_daily_similarity",
+        "object_name": "mart_public_listening_daily_similarity",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "mart_public_listening_trends",
+        "object_name": "mart_public_listening_trends",
+        "object_kind": "table",
+    },
     {"expected_asset_name": "model_run_summary", "object_name": "model_run_summary", "object_kind": "table"},
-    {"expected_asset_name": "creator_market_scene_summary", "object_name": "creator_market_scene_summary", "object_kind": "table"},
-    {"expected_asset_name": "research_platform_status_summary", "object_name": "research_platform_status_summary", "object_kind": "table"},
-    {"expected_asset_name": "scope_expansion_strategy_cards", "object_name": "scope_expansion_strategy_cards", "object_kind": "table"},
-    {"expected_asset_name": "scope_expansion_branch_health", "object_name": "scope_expansion_branch_health", "object_kind": "table"},
+    {
+        "expected_asset_name": "creator_market_scene_summary",
+        "object_name": "creator_market_scene_summary",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "research_platform_status_summary",
+        "object_name": "research_platform_status_summary",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "scope_expansion_strategy_cards",
+        "object_name": "scope_expansion_strategy_cards",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "scope_expansion_branch_health",
+        "object_name": "scope_expansion_branch_health",
+        "object_kind": "table",
+    },
     {"expected_asset_name": "mart_run_quality", "object_name": "mart_run_quality", "object_kind": "table"},
     {"expected_asset_name": "mart_model_registry", "object_name": "mart_model_registry", "object_kind": "table"},
     {"expected_asset_name": "mart_ops_overview", "object_name": "mart_ops_overview", "object_kind": "table"},
-    {"expected_asset_name": "mart_creator_market_watchlist", "object_name": "mart_creator_market_watchlist", "object_kind": "table"},
-    {"expected_asset_name": "mart_research_platform_status", "object_name": "mart_research_platform_status", "object_kind": "table"},
-    {"expected_asset_name": "mart_scope_expansion_health", "object_name": "mart_scope_expansion_health", "object_kind": "table"},
+    {
+        "expected_asset_name": "mart_creator_market_watchlist",
+        "object_name": "mart_creator_market_watchlist",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "mart_research_platform_status",
+        "object_name": "mart_research_platform_status",
+        "object_kind": "table",
+    },
+    {
+        "expected_asset_name": "mart_scope_expansion_health",
+        "object_name": "mart_scope_expansion_health",
+        "object_kind": "table",
+    },
     {"expected_asset_name": "mart_ops_overview", "object_name": "latest_ops_overview", "object_kind": "view"},
     {
         "expected_asset_name": "mart_research_platform_status",
@@ -101,14 +158,26 @@ def _duckdb_retry_policy() -> tuple[int, float]:
     return retries, max(0.0, sleep_seconds)
 
 
-def _connect_duckdb_with_retries(*, duckdb, target_path: Path, retries: int, sleep_seconds: float):
+def _is_duckdb_lock_error(exc: Exception) -> bool:
+    message = str(exc).strip().lower()
+    return "could not set lock on file" in message or "conflicting lock is held" in message
+
+
+def _connect_duckdb_with_retries(
+    *,
+    duckdb,
+    target_path: Path,
+    retries: int,
+    sleep_seconds: float,
+    stop_on_lock: bool = False,
+):
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
             return duckdb.connect(str(target_path)), attempt
         except Exception as exc:
             last_error = exc
-            if attempt >= retries:
+            if attempt >= retries or (stop_on_lock and _is_duckdb_lock_error(exc)):
                 break
             time.sleep(sleep_seconds)
     if last_error is not None:
@@ -121,10 +190,7 @@ def verify_analytics_duckdb_consistency(con, *, logger) -> pd.DataFrame:
     asset_column_manifest = con.execute(
         "SELECT * FROM warehouse_asset_columns ORDER BY object_name, column_position"
     ).fetchdf()
-    asset_lookup = {
-        str(row["object_name"]): row
-        for row in asset_manifest.to_dict(orient="records")
-    }
+    asset_lookup = {str(row["object_name"]): row for row in asset_manifest.to_dict(orient="records")}
     expected_schema_lookup: dict[str, list[dict[str, object]]] = {}
     if not asset_column_manifest.empty:
         ordered = asset_column_manifest.sort_values(["object_name", "column_position"])
@@ -166,16 +232,10 @@ def verify_analytics_duckdb_consistency(con, *, logger) -> pd.DataFrame:
             expected_columns = [str(record["column_name"]) for record in expected_schema]
             expected_logical_types = [str(record["logical_type"]) for record in expected_schema]
             try:
-                actual_rows = int(
-                    con.execute(f"SELECT COUNT(*) FROM {_quote_identifier(object_name)}").fetchone()[0]
-                )
-                describe_df = con.execute(
-                    f"DESCRIBE SELECT * FROM {_quote_identifier(object_name)}"
-                ).fetchdf()
+                actual_rows = int(con.execute(f"SELECT COUNT(*) FROM {_quote_identifier(object_name)}").fetchone()[0])
+                describe_df = con.execute(f"DESCRIBE SELECT * FROM {_quote_identifier(object_name)}").fetchdf()
                 actual_columns = [str(value) for value in describe_df["column_name"].tolist()]
-                actual_logical_types = [
-                    _duckdb_logical_type(value) for value in describe_df["column_type"].tolist()
-                ]
+                actual_logical_types = [_duckdb_logical_type(value) for value in describe_df["column_type"].tolist()]
                 row_count_match = actual_rows == expected_rows
                 column_match = actual_columns == expected_columns
                 logical_type_match = actual_logical_types == expected_logical_types
@@ -276,13 +336,20 @@ def refresh_analytics_database(
             target_path=db_path,
             retries=retries,
             sleep_seconds=sleep_seconds,
+            stop_on_lock=True,
         )
     except Exception as exc:
-        logger.warning(
-            "Primary DuckDB analytics database is busy or unavailable after %d attempt(s): %s",
-            retries + 1,
-            exc,
-        )
+        if _is_duckdb_lock_error(exc):
+            logger.warning(
+                "Primary DuckDB analytics database is externally locked; using the fallback immediately: %s",
+                exc,
+            )
+        else:
+            logger.warning(
+                "Primary DuckDB analytics database is unavailable after %d attempt(s): %s",
+                retries + 1,
+                exc,
+            )
         try:
             con, _ = _connect_duckdb_with_retries(
                 duckdb=duckdb,
@@ -293,7 +360,9 @@ def refresh_analytics_database(
             connected_path = fallback_db_path
             fallback_used = True
         except Exception as fallback_exc:
-            logger.warning("DuckDB analytics refresh skipped because fallback database creation failed: %s", fallback_exc)
+            logger.warning(
+                "DuckDB analytics refresh skipped because fallback database creation failed: %s", fallback_exc
+            )
             return None
     try:
         for asset in asset_manifest.to_dict(orient="records"):
@@ -322,6 +391,8 @@ def refresh_analytics_database(
         mart_research_platform_status_columns = asset_columns_lookup.get("mart_research_platform_status", set())
         mart_research_claim_watchlist_columns = asset_columns_lookup.get("mart_research_claim_watchlist", set())
         mart_scope_expansion_health_columns = asset_columns_lookup.get("mart_scope_expansion_health", set())
+        mart_public_listening_daily_columns = asset_columns_lookup.get("mart_public_listening_daily_similarity", set())
+        mart_public_listening_trends_columns = asset_columns_lookup.get("mart_public_listening_trends", set())
 
         if {"run_id", "run_timestamp"}.issubset(run_manifests_columns) and {"run_id"}.issubset(run_results_columns):
             con.execute(
@@ -409,7 +480,9 @@ def refresh_analytics_database(
                 WHERE COALESCE(CAST(champion_gate_promoted AS BOOLEAN), FALSE)
                 """
             )
-        if {"model_name", "max_top1_gap", "worst_segment", "worst_bucket", "run_id"}.issubset(robustness_summary_columns):
+        if {"model_name", "max_top1_gap", "worst_segment", "worst_bucket", "run_id"}.issubset(
+            robustness_summary_columns
+        ):
             con.execute(
                 """
                 CREATE OR REPLACE VIEW robustness_model_summary AS
@@ -423,7 +496,9 @@ def refresh_analytics_database(
                 ORDER BY mean_max_top1_gap DESC
                 """
             )
-        if {"model_name", "model_type", "test_discounted_reward", "test_hit_at_k", "run_id"}.issubset(policy_summary_columns):
+        if {"model_name", "model_type", "test_discounted_reward", "test_hit_at_k", "run_id"}.issubset(
+            policy_summary_columns
+        ):
             con.execute(
                 """
                 CREATE OR REPLACE VIEW policy_model_summary AS
@@ -574,6 +649,35 @@ def refresh_analytics_database(
                   CAST(risk_reduction_score AS DOUBLE) DESC NULLS LAST,
                   CAST(risk_score AS DOUBLE) DESC NULLS LAST,
                   branch_key
+                """
+            )
+        if {
+            "listening_date",
+            "dimension",
+            "closer_scope",
+            "global_similarity",
+            "united_states_similarity",
+        }.issubset(mart_public_listening_daily_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW public_listening_daily_trend AS
+                SELECT *
+                FROM mart_public_listening_daily_similarity
+                ORDER BY listening_date, dimension
+                """
+            )
+        if {
+            "listening_date",
+            "dimension",
+            "similarity_anomaly_flag",
+        }.issubset(mart_public_listening_trends_columns):
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW public_listening_similarity_anomalies AS
+                SELECT *
+                FROM mart_public_listening_trends
+                WHERE COALESCE(CAST(similarity_anomaly_flag AS BOOLEAN), FALSE)
+                ORDER BY listening_date DESC, dimension
                 """
             )
         verify_analytics_duckdb_consistency(con, logger=logger)

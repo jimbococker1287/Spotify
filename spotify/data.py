@@ -24,7 +24,7 @@ from .data_preparation import append_technical_log_features as _append_technical
 from .data_preparation import engineer_features as _engineer_features_impl
 from .data_preparation import prepare_training_data as _prepare_training_data_impl
 
-CACHE_SCHEMA_VERSION = "prepared-data-v4"
+CACHE_SCHEMA_VERSION = "prepared-data-v5"
 
 __all__ = [
     "CACHE_SCHEMA_VERSION",
@@ -458,7 +458,7 @@ def load_or_prepare_training_data(
     df = raw_df.copy() if raw_df is not None else load_streaming_history(data_dir, include_video, logger)
     raw_load_stats = df.attrs.get("spotify_load_stats", {})
     load_stats = dict(raw_load_stats) if isinstance(raw_load_stats, dict) else {}
-    df = engineer_features(df, max_artists, logger)
+    df = engineer_features(df, max_artists, logger, artist_vocabulary_fraction=0.64)
     raw_feature_stats = df.attrs.get("spotify_feature_stats", {})
     feature_stats = dict(raw_feature_stats) if isinstance(raw_feature_stats, dict) else {}
     df = append_technical_log_features(df, data_dir=data_dir, logger=logger, technical_files=technical_files)
@@ -516,12 +516,14 @@ def engineer_features(
     max_artists: int,
     logger,
     artist_classes: list[str] | tuple[str, ...] | None = None,
+    artist_vocabulary_fraction: float | None = None,
 ) -> pd.DataFrame:
     return _engineer_features_impl(
         df,
         max_artists=max_artists,
         logger=logger,
         artist_classes=artist_classes,
+        artist_vocabulary_fraction=artist_vocabulary_fraction,
     )
 
 

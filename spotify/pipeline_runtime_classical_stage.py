@@ -37,6 +37,17 @@ def run_classical_benchmarks(
             cache_fingerprint=context.cache_fingerprint,
             cache_stats_out=classical_cache_stats,
         )
+        if context.config.enable_shap:
+            from .explainability import run_classical_explainability
+
+            context.artifact_paths.extend(
+                run_classical_explainability(
+                    classical_results,
+                    data=context.prepared,
+                    output_dir=context.run_dir,
+                    logger=context.logger,
+                )
+            )
         context.artifact_paths.append(context.run_dir / "classical_results.json")
         for row in classical_results:
             context.result_rows.append(

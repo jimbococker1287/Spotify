@@ -18,6 +18,17 @@ from .run_artifacts import materialize_cached_file, safe_read_json, write_json
 
 
 CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v1"
+CLASSICAL_SEQUENCE_FEATURE_NAMES: tuple[str, ...] = (
+    "sequence_last_artist_id",
+    "sequence_previous_artist_id",
+    "sequence_first_artist_id",
+    "sequence_artist_id_mean",
+    "sequence_artist_id_std",
+    "sequence_unique_ratio",
+    "sequence_last_run_length",
+    "sequence_last_two_repeat",
+    "sequence_recent_unique_ratio",
+)
 
 
 @dataclass
@@ -159,7 +170,11 @@ def _classical_cache_enabled_from_env() -> bool:
 
 
 def _classical_benchmarks_source_digest() -> str:
-    sources = [Path(__file__).resolve()]
+    sources = [
+        Path(__file__).resolve(),
+        Path(__file__).with_name("lightgbm_model.py").resolve(),
+        Path(__file__).with_name("xgboost_model.py").resolve(),
+    ]
     digest = hashlib.sha256()
     for path in sources:
         digest.update(path.read_bytes())
@@ -463,7 +478,9 @@ def get_classical_model_registry(
     from sklearn.neural_network import MLPClassifier
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
+    from .lightgbm_model import build_lightgbm_classifier
     from .session_knn import SessionKNNClassifier
+    from .xgboost_model import build_xgboost_classifier
 
     def build_logreg(params: dict[str, object] | None):
         params = params or {}
@@ -580,6 +597,20 @@ def get_classical_model_registry(
             thread_count=thread_count,
         )
 
+    def build_lightgbm(params: dict[str, object] | None):
+        return build_lightgbm_classifier(
+            params,
+            random_seed=random_seed,
+            n_jobs=estimator_n_jobs,
+        )
+
+    def build_xgboost(params: dict[str, object] | None):
+        return build_xgboost_classifier(
+            params,
+            random_seed=random_seed,
+            n_jobs=estimator_n_jobs,
+        )
+
     return {
         "logreg": ("linear", build_logreg),
         "random_forest": ("tree_ensemble", build_random_forest),
@@ -590,6 +621,8 @@ def get_classical_model_registry(
         "mlp": ("shallow_neural", build_mlp),
         "session_knn": ("session_memory", build_session_knn),
         "catboost": ("boosting", build_catboost),
+        "lightgbm": ("boosting", build_lightgbm),
+        "xgboost": ("boosting", build_xgboost),
     }
 
 

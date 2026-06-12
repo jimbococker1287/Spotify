@@ -25,6 +25,13 @@ class LastFmArtistChartRow:
     url: str
 
 
+@dataclass(frozen=True)
+class LastFmTagRow:
+    name: str
+    count: int | None
+    url: str
+
+
 class LastFmClient:
     def __init__(self, api_key: str, *, timeout_seconds: float = 10.0) -> None:
         self._api_key = api_key.strip()
@@ -77,6 +84,84 @@ class LastFmClient:
                     name=name,
                     playcount=self._optional_int(row.get("playcount")),
                     listeners=self._optional_int(row.get("listeners")),
+                    url=str(row.get("url", "")).strip(),
+                )
+            )
+        return parsed
+
+    def get_tag_top_artists(
+        self,
+        tag: str,
+        *,
+        limit: int = 50,
+        page: int = 1,
+    ) -> list[LastFmArtistChartRow]:
+        normalized_tag = tag.strip()
+        if not normalized_tag:
+            raise ValueError("A Last.fm tag is required.")
+        payload = self._call(
+            "tag.gettopartists",
+            {
+                "tag": normalized_tag,
+                "limit": max(1, int(limit)),
+                "page": max(1, int(page)),
+            },
+        )
+        root = payload.get("topartists")
+        if not isinstance(root, dict):
+            raise LastFmError("Last.fm response did not include a tag artist chart payload.")
+        rows = root.get("artist", [])
+        if not isinstance(rows, list):
+            raise LastFmError("Last.fm response did not include a tag artist list.")
+
+        parsed: list[LastFmArtistChartRow] = []
+        for idx, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            attr_rank = row.get("@attr", {}).get("rank") if isinstance(row.get("@attr"), dict) else None
+            parsed.append(
+                LastFmArtistChartRow(
+                    rank=self._optional_int(attr_rank) or idx,
+                    name=name,
+                    playcount=self._optional_int(row.get("playcount")),
+                    listeners=self._optional_int(row.get("listeners")),
+                    url=str(row.get("url", "")).strip(),
+                )
+            )
+        return parsed
+
+    def get_artist_top_tags(self, artist: str) -> list[LastFmTagRow]:
+        normalized_artist = artist.strip()
+        if not normalized_artist:
+            raise ValueError("An artist name is required.")
+        payload = self._call(
+            "artist.gettoptags",
+            {
+                "artist": normalized_artist,
+                "autocorrect": 1,
+            },
+        )
+        root = payload.get("toptags")
+        if not isinstance(root, dict):
+            raise LastFmError("Last.fm response did not include an artist tag payload.")
+        rows = root.get("tag", [])
+        if not isinstance(rows, list):
+            raise LastFmError("Last.fm response did not include an artist tag list.")
+
+        parsed: list[LastFmTagRow] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            parsed.append(
+                LastFmTagRow(
+                    name=name,
+                    count=self._optional_int(row.get("count")),
                     url=str(row.get("url", "")).strip(),
                 )
             )

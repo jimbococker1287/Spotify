@@ -77,7 +77,7 @@ CLASSICAL_ALL="${CLASSICAL_ALL:-logreg,extra_trees,knn,gaussian_nb,mlp}"
 OPTUNA_MODELS="${OPTUNA_MODELS:-logreg,mlp}"
 BACKTEST_MODELS="${BACKTEST_MODELS:-logreg,extra_trees,mlp,retrieval_reranker,blended_ensemble}"
 DEEP_CORE_DEFAULT="dense,gru,transformer"
-DEEP_RESEARCH_DEFAULT="lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist"
+DEEP_RESEARCH_DEFAULT="sasrec,bert4rec,srgnn,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist"
 if [[ -z "${DEEP_ALL:-}" ]]; then
   if [[ "${SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS:-0}" == "1" || "${SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS:-0}" == "true" || "${SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS:-0}" == "yes" || "${SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS:-0}" == "on" ]]; then
     DEEP_ALL="${DEEP_CORE_DEFAULT},${DEEP_RESEARCH_DEFAULT}"

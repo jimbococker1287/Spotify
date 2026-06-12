@@ -8,7 +8,12 @@ def build_model_builders(
     num_artists: int,
     num_ctx: int,
     selected_names: tuple[str, ...],
+    model_params_by_name: dict[str, dict[str, object]] | None = None,
 ):
+    from .bert4rec_model import build_bert4rec_model
+    from .sasrec_model import build_sasrec_model
+    from .srgnn_model import build_srgnn_model
+
     import tensorflow as tf
     from tensorflow.keras import Model, Input, regularizers
     from tensorflow.keras import backend as K
@@ -294,7 +299,26 @@ def build_model_builders(
         skip = Dense(1, activation="sigmoid", name="skip_output", dtype="float32")(merged)
         return Model([seq_in, ctx_in], [art, skip])
 
+    model_params_by_name = model_params_by_name or {}
     registry: dict[str, Callable[[], object]] = {
+        "sasrec": lambda: build_sasrec_model(
+            sequence_length,
+            num_artists,
+            num_ctx,
+            model_params_by_name.get("sasrec"),
+        ),
+        "bert4rec": lambda: build_bert4rec_model(
+            sequence_length,
+            num_artists,
+            num_ctx,
+            model_params_by_name.get("bert4rec"),
+        ),
+        "srgnn": lambda: build_srgnn_model(
+            sequence_length,
+            num_artists,
+            num_ctx,
+            model_params_by_name.get("srgnn"),
+        ),
         "gru_artist": build_gru_artist,
         "memory_net_artist": build_memory_network_artist,
         "lstm": build_lstm,

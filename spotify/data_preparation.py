@@ -632,6 +632,7 @@ def engineer_features(
     max_artists: int,
     logger,
     artist_classes: list[str] | tuple[str, ...] | None = None,
+    artist_vocabulary_fraction: float | None = None,
 ) -> pd.DataFrame:
     start_time = time.perf_counter()
     input_rows = len(df)
@@ -688,8 +689,16 @@ def engineer_features(
         df[col] = pd.Series(df[col], dtype="boolean").fillna(False).astype("int8")
 
     if artist_classes is None:
+        vocabulary_source_rows = len(df)
+        vocabulary_source = df
+        vocabulary_source_name = "full_history"
+        if artist_vocabulary_fraction is not None:
+            fraction = float(np.clip(artist_vocabulary_fraction, 0.0, 1.0))
+            vocabulary_source_rows = max(1, int(len(df) * fraction))
+            vocabulary_source = df.iloc[:vocabulary_source_rows]
+            vocabulary_source_name = "chronological_training_prefix"
         top_artists = (
-            df["master_metadata_album_artist_name"]
+            vocabulary_source["master_metadata_album_artist_name"]
             .value_counts()
             .nlargest(max_artists)
             .index
@@ -846,6 +855,8 @@ def engineer_features(
         "output_rows": int(len(df)),
         "max_artists": int(max_artists),
         "artist_class_count": int(len(top_artists)),
+        "artist_vocabulary_source": vocabulary_source_name if artist_classes is None else "provided_classes",
+        "artist_vocabulary_source_rows": int(vocabulary_source_rows) if artist_classes is None else 0,
         "engineer_seconds": round(elapsed, 6),
         "rows_per_second": round(float(input_rows) / elapsed, 3),
         "vectorized_rolling_artist_counts": True,
@@ -853,6 +864,40 @@ def engineer_features(
     }
 
     return df
+
+
+def _derive_session_ids(df: pd.DataFrame) -> np.ndarray:
+    if "session_id" in df.columns:
+        return df["session_id"].to_numpy(copy=False)
+    timestamps = pd.to_datetime(df["ts"], errors="coerce")
+    gaps = timestamps.diff().dt.total_seconds().fillna(0.0)
+    return (gaps > 30 * 60).cumsum().to_numpy(dtype="int64", copy=False)
+
+
+def _session_aware_split_points(target_session_ids: np.ndarray) -> tuple[int, int]:
+    sample_count = len(target_session_ids)
+    default_val_start = int(sample_count * 0.64)
+    default_test_start = int(sample_count * 0.80)
+    if sample_count < 3:
+        return default_val_start, default_test_start
+
+    boundaries = np.flatnonzero(target_session_ids[1:] != target_session_ids[:-1]) + 1
+    if len(boundaries) < 2:
+        return default_val_start, default_test_start
+
+    val_candidates = boundaries[boundaries < default_test_start]
+    if len(val_candidates) == 0:
+        return default_val_start, default_test_start
+    val_start = int(val_candidates[np.argmin(np.abs(val_candidates - default_val_start))])
+
+    test_candidates = boundaries[boundaries > val_start]
+    if len(test_candidates) == 0:
+        return default_val_start, default_test_start
+    test_start = int(test_candidates[np.argmin(np.abs(test_candidates - default_test_start))])
+
+    if not 0 < val_start < test_start < sample_count:
+        return default_val_start, default_test_start
+    return val_start, test_start
 
 
 def prepare_training_data(
@@ -878,16 +923,30 @@ def prepare_training_data(
             f"Need > {sequence_length + 1}, found {len(labels)}."
         )
 
-    sample_count = len(labels) - sequence_length - 1
+    sample_count = len(labels) - sequence_length
+    target_positions = np.arange(sequence_length, len(labels), dtype="int64")
     X_seq = np.ascontiguousarray(sliding_window_view(labels, sequence_length)[:sample_count])
-    target_slice = slice(sequence_length, sequence_length + sample_count)
-    X_ctx = context_vals[target_slice]
-    y_seq = labels[target_slice]
-    y_skip = skipped_vals[target_slice]
 
-    n = len(X_seq)
-    test_start = int(n * 0.80)
-    val_start = int(n * 0.64)
+    session_ids = _derive_session_ids(df)
+    session_windows = sliding_window_view(session_ids, sequence_length + 1)
+    session_pure_mask = np.all(session_windows == session_windows[:, :1], axis=1)
+    if not np.any(session_pure_mask):
+        raise RuntimeError(
+            "No session-pure training examples remain. Reduce sequence_length or review the 30-minute session threshold."
+        )
+
+    X_seq = X_seq[session_pure_mask]
+    target_positions = target_positions[session_pure_mask]
+    target_session_ids = session_ids[target_positions]
+
+    # Context must be available before the target event. Using the target row
+    # leaks fields such as skip outcome, reason_end, and target-artist history.
+    context_positions = target_positions - 1
+    X_ctx = context_vals[context_positions]
+    y_seq = labels[target_positions]
+    y_skip = skipped_vals[target_positions]
+
+    val_start, test_start = _session_aware_split_points(target_session_ids)
 
     X_seq_train, X_seq_val, X_seq_test = X_seq[:val_start], X_seq[val_start:test_start], X_seq[test_start:]
     X_ctx_train, X_ctx_val, X_ctx_test = X_ctx[:val_start], X_ctx[val_start:test_start], X_ctx[test_start:]
@@ -918,8 +977,9 @@ def prepare_training_data(
     joblib.dump(scaler, scaler_path)
 
     logger.info(
-        "Total sequences=%d | train=%d | val=%d | test=%d",
+        "Session-pure sequences=%d/%d | train=%d | val=%d | test=%d",
         len(X_seq),
+        sample_count,
         len(X_seq_train),
         len(X_seq_val),
         len(X_seq_test),

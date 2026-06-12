@@ -11,7 +11,7 @@ fi
 # Train every configured deep architecture, but trade throughput for lower RAM.
 export SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS="${SPOTIFY_ENABLE_RESEARCH_DEEP_MODELS:-1}"
 export SPOTIFY_DEEP_SCREENING="${SPOTIFY_DEEP_SCREENING:-off}"
-export DEEP_ALL="${DEEP_ALL:-dense,gru,transformer,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist}"
+export DEEP_ALL="${DEEP_ALL:-sasrec,bert4rec,srgnn,dense,gru,transformer,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist}"
 export BATCH_SIZE="${BATCH_SIZE:-256}"
 export EPOCHS="${EPOCHS:-10}"
 

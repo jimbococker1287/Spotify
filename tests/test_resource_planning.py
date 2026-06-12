@@ -46,11 +46,20 @@ def _cached_gpu_environment(tmp_path: Path) -> dict[str, str]:
         cache_path=cache_path,
         environ={"PYTHONNOUSERSITE": "1"},
     )
-    return {
+    environment = {
         **os.environ,
         "PYTHONNOUSERSITE": "1",
         "SPOTIFY_RESOURCE_GPU_PROBE_CACHE_PATH": str(cache_path),
     }
+    for key in (
+        "PYTHON_BIN",
+        "SPOTIFY_AUTO_ROUTE_TF_PYTHON",
+        "SPOTIFY_FORCE_CPU",
+        "SPOTIFY_RESOURCE_REFRESH_GPU_PROBE",
+        "SPOTIFY_TF_DEVICE_MODE",
+    ):
+        environment.pop(key, None)
+    return environment
 
 
 def test_auto_profile_selects_metal_and_low_memory_limits() -> None:

@@ -111,6 +111,14 @@ def _suggest_params(trial, model_name: str) -> dict[str, object]:
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
         }
+    if model_name == "lightgbm":
+        from .lightgbm_model import suggest_lightgbm_params
+
+        return suggest_lightgbm_params(trial)
+    if model_name == "xgboost":
+        from .xgboost_model import suggest_xgboost_params
+
+        return suggest_xgboost_params(trial)
     if model_name == "hist_gbm":
         return {
             "max_iter": trial.suggest_int("max_iter", 80, 400, step=20),
@@ -286,6 +294,13 @@ def _build_optuna_cache_payload(
     fidelity_schedule: tuple[float, ...],
     pruner_name: str,
 ) -> dict[str, object]:
+    source_digest = hashlib.sha256()
+    for path in (
+        Path(__file__).resolve(),
+        Path(__file__).with_name("lightgbm_model.py").resolve(),
+        Path(__file__).with_name("xgboost_model.py").resolve(),
+    ):
+        source_digest.update(path.read_bytes())
     return {
         "schema_version": OPTUNA_CACHE_SCHEMA_VERSION,
         "prepared_fingerprint": str(cache_fingerprint).strip(),
@@ -298,6 +313,7 @@ def _build_optuna_cache_payload(
         "per_trial_timeout_seconds": int(per_trial_timeout_seconds),
         "fidelity_schedule": [float(value) for value in fidelity_schedule],
         "pruner_name": pruner_name,
+        "source_digest": source_digest.hexdigest()[:24],
         "median_startup_trials": _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
         if pruner_name == "median"
         else 0,

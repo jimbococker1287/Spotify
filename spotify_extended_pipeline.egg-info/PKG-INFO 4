@@ -1,0 +1,1381 @@
+Metadata-Version: 2.4
+Name: spotify-extended-pipeline
+Version: 0.1.0
+Summary: Personal Taste OS for Spotify streaming history: experimentation, session planning, public insights, and serving
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: catboost>=1.2
+Requires-Dist: boto3>=1.35
+Requires-Dist: duckdb>=1.1
+Requires-Dist: fastapi>=0.115
+Requires-Dist: google-cloud-storage>=2.18
+Requires-Dist: joblib>=1.4
+Requires-Dist: matplotlib>=3.9
+Requires-Dist: numpy>=1.26
+Requires-Dist: opentelemetry-api>=1.36
+Requires-Dist: opentelemetry-sdk>=1.36
+Requires-Dist: pandas>=2.2
+Requires-Dist: orjson>=3.10
+Requires-Dist: psycopg[binary]>=3.2
+Requires-Dist: psutil>=5.9
+Requires-Dist: PyJWT>=2.9
+Requires-Dist: redis>=5.2
+Requires-Dist: scikit-learn>=1.5
+Requires-Dist: SQLAlchemy>=2.0
+Requires-Dist: tensorflow>=2.16
+Requires-Dist: mlflow>=2.17
+Requires-Dist: optuna>=3.6
+Requires-Dist: uvicorn>=0.30
+Provides-Extra: extras
+Requires-Dist: spotipy>=2.24; extra == "extras"
+Requires-Dist: shap>=0.46; extra == "extras"
+Requires-Dist: gputil>=1.4; extra == "extras"
+Provides-Extra: dev
+Requires-Dist: httpx>=0.28; extra == "dev"
+Requires-Dist: pytest>=8.3; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Requires-Dist: mypy>=1.11; extra == "dev"
+Requires-Dist: pre-commit>=3.8; extra == "dev"
+
+# Spotify Personal Taste OS
+
+This repository packages a Personal Taste OS on top of Spotify extended streaming history. The central idea is to turn raw listening logs into session-aware recommendations, explanations, and policy-safe public insights that can eventually power product modes like focus sessions, workout arcs, commute mode, discovery mode, "why this next", and adaptive playlist steering.
+
+The repo is broad, but the parts fit together around four clear surfaces:
+
+- Taste engine: training, benchmarking, retrieval, uncertainty, and champion gating
+- Session planner: digital twin, causal friction, journey planning, safe policy routing, and stress tests
+- Personal insights CLI: policy-safe explainers, release tracking, playlist diffing, and catalog exploration
+- Serving layer: prediction CLI, HTTP service, and promoted-model aliases
+
+The current system already includes:
+
+- Deep model training
+- Classical model benchmarking
+- Optuna hyperparameter tuning
+- Temporal backtesting
+- MLflow tracking
+- Prepared-data fingerprint caching
+- Ranking metrics (`NDCG@5`, `MRR@5`, coverage, diversity)
+- Champion/challenger gating
+- Recommender safety platform primitives for governance, drift, backtesting, and conformal abstention across arbitrary sequence recommenders
+- Drift diagnostics across train/validation/test regimes
+- Self-supervised sequence pretraining for artist embeddings
+- Two-stage retrieval plus reranking recommenders
+- Friction proxy analysis for skip-risk counterfactuals
+- ANN candidate retrieval diagnostics with latency/recall reporting
+- Robustness slice evaluation across friction, repeat, platform, and session regimes
+- Semi-synthetic policy simulation for offline policy comparison
+- Benchmark protocol, experiment registry, ablation, and significance artifacts
+- Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, group Auto-DJ planning, and stress tests
+- Pre-train data quality gate with fail-fast checks
+- Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
+- Per-run Markdown auto-report
+- Persistent cross-run history and charts
+- Benchmark lock runs with seed-based confidence intervals
+- Prediction CLI for serving top-k next-artist recommendations
+- Conformal uncertainty diagnostics with abstaining prediction support
+- Materialized serving bundles for bundle-only online inference
+- Production-style ASGI APIs with versioned routes, request IDs, readiness probes, Prometheus-style metrics, and OpenTelemetry-friendly trace IDs
+- Durable SQL-backed Taste OS feedback and session state with local SQLite and SQLAlchemy database URL support
+- Deployment registry channels for stable/canary rollout metadata and release packaging
+
+## Product Direction
+
+The strongest big-scope bet in this codebase is `Personal Taste OS`: use the digital twin, journey planner, safe policy layer, and public metadata surface to actively shape listening sessions instead of only scoring the next artist. A short product framing and build map lives in `docs/personal_taste_os.md`.
+
+## Recommender Safety Platform
+
+`spotify/recommender_safety.py` now exposes the reusable safety surface behind the Spotify pipeline:
+
+- Generic temporal backtest windows, callback-driven backtest benchmarking, and artifact writers
+- Split drift utilities over arbitrary sequence/context/target snapshots plus pluggable segment extractors
+- Promotion gating for arbitrary leaderboard metrics and history tables, including selective-risk and abstention caps
+- Conformal abstention summary builders that can be reused by any sequence recommender with class-probability outputs
+
+The Spotify-specific modules (`spotify/backtesting.py`, `spotify/drift.py`, `spotify/governance.py`, and the conformal path in `spotify/evaluation.py`) sit on top of that shared layer, so the same safety logic can be reused as a B2B-style recommender safety SDK.
+
+## Project Threads
+
+The six new project threads added in the latest scope expansion now clear the same requirement bar:
+
+- a clear thesis
+- implementation anchors in code
+- verification anchors in tests or integration coverage
+- a user-facing surface or an intentional integration-only role
+- named artifacts or outputs
+- top-level documentation
+
+All six threads meet that bar today. The detailed audit and expansion map lives in `docs/project_threads.md`, and the short version is:
+
+- Personal Taste OS: the umbrella product thesis tying training, planning, explanation, and safe delivery into one system.
+- Recommender Safety Platform: the reusable safety SDK layer behind drift, backtesting, governance, and abstention.
+- Control Room: the operator-facing summary that turns run artifacts into a portfolio dashboard.
+- Creator Label Intelligence: the public-insights graph for adjacency, migration, scenes, and release whitespace.
+- Group Auto-DJ: the shared-session planner for household, party, car, and ambient group listening.
+- Doctorate-Level Roadmap: the research program that turns the repository into publication-grade work.
+
+## Project Layout
+
+- `spotify/`: pipeline source code
+- `tests/`: smoke/config tests
+- `data/raw/`: Spotify `Streaming_History_*.json` files, either flat or inside the exported `Spotify Extended Streaming History/` folder
+- `outputs/runs/<run_id>/`: per-run artifacts, logs, charts, model files
+- `outputs/history/experiment_history.csv`: cumulative model leaderboard history
+- `outputs/history/optuna_history.csv`: cumulative tuned-model history
+- `outputs/history/backtest_history.csv`: cumulative temporal backtest history
+- `outputs/history/benchmark_history.csv`: benchmark-lock aggregate history with CI stats
+- `outputs/mlruns/mlflow.db`: local MLflow tracking DB (default)
+- `mlruns/`: MLflow artifact store for local runs; storage reporting and pruning now include it alongside `outputs/`
+
+## Storage Controls
+
+MLflow still records params, metrics, and lightweight reports by default, but it now skips mirroring heavyweight local artifacts like model binaries, bundles, and databases unless you opt back in.
+
+- `SPOTIFY_MLFLOW_ARTIFACT_MODE=metadata|all|off`
+- `SPOTIFY_MLFLOW_ARTIFACT_MAX_MB=25`
+- `PYTHONPATH=. .venv/bin/python scripts/prune_artifacts.py` to clean retained run artifacts plus mirrored MLflow artifacts
+- `PYTHONPATH=. .venv/bin/python scripts/storage_report.py --output-dir outputs` to report both `outputs/` and external MLflow artifact roots, storage pressure, and conservative top-level transient candidates without deleting anything
+
+## Profiles
+
+- `dev`: fastest smoke profile (no Optuna, no backtest, no MLflow)
+- `fast`: daily iteration profile (smaller model set + Optuna + backtest + MLflow)
+- `small`: balanced profile (deep + classical + Optuna + backtest + MLflow)
+- `full`: broad profile (full model suite + deeper tuning/backtesting)
+
+CLI flags always override profile defaults.
+
+## Quickstart
+
+```bash
+make setup
+make train PROFILE=dev
+make test
+make qa
+```
+
+`make test` now installs the package in editable mode first, so tests do not require manual `PYTHONPATH=.` exports.
+
+If you activate `.venv`, the package also installs named entry points for the main public-facing surfaces:
+
+```bash
+source .venv/bin/activate
+spotify-lab --help
+spotify-predict --help
+spotify-serve --help
+spotify-build-serving-bundle --help
+spotify-serve-api --help
+spotify-public-insights --help
+spotify-compare-public --help
+spotify-control-room --help
+spotify-taste-os-demo --help
+spotify-creator-evidence-lab --help
+```
+
+The existing `python -m spotify...` module entry points still work too.
+
+## Quality Tooling
+
+```bash
+make lint
+make typecheck
+make qa
+```
+
+Optional local hooks:
+
+```bash
+pre-commit install
+pre-commit run --all-files
+```
+
+## Training Commands
+
+Run deep + classical with profile defaults:
+
+```bash
+make train PROFILE=small
+```
+
+Run fast iteration mode:
+
+```bash
+bash scripts/run_fast.sh
+```
+
+Run full exhaustive mode:
+
+```bash
+bash scripts/run_full.sh
+```
+
+Run classical only:
+
+```bash
+make train-classical PROFILE=small
+```
+
+Run deep only:
+
+```bash
+make train-deep PROFILE=small
+```
+
+Run the all-14 deep benchmark with lower peak RAM and no classical / Optuna / retrieval / backtest tail work:
+
+```bash
+bash scripts/run_deep_benchmark_low_ram.sh
+```
+
+If a long all-deep run finishes model training but exits before the full pipeline wrap-up, finalize the deep comparison artifacts directly:
+
+```bash
+make deep-benchmark-finalize EXTRA_ARGS="--outputs-dir outputs --run-name <run-name>"
+```
+
+Run elite stack:
+
+```bash
+make train-elite
+```
+
+Run everything (all deep + all classical + full Optuna + full temporal backtest + MLflow):
+
+```bash
+bash scripts/run_everything.sh
+```
+
+Run everything with more aggressive CPU parallelism for the classical / Optuna / backtest stages:
+
+```bash
+bash scripts/run_everything_cpu_boost.sh
+```
+
+Run everything with the Apple Silicon Metal GPU environment and the more aggressive CPU profile for classical / Optuna / backtest work:
+
+```bash
+bash scripts/run_everything_gpu.sh
+```
+
+That launcher is tuned for fastest wall-clock runs on Apple Silicon: it skips SHAP by default, keeps Metal enabled for deep models, and uses slightly safer classical parallelism on 16-18 GB unified-memory machines. To re-enable SHAP on that path, run `SPOTIFY_ENABLE_SHAP=1 bash scripts/run_everything_gpu.sh`.
+
+Temporal backtesting can now include deep model names in `--backtest-models` alongside classical ones. For lightweight rolling deep evaluation, the main knobs are:
+
+- `SPOTIFY_DEEP_BACKTEST_EPOCHS` (default `3`)
+- `SPOTIFY_DEEP_BACKTEST_BATCH_SIZE` (default `256`)
+
+Re-run classical + backtest only (useful after metric fixes to refresh temporal artifacts):
+
+```bash
+bash scripts/rerun_classical_backtest.sh
+```
+
+Run a canonical 3-seed benchmark lock and produce confidence intervals:
+
+```bash
+bash scripts/run_benchmark_lock.sh
+```
+
+Run the regression guard (hang + artifact checks):
+
+```bash
+python scripts/regression_guard.py
+```
+
+Inspect the current environment's CPU / GPU acceleration state:
+
+```bash
+python scripts/check_acceleration.py
+```
+
+Build the dedicated Apple Silicon Metal environment:
+
+```bash
+bash scripts/setup_metal_venv.sh
+```
+
+Or via Makefile:
+
+```bash
+make train-everything RUN_NAME=full-e2e
+```
+
+GPU setup / run via Make:
+
+```bash
+make setup-metal
+make train-everything-gpu RUN_NAME=metal-e2e
+```
+
+Benchmark lock via Make:
+
+```bash
+make benchmark-lock RUN_NAME=nightly-benchmark
+```
+
+Regression guard via Make:
+
+```bash
+make regression-guard
+```
+
+Custom run:
+
+```bash
+python -m spotify \
+  --profile full \
+  --run-name nightly-01 \
+  --models lstm,gru,transformer \
+  --classical-models logreg,random_forest,extra_trees \
+  --optuna --optuna-trials 20 \
+  --temporal-backtest --backtest-folds 5 \
+  --mlflow
+```
+
+The `scripts/run_everything.sh` launcher also supports environment overrides:
+
+- `EPOCHS` (default `12`)
+- `OPTUNA_TRIALS` (default `18`)
+- `OPTUNA_TIMEOUT_SECONDS` (default `1200`)
+- `BACKTEST_FOLDS` (default `4`)
+- `BACKTEST_MODELS` (default `logreg,extra_trees,mlp`)
+- `CLASSICAL_MAX_TRAIN_SAMPLES` (default `50000`)
+- `CLASSICAL_MAX_EVAL_SAMPLES` (default `25000`)
+- `BACKTEST_MAX_TRAIN_SAMPLES` (default `30000`)
+- `BACKTEST_MAX_EVAL_SAMPLES` (default `12000`)
+- `PYTHON_BIN` (override Python executable)
+- `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
+- `SPOTIFY_TF_DEVICE_MODE` (`auto`, `cpu`, or `gpu`; `SPOTIFY_FORCE_CPU=1` takes precedence)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TTL_SECONDS` (default `300`; reuses a package-version-aware GPU visibility check)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TIMEOUT_SECONDS` (default `15`; bounds a cold TensorFlow device probe)
+- `SPOTIFY_RESOURCE_REFRESH_GPU_PROBE` (default `0`; set `1` to force a fresh GPU visibility check)
+- `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
+- `SPOTIFY_RUN_EAGER` (default `0` in launcher for faster graph execution)
+- `SPOTIFY_STEPS_PER_EXECUTION` (default `64` in launcher)
+- `SPOTIFY_BATCH_LOG_INTERVAL` (default `100`, reduces logging overhead)
+- `SPOTIFY_DISABLE_MONITOR` (`auto` by default; monitor disabled automatically on macOS)
+- `TF_NUM_INTRAOP_THREADS` (launcher defaults to logical CPU count)
+- `TF_NUM_INTEROP_THREADS` (launcher defaults based on CPU count)
+- `SPOTIFY_CLASSICAL_MODEL_WORKERS` (parallel classical model workers; launcher auto-sets with RAM-aware cap)
+- `SPOTIFY_MAX_CLASSICAL_WORKERS` (`auto` by default; set explicit hard cap)
+- `SPOTIFY_BACKTEST_WORKERS` (parallel temporal backtest workers; launcher auto-sets, capped for memory)
+- `SPOTIFY_OPTUNA_JOBS` (parallel Optuna trial workers inside a study; launcher auto-sets)
+- `SPOTIFY_OPTUNA_MODEL_WORKERS` (parallel Optuna studies across model families; launcher auto-sets to `2` on roomier machines)
+- `SPOTIFY_TF_DATA_CACHE` (default `auto`; only caches batches when memory headroom is sufficient)
+- `SPOTIFY_TF_DATA_CACHE_FRACTION` (default `0.40`; auto-cache headroom fraction of currently available RAM)
+- `SPOTIFY_TF_DATA_THREADPOOL` (optional private `tf.data` threadpool size)
+- `SPOTIFY_TF_PREFETCH` (default `auto`; TensorFlow prefetch buffer)
+- `SPOTIFY_DISTRIBUTION_STRATEGY` (`auto`, `mirrored`, `default`)
+- `SPOTIFY_ISOLATE_MPL_CACHE` (default `0`; shared matplotlib cache for faster startup)
+- `SPOTIFY_HISTORY_LOAD_WORKERS` (default `auto`; parallel JSON shard loading for larger Spotify exports, set `1` to force serial loading)
+- `SPOTIFY_CACHE_PREPARED` (default `1`; reuses preprocessed arrays when raw files/config fingerprint is unchanged)
+- `SPOTIFY_OPTUNA_PRUNER` (default `median`; use `none` to disable pruning)
+- `SPOTIFY_OPTUNA_PRUNING_FIDELITIES` (default `0.25,0.60,1.0`)
+- `SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS` (default `120`; per-trial budget)
+- `SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS` (optional; override per-model tuning timeout)
+- `SPOTIFY_OPTUNA_MODEL_TIMEOUTS` (launcher default `logreg=300,random_forest=900,extra_trees=600,hist_gbm=900,knn=180,gaussian_nb=120,mlp=600`)
+- `SPOTIFY_CHAMPION_GATE_MAX_REGRESSION` (default `0.005`; max allowed drop in gate metric vs previous champion)
+- `SPOTIFY_CHAMPION_GATE_METRIC` (default `backtest_top1`; alternatives: `val_top1`)
+- `SPOTIFY_CHAMPION_GATE_MATCH_PROFILE` (default `1`; compare challengers only against prior runs of the same profile)
+- `SPOTIFY_CHAMPION_GATE_STRICT` (default `0`; set `1` to fail run when gate fails)
+- `SPOTIFY_BACKTEST_ADAPTATION_MODE` (`cold`, `warm`, `continual`; default `cold`)
+- `SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK` (optional absolute ceiling for conformal selective risk)
+- `SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE` (optional absolute ceiling for abstention rate)
+- `SPOTIFY_CONFORMAL_TARGET_SELECTIVE_RISK` (launcher defaults: `0.40` full / `0.45` fast; target selective-risk operating point for abstention tuning)
+- `SPOTIFY_CONFORMAL_MIN_ACCEPTED_RATE` (launcher defaults: `0.25` full / `0.20` fast; minimum accepted-rate floor while tuning abstention)
+- `SPOTIFY_CONFORMAL_MIN_RISK_DROP` (default `0.02`; minimum selective-risk improvement required before raising abstention)
+- `SPOTIFY_PRETRAIN_OBJECTIVES` (comma-separated self-supervised objectives; default `cooccurrence,masked_tail`)
+- `SPOTIFY_PRETRAIN_MAX_PAIRS` (default `1000000`; cap self-supervised pretraining pairs per objective, use `0` for no cap)
+- `SPOTIFY_BACKTEST_MAX_TRAIN_SAMPLES` (default launcher value `30000`; backtest-only train cap, use `0` for full slice)
+- `SPOTIFY_BACKTEST_MAX_EVAL_SAMPLES` (default launcher value `12000`; backtest-only eval cap, use `0` for full slice)
+- `SPOTIFY_RETRIEVAL_ANN_BITS` (default `10`; random-projection ANN hash width)
+- `SPOTIFY_MOONSHOT_PLAN_HORIZON` (default `8`; journey-planner rollout horizon)
+- `SPOTIFY_MOONSHOT_PLAN_BEAM` (default `4`; journey-planner beam width)
+- `SPOTIFY_STRESS_TEST_MAX_SESSIONS` (default `2500`; cap held-out sessions evaluated per stress-test scenario/policy, use `0` for full sweep)
+- `SPOTIFY_STRESS_TEST_PROGRESS_EVERY` (default `500`; progress-log interval inside the stress-test lab)
+- `SPOTIFY_STRESS_BENCHMARK_SCENARIO` (launcher default `evening_drift`; standing stress benchmark scenario)
+- `SPOTIFY_STRESS_BENCHMARK_POLICY` (launcher default `safe_global`; standing stress benchmark policy)
+- `SPOTIFY_STRESS_BENCHMARK_REFERENCE_POLICY` (launcher default `baseline_exploit`; comparison policy for the benchmark)
+- `SPOTIFY_ROBUSTNESS_GUARDRAIL_SEGMENT` (launcher default `repeat_from_prev`; named slice promoted into the robustness guardrail)
+- `SPOTIFY_ROBUSTNESS_GUARDRAIL_BUCKET` (launcher default `new`; bucket within the named robustness guardrail segment)
+
+Use the unified full-run launcher to detect the host and choose a bounded CPU or
+Apple Metal plan:
+
+```bash
+make train-everything                                      # auto-select CPU or Metal
+make train-everything-preflight RESOURCE_PROFILE=auto     # print the plan only
+make train-everything-dry-run RESOURCE_PROFILE=gpu        # print plan and command
+make train-everything RESOURCE_PROFILE=cpu                # explicit CPU pipeline
+make train-everything RESOURCE_PROFILE=gpu                # explicit Metal pipeline
+```
+
+The legacy `train-everything-cpu-boost`, `train-everything-gpu`, and
+`train-everything-hybrid` targets remain compatible. Explicit environment
+overrides still win over planner defaults. On 16 GB Apple Silicon, the Metal
+profile uses conservative TensorFlow threads, disables the in-memory
+`tf.data` cache, keeps CPU stages bounded, and uses float32 by default. Set
+`SPOTIFY_MIXED_PRECISION=on` to opt into mixed float16.
+
+TensorFlow is initialized only when uncached deep work requires it. It is
+released before CPU-only backtesting and is always cleaned up on failure.
+`SPOTIFY_TF_CLEANUP_GC=auto|off|full` controls the post-TensorFlow garbage
+collection pass; `auto` performs a lightweight generation-zero collection.
+
+The launcher still trains the full deep and classical slate, but it now backtests the lighter governance subset by default and runs lighter deep models first so progress appears sooner.
+
+For memory-constrained devices, keep the same model/training-set definitions but reduce peak RAM:
+
+```bash
+SPOTIFY_TF_DATA_CACHE=off \
+SPOTIFY_CLASSICAL_MODEL_WORKERS=1 \
+SPOTIFY_BACKTEST_WORKERS=1 \
+SPOTIFY_OPTUNA_JOBS=1 \
+bash scripts/run_everything.sh
+```
+
+For machines where the classical, Optuna, or backtest stages are underusing CPU, use:
+
+```bash
+bash scripts/run_everything.sh --resource-profile cpu
+```
+
+The GPU profile uses the Metal Python 3.11 environment, skips SHAP by default,
+and preserves unified-memory headroom. It is the preferred full-run path on
+Apple Silicon when `.venv-metal` is available.
+
+## Acceleration
+
+The default `.venv` on this machine is currently `Python 3.13` with
+`tensorflow 2.20.0` for CPU execution. The dedicated `.venv-metal` uses Python
+3.11 and exposes the Apple GPU. On Apple Silicon,
+`python scripts/check_acceleration.py` prints the active packages, visible
+devices, and setup guidance; add `--json` for machine-readable diagnostics.
+
+Local verification on this repo showed:
+
+- the current Python `3.13` environment could not install `tensorflow-metal`
+- a dedicated `Python 3.11` environment with `tensorflow-macos==2.16.2` and `tensorflow-metal==1.2.0` can see `GPU:0` on this Apple Silicon Mac
+- stale user-site TensorFlow Metal plugins under `~/Library/Python/<version>/.../tensorflow-plugins` can interfere with isolated virtualenv checks, so the setup script backs that folder up before creating `.venv-metal`
+
+The easiest repo-local path is:
+
+```bash
+bash scripts/setup_metal_venv.sh
+PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py --json
+bash scripts/run_everything.sh --resource-profile auto --preflight
+bash scripts/run_everything.sh --resource-profile auto
+```
+
+If you want to build it manually, the working stack from local verification was:
+
+```bash
+/opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv-metal
+PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install --upgrade pip setuptools wheel
+PYTHONNOUSERSITE=1 .venv-metal/bin/python -m pip install tensorflow-macos==2.16.2 tensorflow-metal==1.2.0
+PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
+```
+
+`scripts/run_benchmark_lock.sh` supports:
+
+- `BENCHMARK_SEEDS` (default `11 42 77`)
+- `DEEP_MODELS` (default `dense,gru_artist,lstm`)
+- `CLASSICAL_MODELS` (default `logreg,random_forest,extra_trees`)
+- `EPOCHS` (default `6`)
+
+## Elite Flags
+
+- `--mlflow` / `--no-mlflow`
+- `--mlflow-tracking-uri <uri>`
+- `--mlflow-experiment <name>`
+- `--conformal-alpha <float>`
+- `--no-conformal`
+- `--optuna` / `--no-optuna`
+- `--optuna-trials <n>`
+- `--optuna-timeout-seconds <n>`
+- `--optuna-models logreg,random_forest,...`
+- `--temporal-backtest` / `--no-temporal-backtest`
+- `--backtest-folds <n>`
+- `--backtest-models logreg,random_forest,...`
+- `--retrieval-stack` / `--no-retrieval-stack`
+- `--self-supervised-pretrain` / `--no-self-supervised-pretrain`
+- `--friction-analysis` / `--no-friction-analysis`
+- `--moonshot-lab` / `--no-moonshot-lab`
+- `--retrieval-candidates <n>`
+
+## Outputs
+
+Per run (`outputs/runs/<run_id>/`), typical files include:
+
+- `train.log`
+- `run_manifest.json`
+- `benchmark_protocol.json` + `benchmark_protocol.md`
+- `experiment_registry.json`
+- `run_results.json`
+- `run_report.md` (auto-generated run summary with metrics, speed, and trend links)
+- `data_quality_report.json` (schema/null/range gate report, generated before training)
+- `champion_gate.json` (promotion decision vs prior champion)
+- `feature_metadata.json` (artist label map + context feature schema)
+- `run_leaderboard.png`
+- `classical_results.json`
+- `histories.json` and deep-model learning curves
+- `optuna/optuna_results.json`
+- `optuna/optuna_trials_<model>.csv`
+- `optuna/optuna_history_<model>.png`
+- `backtest/temporal_backtest.csv`
+- `backtest/temporal_backtest_top1.png`
+- `backtest/temporal_backtest_summary.csv` + `backtest/temporal_backtest_summary.json`
+- `analysis/*_confidence_summary.json` (ECE/Brier/top-1 confidence summary)
+- `analysis/*_conformal_summary.json` (split-conformal threshold, coverage, abstention stats)
+- `analysis/data_drift_summary.json` (target drift and largest context/segment shifts)
+- `analysis/context_feature_drift.csv` + `analysis/segment_drift.csv`
+- `analysis/context_feature_drift.png` + `analysis/segment_drift.png`
+- `analysis/friction_proxy_summary.json` (proxy counterfactual gap between observed and healthier technical context)
+- `analysis/friction_feature_coefficients.csv` + `analysis/friction_counterfactual_delta.csv`
+- `analysis/robustness_slices.csv` + `analysis/robustness_summary.json`
+- `analysis/policy_simulation_summary.csv` + `analysis/policy_simulation_summary.json`
+- `analysis/ablation_summary.csv` + `analysis/backtest_significance.csv`
+- `analysis/moonshot_summary.json`
+- `analysis/multimodal/*` (artist-space summary, neighbors, and embedding artifact)
+- `analysis/causal/*` (causal skip decomposition summary and per-row uplift estimates)
+- `analysis/digital_twin/*` (listener digital twin artifact and end-of-session diagnostics)
+- `analysis/journey_planner/*` (multi-step listening journey plans)
+- `analysis/safe_policy/*` (safe bandit policy candidates and selected routing map)
+- `analysis/group_auto_dj/*` (shared-space cohort plans for household, party, car, and ambient listening)
+- `analysis/stress_test/*` (policy stress scenarios across friction and drift regimes)
+- `retrieval/retrieval_summary.json` + retrieval model artifacts
+- `analysis/*_reliability.png` (calibration curves)
+- `analysis/*_segment_metrics.csv` (segment-level top-1 and confidence)
+- `analysis/*_top_errors.csv` (most frequent true/prediction confusions)
+
+Global history (`outputs/history/`):
+
+- `experiment_history.csv` + `history_best_runs.png`
+- `optuna_history.csv` + `history_optuna_best_runs.png`
+- `backtest_history.csv` + `history_backtest_mean_top1.png`
+- `benchmark_lock_<id>_rows.csv` + `benchmark_lock_<id>_summary.csv`
+- `benchmark_lock_<id>_ci95.png`
+- `benchmark_history.csv`
+
+Prepared-data cache:
+
+- `outputs/cache/prepared_data/<fingerprint>/prepared_bundle.joblib`
+- `outputs/cache/prepared_data/<fingerprint>/cache_meta.json` (includes streaming ingestion and feature-engineering throughput stats for cold data-prep runs)
+
+Champion alias:
+
+- `outputs/models/champion/alias.json` (latest promoted run pointer + default serving model)
+
+Control room:
+
+- `outputs/analytics/control_room.json`
+- `outputs/analytics/control_room.md`
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
+- `outputs/analytics/spotify_analytics.duckdb`
+- `outputs/analytics/warehouse/`
+
+Generate the control-room summary:
+
+```bash
+make control-room
+```
+
+The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
+
+It also includes an automatic run tradeoff dossier comparing the selected run with its promoted baseline across quality, safety, runtime, phase regressions, and currently retained storage. Profile, workload, cache, or artifact mismatches are reported as explicit comparability blockers. Dossier verdicts now produce classified review actions with quoted, read-only inspection commands in the control-room and triage artifacts.
+
+Build the local analytics SQL file and warehouse:
+
+```bash
+make analytics-db
+```
+
+Build only the local bronze/silver/gold Parquet warehouse:
+
+```bash
+make analytics-warehouse
+```
+
+The warehouse writes bronze, silver, and gold marts plus a manifest under `outputs/analytics/warehouse/`. See [docs/analytics_db.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/analytics_db.md) for the local analytics-engineering layout and example queries.
+
+Data-science and quant branches now build on top of that local warehouse too:
+
+```bash
+make listener-archetypes
+make quant-decision-lab
+make creator-market-intelligence
+make creator-evidence-lab
+make research-platform-lab
+make scope-expansion-lab
+```
+
+`make scope-expansion-lab` writes a four-branch scorecard, ranked implementation queue, branch development cockpit, and per-branch strategy cards under `outputs/analysis/scope_expansion/`, covering analytics engineering, DS/quant, creator-market intelligence, and the research platform.
+
+Those commands now write local-first behavioral clustering, decision-frontier, creator-market, and research-platform artifacts under:
+
+- `outputs/analysis/listener_archetypes/`
+- `outputs/analysis/quant_decision_lab/`
+- `outputs/analysis/creator_market_intelligence/`
+- `outputs/analysis/creator_evidence_lab/`
+- `outputs/analysis/research_platform_lab/`
+
+See [docs/data_science_quant.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/data_science_quant.md), [docs/creator_market_intelligence.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/creator_market_intelligence.md), and [docs/research_platform_lab.md](/Users/akashponugoti/Documents/Documents - Akash’s MacBook Pro/Spotify/docs/research_platform_lab.md) for the local-lab workflow.
+
+## Taste OS Demo
+
+Run the first unified `Personal Taste OS` demo contract against the current champion run:
+
+```bash
+python -m spotify.taste_os_demo --mode focus --scenario steady --top-k 5
+```
+
+Or via the console script:
+
+```bash
+spotify-taste-os-demo --mode discovery --scenario skip_recovery --top-k 5
+```
+
+Or via Make:
+
+```bash
+make taste-os-demo EXTRA_ARGS='--mode commute --scenario friction_spike'
+```
+
+The command now writes both JSON and Markdown artifacts under `outputs/analysis/taste_os_demo/` and supports adaptive scenarios such as `skip_recovery`, `repeat_request`, `friction_spike`, and `mixed_session`.
+
+Build the Week 3-4 showcase pack with canonical adaptive examples plus a steady-mode comparison:
+
+```bash
+spotify-taste-os-showcase --top-k 5
+```
+
+Or via Make:
+
+```bash
+make taste-os-showcase EXTRA_ARGS='--top-k 5'
+```
+
+Build a serving bundle once so online services can run without rebuilding request context from raw history files:
+
+```bash
+python -m spotify.serving_bundle \
+  --run-dir outputs/runs/<run_id> \
+  --data-dir data/raw \
+  --all-contexts
+```
+
+Serve Taste OS session plans over HTTP:
+
+```bash
+python -m spotify.taste_os_service --host 127.0.0.1 --port 8010
+```
+
+Then open [http://127.0.0.1:8010/taste-os](http://127.0.0.1:8010/taste-os) for the built-in session studio.
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8010/taste-os/session \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"focus","scenario":"skip_recovery","top_k":5,"persist_artifacts":true,"use_feedback_memory":true}'
+```
+
+That service exposes a browser UI at `GET /taste-os`, plus:
+
+- `GET /health`
+- `GET /taste-os/catalog`
+- `GET /taste-os/history`
+- `GET /taste-os/session/<session_id>`
+- `POST /taste-os/session`
+- `POST /taste-os/session/event`
+- `POST /taste-os/feedback`
+
+`POST /taste-os/session/event` accepts an idempotent `event_id`, the current `expected_version`, and a `skip`, `repeat`, `like`, or `dislike` event. It returns a revised plan under the same session ID plus `why_this_changed`; the browser studio uses this path automatically. Likes and dislikes update durable taste memory, while skips and repeats only steer the active session.
+
+The session snapshot endpoint returns the current plan, version, adaptation summary, and a bounded chronological event history. Recent-session cards in the browser studio use it to resume live sessions without creating a replacement session.
+
+The service persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and stores feedback plus versioned active-session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
+
+For the production-style ASGI surface with versioned endpoints, request IDs, rate limiting, and metrics:
+
+```bash
+python -m spotify.service_api \
+  --app taste-os \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8010
+```
+
+The ASGI surface adds:
+
+- `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
+- `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
+- `GET /v1/taste-os/catalog`
+- `GET /v1/taste-os/history`
+- `GET /v1/taste-os/session/<session_id>`
+- `POST /v1/taste-os/session`
+- `POST /v1/taste-os/session/event`
+- `POST /v1/taste-os/feedback`
+
+Useful production flags:
+
+- `--state-db-url postgresql+psycopg://...` to move Taste OS state onto a shared SQL backend
+- `--rate-limit-backend redis --redis-url redis://...` for multi-instance request limiting
+- `--disable-otel` to turn off request spans / trace IDs when needed
+
+The contract lives in `docs/taste_os_demo_contract.md`, the demo guide lives in `docs/taste_os_demo_walkthrough.md`, and the short product framing lives in `docs/taste_os_product_story.md`.
+
+## Prediction CLI
+
+Load the best deep model from the latest promoted champion run and print top-5 predictions:
+
+```bash
+python -m spotify.predict_next --top-k 5
+```
+
+Or target a specific run directory:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --top-k 5
+```
+
+Use a specific model checkpoint:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --model-name gru_artist \
+  --top-k 5
+```
+
+Override sequence input with your own recent artists:
+
+```bash
+python -m spotify.predict_next \
+  --run-dir outputs/runs/<run_id> \
+  --recent-artists "Artist A|Artist B|Artist C|..."
+```
+
+Optionally enrich printed predictions with Spotify public artist metadata:
+
+```bash
+SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... \
+python -m spotify.predict_next \
+  --top-k 5 \
+  --spotify-public-metadata \
+  --spotify-market US
+```
+
+## Prediction Service (HTTP)
+
+Serve the latest promoted champion run via a lightweight HTTP API:
+
+```bash
+python -m spotify.predict_service \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Or pin a specific run:
+
+```bash
+python -m spotify.predict_service \
+  --run-dir outputs/runs/<run_id> \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Health check:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+Prediction request:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"top_k":5,"recent_artists":["Artist A","Artist B","Artist C"]}'
+```
+
+For the production-style ASGI surface that prefers materialized serving bundles, exposes `/v1` routes, and adds request telemetry:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/runs/<run_id> \
+  --require-serving-bundle \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+That API exposes:
+
+- `GET /v1/health`
+- `GET /v1/livez`
+- `GET /v1/readyz`
+- `GET /v1/metrics`
+- `GET /v1/metrics/prometheus`
+- `POST /v1/predict`
+- OpenAPI at `GET /openapi.json`
+
+Optional auth + request limits:
+
+- Set `SPOTIFY_PREDICT_AUTH_TOKEN` (or pass `--auth-token`) to require `Authorization: Bearer <token>` or `X-API-Key`.
+- Set `--auth-mode jwt` with `--jwks-url https://...` or `--jwt-secret ...` for JWT validation.
+- Use `--jwt-issuer`, `--jwt-audience`, and `--jwt-required-scopes` to make the API OAuth-provider-ready when your gateway or IdP issues JWT bearer tokens.
+- Use `--auth-scope all` to protect reads as well as mutations.
+- Set `--max-top-k` (or `SPOTIFY_PREDICT_MAX_TOP_K`) to cap request `top_k`.
+- Errors return structured payloads: `{"error":{"code","message","details"}}`.
+- When conformal diagnostics exist for the served model, requests can set `allow_abstain` and `return_prediction_set` to get risk-aware responses.
+- The ASGI surface adds `X-Request-ID` and `X-Trace-ID` headers, route-level telemetry at `/metrics`, Prometheus exposition at `/metrics/prometheus`, and shared Redis-backed rate limiting when configured.
+
+## Deployment Registry
+
+Publish a promoted run into the deployment registry and activate the `stable` channel:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable
+```
+
+That writes:
+
+- `outputs/deployments/registry/releases/<run_id>/deployment_release.json`
+- `outputs/deployments/registry/channels/<channel>/deployment_channel.json`
+- `outputs/deployments/registry/channels/<channel>/alias.json`
+
+Because the channel directory exports a normal `alias.json`, the serving APIs can point directly at it:
+
+```bash
+python -m spotify.service_api \
+  --app predict \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --require-serving-bundle
+```
+
+Before promoting or handing off a channel, write a release-readiness smoke bundle that checks alias resolution, champion-gate status, serving bundle manifests, deployment registry agreement, and deploy template readiness:
+
+```bash
+python -m spotify.release_readiness \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --registry-root outputs/deployments/registry \
+  --channel stable \
+  --require-registry \
+  --strict
+```
+
+That writes `outputs/analysis/release_readiness/release_readiness_smoke.json`, `.md`, and `release_readiness_checks.csv`.
+
+After the release metadata agrees, run the production smoke pass. It builds both ASGI apps in-process from the active channel, calls `/v1/readyz`, `/v1/metrics`, one prediction request, and one Taste OS session request, then records status codes, latency, request IDs, readiness checks, and blockers:
+
+```bash
+python -m spotify.production_smoke \
+  --run-dir outputs/deployments/registry/channels/stable \
+  --strict
+```
+
+That writes `outputs/analysis/production_smoke/production_smoke.json`, `.md`, `production_smoke_checks.csv`, and `production_smoke_requests.csv`.
+Each run also appends `outputs/history/production_smoke_history.csv` and refreshes `production_smoke_trend.json` / `.md` so release handoffs can compare readiness status and latency against earlier smoke runs.
+
+If you already mirror artifacts to another store, record its base URI with `--artifact-base-uri s3://...` so the release metadata keeps the external pointers too.
+
+To publish the copied release artifacts directly to a remote target, add `--publish-artifacts`. Supported targets are:
+
+- `file:///shared/releases`
+- `s3://bucket/prefix`
+- `gs://bucket/prefix`
+
+Example:
+
+```bash
+python -m spotify.deployment_registry \
+  --run-dir outputs/runs/<run_id> \
+  --registry-root outputs/deployments/registry \
+  --channel stable \
+  --artifact-base-uri s3://spotify-prod-releases/runs \
+  --publish-artifacts
+```
+
+Deployment templates live in:
+
+- `deploy/kubernetes/`
+- `deploy/ecs/`
+- `deploy/terraform/aws/`
+- `deploy/local/`
+
+## Infrastructure Bootstrap
+
+The repo now includes two practical infrastructure paths:
+
+- `deploy/local/` for a local production-smoke stack with Postgres, Redis, and both ASGI services
+- `deploy/terraform/aws/` for an AWS-first production baseline with VPC, ALB, ECS Fargate, EFS, RDS Postgres, ElastiCache Redis, ECR, and Secrets Manager
+
+Recommended order:
+
+1. Validate the service wiring locally with `deploy/local/production-smoke.compose.yaml`
+2. Provision the cloud baseline with `deploy/terraform/aws/`
+3. Publish a promoted run into the deployment registry
+4. Point the deployed services at `outputs/deployments/registry/channels/stable`
+
+The deployment asset map lives in `deploy/README.md`.
+
+## Public Comparison
+
+Compare your date-aligned listening history with Spotify's official 2025 Wrapped global and U.S. top lists:
+
+```bash
+python -m spotify.compare_public \
+  --provider spotify-wrapped \
+  --year 2025 \
+  --scope both \
+  --top-n 10
+```
+
+The offline report covers:
+
+- artists and songs ranked by your stream counts
+- podcasts ranked by your listening duration
+- global-versus-U.S. ranked overlap and a closest-scope summary
+- your play and listening-time concentration on public-top entities
+- monthly alignment throughout the January-to-mid-November Wrapped window
+- distinctive personal entries and public entries that are new to you
+
+Spotify publishes the top rankings but not worldwide or U.S. duration distributions. The report therefore does not invent a population listening-time average: duration metrics show how much of your own time was spent on public-top artists, songs, and podcasts.
+
+Optional genre detail uses Last.fm community tags as a clearly labeled proxy. For example:
+
+```bash
+LASTFM_API_KEY=... \
+python -m spotify.compare_public \
+  --provider spotify-wrapped \
+  --scope both \
+  --genre hip-hop
+```
+
+This reports your tagged hip-hop play/time share and overlap with Last.fm's public hip-hop artist chart. It is not presented as a Spotify genre market-share estimate.
+
+The earlier rolling Last.fm artist comparison remains available:
+
+```bash
+make compare-public EXTRA_ARGS='--provider lastfm --scope global --lookback-days 90 --top-n 50'
+```
+
+Outputs are written under `outputs/analysis/public_compare/` as both JSON and Markdown summaries. The report highlights:
+
+- the exact personal-history and public-reference date coverage
+- per-dimension similarity, overlap, and time concentration
+- monthly changes in alignment
+- the methodological and data-availability boundaries
+
+Spotify's developer policy prohibits using Spotify Platform content to create derived listenership metrics or benchmarks. This workflow uses Spotify's separately published aggregate Wrapped lists and does not derive public metrics from Spotify API content.
+
+The analytics refresh also calculates the comparison for every date with listening history:
+
+- `public_listening_daily_comparison`: one row per date, public scope, and dimension
+- `mart_public_listening_daily_similarity`: global and U.S. scores side by side
+- `mart_public_listening_trends`: rolling 7/30-day signals, scope streaks, and anomaly flags
+- `mart_public_listening_daily_narratives`: deterministic explanations for each listening day
+- `mart_public_listening_weekly_narratives`: Monday-based weekly explanations
+- `public_listening_daily_trend`: ordered DuckDB view over the daily mart
+- `public_listening_similarity_anomalies`: DuckDB view containing flagged trend anomalies
+
+Dates inside January 1 through November 15, 2025 are marked `date_aligned`. Earlier and later dates are retained as explicitly labeled projections against the fixed 2025 benchmark.
+
+```sql
+SELECT *
+FROM public_listening_daily_trend
+ORDER BY listening_date DESC, dimension;
+```
+
+Additional extension modules support validated custom reference years, cached
+genre/tag comparisons, and read-only DuckDB/Parquet dashboard queries. See
+[`docs/listening_comparison_roadmap.md`](docs/listening_comparison_roadmap.md).
+
+## Spotify Public Insights
+
+You can also use Spotify's public Web API for policy-safe metadata workflows that do not benchmark users or train models on Spotify content.
+
+All commands below require:
+
+```bash
+export SPOTIFY_CLIENT_ID=...
+export SPOTIFY_CLIENT_SECRET=...
+```
+
+The default transport uses the raw Spotify Web API client in this repo. If you want to route supported catalog calls through Spotipy, use either `--spotify-catalog-backend spotipy` or:
+
+```bash
+export SPOTIFY_PUBLIC_CATALOG_BACKEND=spotipy
+```
+
+Public API responses are cached by default under `outputs/cache/public_spotify/` and live requests are paced to reduce Spotify `429` rate-limit errors. Use `--spotify-cache-mode off` for a fresh live check, `--spotify-cache-ttl-hours 24` to shorten cache lifetime, or `--spotify-request-interval-seconds 0.5` for bigger catalog/radar runs.
+
+Artist explainer for your recent top artists:
+
+```bash
+python -m spotify.public_insights explain-artists --top-n 5 --lookback-days 180
+```
+
+Release tracker for favorite artists:
+
+```bash
+python -m spotify.public_insights release-tracker --top-n 10 --since-days 120
+```
+
+Public top tracks for favorite artists:
+
+```bash
+python -m spotify.public_insights artist-top-tracks --artists "Taylor Swift|SZA" --track-limit 10
+```
+
+New releases in a market:
+
+```bash
+python -m spotify.public_insights --spotify-market US new-releases --limit 20
+```
+
+Market availability check for your recent top tracks:
+
+```bash
+python -m spotify.public_insights market-check --markets US,GB,IN --top-n 20
+```
+
+Discography timeline:
+
+```bash
+python -m spotify.public_insights discography --top-n 5 --album-limit 20
+```
+
+Artist catalog completeness audit:
+
+```bash
+python -m spotify.public_insights artist-catalog-completeness --artists "Taylor Swift|SZA" --album-limit 20 --track-limit 50
+```
+
+Album deep dive with local-history coverage:
+
+```bash
+python -m spotify.public_insights album-profile --album spotify:album:<id> --track-limit 50
+```
+
+Public playlist viewer:
+
+```bash
+python -m spotify.public_insights playlist-view --playlist https://open.spotify.com/playlist/<id>
+```
+
+Playlist intelligence:
+
+```bash
+python -m spotify.public_insights playlist-intelligence --playlist https://open.spotify.com/playlist/<id> --item-limit 100
+```
+
+Discovery console:
+
+```bash
+python -m spotify.public_insights discovery-search --query "genre:indie year:2024-2026 tag:hipster" --types artist,album,track
+```
+
+Catalog link-outs:
+
+```bash
+python -m spotify.public_insights catalog-linkouts --top-artists 10 --top-tracks 20
+```
+
+Artist graph:
+
+```bash
+python -m spotify.public_insights artist-graph --top-n 5 --related-limit 10
+```
+
+Creator / label intelligence graph:
+
+```bash
+python -m spotify.public_insights creator-label-intelligence --top-n 8 --lookback-days 365 --neighbor-k 5
+```
+
+That report now reads more like a strategy brief: it starts with an executive summary, adds scene and seed comparison views, and writes comparison CSVs alongside the core adjacency, scene, migration, whitespace, and opportunity outputs.
+
+Release inbox:
+
+```bash
+python -m spotify.public_insights release-inbox --top-n 10 --since-days 120
+```
+
+Personal release radar:
+
+```bash
+python -m spotify.public_insights personal-release-radar --top-n 10 --since-days 120 --include-related
+```
+
+If a larger release radar hits API warnings, rerun with a smaller batch first:
+
+```bash
+python -m spotify.public_insights personal-release-radar --top-n 3 --since-days 365 --per-artist-limit 20
+```
+
+Playlist diff tracker:
+
+```bash
+python -m spotify.public_insights playlist-diff --playlist https://open.spotify.com/playlist/<id>
+```
+
+Market gap finder:
+
+```bash
+python -m spotify.public_insights market-gap --top-n 20
+```
+
+Playlist archive:
+
+```bash
+python -m spotify.public_insights playlist-archive --playlist https://open.spotify.com/playlist/<id>
+```
+
+ISRC / UPC / EAN crosswalk:
+
+```bash
+python -m spotify.public_insights catalog-crosswalk --top-n 20
+```
+
+Podcast / audiobook explorer:
+
+```bash
+python -m spotify.public_insights media-explorer --media-type show --query "indie music"
+```
+
+Cross-media taste graph:
+
+```bash
+python -m spotify.public_insights cross-media-taste-graph --lookback-days 180 --bridge-limit 6
+```
+
+Summarize recent public-insights artifacts and decide what to open next:
+
+```bash
+python -m spotify.public_insights summary --max-reports 25
+```
+
+Or use the Make target:
+
+```bash
+make public-insights EXTRA_ARGS='explain-artists --top-n 5'
+```
+
+Artifacts are written under `outputs/analysis/public_spotify/`. Full pipeline runs also write a display-only public insights index into `runs/<run_id>/analysis/public_spotify/`; these reports remain link-out/reporting artifacts and are not used as training features.
+
+## Roadmaps
+
+See `docs/personal_taste_os.md` for the product thesis, `docs/taste_os_demo_contract.md` for the demo contract, `docs/taste_os_demo_walkthrough.md` for a guided demo flow, `docs/project_threads.md` for the six-thread audit and expansion map, `docs/90_day_roadmap.md` for a concrete 90-day execution plan, and `docs/doctorate_roadmap.md` for the dissertation-scale research plan.
+
+## Docker (Serving APIs)
+
+Build:
+
+```bash
+docker build -t spotify-serving-api .
+```
+
+Run the prediction API:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e SERVICE_MODE=predict \
+  -e RUN_DIR=/app/outputs/models/champion \
+  -v "$(pwd)/outputs:/app/outputs" \
+  spotify-serving-api
+```
+
+Run the Taste OS API:
+
+```bash
+docker run --rm -p 8010:8010 \
+  -e SERVICE_MODE=taste-os \
+  -e PORT=8010 \
+  -e RUN_DIR=/app/outputs/models/champion \
+  -e TASTE_OS_OUTPUT_DIR=/app/outputs/analysis/taste_os_service \
+  -v "$(pwd)/outputs:/app/outputs" \
+  spotify-serving-api
+```
+
+The container includes a `/readyz` Docker healthcheck.
+
+New container envs:
+
+- `TASTE_OS_DATABASE_URL` to use a shared SQL backend for Taste OS state
+- `RATE_LIMIT_BACKEND=redis` plus `REDIS_URL=redis://...` for shared rate limiting
+- `AUTH_MODE=token|jwt|token_or_jwt|off`
+- `AUTH_SCOPE=mutations|all`
+- `JWT_SECRET=...` or `JWKS_URL=https://...`
+- `JWT_ISSUER=...`, `JWT_AUDIENCE=...`, `JWT_REQUIRED_SCOPES=...`
+- `OTEL_ENABLED=0` to disable request spans / trace IDs
+
+## CI
+
+GitHub Actions CI is defined in `.github/workflows/ci.yml` and runs on push/PR:
+
+- `ruff`
+- `mypy`
+- `pytest`
+- wheel build smoke
+- Docker image build smoke
+
+## Scheduling + Alerts
+
+Run scheduled-style jobs (fast/full) and alert on champion-gate regression plus control-room ops thresholds:
+
+```bash
+bash scripts/run_scheduled.sh fast
+```
+
+Check the latest run manually:
+
+```bash
+python scripts/regression_alert.py
+```
+
+Refresh the champion gate for an already-completed run without retraining:
+
+```bash
+python -m spotify.champion_gate_refresh --run-dir outputs/runs/<run_id>
+```
+
+Or via Make:
+
+```bash
+make refresh-champion-gate EXTRA_ARGS='--run-dir outputs/runs/<run_id>'
+```
+
+Publish a promoted run into the deployment registry:
+
+```bash
+make deploy-release EXTRA_ARGS='--run-dir outputs/runs/<run_id> --registry-root outputs/deployments/registry --channel stable'
+```
+
+Verify the promoted channel before handoff:
+
+```bash
+make release-readiness EXTRA_ARGS='--run-dir outputs/deployments/registry/channels/stable --registry-root outputs/deployments/registry --channel stable --require-registry --strict'
+```
+
+Exercise both ASGI services and capture latency/readiness evidence:
+
+```bash
+make production-smoke EXTRA_ARGS='--run-dir outputs/deployments/registry/channels/stable --strict'
+```
+
+Keep the outward-facing package current after Day 90:
+
+```bash
+make show-ready-backfill
+make show-ready-maintenance
+python -m spotify.phase_readiness --scope weeks-1-16
+```
+
+That post-launch loop backfills legacy creator and research artifacts, checks whether Taste OS / control room / research still share one review anchor, and reports whether the canonical launch package has gone stale after newer runs.
+
+Optional webhook alerts:
+
+```bash
+SPOTIFY_ALERT_WEBHOOK_URL="https://example.com/webhook" python scripts/regression_alert.py
+```
+
+By default, the alert path refreshes `outputs/analytics/control_room.json`, includes the top review actions in stdout/webhooks, and returns a non-zero exit code for:
+
+- champion-gate failure
+- control-room actions at `high` priority or above
+
+Tune that threshold with:
+
+```bash
+SPOTIFY_ALERT_REVIEW_THRESHOLD=medium python scripts/regression_alert.py
+SPOTIFY_ALERT_REVIEW_THRESHOLD=off python scripts/regression_alert.py
+```
+
+The scheduled wrapper also runs a dedicated control-room guard with these default thresholds:
+
+- `SPOTIFY_CONTROL_ROOM_MAX_ROBUSTNESS_GAP=0.35`
+- `SPOTIFY_CONTROL_ROOM_MAX_REPEAT_FROM_PREV_NEW_GAP=0.35`
+- `SPOTIFY_CONTROL_ROOM_MAX_STRESS_SKIP_RISK=0.45`
+- `SPOTIFY_CONTROL_ROOM_MAX_STRESS_BENCHMARK_SKIP_RISK=0.45`
+- `SPOTIFY_CONTROL_ROOM_MAX_TARGET_DRIFT_JSD=0.20`
+- `SPOTIFY_CONTROL_ROOM_MAX_SELECTIVE_RISK=0.50`
+
+The scheduled `full` wrapper is now intentionally more opinionated than the raw profile defaults: it seeds retrieval pretraining with `cooccurrence,masked_tail`, caps pretraining pairs at `1000000`, tunes only `logreg,extra_trees,mlp`, promotes `repeat_from_prev=new` into the named robustness guardrail, evaluates a standing `evening_drift` stress benchmark, and tunes conformal abstention toward lower selective risk unless you override the corresponding env vars.
+
+You can run that guard directly:
+
+```bash
+python scripts/control_room_guard.py \
+  --max-robustness-gap 0.35 \
+  --max-repeat-from-prev-new-gap 0.35 \
+  --max-stress-skip-risk 0.45 \
+  --max-stress-benchmark-skip-risk 0.45 \
+  --max-target-drift-jsd 0.20 \
+  --max-selective-risk 0.50
+```
+
+That guard also writes:
+
+- `outputs/analytics/control_room_history.csv`
+- `outputs/analytics/control_room_weekly_summary.json`
+- `outputs/analytics/control_room_weekly_summary.md`
+- `outputs/analytics/control_room_triage.json`
+- `outputs/analytics/control_room_triage.md`
+
+The history artifact keeps one snapshot per run, the weekly summary rolls recent runs into a trend view, the control room now calls out missing analysis coverage explicitly, and the triage artifacts expand the current review actions into inspect/fix/rerun steps so the next ops move is explicit after a failed scheduled run.
+
+New runs also leave behind two more ops-facing artifacts that the guard and control room understand:
+
+- `analysis/robustness_guardrails.json` for the named slice benchmark (default `repeat_from_prev=new`)
+- `analysis/stress_test/stress_test_benchmark.json` for the standing stress benchmark (default `evening_drift` under `safe_global`)
+
+## Spotify API Credentials
+
+The training pipeline no longer fetches Spotify audio features. Spotify's `audio-features` Web API endpoint is deprecated, and Spotify's current developer policy does not allow Spotify content to train ML/AI models.
+
+Existing `.env` and `.env.local` loading remains in place for compatibility, but training now zero-fills `danceability`, `energy`, and `tempo` instead of calling Spotify.
+
+You can still use `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` for opt-in prediction-time enrichment via `python -m spotify.predict_next --spotify-public-metadata`. That lookup only fetches public artist metadata for display and does not feed Spotify content into training.
+
+## Feature Upgrades
+
+The training context now includes additional recency/frequency and session-transition features:
+
+- `artist_play_count_24h`, `artist_play_count_7d`
+- `artist_freq_smooth` (Laplace-smoothed per-artist frequency)
+- `plays_since_last_artist`
+- `artist_session_play_count`
+- `session_elapsed_seconds`
+- `session_skip_rate_so_far`
+- `hours_since_last_artist`
+- `session_unique_artists_so_far`
+- `is_artist_repeat_from_prev`
+- `transition_repeat_count`
+- `artist_skip_rate_hist`
+- `artist_skip_rate_smooth`
+
+If `data/raw/Spotify Technical Log Information/` is present, preprocessing also joins recent device/network/playback-health context from the export, including connection churn, playback errors, stutters, track-not-played events, cloud-playback stalls, and the latest known bitrate / downgrade settings for the current device family.
+
+## Notes
+
+- Spotify audio feature columns are zero-filled during training.
+- `orjson` is used automatically (when installed) for faster raw JSON loading.
+- Matplotlib cache is shared under `outputs/.mplconfig` by default for faster repeat runs (`SPOTIFY_ISOLATE_MPL_CACHE=1` restores per-run isolation).
+- `make clean` keeps historical outputs.
+- `make clean-all` removes all outputs.

@@ -119,6 +119,9 @@ def _deep_training_source_digest() -> str:
     sources = [
         Path(__file__).with_name("training.py").resolve(),
         Path(__file__).with_name("modeling.py").resolve(),
+        Path(__file__).with_name("sasrec_model.py").resolve(),
+        Path(__file__).with_name("bert4rec_model.py").resolve(),
+        Path(__file__).with_name("srgnn_model.py").resolve(),
     ]
     hasher = hashlib.sha256()
     for path in sources:
