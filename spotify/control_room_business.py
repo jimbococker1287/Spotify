@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import math
 from pathlib import Path
+import shlex
 from typing import Callable
 
 from .run_artifacts import safe_read_json
@@ -346,6 +347,7 @@ def build_review_actions(
     qoe: dict[str, object],
     ops_coverage: dict[str, object],
     baseline_comparison: dict[str, object],
+    run_tradeoffs: dict[str, object],
     run_selection: dict[str, object],
     operating_rhythm: dict[str, object],
     safe_float: Callable[[object], float],
@@ -577,6 +579,209 @@ def build_review_actions(
             }
         )
 
+    tradeoff_verdict = str(run_tradeoffs.get("verdict", "")).strip().lower()
+    if tradeoff_verdict in {"not_comparable", "baseline_preferred", "tradeoff_review"}:
+        quality_rows = run_tradeoffs.get("quality_safety_deltas", [])
+        quality_rows = [row for row in quality_rows if isinstance(row, dict)] if isinstance(quality_rows, list) else []
+        worse_rows = [row for row in quality_rows if str(row.get("status", "")).strip().lower() == "worse"]
+        existing_areas = {
+            str(action.get("area", "")).strip().lower()
+            for action in actions
+            if isinstance(action, dict)
+        }
+        regression_areas = {
+            "best_model_test_top1": "promotion",
+            "best_model_val_top1": "promotion",
+            "target_drift_jsd": "drift",
+            "test_selective_risk": "uncertainty",
+            "robustness_gap": "robustness",
+            "stress_skip_risk": "stress_test",
+        }
+        unexplained_rows = [
+            row
+            for row in worse_rows
+            if regression_areas.get(str(row.get("key", "")).strip()) not in existing_areas
+        ]
+        promotion_already_explains_verdict = (
+            tradeoff_verdict == "baseline_preferred"
+            and not worse_rows
+            and "promotion" in existing_areas
+            and "did not pass promotion" in str(run_tradeoffs.get("verdict_summary", "")).lower()
+        )
+        regressions_already_explained = (
+            tradeoff_verdict == "baseline_preferred"
+            and bool(worse_rows)
+            and not unexplained_rows
+        )
+
+        if not promotion_already_explains_verdict and not regressions_already_explained:
+            runtime = run_tradeoffs.get("runtime", {})
+            runtime = runtime if isinstance(runtime, dict) else {}
+            runtime_selected = runtime.get("selected", {})
+            runtime_selected = runtime_selected if isinstance(runtime_selected, dict) else {}
+            runtime_baseline = runtime.get("baseline", {})
+            runtime_baseline = runtime_baseline if isinstance(runtime_baseline, dict) else {}
+            storage = run_tradeoffs.get("storage", {})
+            storage = storage if isinstance(storage, dict) else {}
+            storage_selected = storage.get("selected", {})
+            storage_selected = storage_selected if isinstance(storage_selected, dict) else {}
+            storage_baseline = storage.get("baseline", {})
+            storage_baseline = storage_baseline if isinstance(storage_baseline, dict) else {}
+
+            selected_run_dir = str(storage_selected.get("run_dir", "")).strip()
+            baseline_run_dir = str(storage_baseline.get("run_dir", "")).strip()
+            selected_timing_path = str(runtime_selected.get("timing_path", "")).strip()
+            baseline_timing_path = str(runtime_baseline.get("timing_path", "")).strip()
+            metric_rows = unexplained_rows if tradeoff_verdict == "baseline_preferred" else worse_rows
+            metric_keys = {str(row.get("key", "")).strip() for row in metric_rows}
+            inspect_paths: list[str] = []
+            inspect_commands: list[str] = []
+
+            def add_path(raw_path: object) -> None:
+                path = str(raw_path).strip()
+                if path and path not in inspect_paths:
+                    inspect_paths.append(path)
+
+            def add_command(parts: list[str]) -> None:
+                if not all(str(part).strip() for part in parts):
+                    return
+                command = " ".join(shlex.quote(str(part)) for part in parts)
+                if command not in inspect_commands:
+                    inspect_commands.append(command)
+
+            selected_manifest_path = str(Path(selected_run_dir) / "run_manifest.json") if selected_run_dir else ""
+            baseline_manifest_path = str(Path(baseline_run_dir) / "run_manifest.json") if baseline_run_dir else ""
+            selected_results_path = str(Path(selected_run_dir) / "run_results.json") if selected_run_dir else ""
+            baseline_results_path = str(Path(baseline_run_dir) / "run_results.json") if baseline_run_dir else ""
+
+            if tradeoff_verdict == "not_comparable":
+                for path in (
+                    baseline_manifest_path,
+                    selected_manifest_path,
+                    baseline_results_path,
+                    selected_results_path,
+                    baseline_timing_path,
+                    selected_timing_path,
+                    baseline_run_dir,
+                    selected_run_dir,
+                ):
+                    add_path(path)
+                add_command(["diff", "-u", baseline_manifest_path, selected_manifest_path])
+                if bool(runtime.get("available")):
+                    add_command(["diff", "-u", baseline_timing_path, selected_timing_path])
+                else:
+                    add_command(["ls", "-ld", baseline_timing_path, selected_timing_path])
+                add_command(["du", "-sh", baseline_run_dir, selected_run_dir])
+                priority = "medium"
+                classification = "operational"
+                title = "Resolve run comparability before choosing a winner"
+                comparability = run_tradeoffs.get("comparability", {})
+                comparability = comparability if isinstance(comparability, dict) else {}
+                blockers = comparability.get("blockers", [])
+                blockers = [row for row in blockers if isinstance(row, dict)] if isinstance(blockers, list) else []
+                blocker_details = "; ".join(
+                    str(row.get("detail", "")).strip()
+                    for row in blockers[:3]
+                    if str(row.get("detail", "")).strip()
+                )
+                detail = str(run_tradeoffs.get("verdict_summary", "")).strip()
+                if blocker_details:
+                    detail = f"{detail} Start with: {blocker_details}"
+            elif tradeoff_verdict == "baseline_preferred":
+                for path in (
+                    baseline_manifest_path,
+                    selected_manifest_path,
+                    baseline_results_path,
+                    selected_results_path,
+                ):
+                    add_path(path)
+                metric_artifacts = {
+                    "target_drift_jsd": ("analysis/data_drift_summary.json",),
+                    "robustness_gap": ("analysis/robustness_summary.json", "analysis/robustness_guardrails.json"),
+                    "stress_skip_risk": (
+                        "analysis/moonshot_summary.json",
+                        "analysis/stress_test/stress_test_benchmark.json",
+                    ),
+                }
+                for metric_key in sorted(metric_keys):
+                    for relative_path in metric_artifacts.get(metric_key, ()):
+                        if baseline_run_dir:
+                            add_path(Path(baseline_run_dir) / relative_path)
+                        if selected_run_dir:
+                            add_path(Path(selected_run_dir) / relative_path)
+                if metric_keys.intersection({"test_ece", "test_selective_risk"}):
+                    if baseline_run_dir:
+                        add_path(Path(baseline_run_dir) / "analysis")
+                    if selected_run_dir:
+                        add_path(Path(selected_run_dir) / "analysis")
+                add_command(["diff", "-u", baseline_results_path, selected_results_path])
+                priority = "high"
+                classification = "strategic"
+                title = "Hold the promoted baseline while unexplained regressions are reviewed"
+                labels = ", ".join(
+                    str(row.get("label", "")).strip()
+                    for row in metric_rows[:4]
+                    if str(row.get("label", "")).strip()
+                )
+                detail = str(run_tradeoffs.get("verdict_summary", "")).strip()
+                if labels:
+                    detail = f"{detail} Unexplained signals: {labels}."
+            else:
+                for path in (
+                    baseline_timing_path,
+                    selected_timing_path,
+                    baseline_run_dir,
+                    selected_run_dir,
+                ):
+                    add_path(path)
+                add_command(["diff", "-u", baseline_timing_path, selected_timing_path])
+                add_command(["du", "-sh", baseline_run_dir, selected_run_dir])
+                priority = "medium"
+                classification = "strategic"
+                title = "Decide whether the selected run's resource cost is justified"
+                detail = str(run_tradeoffs.get("verdict_summary", "")).strip()
+                phase_regressions = run_tradeoffs.get("largest_phase_regressions", [])
+                phase_regressions = (
+                    [row for row in phase_regressions if isinstance(row, dict)]
+                    if isinstance(phase_regressions, list)
+                    else []
+                )
+                if phase_regressions:
+                    phase = phase_regressions[0]
+                    detail += (
+                        f" Largest phase regression: `{phase.get('phase_name', 'unknown')}` "
+                        f"at `{format_metric(phase.get('delta_seconds'))}` seconds."
+                    )
+
+            tradeoff_action: dict[str, object] = {
+                "priority": priority,
+                "classification": classification,
+                "area": "tradeoff",
+                "tradeoff_verdict": tradeoff_verdict,
+                "title": title,
+                "detail": detail,
+                "inspect": inspect_paths,
+                "commands": inspect_commands,
+            }
+            priority_rank = {"high": 0, "medium": 1, "low": 2}
+            insertion_rank = priority_rank.get(priority, 1)
+            insertion_index = next(
+                (
+                    index
+                    for index, action in enumerate(actions)
+                    if (
+                        priority_rank.get(str(action.get("priority", "")).strip().lower(), 1) > insertion_rank
+                        or (
+                            insertion_rank > 0
+                            and priority_rank.get(str(action.get("priority", "")).strip().lower(), 1)
+                            == insertion_rank
+                        )
+                    )
+                ),
+                len(actions),
+            )
+            actions.insert(insertion_index, tradeoff_action)
+
     if not actions:
         actions.append(
             {
@@ -587,6 +792,11 @@ def build_review_actions(
                 "inspect": ["outputs/analytics/control_room.md"],
             }
         )
+
+    for action in actions:
+        if "classification" not in action:
+            area = str(action.get("area", "")).strip().lower()
+            action["classification"] = "operational" if area in {"instrumentation", "cadence"} else "strategic"
 
     return actions[:6]
 

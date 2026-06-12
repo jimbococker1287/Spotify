@@ -54,6 +54,13 @@ def _split_review_actions(review_actions: list[dict[str, object]]) -> tuple[list
     for action in review_actions:
         if not isinstance(action, dict):
             continue
+        classification = str(action.get("classification", "")).strip().lower()
+        if classification == "operational":
+            operational.append(action)
+            continue
+        if classification == "strategic":
+            strategic.append(action)
+            continue
         area = str(action.get("area", "")).strip().lower()
         if area in _OPERATIONAL_REVIEW_AREAS:
             operational.append(action)
@@ -588,6 +595,7 @@ def _build_review_actions(
     qoe: dict[str, object],
     ops_coverage: dict[str, object],
     baseline_comparison: dict[str, object],
+    run_tradeoffs: dict[str, object],
     run_selection: dict[str, object],
     operating_rhythm: dict[str, object],
 ) -> list[dict[str, object]]:
@@ -597,6 +605,7 @@ def _build_review_actions(
         qoe=qoe,
         ops_coverage=ops_coverage,
         baseline_comparison=baseline_comparison,
+        run_tradeoffs=run_tradeoffs,
         run_selection=run_selection,
         operating_rhythm=operating_rhythm,
         safe_float=_safe_float,
@@ -703,6 +712,7 @@ def build_control_room_report(
         qoe=qoe,
         ops_coverage=ops_coverage,
         baseline_comparison=baseline_comparison,
+        run_tradeoffs=run_tradeoffs,
         run_selection=run_selection,
         operating_rhythm=operating_rhythm,
     )

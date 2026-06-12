@@ -7,6 +7,19 @@ import sqlite3
 from urllib.parse import unquote, urlparse
 
 
+_GIB = 1024**3
+_STORAGE_PRESSURE_THRESHOLDS = {
+    "elevated": 5 * _GIB,
+    "high": 20 * _GIB,
+    "critical": 50 * _GIB,
+}
+_TRANSIENT_GROUP_LABELS = {
+    "tmp_prefix": "Top-level tmp-prefixed artifacts",
+    "ds_store": "Top-level .DS_Store metadata",
+    "mplconfig_cache": "Top-level local Matplotlib cache",
+}
+
+
 def _file_size(path: Path) -> int:
     try:
         return int(path.stat().st_size)
@@ -24,6 +37,17 @@ def _format_bytes(num_bytes: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{int(num_bytes)} B"
+
+
+def _retain_largest_file(
+    rows: list[dict[str, object]],
+    row: dict[str, object],
+    *,
+    limit: int,
+) -> None:
+    rows.append(row)
+    rows.sort(key=lambda item: int(item["bytes"]), reverse=True)
+    del rows[max(0, int(limit)) :]
 
 
 def _categorize_output_path(output_dir: Path, path: Path) -> str:
@@ -67,6 +91,46 @@ def _categorize_output_path(output_dir: Path, path: Path) -> str:
     if parts[0] == "models":
         return "models"
     return "other"
+
+
+def _transient_group_for_top_level_name(name: str) -> str | None:
+    normalized = str(name).strip().casefold()
+    if normalized == ".ds_store":
+        return "ds_store"
+    if normalized == ".mplconfig":
+        return "mplconfig_cache"
+    if normalized.startswith("tmp"):
+        return "tmp_prefix"
+    return None
+
+
+def _storage_pressure_summary(total_bytes: int, potential_reclaim_bytes: int) -> dict[str, object]:
+    total = max(0, int(total_bytes))
+    potential_reclaim = max(0, int(potential_reclaim_bytes))
+    if total >= _STORAGE_PRESSURE_THRESHOLDS["critical"]:
+        status = "critical"
+    elif total >= _STORAGE_PRESSURE_THRESHOLDS["high"]:
+        status = "high"
+    elif total >= _STORAGE_PRESSURE_THRESHOLDS["elevated"]:
+        status = "elevated"
+    elif potential_reclaim > 0:
+        status = "review"
+    else:
+        status = "normal"
+    reclaim_ratio = float(potential_reclaim / total) if total > 0 else 0.0
+    return {
+        "status": status,
+        "total_bytes": total,
+        "human_size": _format_bytes(total),
+        "potential_reclaim_bytes": potential_reclaim,
+        "potential_reclaim_human_size": _format_bytes(potential_reclaim),
+        "potential_reclaim_ratio": round(reclaim_ratio, 6),
+        "thresholds_bytes": dict(_STORAGE_PRESSURE_THRESHOLDS),
+        "summary": (
+            f"Storage pressure is {status}; {_format_bytes(potential_reclaim)} is identified for manual review "
+            "from strict top-level transient candidates."
+        ),
+    }
 
 
 def _resolve_path_from_uri(raw_uri: str) -> Path | None:
@@ -119,13 +183,39 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
     storage_roots = _discover_storage_roots(output_root)
 
     section_totals: dict[str, int] = {}
+    section_file_counts: dict[str, int] = {}
     category_totals: dict[str, dict[str, int]] = {}
     run_totals: dict[str, dict[str, object]] = {}
     top_files: list[dict[str, object]] = []
+    transient_candidates: dict[str, dict[str, object]] = {}
+    if output_root.exists():
+        try:
+            top_level_entries = list(output_root.iterdir())
+        except OSError:
+            top_level_entries = []
+        for entry in top_level_entries:
+            group = _transient_group_for_top_level_name(entry.name)
+            if group is None:
+                continue
+            transient_candidates[entry.name] = {
+                "group": group,
+                "label": _TRANSIENT_GROUP_LABELS[group],
+                "top_level_name": entry.name,
+                "path": str(entry.resolve()),
+                "entry_type": "directory" if entry.is_dir() else "file",
+                "file_count": 0,
+                "bytes": 0,
+                "review_status": "safe_to_review",
+                "reason": (
+                    "Strict top-level transient/debug name match. Review contents before removal; "
+                    "this report does not delete anything."
+                ),
+            }
 
     for root_label, root in storage_roots:
-        files = [path for path in root.rglob("*") if path.is_file()]
-        for path in files:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
             size_bytes = _file_size(path)
             if root_label == "outputs":
                 try:
@@ -134,6 +224,11 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
                     continue
                 category = _categorize_output_path(output_root, path)
                 section = relative.parts[0] if relative.parts else "other"
+                if relative.parts:
+                    candidate = transient_candidates.get(relative.parts[0])
+                    if candidate is not None:
+                        candidate["bytes"] = int(candidate["bytes"]) + size_bytes
+                        candidate["file_count"] = int(candidate["file_count"]) + 1
 
                 if section == "runs" and len(relative.parts) >= 2:
                     run_id = relative.parts[1]
@@ -153,24 +248,33 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
                     categories = run_entry["categories"]
                     categories[category] = int(categories.get(category, 0)) + size_bytes
                     top_entries = run_entry["top_files"]
-                    top_entries.append({"path": str(path.resolve()), "bytes": size_bytes})
-                    top_entries.sort(key=lambda item: int(item["bytes"]), reverse=True)
-                    del top_entries[top_n:]
+                    _retain_largest_file(
+                        top_entries,
+                        {"path": str(path.resolve()), "bytes": size_bytes},
+                        limit=top_n,
+                    )
             else:
                 category = "mlflow_artifacts"
                 section = root_label
 
             section_totals[section] = section_totals.get(section, 0) + size_bytes
+            section_file_counts[section] = section_file_counts.get(section, 0) + 1
             bucket = category_totals.setdefault(category, {"bytes": 0, "file_count": 0})
             bucket["bytes"] += size_bytes
             bucket["file_count"] += 1
-            top_files.append({"path": str(path.resolve()), "bytes": size_bytes, "category": category})
-
-    top_files.sort(key=lambda item: int(item["bytes"]), reverse=True)
-    top_files = top_files[:top_n]
+            _retain_largest_file(
+                top_files,
+                {"path": str(path.resolve()), "bytes": size_bytes, "category": category},
+                limit=top_n,
+            )
 
     section_rows = [
-        {"section": name, "bytes": total, "human_size": _format_bytes(total)}
+        {
+            "section": name,
+            "bytes": total,
+            "human_size": _format_bytes(total),
+            "file_count": section_file_counts.get(name, 0),
+        }
         for name, total in sorted(section_totals.items(), key=lambda item: item[1], reverse=True)
     ]
     category_rows = [
@@ -203,12 +307,102 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
             }
         )
 
+    candidate_rows = [
+        {
+            **candidate,
+            "human_size": _format_bytes(int(candidate["bytes"])),
+        }
+        for candidate in sorted(
+            transient_candidates.values(),
+            key=lambda item: (-int(item["bytes"]), str(item["top_level_name"]).casefold()),
+        )
+    ]
+    candidate_group_totals: dict[str, dict[str, int]] = {}
+    for candidate in candidate_rows:
+        group = str(candidate["group"])
+        bucket = candidate_group_totals.setdefault(
+            group,
+            {"bytes": 0, "file_count": 0, "candidate_count": 0},
+        )
+        bucket["bytes"] += int(candidate["bytes"])
+        bucket["file_count"] += int(candidate["file_count"])
+        bucket["candidate_count"] += 1
+    candidate_groups = [
+        {
+            "group": group,
+            "label": _TRANSIENT_GROUP_LABELS[group],
+            "bytes": payload["bytes"],
+            "human_size": _format_bytes(payload["bytes"]),
+            "file_count": payload["file_count"],
+            "candidate_count": payload["candidate_count"],
+            "review_status": "safe_to_review",
+        }
+        for group, payload in sorted(
+            candidate_group_totals.items(),
+            key=lambda item: (-item[1]["bytes"], item[0]),
+        )
+    ]
+    potential_reclaim_bytes = sum(int(candidate["bytes"]) for candidate in candidate_rows)
+    safe_to_review_file_count = sum(int(candidate["file_count"]) for candidate in candidate_rows)
+    runs_bytes = int(section_totals.get("runs", 0))
+    runs_file_count = int(section_file_counts.get("runs", 0))
+    mlflow_bytes = int(section_totals.get("mlruns", 0)) + int(section_totals.get("mlflow_artifacts", 0))
+    mlflow_file_count = int(section_file_counts.get("mlruns", 0)) + int(
+        section_file_counts.get("mlflow_artifacts", 0)
+    )
+    total_bytes = sum(section_totals.values())
+    storage_pressure = _storage_pressure_summary(total_bytes, potential_reclaim_bytes)
+    cleanup_opportunities = {
+        "potential_reclaim_bytes": potential_reclaim_bytes,
+        "potential_reclaim_human_size": _format_bytes(potential_reclaim_bytes),
+        "safe_to_review": {
+            "candidate_count": len(candidate_rows),
+            "file_count": safe_to_review_file_count,
+            "bytes": potential_reclaim_bytes,
+            "human_size": _format_bytes(potential_reclaim_bytes),
+            "groups": candidate_groups,
+            "candidates": candidate_rows,
+        },
+        "policy_managed": {
+            "runs": {
+                "bytes": runs_bytes,
+                "human_size": _format_bytes(runs_bytes),
+                "file_count": runs_file_count,
+                "status": "policy_managed",
+                "included_in_potential_reclaim": False,
+            },
+            "mlflow": {
+                "bytes": mlflow_bytes,
+                "human_size": _format_bytes(mlflow_bytes),
+                "file_count": mlflow_file_count,
+                "status": "policy_managed",
+                "included_in_potential_reclaim": False,
+                "includes_external_roots": any(label == "mlflow_artifacts" for label, _path in storage_roots),
+            },
+        },
+        "guidance": {
+            "deletes_files": False,
+            "workflow_path": "scripts/prune_artifacts.py",
+            "safe_to_review": (
+                "Review strict top-level transient candidates manually. Names alone are not authorization to delete."
+            ),
+            "policy_managed": (
+                "Use the existing scripts/prune_artifacts.py workflow for run and MLflow retention decisions; "
+                "their bytes are not counted as immediately reclaimable."
+            ),
+        },
+    }
+
     report = {
         "generated_at": generated_at,
         "output_dir": str(output_root),
         "scanned_roots": [{"label": label, "path": str(path)} for label, path in storage_roots],
-        "total_bytes": sum(section_totals.values()),
-        "human_size": _format_bytes(sum(section_totals.values())),
+        "total_bytes": total_bytes,
+        "human_size": _format_bytes(total_bytes),
+        "storage_pressure": storage_pressure,
+        "potential_reclaim_bytes": potential_reclaim_bytes,
+        "potential_reclaim_human_size": _format_bytes(potential_reclaim_bytes),
+        "cleanup_opportunities": cleanup_opportunities,
         "section_totals": section_rows,
         "category_totals": category_rows,
         "runs": run_rows,
@@ -217,11 +411,16 @@ def build_storage_report(output_dir: Path, *, top_n: int = 15) -> dict[str, obje
     return report
 
 
-def write_storage_report(output_dir: Path, *, top_n: int = 15) -> tuple[Path, Path]:
+def write_storage_report(
+    output_dir: Path,
+    *,
+    top_n: int = 15,
+    report: dict[str, object] | None = None,
+) -> tuple[Path, Path]:
     output_root = output_dir.expanduser().resolve()
     analytics_dir = output_root / "analytics"
     analytics_dir.mkdir(parents=True, exist_ok=True)
-    report = build_storage_report(output_root, top_n=top_n)
+    report = report if report is not None else build_storage_report(output_root, top_n=top_n)
 
     json_path = analytics_dir / "storage_report.json"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -232,6 +431,9 @@ def write_storage_report(output_dir: Path, *, top_n: int = 15) -> tuple[Path, Pa
         f"- Generated: `{report['generated_at']}`",
         f"- Output root: `{report['output_dir']}`",
         f"- Total size: `{report['human_size']}`",
+        f"- Storage pressure: `{report['storage_pressure']['status']}`",
+        f"- Strict transient candidates: `{report['cleanup_opportunities']['safe_to_review']['candidate_count']}`",
+        f"- Potential reclaim for review: `{report['potential_reclaim_human_size']}`",
         "",
         "## Scanned Roots",
         "",
@@ -239,9 +441,69 @@ def write_storage_report(output_dir: Path, *, top_n: int = 15) -> tuple[Path, Pa
     for row in report["scanned_roots"]:
         lines.append(f"- `{row['label']}`: `{row['path']}`")
 
+    pressure = report["storage_pressure"]
+    lines.extend(
+        [
+            "",
+            "## Storage Pressure",
+            "",
+            f"- Status: `{pressure['status']}`",
+            f"- Accounted storage: `{pressure['human_size']}`",
+            f"- Potential reclaim from strict transient candidates: `{pressure['potential_reclaim_human_size']}`",
+            f"- Potential reclaim ratio: `{float(pressure['potential_reclaim_ratio']):.2%}`",
+            f"- Summary: {pressure['summary']}",
+        ]
+    )
+
+    cleanup = report["cleanup_opportunities"]
+    safe_to_review = cleanup["safe_to_review"]
+    policy_managed = cleanup["policy_managed"]
+    guidance = cleanup["guidance"]
+    lines.extend(
+        [
+            "",
+            "## Cleanup Opportunities",
+            "",
+            "This section is diagnostic only. No files were deleted.",
+            "",
+            "### Safe To Review",
+            "",
+            f"- Potential reclaim: `{safe_to_review['human_size']}` across `{safe_to_review['file_count']}` files and `{safe_to_review['candidate_count']}` top-level candidates.",
+        ]
+    )
+    if safe_to_review["groups"]:
+        for row in safe_to_review["groups"]:
+            lines.append(
+                f"- `{row['group']}`: `{row['human_size']}` across `{row['file_count']}` files in `{row['candidate_count']}` candidates"
+            )
+    else:
+        lines.append("- No strict top-level transient/debug candidates were detected.")
+    if safe_to_review["candidates"]:
+        lines.extend(["", "#### Candidate Paths", ""])
+        for row in safe_to_review["candidates"]:
+            lines.append(
+                f"- `{row['review_status']}` `{row['human_size']}` across `{row['file_count']}` files: `{row['path']}`"
+            )
+
+    lines.extend(
+        [
+            "",
+            "### Policy-Managed Storage",
+            "",
+            f"- Runs: `{policy_managed['runs']['human_size']}` across `{policy_managed['runs']['file_count']}` files; excluded from immediate reclaim estimates.",
+            f"- MLflow: `{policy_managed['mlflow']['human_size']}` across `{policy_managed['mlflow']['file_count']}` files; excluded from immediate reclaim estimates.",
+            "",
+            "### Guidance",
+            "",
+            f"- {guidance['safe_to_review']}",
+            f"- {guidance['policy_managed']}",
+            f"- Cleanup workflow: `{guidance['workflow_path']}`",
+        ]
+    )
+
     lines.extend(["", "## Sections", ""])
     for row in report["section_totals"]:
-        lines.append(f"- `{row['section']}`: `{row['human_size']}`")
+        lines.append(f"- `{row['section']}`: `{row['human_size']}` across `{row['file_count']}` files")
 
     lines.extend(["", "## Categories", ""])
     for row in report["category_totals"][:10]:

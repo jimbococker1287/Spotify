@@ -109,6 +109,13 @@ def test_run_optuna_tuning_reuses_cached_result_without_loading_optuna(
         raise AssertionError("Optuna should not be loaded on a full cache hit")
 
     monkeypatch.setattr(tuning, "_load_optuna", _unexpected_optuna_load)
+    monkeypatch.setattr(
+        tuning,
+        "validate_classical_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Estimator registry should not load on a full cache hit")
+        ),
+    )
     cache_stats: dict[str, object] = {}
 
     results = tuning.run_optuna_tuning(
@@ -134,6 +141,12 @@ def test_run_optuna_tuning_reuses_cached_result_without_loading_optuna(
     assert (output_dir / "estimators" / "classical_tuned_logreg.joblib").exists()
     assert (output_dir / "optuna_trials_logreg.csv").exists()
     assert (output_dir / "optuna_history_logreg.png").exists()
+    assert (output_dir / "prediction_bundles" / "classical_tuned_logreg.npz").samefile(
+        cache_paths.prediction_bundle_path
+    )
+    assert (output_dir / "estimators" / "classical_tuned_logreg.joblib").samefile(
+        cache_paths.estimator_artifact_path
+    )
     assert (output_dir / "optuna_results.json").exists()
     assert cache_stats == {
         "enabled": True,
@@ -228,11 +241,56 @@ def test_find_optuna_warm_start_candidate_prefers_matching_fingerprint(
         model_name="logreg",
         max_train_samples=10_000,
         max_eval_samples=4_000,
-        per_trial_timeout_seconds=120,
-        fidelity_schedule=(0.25, 0.6, 1.0),
-        pruner_name="median",
     )
 
     assert candidate is not None
     assert candidate.cache_fingerprint == "prepared-next"
     assert candidate.best_params == {"C": 0.5, "max_iter": 250}
+
+
+def test_find_optuna_warm_start_candidate_allows_policy_changes(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache"
+    payload = tuning._build_optuna_cache_payload(
+        cache_fingerprint="prepared123",
+        model_name="logreg",
+        random_seed=42,
+        trials=8,
+        max_train_samples=10_000,
+        max_eval_samples=4_000,
+        model_timeout_seconds=300,
+        per_trial_timeout_seconds=120,
+        fidelity_schedule=(0.25, 0.6, 1.0),
+        pruner_name="median",
+    )
+    cache_key = tuning._build_optuna_cache_key(payload)
+    cache_paths = tuning._resolve_optuna_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint="prepared123",
+        model_name="logreg",
+        cache_key=cache_key,
+    )
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    tuning.write_json(cache_paths.metadata_path, {**payload, "cache_key": cache_key})
+    tuning.write_json(
+        cache_paths.result_path,
+        {
+            "result": {
+                "val_top1": 0.82,
+                "best_params": {"C": 0.75, "max_iter": 350},
+            }
+        },
+    )
+
+    candidate = tuning._find_optuna_warm_start_candidate(
+        cache_root=cache_root,
+        current_cache_key="different-policy-key",
+        cache_fingerprint="prepared123",
+        model_name="logreg",
+        max_train_samples=10_000,
+        max_eval_samples=4_000,
+    )
+
+    assert candidate is not None
+    assert candidate.best_params == {"C": 0.75, "max_iter": 350}

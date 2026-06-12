@@ -350,10 +350,18 @@ def build_control_room_markdown_lines(
         if not isinstance(action, dict):
             continue
         detail = str(action.get("detail", "")).strip()
+        classification = str(action.get("classification", "")).strip().upper()
         inspect = action.get("inspect", [])
         inspect_items = inspect if isinstance(inspect, list) else []
         inspect_text = f" Inspect: {', '.join(str(item) for item in inspect_items if item)}." if inspect_items else ""
-        lines.append(f"- [{str(action.get('priority', '')).upper()}] {action.get('title', '')}: {detail}{inspect_text}")
+        commands = action.get("commands", [])
+        command_items = commands if isinstance(commands, list) else []
+        command_text = f" Commands: {', '.join(f'`{item}`' for item in command_items if item)}." if command_items else ""
+        classification_text = f"[{classification}]" if classification else ""
+        lines.append(
+            f"- [{str(action.get('priority', '')).upper()}]{classification_text} "
+            f"{action.get('title', '')}: {detail}{inspect_text}{command_text}"
+        )
 
     lines.extend(
         [

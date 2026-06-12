@@ -69,6 +69,13 @@ def run_temporal_backtest(
         phase["cache_fingerprint"] = str(backtest_cache_stats.get("fingerprint", ""))
         phase["cache_key"] = str(backtest_cache_stats.get("cache_key", ""))
         phase["cache_hit"] = bool(backtest_cache_stats.get("hit", False))
+        phase["cache_scope"] = str(backtest_cache_stats.get("cache_scope", "miss"))
+        phase["cache_hit_models"] = list(backtest_cache_stats.get("model_cache_hit_names", []))
+        phase["cache_miss_models"] = list(backtest_cache_stats.get("model_cache_miss_names", []))
+        phase["cache_reused_rows"] = int(backtest_cache_stats.get("reused_row_count", 0))
+        phase["retrieval_fit_count"] = int(backtest_cache_stats.get("retrieval_fit_count", 0))
+        phase["retrieval_fit_reuse_count"] = int(backtest_cache_stats.get("retrieval_fit_reuse_count", 0))
+        phase["backtest_wall_seconds"] = float(backtest_cache_stats.get("wall_seconds", 0.0))
 
 
 __all__ = ["run_temporal_backtest"]

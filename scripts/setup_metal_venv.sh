@@ -41,5 +41,6 @@ PYTHONNOUSERSITE=1 "$VENV_DIR/bin/python" -m pip install -e . --no-deps
 
 echo
 echo "Metal environment ready at $VENV_DIR"
-echo "Verifying GPU visibility..."
-PYTHONNOUSERSITE=1 "$VENV_DIR/bin/python" scripts/check_acceleration.py
+echo "Verifying the Metal full-run resource profile..."
+PYTHON_BIN="$VENV_DIR/bin/python" PYTHONPATH="$ROOT_DIR" PYTHONNOUSERSITE=1 \
+  bash scripts/run_everything.sh --resource-profile gpu --preflight

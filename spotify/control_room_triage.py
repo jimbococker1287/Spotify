@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 
 
+def _string_list(value: object) -> list[str]:
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
 def _violation_area(key: str) -> str:
     if key in {"robustness_gap", "repeat_from_prev_new_gap"}:
         return "robustness"
@@ -124,6 +128,21 @@ def _triage_playbook(area: str) -> dict[str, list[str]]:
                 "Confirm the async handoff and cadence sections now point at the fresh run instead of the stale fallback.",
             ],
         }
+    if normalized == "tradeoff":
+        return {
+            "inspect": [
+                "Open the dossier-derived selected and baseline paths listed on this item before interpreting the verdict.",
+                "Review the listed inspection commands as read-only comparisons; the triage artifact does not execute them.",
+            ],
+            "fix": [
+                "For comparability blockers, align the run profile, workload, timing evidence, and retained-artifact policy before deciding.",
+                "For baseline or resource tradeoffs, keep the promoted baseline until the regression or added cost has an explicit owner and rationale.",
+            ],
+            "rerun": [
+                "Refresh the control room after the evidence or decision record changes.",
+                "Confirm the dossier verdict changes or the accepted tradeoff is documented before altering promotion policy.",
+            ],
+        }
     return {
         "inspect": [
             "Open outputs/analytics/control_room.md and review the latest run against the promoted baseline.",
@@ -157,9 +176,11 @@ def _build_triage_items(
             {
                 "area": area,
                 "priority": str(action.get("priority", "")).strip().lower() or "medium",
+                "classification": str(action.get("classification", "")).strip().lower() or "strategic",
                 "title": str(action.get("title", "")).strip() or "Untitled review action",
                 "trigger": str(action.get("detail", "")).strip(),
-                "inspect_files": [str(item) for item in action.get("inspect", [])] if isinstance(action.get("inspect", []), list) else [],
+                "inspect_files": _string_list(action.get("inspect", [])),
+                "inspect_commands": _string_list(action.get("commands", [])),
                 "threshold_violation": violation_by_area.get(area),
                 "inspect_steps": playbook["inspect"],
                 "fix_steps": playbook["fix"],
@@ -177,9 +198,11 @@ def _build_triage_items(
             {
                 "area": area,
                 "priority": "high",
+                "classification": "strategic",
                 "title": str(violation.get("label", "")).strip() or "Threshold violation",
                 "trigger": str(violation.get("message", "")).strip(),
                 "inspect_files": [],
+                "inspect_commands": [],
                 "threshold_violation": violation,
                 "inspect_steps": playbook["inspect"],
                 "fix_steps": playbook["fix"],
@@ -260,14 +283,17 @@ def write_control_room_triage_artifacts(
             lines.append("")
             lines.append(f"- Area: `{item['area']}`")
             lines.append(f"- Priority: `{item['priority']}`")
+            lines.append(f"- Classification: `{item['classification']}`")
             lines.append(f"- Trigger: {item['trigger']}")
-            for inspect_file in item["inspect_files"]:
+            for inspect_file in _string_list(item.get("inspect_files", [])):
                 lines.append(f"- Inspect file: `{inspect_file}`")
-            for step in item["inspect_steps"]:
+            for inspect_command in _string_list(item.get("inspect_commands", [])):
+                lines.append(f"- Inspect command: `{inspect_command}`")
+            for step in _string_list(item.get("inspect_steps", [])):
                 lines.append(f"- Inspect: {step}")
-            for step in item["fix_steps"]:
+            for step in _string_list(item.get("fix_steps", [])):
                 lines.append(f"- Fix: {step}")
-            for step in item["rerun_steps"]:
+            for step in _string_list(item.get("rerun_steps", [])):
                 lines.append(f"- Rerun: {step}")
     else:
         lines.append("- No triage items were generated.")

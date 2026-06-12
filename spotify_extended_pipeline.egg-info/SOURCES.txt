@@ -29,6 +29,8 @@ spotify/control_room_history.py
 spotify/control_room_rendering.py
 spotify/control_room_selection.py
 spotify/control_room_triage.py
+spotify/creator_benchmark_contract.py
+spotify/creator_evidence_lab.py
 spotify/creator_label_intelligence.py
 spotify/creator_label_intelligence_core.py
 spotify/creator_market_intelligence.py
@@ -145,6 +147,7 @@ spotify/reporting.py
 spotify/research_artifacts.py
 spotify/research_claims.py
 spotify/research_platform_lab.py
+spotify/resource_planning.py
 spotify/retrieval.py
 spotify/retrieval_ann_metrics.py
 spotify/retrieval_artifact_payloads.py
@@ -166,6 +169,7 @@ spotify/retrieval_training.py
 spotify/robustness.py
 spotify/run_artifacts.py
 spotify/run_timing.py
+spotify/run_tradeoffs.py
 spotify/runtime.py
 spotify/safe_policy.py
 spotify/safety_platform.py
@@ -219,6 +223,8 @@ tests/test_config_smoke.py
 tests/test_control_room.py
 tests/test_control_room_cli_smoke.py
 tests/test_control_room_guard.py
+tests/test_creator_benchmark_contract.py
+tests/test_creator_evidence_lab.py
 tests/test_creator_label_intelligence.py
 tests/test_creator_market_intelligence.py
 tests/test_data_discovery.py
@@ -243,6 +249,7 @@ tests/test_outward_package_cli_smoke.py
 tests/test_packaging_smoke.py
 tests/test_phase_readiness.py
 tests/test_pipeline_runtime_analysis_artifacts.py
+tests/test_pipeline_runtime_cleanup.py
 tests/test_pipeline_runtime_dependency_bundle.py
 tests/test_pipeline_runtime_experiments.py
 tests/test_pipeline_runtime_runner_setup.py
@@ -268,11 +275,13 @@ tests/test_research_claims.py
 tests/test_research_claims_cli_smoke.py
 tests/test_research_platform.py
 tests/test_research_platform_lab.py
+tests/test_resource_planning.py
 tests/test_retrieval_and_friction.py
 tests/test_retrieval_reranking.py
 tests/test_run_artifact_writes.py
 tests/test_run_artifacts.py
 tests/test_run_timing.py
+tests/test_run_tradeoffs.py
 tests/test_runtime_acceleration.py
 tests/test_safe_policy.py
 tests/test_safety_platform_surface.py
@@ -287,6 +296,7 @@ tests/test_storage_report.py
 tests/test_stress_test.py
 tests/test_taste_os_demo.py
 tests/test_taste_os_demo_cli_smoke.py
+tests/test_taste_os_http.py
 tests/test_taste_os_service.py
 tests/test_taste_os_service_cli_smoke.py
 tests/test_taste_os_showcase.py

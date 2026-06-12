@@ -111,7 +111,9 @@ This demo is intentionally still a thin product layer. The browser service now a
 - a built-in consumer-style session studio at `GET /taste-os`
 - persistent feedback memory and recent-session history under `outputs/analysis/taste_os_service/`
 - `GET /taste-os/history` and `POST /taste-os/feedback` so the planner can reuse simple preference memory across sessions
+- `GET /taste-os/session/<session_id>` plus Resume controls for restoring a live plan, version, adaptation summary, and recent event timeline
 - `POST /taste-os/session/event` for versioned, idempotent live replanning after skip, repeat, like, or dislike events
+- production ASGI parity at `GET /v1/taste-os/session/<session_id>` and `POST /v1/taste-os/session/event`
 
 It still does not yet include:
 

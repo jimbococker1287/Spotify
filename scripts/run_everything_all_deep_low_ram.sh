@@ -50,10 +50,23 @@ if [[ $# -eq 0 || "$1" == --* ]]; then
 fi
 
 RUN_NAME="$1"
+PLAN_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|--preflight)
+      PLAN_ONLY=1
+      ;;
+  esac
+done
+
 set +e
 bash scripts/run_everything_balanced_full.sh "$@"
 STATUS=$?
 set -e
+
+if [[ "$PLAN_ONLY" == "1" ]]; then
+  exit "$STATUS"
+fi
 
 # If the later full-pipeline stages are interrupted, preserve the all-14 deep
 # benchmark as a structured partial artifact instead of leaving only logs.

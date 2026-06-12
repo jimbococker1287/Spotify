@@ -400,6 +400,118 @@ def test_run_temporal_backtest_supports_blended_ensemble_models(tmp_path: Path, 
     ]
 
 
+def test_run_temporal_backtest_shares_retrieval_fit_across_fold_consumers(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    fit_calls: list[int] = []
+
+    monkeypatch.setattr(backtesting, "_build_expanding_windows", lambda _n_rows, _folds: [(4, 6)])
+    monkeypatch.setenv("SPOTIFY_BACKTEST_WORKERS", "1")
+
+    def _fake_fit_retrieval_backtest_models(**kwargs):
+        fit_calls.append(int(kwargs["fold_idx"]))
+        baseline = SimpleNamespace(
+            retrieval_metrics_val={"top1": 0.4, "top5": 0.8},
+            retrieval_metrics_test={"top1": 0.45, "top5": 0.85},
+            val_retrieval_scores=np.array([[2.0, 0.0, -1.0]], dtype="float32"),
+            test_retrieval_scores=np.array(
+                [[0.0, -1.0, 2.0], [0.0, 2.0, -1.0]],
+                dtype="float32",
+            ),
+        )
+        reranker = SimpleNamespace(
+            rerank_metrics_val={"top1": 0.5, "top5": 1.0},
+            rerank_metrics_test={"top1": 1.0, "top5": 1.0},
+            val_rerank_proba=np.array([[0.8, 0.1, 0.1]], dtype="float32"),
+            test_rerank_proba=np.array(
+                [[0.1, 0.1, 0.8], [0.1, 0.8, 0.1]],
+                dtype="float32",
+            ),
+        )
+        return baseline, reranker, 2.5
+
+    monkeypatch.setattr(backtesting, "_fit_retrieval_backtest_models", _fake_fit_retrieval_backtest_models)
+    cache_stats: dict[str, object] = {}
+
+    rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path,
+        selected_models=("retrieval_dual_encoder", "retrieval_reranker", "blended_ensemble"),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_shared_retrieval"),
+        cache_stats_out=cache_stats,
+    )
+
+    assert fit_calls == [1]
+    assert [row.model_name for row in rows] == [
+        "retrieval_dual_encoder",
+        "retrieval_reranker",
+        "blended_ensemble",
+    ]
+    assert cache_stats["retrieval_fit_count"] == 1
+    assert cache_stats["retrieval_fit_reuse_count"] == 2
+
+
+def test_ensemble_backtest_skips_base_candidate_shadowed_by_best_tuned_alias(monkeypatch) -> None:
+    fit_calls: list[str] = []
+
+    def _fake_fit_classical_backtest_probabilities(**kwargs):
+        model_name = str(kwargs["model_name"])
+        fit_calls.append(model_name)
+        score = {"mlp_optuna": 0.9, "mlp": 0.4, "extra_trees": 0.7}[model_name]
+        return {
+            "model_name": model_name,
+            "model_type": "classical_tuned" if model_name == "mlp_optuna" else "classical",
+            "model_family": "test",
+            "base_model_name": "mlp" if model_name == "mlp_optuna" else model_name,
+            "fit_seconds": 0.1,
+            "val_proba": np.array([[0.1, 0.8, 0.1]], dtype="float32"),
+            "test_proba": np.array(
+                [[0.1, 0.1, 0.8], [0.1, 0.8, 0.1]],
+                dtype="float32",
+            ),
+            "val_top1": score,
+            "val_top5": 1.0,
+            "test_top1": 1.0,
+            "test_top5": 1.0,
+        }
+
+    monkeypatch.setattr(
+        backtesting,
+        "_fit_classical_backtest_probabilities",
+        _fake_fit_classical_backtest_probabilities,
+    )
+
+    row = backtesting._run_ensemble_backtest_job(
+        model_name="blended_ensemble",
+        fold_idx=1,
+        random_seed=42,
+        estimator_n_jobs=1,
+        X_train_tab=np.arange(12, dtype="float32").reshape(4, 3),
+        y_train=np.array([1, 2, 0, 1], dtype="int32"),
+        X_test_tab=np.arange(6, dtype="float32").reshape(2, 3),
+        y_test=np.array([2, 1], dtype="int32"),
+        X_seq_train=np.array([[0, 1], [1, 2], [2, 0], [0, 1]], dtype="int32"),
+        X_ctx_train=np.arange(8, dtype="float32").reshape(4, 2),
+        X_seq_test=np.array([[0, 2], [2, 1]], dtype="int32"),
+        X_ctx_test=np.arange(4, dtype="float32").reshape(2, 2),
+        num_artists=3,
+        logger=_logger("spotify.test.backtest_ensemble_alias"),
+        candidate_model_names=("mlp", "mlp_optuna", "extra_trees", "blended_ensemble"),
+        tuned_model_specs={
+            "mlp_optuna": {
+                "base_model_name": "mlp",
+                "best_params": {"hidden_1": 128},
+            }
+        },
+    )
+
+    assert fit_calls == ["mlp_optuna", "extra_trees"]
+    assert row.model_name == "blended_ensemble"
+
+
 def test_retrieval_backtest_runtime_config_tracks_extended_knobs(monkeypatch) -> None:
     monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_ANN_BITS", "12")
     monkeypatch.setenv("SPOTIFY_RETRIEVAL_BACKTEST_BATCH_SIZE", "512")
@@ -559,10 +671,80 @@ def test_run_temporal_backtest_reuses_cached_phase_artifacts_without_recomputing
     assert rows[0].fit_seconds == 3.5
     for name, payload in cached_artifacts.items():
         assert (output_dir / name).read_bytes() == payload
+    wall_seconds = float(cache_stats.pop("wall_seconds"))
+    assert wall_seconds >= 0.0
     assert cache_stats == {
         "enabled": True,
         "fingerprint": cache_fingerprint,
         "cache_key": cache_key,
         "hit": True,
         "selected_models": [model_name],
+        "cache_scope": "whole_run",
+        "model_cache_hit_names": [model_name],
+        "model_cache_miss_names": [],
+        "reused_row_count": 1,
+        "retrieval_fit_count": 0,
+        "retrieval_fit_reuse_count": 0,
     }
+
+
+def test_run_temporal_backtest_reuses_model_cache_when_shortlist_changes(tmp_path: Path, monkeypatch) -> None:
+    data = _prepared_data()
+    cache_root = tmp_path / "cache"
+    fit_calls: list[str] = []
+
+    monkeypatch.setattr(backtesting, "_build_expanding_windows", lambda _n_rows, _folds: [(4, 6)])
+    monkeypatch.setenv("SPOTIFY_CACHE_BACKTEST", "1")
+    monkeypatch.setenv("SPOTIFY_BACKTEST_WORKERS", "1")
+
+    def _fake_backtest_job(**kwargs) -> BacktestFoldResult:
+        model_name = str(kwargs["model_name"])
+        fit_calls.append(model_name)
+        return BacktestFoldResult(
+            model_name=model_name,
+            model_type="classical",
+            model_family="test",
+            fold=int(kwargs["fold_idx"]),
+            train_rows=len(kwargs["X_train"]),
+            test_rows=len(kwargs["X_test"]),
+            fit_seconds=1.0,
+            top1=0.5,
+            top5=1.0,
+        )
+
+    monkeypatch.setattr(backtesting, "_run_backtest_job", _fake_backtest_job)
+
+    first_rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path / "first",
+        selected_models=("logreg",),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_model_cache_first"),
+        cache_root=cache_root,
+        cache_fingerprint="prepared123",
+    )
+    second_cache_stats: dict[str, object] = {}
+    second_rows = run_temporal_backtest(
+        data=data,
+        output_dir=tmp_path / "second",
+        selected_models=("logreg", "extra_trees"),
+        random_seed=42,
+        folds=1,
+        max_train_samples=0,
+        max_eval_samples=0,
+        logger=_logger("spotify.test.backtest_model_cache_second"),
+        cache_root=cache_root,
+        cache_fingerprint="prepared123",
+        cache_stats_out=second_cache_stats,
+    )
+
+    assert [row.model_name for row in first_rows] == ["logreg"]
+    assert [row.model_name for row in second_rows] == ["logreg", "extra_trees"]
+    assert fit_calls == ["logreg", "extra_trees"]
+    assert second_cache_stats["cache_scope"] == "partial_model"
+    assert second_cache_stats["model_cache_hit_names"] == ["logreg"]
+    assert second_cache_stats["model_cache_miss_names"] == ["extra_trees"]
+    assert second_cache_stats["reused_row_count"] == 1

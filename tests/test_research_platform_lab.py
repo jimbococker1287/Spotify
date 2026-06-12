@@ -483,3 +483,138 @@ def test_research_platform_lab_surfaces_blocked_claims_incomplete_locks_and_stal
     assert "non-degenerate" in friction_experiment["recommended_experiment"]
     assert "Research Next Experiments" in next_experiments_markdown
     assert "friction_counterfactual_trustworthiness" in next_experiments_markdown
+
+
+def test_research_platform_lab_registers_creator_evidence_and_downgrades_stale_passports(tmp_path: Path) -> None:
+    logger = logging.getLogger("spotify.test.research_platform_lab.creator_evidence")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+
+    output_dir = tmp_path / "outputs"
+    run_dir = output_dir / "runs" / "run_creator"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        run_dir / "run_manifest.json",
+        {
+            "run_id": "run_creator",
+            "profile": "small",
+            "timestamp": "2026-06-01T12:00:00",
+            "champion_gate": {"status": "attention", "promoted": False},
+        },
+    )
+
+    evidence_root = output_dir / "analysis" / "creator_evidence_lab"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    ready_source = output_dir / "creator_ready_source.json"
+    stale_source = output_dir / "creator_stale_source.json"
+    missing_source = output_dir / "creator_missing_source.json"
+    ready_source.write_text("{}", encoding="utf-8")
+    stale_source.write_text("{}", encoding="utf-8")
+
+    passports_path = evidence_root / "creator_opportunity_evidence_passports.json"
+    csv_path = evidence_root / "creator_opportunity_evidence_passports.csv"
+    markdown_path = evidence_root / "creator_opportunity_evidence_passports.md"
+    manifest_path = evidence_root / "creator_evidence_manifest.json"
+    csv_path.write_text("passport_id\n", encoding="utf-8")
+    markdown_path.write_text("# Creator Evidence\n", encoding="utf-8")
+    freshness_gate = {
+        "key": "evidence_freshness",
+        "status": "pass",
+        "observed": {"timestamp_coverage": 1.0, "latest_source_age_days": 5},
+        "threshold": {"timestamp_coverage": 1.0, "maximum_source_age_days": 90},
+    }
+    _write_json(
+        passports_path,
+        [
+            {
+                "passport_id": "ready",
+                "artist_name": "Artist Ready",
+                "market": "US",
+                "evidence_grade": "publishable",
+                "verified": True,
+                "contract_version": "2026-06-v1",
+                "occurrence_count": 2,
+                "report_family_count": 2,
+                "latest_source_age_days": 5,
+                "source_artifact_paths": [str(ready_source)],
+                "gates": [freshness_gate],
+            },
+            {
+                "passport_id": "stale",
+                "artist_name": "Artist Stale",
+                "market": "US",
+                "evidence_grade": "publishable",
+                "verified": True,
+                "contract_version": "2026-06-v1",
+                "occurrence_count": 2,
+                "report_family_count": 2,
+                "latest_source_age_days": 5,
+                "source_artifact_paths": [str(stale_source)],
+                "gates": [freshness_gate],
+            },
+            {
+                "passport_id": "watch",
+                "artist_name": "Artist Missing Source",
+                "market": "US",
+                "evidence_grade": "watch_only",
+                "verified": False,
+                "contract_version": "2026-06-v1",
+                "occurrence_count": 1,
+                "report_family_count": 1,
+                "latest_source_age_days": 5,
+                "source_artifact_paths": [str(missing_source)],
+                "gates": [freshness_gate],
+            },
+        ],
+    )
+    _write_json(
+        manifest_path,
+        {
+            "contract": {
+                "contract_version": "2026-06-v1",
+                "verified_grade": "publishable",
+            },
+            "passport_count": 3,
+            "grade_counts": {"publishable": 2, "watch_only": 1, "suppress": 0},
+            "artifact_paths": {
+                "json": str(passports_path),
+                "csv": str(csv_path),
+                "markdown": str(markdown_path),
+                "manifest": str(manifest_path),
+            },
+        },
+    )
+    base_time = 1_800_000_000
+    _set_mtime(ready_source, base_time)
+    _set_mtime(csv_path, base_time + 1)
+    _set_mtime(markdown_path, base_time + 1)
+    _set_mtime(passports_path, base_time + 2)
+    _set_mtime(manifest_path, base_time + 3)
+    _set_mtime(stale_source, base_time + 4)
+
+    build_research_platform_lab(output_dir=output_dir, run_dir=run_dir, logger=logger)
+
+    result_root = output_dir / "analysis" / "research_platform_lab"
+    registry = pd.read_csv(result_root / "creator_evidence_registry.csv")
+    maturity = json.loads((result_root / "research_platform_maturity.json").read_text(encoding="utf-8"))
+    maturity_markdown = (result_root / "research_platform_maturity.md").read_text(encoding="utf-8")
+    manifest = json.loads((result_root / "research_platform_manifest.json").read_text(encoding="utf-8"))
+
+    ready = registry.loc[registry["artist_name"] == "Artist Ready"].iloc[0]
+    stale = registry.loc[registry["artist_name"] == "Artist Stale"].iloc[0]
+    missing = registry.loc[registry["artist_name"] == "Artist Missing Source"].iloc[0]
+    assert bool(ready["effective_verified"]) is True
+    assert bool(stale["effective_verified"]) is False
+    assert stale["freshness_status"] == "stale"
+    assert missing["source_artifact_path_status"] == "missing"
+
+    evidence_summary = maturity["creator_evidence"]
+    assert evidence_summary["status"] == "stale"
+    assert evidence_summary["effective_verified_passport_count"] == 1
+    assert evidence_summary["grade_counts"] == {"publishable": 2, "suppress": 0, "watch_only": 1}
+    assert evidence_summary["contract_status"] == "ready"
+    assert evidence_summary["artifact_path_status"] == "ready"
+    assert evidence_summary["missing_source_artifact_count"] == 1
+    assert "directional/watch signals" in maturity_markdown
+    assert manifest["tables"]["creator_evidence_registry"]["row_count"] == 3
+    assert manifest["creator_evidence"]["freshness_status"] == "stale"

@@ -24,6 +24,7 @@ from .run_artifacts import write_markdown
 _READY_STATUSES = {"analysis_ready", "submission_candidate"}
 _REVIEW_READY_STATUSES = {"ready", "n/a"}
 _GAP_STATUSES = {"gap", "missing", "attention", "blocked", "incomplete", "stale"}
+_CREATOR_EVIDENCE_GRADES = {"publishable", "watch_only", "suppress"}
 
 
 def _safe_float(value: object) -> float:
@@ -264,6 +265,273 @@ def _artifact_path_health(
         "reference_path": str(reference_path) if reference_path is not None else "",
         "reference_timestamp": _isoformat(reference_ts),
     }
+
+
+def _resolve_creator_evidence_path(output_dir: Path, evidence_root: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    candidates = [candidate] if candidate.is_absolute() else [output_dir / candidate, evidence_root / candidate]
+    for path in candidates:
+        if path.exists():
+            return path.resolve()
+    return candidates[0].resolve()
+
+
+def _creator_evidence_gate(passport: dict[str, object], key: str) -> dict[str, object]:
+    gates = passport.get("gates", [])
+    if not isinstance(gates, list):
+        return {}
+    for gate in gates:
+        if isinstance(gate, dict) and str(gate.get("key", "")).strip() == key:
+            return gate
+    return {}
+
+
+def _creator_evidence_freshness_status(
+    passport: dict[str, object],
+    *,
+    source_health: dict[str, object],
+) -> str:
+    if str(source_health.get("freshness_status", "")) == "stale":
+        return "stale"
+    freshness_gate = _creator_evidence_gate(passport, "evidence_freshness")
+    gate_status = str(freshness_gate.get("status", "")).strip().lower()
+    if gate_status == "pass":
+        return "ready"
+    if gate_status == "fail":
+        return "stale"
+    if gate_status == "watch":
+        observed = freshness_gate.get("observed", {})
+        threshold = freshness_gate.get("threshold", {})
+        observed = observed if isinstance(observed, dict) else {}
+        threshold = threshold if isinstance(threshold, dict) else {}
+        age = observed.get("latest_source_age_days")
+        maximum_age = threshold.get("maximum_source_age_days")
+        try:
+            if age is not None and maximum_age is not None and float(age) > float(maximum_age):
+                return "stale"
+        except (TypeError, ValueError):
+            pass
+        return "attention"
+    return "missing"
+
+
+def _build_creator_evidence_registry(
+    output_dir: Path,
+    *,
+    now: datetime,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    evidence_root = output_dir / "analysis" / "creator_evidence_lab"
+    manifest_path = evidence_root / "creator_evidence_manifest.json"
+    passports_path = evidence_root / "creator_opportunity_evidence_passports.json"
+    manifest_payload = safe_read_json(manifest_path, default={})
+    manifest = manifest_payload if isinstance(manifest_payload, dict) else {}
+    passports_payload = safe_read_json(passports_path, default=[])
+    passports = [row for row in passports_payload if isinstance(row, dict)] if isinstance(passports_payload, list) else []
+
+    artifact_paths_payload = manifest.get("artifact_paths", {})
+    expected_artifact_keys = {"json", "csv", "markdown", "manifest"}
+    artifact_paths = [
+        path
+        for path in (
+            _resolve_creator_evidence_path(output_dir, evidence_root, raw_path)
+            for raw_path in artifact_paths_payload.values()
+        )
+        if path is not None
+    ] if isinstance(artifact_paths_payload, dict) else []
+    required_paths = [manifest_path, passports_path]
+    declared_artifact_paths = list(dict.fromkeys([*required_paths, *artifact_paths]))
+    artifact_health = _artifact_path_health(
+        artifact_paths=declared_artifact_paths,
+        now=now,
+    )
+    if any(not path.exists() for path in required_paths):
+        artifact_path_status = "missing"
+    elif (
+        not isinstance(artifact_paths_payload, dict)
+        or not expected_artifact_keys <= {str(key).strip() for key in artifact_paths_payload}
+        or any(not str(artifact_paths_payload.get(key, "")).strip() for key in expected_artifact_keys)
+    ):
+        artifact_path_status = "attention"
+    else:
+        artifact_path_status = str(artifact_health.get("path_status", "missing"))
+
+    contract = manifest.get("contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    contract_version = str(contract.get("contract_version", "")).strip()
+    verified_grade = str(contract.get("verified_grade", "")).strip()
+    passport_contract_versions = {
+        str(passport.get("contract_version", "")).strip()
+        for passport in passports
+    }
+    observed_grades = {str(passport.get("evidence_grade", "")).strip() for passport in passports}
+    if not contract_version or not manifest_path.exists():
+        contract_status = "missing"
+    elif (
+        verified_grade == "publishable"
+        and all(version == contract_version for version in passport_contract_versions)
+        and all(grade in _CREATOR_EVIDENCE_GRADES for grade in observed_grades)
+    ):
+        contract_status = "ready"
+    else:
+        contract_status = "attention"
+
+    rows: list[dict[str, object]] = []
+    freshness_counts: dict[str, int] = {}
+    effective_verified_count = 0
+    for passport in passports:
+        source_paths = [
+            path
+            for path in (
+                _resolve_creator_evidence_path(output_dir, evidence_root, raw_path)
+                for raw_path in passport.get("source_artifact_paths", [])
+            )
+            if path is not None
+        ] if isinstance(passport.get("source_artifact_paths"), list) else []
+        source_health = _artifact_path_health(
+            artifact_paths=source_paths,
+            reference_paths=[manifest_path, passports_path],
+            now=now,
+        )
+        freshness_status = _creator_evidence_freshness_status(
+            passport,
+            source_health=source_health,
+        )
+        freshness_counts[freshness_status] = freshness_counts.get(freshness_status, 0) + 1
+        grade = str(passport.get("evidence_grade", "")).strip()
+        effective_verified = bool(
+            passport.get("verified")
+            and grade == "publishable"
+            and contract_status == "ready"
+            and artifact_path_status == "ready"
+            and freshness_status == "ready"
+            and str(source_health.get("path_status", "")) == "ready"
+        )
+        effective_verified_count += int(effective_verified)
+        rows.append(
+            {
+                "passport_id": str(passport.get("passport_id", "")).strip(),
+                "artist_name": str(passport.get("artist_name", "")).strip(),
+                "market": str(passport.get("market", "")).strip(),
+                "evidence_grade": grade,
+                "raw_verified": bool(passport.get("verified", False)),
+                "effective_verified": effective_verified,
+                "evidence_status": (
+                    "verified"
+                    if effective_verified
+                    else "suppressed"
+                    if grade == "suppress"
+                    else "stale"
+                    if freshness_status == "stale"
+                    else "watch"
+                ),
+                "contract_version": str(passport.get("contract_version", "")).strip(),
+                "contract_status": contract_status,
+                "freshness_status": freshness_status,
+                "source_artifact_path_status": str(source_health.get("path_status", "")),
+                "source_artifact_count": int(len(source_paths)),
+                "existing_source_artifact_count": _safe_int(source_health.get("existing_count")),
+                "missing_source_artifact_count": _safe_int(source_health.get("missing_count")),
+                "stale_source_artifact_count": _safe_int(source_health.get("stale_count")),
+                "missing_source_artifact_path": str(source_health.get("missing_path", "")),
+                "stale_source_artifact_path": str(source_health.get("stale_path", "")),
+                "occurrence_count": _safe_int(passport.get("occurrence_count")),
+                "report_family_count": _safe_int(passport.get("report_family_count")),
+                "latest_source_age_days": _safe_float(passport.get("latest_source_age_days")),
+                "manifest_path": str(manifest_path.resolve()) if manifest_path.exists() else "",
+                "passport_json_path": str(passports_path.resolve()) if passports_path.exists() else "",
+            }
+        )
+
+    registry = pd.DataFrame(rows)
+    if not registry.empty:
+        registry = registry.sort_values(
+            ["effective_verified", "evidence_grade", "artist_name", "passport_id"],
+            ascending=[False, True, True, True],
+        ).reset_index(drop=True)
+
+    if freshness_counts.get("stale"):
+        freshness_status = "stale"
+    elif freshness_counts.get("attention") or freshness_counts.get("missing"):
+        freshness_status = "attention"
+    elif passports:
+        freshness_status = "ready"
+    else:
+        freshness_status = "missing"
+    observed_grade_counts = {
+        grade: sum(str(passport.get("evidence_grade", "")).strip() == grade for passport in passports)
+        for grade in sorted(_CREATOR_EVIDENCE_GRADES)
+    }
+    manifest_grade_counts = manifest.get("grade_counts", {})
+    manifest_grade_counts = manifest_grade_counts if isinstance(manifest_grade_counts, dict) else {}
+    grade_count_status = (
+        "ready"
+        if all(int(manifest_grade_counts.get(grade, 0) or 0) == count for grade, count in observed_grade_counts.items())
+        and int(manifest.get("passport_count", len(passports)) or 0) == len(passports)
+        else "attention"
+        if manifest_path.exists()
+        else "missing"
+    )
+    source_artifact_path_status = (
+        "missing"
+        if not registry.empty
+        and (registry["source_artifact_path_status"].astype(str) == "missing").any()
+        else "ready"
+        if not registry.empty
+        else "missing"
+    )
+    missing_source_artifact_count = (
+        sum(
+            max(
+                _safe_int(row.get("missing_source_artifact_count")),
+                int(str(row.get("source_artifact_path_status", "")) == "missing"),
+            )
+            for row in rows
+        )
+        if rows
+        else 0
+    )
+    overall_status = (
+        "ready"
+        if (
+            artifact_path_status
+            == contract_status
+            == freshness_status
+            == grade_count_status
+            == source_artifact_path_status
+            == "ready"
+        )
+        else "stale"
+        if freshness_status == "stale"
+        else "missing"
+        if artifact_path_status == "missing"
+        else "attention"
+    )
+    summary = {
+        "status": overall_status,
+        "passport_count": int(len(passports)),
+        "effective_verified_passport_count": int(effective_verified_count),
+        "grade_counts": observed_grade_counts,
+        "grade_count_status": grade_count_status,
+        "contract_status": contract_status,
+        "contract_version": contract_version,
+        "freshness_status": freshness_status,
+        "freshness_counts": freshness_counts,
+        "artifact_path_status": artifact_path_status,
+        "artifact_existing_count": _safe_int(artifact_health.get("existing_count")),
+        "artifact_missing_count": _safe_int(artifact_health.get("missing_count")),
+        "missing_artifact_path": str(artifact_health.get("missing_path", "")),
+        "source_artifact_path_status": source_artifact_path_status,
+        "missing_source_artifact_count": int(missing_source_artifact_count),
+        "stale_source_artifact_count": int(
+            registry.get("stale_source_artifact_count", pd.Series(dtype="int64")).fillna(0).sum()
+        ) if not registry.empty else 0,
+        "manifest_path": str(manifest_path.resolve()) if manifest_path.exists() else "",
+        "passport_json_path": str(passports_path.resolve()) if passports_path.exists() else "",
+    }
+    return registry, summary
 
 
 def _research_stage(*, protocol_present: bool, contract_present: bool, artifact_ratio: float, promoted: bool) -> str:
@@ -614,6 +882,7 @@ def _build_maturity_brief(
     benchmark_atlas: pd.DataFrame,
     claim_registry: pd.DataFrame,
     research_payload: dict[str, Any],
+    creator_evidence_summary: dict[str, object],
 ) -> tuple[dict[str, Any], list[str]]:
     anchor_run_id = anchor_run_dir.name
     anchor_row = (
@@ -656,6 +925,25 @@ def _build_maturity_brief(
         f"Research platform anchor is `{anchor_run_id}`.",
         f"Run registry covers `{len(run_registry.index)}` completed runs, with `{int((run_registry['benchmark_protocol_present'] & run_registry['safety_platform_contract_present']).sum()) if not run_registry.empty else 0}` runs carrying both protocol and contract artifacts.",
     ]
+    creator_grade_counts = creator_evidence_summary.get("grade_counts", {})
+    creator_grade_counts = creator_grade_counts if isinstance(creator_grade_counts, dict) else {}
+    summary.append(
+        "Creator evidence registry is "
+        f"`{creator_evidence_summary.get('status', 'missing')}` with "
+        f"`{int(creator_evidence_summary.get('effective_verified_passport_count', 0) or 0)}` of "
+        f"`{int(creator_evidence_summary.get('passport_count', 0) or 0)}` passports effectively verified; "
+        f"grades are publishable `{int(creator_grade_counts.get('publishable', 0) or 0)}`, "
+        f"watch-only `{int(creator_grade_counts.get('watch_only', 0) or 0)}`, and "
+        f"suppress `{int(creator_grade_counts.get('suppress', 0) or 0)}`. "
+        f"Contract `{creator_evidence_summary.get('contract_status', 'missing')}`, "
+        f"freshness `{creator_evidence_summary.get('freshness_status', 'missing')}`, and "
+        f"artifact paths `{creator_evidence_summary.get('artifact_path_status', 'missing')}` with "
+        f"source paths `{creator_evidence_summary.get('source_artifact_path_status', 'missing')}`."
+    )
+    if str(creator_evidence_summary.get("status", "")) != "ready":
+        summary.append(
+            "Creator opportunities without an effectively verified passport remain directional/watch signals, not confident immediate priorities."
+        )
     if anchor_row:
         summary.append(
             f"Anchor run stage is `{anchor_row.get('research_stage', '')}` with artifact ratio `{_safe_float(anchor_row.get('research_artifact_ratio')):.3f}` and promoted `{bool(anchor_row.get('promoted', False))}`."
@@ -708,6 +996,10 @@ def _build_maturity_brief(
         actions.append("Refresh `benchmark_protocol.json` and `safety_platform_contract.json` so portability signals are attached to the anchor run.")
     if anchor_row and str(anchor_row.get("claim_pack_freshness_status", "")) == "stale":
         actions.append("Regenerate `research_claims.json` after the newer anchor artifacts so the readiness story stops pointing at stale evidence.")
+    if str(creator_evidence_summary.get("status", "")) != "ready":
+        actions.append(
+            "Refresh the creator evidence manifest and passports, repair missing source paths, and clear freshness or contract gaps before publishing creator priorities."
+        )
     if not actions:
         actions = [
             "Use the run registry to choose which completed runs are strong enough to reopen as research anchors.",
@@ -728,6 +1020,7 @@ def _build_maturity_brief(
         "ready_for_external_review": bool(submission_readiness.get("ready_for_external_review", False)),
         "blockers": blockers,
         "top_next_gate": top_next_gate,
+        "creator_evidence": creator_evidence_summary,
         "summary": summary,
         "actions": actions,
     }
@@ -1239,6 +1532,10 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
     )
     benchmark_atlas = _load_benchmark_lock_atlas(output_dir, now=now)
     claim_registry, research_payload = _build_claim_registry(output_dir, now=now)
+    creator_evidence_registry, creator_evidence_summary = _build_creator_evidence_registry(
+        output_dir,
+        now=now,
+    )
     if run_registry.empty and benchmark_atlas.empty and claim_registry.empty:
         return []
 
@@ -1248,6 +1545,7 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
         benchmark_atlas=benchmark_atlas,
         claim_registry=claim_registry,
         research_payload=research_payload,
+        creator_evidence_summary=creator_evidence_summary,
     )
     next_experiment_payload, next_experiment_markdown = _build_next_experiment_plan(
         run_registry=run_registry,
@@ -1370,10 +1668,38 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
                 "missing_checks_json",
             ],
         ),
+        "creator_evidence_registry": (
+            creator_evidence_registry,
+            [
+                "passport_id",
+                "artist_name",
+                "market",
+                "evidence_grade",
+                "raw_verified",
+                "effective_verified",
+                "evidence_status",
+                "contract_version",
+                "contract_status",
+                "freshness_status",
+                "source_artifact_path_status",
+                "source_artifact_count",
+                "existing_source_artifact_count",
+                "missing_source_artifact_count",
+                "stale_source_artifact_count",
+                "missing_source_artifact_path",
+                "stale_source_artifact_path",
+                "occurrence_count",
+                "report_family_count",
+                "latest_source_age_days",
+                "manifest_path",
+                "passport_json_path",
+            ],
+        ),
     }
     manifest_payload = {
         "anchor_run_id": maturity_payload["anchor_run_id"],
         "artifact_root": str(output_root),
+        "creator_evidence": creator_evidence_summary,
         "tables": {},
         "reports": {},
     }
@@ -1403,10 +1729,11 @@ def build_research_platform_lab(*, output_dir: Path, run_dir: Path | None, logge
     manifest_json = write_json(output_root / "research_platform_manifest.json", manifest_payload)
     paths.extend([maturity_json, maturity_md, next_experiment_json, next_experiment_md, manifest_json])
     logger.info(
-        "Built research platform lab with %d runs, %d benchmark locks, %d claims, and %d next experiments.",
+        "Built research platform lab with %d runs, %d benchmark locks, %d claims, %d creator evidence passports, and %d next experiments.",
         len(run_registry.index),
         len(benchmark_atlas.index),
         len(claim_registry.index),
+        len(creator_evidence_registry.index),
         int(next_experiment_payload.get("experiment_count", 0) or 0),
     )
     return paths

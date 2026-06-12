@@ -98,6 +98,9 @@ _CREATOR_REPORT_FAMILY_REFRESH_ANCHORS = {
     "opportunity_lane": "opportunity_lane_comparison",
     "scene_strategy": "scene_strategy_watch",
 }
+_CREATOR_EVIDENCE_GRADES = {"publishable", "watch_only", "suppress"}
+_CREATOR_EVIDENCE_MANIFEST = "creator_evidence_manifest.json"
+_CREATOR_EVIDENCE_PASSPORTS = "creator_opportunity_evidence_passports.json"
 
 
 def _slugify(value: str) -> str:
@@ -173,6 +176,388 @@ def _artifact_modified_at(path: Path | None) -> str | None:
     if path is None or not path.exists():
         return None
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _read_json_artifact(path: Path, *, default: object) -> object:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _creator_evidence_output_dir(report_dir: Path) -> Path | None:
+    for candidate in (report_dir, *report_dir.parents):
+        if candidate.name == "analysis":
+            return candidate.parent
+    return None
+
+
+def _resolve_creator_evidence_path(output_dir: Path, evidence_root: Path, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    candidates = [candidate] if candidate.is_absolute() else [output_dir / candidate, evidence_root / candidate]
+    for path in candidates:
+        if path.exists():
+            return path.resolve()
+    return candidates[0].resolve()
+
+
+def _creator_evidence_gate(passport: dict[str, Any], key: str) -> dict[str, Any]:
+    gates = passport.get("gates", [])
+    if not isinstance(gates, list):
+        return {}
+    for gate in gates:
+        if isinstance(gate, dict) and str(gate.get("key", "")).strip() == key:
+            return gate
+    return {}
+
+
+def _creator_passport_freshness_status(
+    passport: dict[str, Any],
+    *,
+    snapshot_timestamp: float | None,
+    source_paths: list[Path],
+) -> tuple[str, list[str]]:
+    stale_paths = [
+        str(path)
+        for path in source_paths
+        if path.exists() and snapshot_timestamp is not None and path.stat().st_mtime > snapshot_timestamp
+    ]
+    if stale_paths:
+        return "stale", stale_paths
+
+    freshness_gate = _creator_evidence_gate(passport, "evidence_freshness")
+    gate_status = str(freshness_gate.get("status", "")).strip().lower()
+    if gate_status == "pass":
+        return "ready", []
+    if gate_status == "fail":
+        return "stale", []
+    if gate_status == "watch":
+        observed = freshness_gate.get("observed", {})
+        threshold = freshness_gate.get("threshold", {})
+        observed = observed if isinstance(observed, dict) else {}
+        threshold = threshold if isinstance(threshold, dict) else {}
+        age = observed.get("latest_source_age_days")
+        maximum_age = threshold.get("maximum_source_age_days")
+        try:
+            if age is not None and maximum_age is not None and float(age) > float(maximum_age):
+                return "stale", []
+        except (TypeError, ValueError):
+            pass
+        return "attention", []
+    return "missing", []
+
+
+def _load_creator_evidence_status(output_dir: Path) -> dict[str, Any] | None:
+    evidence_root = output_dir / "analysis" / "creator_evidence_lab"
+    manifest_path = evidence_root / _CREATOR_EVIDENCE_MANIFEST
+    passports_path = evidence_root / _CREATOR_EVIDENCE_PASSPORTS
+    if not manifest_path.exists() and not passports_path.exists():
+        return None
+
+    manifest_payload = _read_json_artifact(manifest_path, default={})
+    manifest = manifest_payload if isinstance(manifest_payload, dict) else {}
+    passports_payload = _read_json_artifact(passports_path, default=[])
+    passports = [row for row in passports_payload if isinstance(row, dict)] if isinstance(passports_payload, list) else []
+
+    required_paths = [manifest_path, passports_path]
+    artifact_paths = manifest.get("artifact_paths", {})
+    expected_artifact_keys = {"json", "csv", "markdown", "manifest"}
+    referenced_paths = [
+        path
+        for path in (
+            _resolve_creator_evidence_path(output_dir, evidence_root, raw_path)
+            for raw_path in artifact_paths.values()
+        )
+        if path is not None
+    ] if isinstance(artifact_paths, dict) else []
+    all_artifact_paths = list(dict.fromkeys([*required_paths, *referenced_paths]))
+    missing_artifact_paths = [str(path.resolve()) for path in all_artifact_paths if not path.exists()]
+    if any(not path.exists() for path in required_paths):
+        artifact_path_status = "missing"
+    elif (
+        missing_artifact_paths
+        or not isinstance(artifact_paths, dict)
+        or not expected_artifact_keys <= {str(key).strip() for key in artifact_paths}
+        or any(not str(artifact_paths.get(key, "")).strip() for key in expected_artifact_keys)
+    ):
+        artifact_path_status = "attention"
+    else:
+        artifact_path_status = "ready"
+
+    contract = manifest.get("contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    contract_version = str(contract.get("contract_version", "")).strip()
+    verified_grade = str(contract.get("verified_grade", "")).strip()
+    passport_contract_versions = {
+        str(passport.get("contract_version", "")).strip()
+        for passport in passports
+    }
+    observed_grades = {str(passport.get("evidence_grade", "")).strip() for passport in passports}
+    if not contract_version or not manifest_path.exists():
+        contract_status = "missing"
+    elif (
+        verified_grade == "publishable"
+        and all(version == contract_version for version in passport_contract_versions)
+        and all(grade in _CREATOR_EVIDENCE_GRADES for grade in observed_grades)
+    ):
+        contract_status = "ready"
+    else:
+        contract_status = "attention"
+
+    snapshot_timestamp = (
+        min(manifest_path.stat().st_mtime, passports_path.stat().st_mtime)
+        if manifest_path.exists() and passports_path.exists()
+        else None
+    )
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    artist_lookup: dict[str, list[dict[str, Any]]] = {}
+    freshness_counts: Counter[str] = Counter()
+    effective_verified_count = 0
+    missing_source_paths: set[str] = set()
+    stale_source_paths: set[str] = set()
+    missing_source_reference_count = 0
+    normalized_passports: list[dict[str, Any]] = []
+    for passport in passports:
+        source_paths = [
+            path
+            for path in (
+                _resolve_creator_evidence_path(output_dir, evidence_root, raw_path)
+                for raw_path in passport.get("source_artifact_paths", [])
+            )
+            if path is not None
+        ] if isinstance(passport.get("source_artifact_paths"), list) else []
+        row_missing_paths = [str(path) for path in source_paths if not path.exists()]
+        missing_source_paths.update(row_missing_paths)
+        freshness_status, row_stale_paths = _creator_passport_freshness_status(
+            passport,
+            snapshot_timestamp=snapshot_timestamp,
+            source_paths=source_paths,
+        )
+        stale_source_paths.update(row_stale_paths)
+        freshness_counts[freshness_status] += 1
+        source_path_status = "missing" if row_missing_paths or not source_paths else "ready"
+        missing_source_reference_count += int(source_path_status == "missing")
+        grade = str(passport.get("evidence_grade", "")).strip()
+        effectively_verified = bool(
+            passport.get("verified")
+            and grade == "publishable"
+            and contract_status == "ready"
+            and artifact_path_status == "ready"
+            and freshness_status == "ready"
+            and source_path_status == "ready"
+        )
+        effective_verified_count += int(effectively_verified)
+        normalized = {
+            **passport,
+            "freshness_status": freshness_status,
+            "source_artifact_path_status": source_path_status,
+            "missing_source_artifact_paths": row_missing_paths,
+            "stale_source_artifact_paths": row_stale_paths,
+            "effectively_verified": effectively_verified,
+        }
+        normalized_passports.append(normalized)
+        artist_key = str(passport.get("artist_name", "")).strip().casefold()
+        market_key = str(passport.get("market", "")).strip().casefold()
+        if artist_key:
+            lookup[(market_key, artist_key)] = normalized
+            artist_lookup.setdefault(artist_key, []).append(normalized)
+
+    if freshness_counts.get("stale"):
+        freshness_status = "stale"
+    elif freshness_counts.get("attention") or freshness_counts.get("missing"):
+        freshness_status = "attention"
+    elif passports:
+        freshness_status = "ready"
+    else:
+        freshness_status = "missing"
+
+    grade_counts = Counter(str(row.get("evidence_grade", "")).strip() for row in passports)
+    manifest_grade_counts = manifest.get("grade_counts", {})
+    manifest_grade_counts = manifest_grade_counts if isinstance(manifest_grade_counts, dict) else {}
+    grade_count_status = (
+        "ready"
+        if all(int(manifest_grade_counts.get(grade, 0) or 0) == grade_counts.get(grade, 0) for grade in _CREATOR_EVIDENCE_GRADES)
+        and int(manifest.get("passport_count", len(passports)) or 0) == len(passports)
+        else "attention"
+        if manifest_path.exists()
+        else "missing"
+    )
+    source_artifact_path_status = "missing" if missing_source_reference_count else "ready"
+    return {
+        "status": (
+            "ready"
+            if (
+                artifact_path_status
+                == contract_status
+                == freshness_status
+                == grade_count_status
+                == source_artifact_path_status
+                == "ready"
+            )
+            else "stale"
+            if freshness_status == "stale"
+            else "attention"
+        ),
+        "manifest_path": str(manifest_path.resolve()),
+        "passport_json_path": str(passports_path.resolve()),
+        "passport_count": len(passports),
+        "verified_passport_count": effective_verified_count,
+        "grade_counts": {grade: int(grade_counts.get(grade, 0)) for grade in sorted(_CREATOR_EVIDENCE_GRADES)},
+        "artifact_path_status": artifact_path_status,
+        "missing_artifact_paths": missing_artifact_paths,
+        "contract_status": contract_status,
+        "contract_version": contract_version,
+        "grade_count_status": grade_count_status,
+        "freshness_status": freshness_status,
+        "freshness_counts": dict(freshness_counts),
+        "source_artifact_path_status": source_artifact_path_status,
+        "missing_source_artifact_count": len(missing_source_paths),
+        "missing_source_reference_count": missing_source_reference_count,
+        "stale_source_artifact_count": len(stale_source_paths),
+        "missing_source_artifact_paths": sorted(missing_source_paths),
+        "stale_source_artifact_paths": sorted(stale_source_paths),
+        "evaluation_anchor": manifest.get("evaluation_anchor"),
+        "_passport_lookup": lookup,
+        "_artist_lookup": artist_lookup,
+        "_passports": normalized_passports,
+    }
+
+
+def _creator_evidence_metadata(evidence_status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in evidence_status.items()
+        if not key.startswith("_")
+    }
+
+
+def _creator_passport_for_opportunity(
+    evidence_status: dict[str, Any],
+    *,
+    market: str,
+    artist_name: str,
+) -> dict[str, Any] | None:
+    market_key = market.strip().casefold()
+    artist_key = artist_name.strip().casefold()
+    lookup = evidence_status.get("_passport_lookup", {})
+    if isinstance(lookup, dict):
+        passport = lookup.get((market_key, artist_key)) or lookup.get(("", artist_key))
+        if isinstance(passport, dict):
+            return passport
+    artist_lookup = evidence_status.get("_artist_lookup", {})
+    matches = artist_lookup.get(artist_key, []) if isinstance(artist_lookup, dict) else []
+    if isinstance(matches, list) and len(matches) == 1 and isinstance(matches[0], dict):
+        passport_market = str(matches[0].get("market", "")).strip().casefold()
+        if not market_key or not passport_market:
+            return matches[0]
+    return None
+
+
+def _apply_creator_evidence_to_payload(payload: dict[str, Any], evidence_status: dict[str, Any] | None) -> None:
+    if evidence_status is None:
+        return
+    payload["creator_evidence_status"] = _creator_evidence_metadata(evidence_status)
+    market = str(payload.get("market", "")).strip()
+    opportunities = payload.get("opportunities", [])
+    if not isinstance(opportunities, list):
+        return
+    matched_count = 0
+    verified_count = 0
+    for row in opportunities:
+        if not isinstance(row, dict):
+            continue
+        artist_name = str(row.get("artist_name", "")).strip()
+        passport = _creator_passport_for_opportunity(evidence_status, market=market, artist_name=artist_name)
+        original_why_now = str(row.get("why_now", "")).strip()
+        row["raw_opportunity_band"] = str(row.get("opportunity_band", "")).strip()
+        row["raw_why_now"] = original_why_now
+        if passport is None:
+            row.update(
+                {
+                    "evidence_status": "missing",
+                    "evidence_grade": "unverified",
+                    "evidence_verified": False,
+                    "opportunity_band": "watchlist",
+                    "evidence_adjusted_band": "watchlist",
+                    "evidence_public_posture": "directional_watch",
+                    "evidence_passport_id": "",
+                    "evidence_claim": "",
+                    "evidence_limitations": ["No matching creator evidence passport was found."],
+                    "why_now": (
+                        "Directional watch signal only, not a confident immediate priority. "
+                        + original_why_now
+                    ).strip(),
+                }
+            )
+            continue
+
+        matched_count += 1
+        verified = bool(passport.get("effectively_verified"))
+        verified_count += int(verified)
+        grade = str(passport.get("evidence_grade", "")).strip() or "unverified"
+        if verified:
+            adjusted_band = str(row.get("opportunity_band", "")).strip()
+            public_posture = "evidence_qualified_priority"
+            evidence_row_status = "verified"
+            why_now = original_why_now
+        elif grade == "suppress":
+            adjusted_band = "suppress"
+            public_posture = "suppressed"
+            evidence_row_status = "suppressed"
+            why_now = (
+                "Suppressed from confident priority treatment; retain only as a directional watch signal "
+                "until evidence gaps are resolved. "
+                + original_why_now
+            ).strip()
+        else:
+            adjusted_band = "watchlist"
+            public_posture = "directional_watch"
+            evidence_row_status = (
+                "stale"
+                if str(passport.get("freshness_status", "")) == "stale"
+                else "watch"
+            )
+            why_now = (
+                "Directional watch signal only, not a confident immediate priority. "
+                + original_why_now
+            ).strip()
+        row.update(
+            {
+                "evidence_status": evidence_row_status,
+                "evidence_grade": grade,
+                "evidence_verified": verified,
+                "opportunity_band": adjusted_band,
+                "evidence_adjusted_band": adjusted_band,
+                "evidence_public_posture": public_posture,
+                "evidence_passport_id": str(passport.get("passport_id", "")).strip(),
+                "evidence_claim": str(passport.get("claim", "")).strip(),
+                "evidence_limitations": (
+                    list(passport.get("limitations", []))
+                    if isinstance(passport.get("limitations"), list)
+                    else []
+                ),
+                "evidence_freshness_status": str(passport.get("freshness_status", "")).strip(),
+                "evidence_source_artifact_path_status": str(
+                    passport.get("source_artifact_path_status", "")
+                ).strip(),
+                "why_now": why_now,
+            }
+        )
+    payload["creator_evidence_status"]["matched_opportunity_count"] = matched_count
+    payload["creator_evidence_status"]["verified_opportunity_count"] = verified_count
+    payload["creator_evidence_status"]["directional_opportunity_count"] = max(
+        0,
+        len([row for row in opportunities if isinstance(row, dict)]) - verified_count,
+    )
+
+
+def _public_opportunity_band(row: dict[str, object]) -> str:
+    return str(row.get("evidence_adjusted_band", row.get("opportunity_band", ""))).strip()
 
 
 def _creator_report_family_artifact_candidates(
@@ -416,6 +801,14 @@ def normalize_creator_report_family_manifest(
         packaging_metadata["refresh_source"] = str(packaging_metadata.get("refresh_source")).strip()
     else:
         packaging_metadata.pop("refresh_source", None)
+    evidence_status = normalized.get("creator_evidence_status")
+    output_dir = _creator_evidence_output_dir(report_dir)
+    discovered_evidence = _load_creator_evidence_status(output_dir) if output_dir is not None else None
+    if discovered_evidence is not None:
+        evidence_status = _creator_evidence_metadata(discovered_evidence)
+        normalized["creator_evidence_status"] = evidence_status
+    if isinstance(evidence_status, dict):
+        packaging_metadata["creator_evidence"] = dict(evidence_status)
     normalized["packaging_metadata"] = packaging_metadata
     return normalized
 
@@ -463,9 +856,9 @@ def _creator_brief_scene_comparison(payload: dict[str, Any]) -> list[dict[str, o
             continue
         opportunity_count_by_scene[int(scene_id)] += 1
         opportunity_rows_by_scene.setdefault(int(scene_id), []).append(row)
-        if str(row.get("opportunity_band", "")) == "priority_now":
+        if _public_opportunity_band(row) == "priority_now":
             priority_count_by_scene[int(scene_id)] += 1
-        elif str(row.get("opportunity_band", "")) == "watchlist":
+        elif _public_opportunity_band(row) == "watchlist":
             watchlist_count_by_scene[int(scene_id)] += 1
         seed_bucket = scene_seed_coverage.setdefault(int(scene_id), set())
         connected_seed_artists = row.get("connected_seed_artists", [])
@@ -517,6 +910,19 @@ def _creator_brief_scene_comparison(payload: dict[str, Any]) -> list[dict[str, o
                 "avg_opportunity_score": round(float(avg_opportunity_score), 4) if scene_opportunities else 0.0,
                 "top_opportunity_artist": str(top_opportunity.get("artist_name", "")),
                 "top_opportunity_score": float(top_opportunity.get("opportunity_score", 0.0) or 0.0),
+                **(
+                    {
+                        "top_opportunity_evidence_status": str(top_opportunity.get("evidence_status", "")),
+                        "verified_opportunity_count": int(
+                            sum(bool(item.get("evidence_verified")) for item in scene_opportunities)
+                        ),
+                        "directional_opportunity_count": int(
+                            sum(1 for item in scene_opportunities if not bool(item.get("evidence_verified")))
+                        ),
+                    }
+                    if any("evidence_status" in item for item in scene_opportunities)
+                    else {}
+                ),
                 "top_seed_artists": sorted(scene_seed_coverage.get(scene_id, set())),
                 "top_migration_route": (
                     f"{top_migration.get('source_artist', '')} -> {top_migration.get('target_artist', '')}"
@@ -619,16 +1025,23 @@ def _creator_brief_seed_comparison(payload: dict[str, Any]) -> list[dict[str, ob
                 "adjacent_artist_count": int(len(ordered)),
                 "scene_coverage_count": int(len(scene_groups)),
                 "priority_now_count": int(
-                    sum(1 for row in seed_opportunities if str(row.get("opportunity_band", "")) == "priority_now")
+                    sum(1 for row in seed_opportunities if _public_opportunity_band(row) == "priority_now")
                 ),
                 "watchlist_count": int(
-                    sum(1 for row in seed_opportunities if str(row.get("opportunity_band", "")) == "watchlist")
+                    sum(1 for row in seed_opportunities if _public_opportunity_band(row) == "watchlist")
                 ),
                 "top_scene_name": top_scene_name,
                 "top_scene_avg_opportunity_score": round(float(top_scene_avg_score), 4) if top_scene_name else 0.0,
                 "top_scene_play_share": float(scene_share_lookup.get(top_scene_name, 0.0)),
                 "top_opportunity_artist": str(top_seed_opportunity.get("artist_name", "")),
                 "top_opportunity_score": float(top_seed_opportunity.get("opportunity_score", 0.0) or 0.0),
+                **(
+                    {
+                        "top_opportunity_evidence_status": str(top_seed_opportunity.get("evidence_status", "")),
+                    }
+                    if "evidence_status" in top_seed_opportunity
+                    else {}
+                ),
             }
         )
     rows.sort(
@@ -670,7 +1083,7 @@ def _creator_brief_ranking_comparison(payload: dict[str, Any]) -> list[dict[str,
                 "artist_name": str(row.get("artist_name", "")),
                 "scene_name": str(row.get("scene_name", "")),
                 "seed_bridges": seed_bridges,
-                "opportunity_band": str(row.get("opportunity_band", "")),
+                "opportunity_band": _public_opportunity_band(row),
                 "primary_driver": str(row.get("primary_driver", "")),
                 "opportunity_score": float(row.get("opportunity_score", 0.0) or 0.0),
                 "adjacency_component": float(row.get("adjacency_component", 0.0) or 0.0),
@@ -679,6 +1092,20 @@ def _creator_brief_ranking_comparison(payload: dict[str, Any]) -> list[dict[str,
                 "scene_component": round(float(scene_component), 4),
                 "gap_component": round(float(gap_component), 4),
                 "why_now": str(row.get("why_now", "")),
+                **(
+                    {
+                        "raw_opportunity_band": str(
+                            row.get("raw_opportunity_band", row.get("opportunity_band", ""))
+                        ),
+                        "evidence_status": str(row.get("evidence_status", "")),
+                        "evidence_grade": str(row.get("evidence_grade", "")),
+                        "evidence_verified": bool(row.get("evidence_verified", False)),
+                        "evidence_public_posture": str(row.get("evidence_public_posture", "")),
+                        "evidence_passport_id": str(row.get("evidence_passport_id", "")),
+                    }
+                    if "evidence_status" in row
+                    else {}
+                ),
             }
         )
     return rows
@@ -755,8 +1182,12 @@ def _creator_brief_opportunity_lane_comparison(payload: dict[str, Any]) -> list[
         best = max(lane_rows, key=lambda row: float(row.get("opportunity_score", 0.0) or 0.0))
         whitespace_row = whitespace_by_scene.get(scene_name, {})
         avg_score = sum(float(row.get("opportunity_score", 0.0) or 0.0) for row in lane_rows) / max(len(lane_rows), 1)
-        priority_now_count = sum(1 for row in lane_rows if str(row.get("opportunity_band", "")) == "priority_now")
-        watchlist_count = sum(1 for row in lane_rows if str(row.get("opportunity_band", "")) == "watchlist")
+        priority_now_count = sum(1 for row in lane_rows if _public_opportunity_band(row) == "priority_now")
+        watchlist_count = sum(1 for row in lane_rows if _public_opportunity_band(row) == "watchlist")
+        verified_opportunity_count = sum(bool(row.get("evidence_verified")) for row in lane_rows)
+        directional_opportunity_count = sum(
+            1 for row in lane_rows if "evidence_status" in row and not bool(row.get("evidence_verified"))
+        )
         seed_bridge_count = len(
             {
                 str(seed_artist).strip()
@@ -783,6 +1214,8 @@ def _creator_brief_opportunity_lane_comparison(payload: dict[str, Any]) -> list[
             lane_posture = "adjacency_expansion"
         else:
             lane_posture = "watch"
+        if directional_opportunity_count and not verified_opportunity_count:
+            lane_posture = "watch"
         rows.append(
             {
                 "scene_name": scene_name,
@@ -791,9 +1224,27 @@ def _creator_brief_opportunity_lane_comparison(payload: dict[str, Any]) -> list[
                 "opportunity_count": int(len(lane_rows)),
                 "priority_now_count": int(priority_now_count),
                 "watchlist_count": int(watchlist_count),
+                **(
+                    {
+                        "verified_opportunity_count": int(verified_opportunity_count),
+                        "directional_opportunity_count": int(directional_opportunity_count),
+                        "evidence_posture": (
+                            "evidence_qualified"
+                            if verified_opportunity_count
+                            else "directional_watch"
+                        ),
+                    }
+                    if any("evidence_status" in row for row in lane_rows)
+                    else {}
+                ),
                 "avg_opportunity_score": round(float(avg_score), 4),
                 "top_opportunity_artist": str(best.get("artist_name", "")),
                 "top_opportunity_score": float(best.get("opportunity_score", 0.0) or 0.0),
+                **(
+                    {"top_opportunity_evidence_status": str(best.get("evidence_status", ""))}
+                    if "evidence_status" in best
+                    else {}
+                ),
                 "seed_bridge_count": int(seed_bridge_count),
                 "incoming_migration_share": incoming_migration_share,
                 "release_whitespace_score": whitespace_score,
@@ -856,6 +1307,19 @@ def _creator_brief_scene_seed_comparison(payload: dict[str, Any]) -> list[dict[s
                 ),
                 "top_opportunity_artist": str(best.get("artist_name", "")),
                 "top_opportunity_score": float(best.get("opportunity_score", 0.0) or 0.0),
+                **(
+                    {
+                        "top_opportunity_evidence_status": str(best.get("evidence_status", "")),
+                        "verified_opportunity_count": int(
+                            sum(bool(row.get("evidence_verified")) for row in group_rows)
+                        ),
+                        "directional_opportunity_count": int(
+                            sum(1 for row in group_rows if not bool(row.get("evidence_verified")))
+                        ),
+                    }
+                    if any("evidence_status" in row for row in group_rows)
+                    else {}
+                ),
                 "top_driver": top_driver_counter.most_common(1)[0][0] if top_driver_counter else "",
                 "scene_local_play_share": float(scene_row.get("scene_local_play_share", 0.0) or 0.0),
                 "scene_release_pressure": float(scene_row.get("scene_release_pressure", 0.0) or 0.0),
@@ -959,7 +1423,7 @@ def _creator_brief_scene_strategy_watch(payload: dict[str, Any]) -> list[dict[st
         scene_name = str(scene.get("scene_name", "")).strip()
         scene_opportunities = opportunity_rows_by_scene.get(scene_name, [])
         priority_now_count = sum(
-            1 for row in scene_opportunities if str(row.get("opportunity_band", "")).strip() == "priority_now"
+            1 for row in scene_opportunities if _public_opportunity_band(row) == "priority_now"
         )
         whitespace_row = whitespace_by_scene.get(scene_name, {})
         top_lane = top_lane_by_scene.get(scene_name, {})
@@ -997,6 +1461,18 @@ def _creator_brief_scene_strategy_watch(payload: dict[str, Any]) -> list[dict[st
                 "release_whitespace_score": whitespace_score,
                 "opportunity_count": int(len(scene_opportunities)),
                 "priority_now_count": int(priority_now_count),
+                **(
+                    {
+                        "verified_opportunity_count": int(
+                            sum(bool(row.get("evidence_verified")) for row in scene_opportunities)
+                        ),
+                        "directional_opportunity_count": int(
+                            sum(1 for row in scene_opportunities if not bool(row.get("evidence_verified")))
+                        ),
+                    }
+                    if any("evidence_status" in row for row in scene_opportunities)
+                    else {}
+                ),
                 "top_lane_driver": str(top_lane.get("primary_driver", "")),
                 "top_lane_posture": str(top_lane.get("lane_posture", "")),
             }
@@ -1026,6 +1502,7 @@ def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
     fan_migration = fan_migration if isinstance(fan_migration, list) else []
     opportunities = payload.get("opportunities", [])
     opportunities = opportunities if isinstance(opportunities, list) else []
+    evidence_present = isinstance(payload.get("creator_evidence_status"), dict)
 
     lines = [
         (
@@ -1040,14 +1517,24 @@ def _creator_brief_executive_summary(payload: dict[str, Any]) -> list[str]:
         )
     if opportunity_lanes:
         top_lane = opportunity_lanes[0]
-        lines.append(
-            f"The strongest opportunity lane is `{top_lane['scene_name']} / {top_lane['primary_driver']}` with average score `{top_lane['avg_opportunity_score']:.3f}` across `{top_lane['opportunity_count']}` candidates."
-        )
+        if evidence_present and not int(top_lane.get("verified_opportunity_count", 0) or 0):
+            lines.append(
+                f"The leading directional watch lane is `{top_lane['scene_name']} / {top_lane['primary_driver']}` with average raw score `{top_lane['avg_opportunity_score']:.3f}` across `{top_lane['opportunity_count']}` candidates; it is not yet an evidence-qualified immediate priority."
+            )
+        else:
+            lines.append(
+                f"The strongest opportunity lane is `{top_lane['scene_name']} / {top_lane['primary_driver']}` with average score `{top_lane['avg_opportunity_score']:.3f}` across `{top_lane['opportunity_count']}` candidates."
+            )
     if opportunities:
         top_opportunity = opportunities[0]
-        lines.append(
-            f"The clearest near-term opportunity is `{top_opportunity.get('artist_name', '')}` in `{top_opportunity.get('scene_name', 'unmapped')}` with score `{float(top_opportunity.get('opportunity_score', 0.0) or 0.0):.3f}`."
-        )
+        if evidence_present and not bool(top_opportunity.get("evidence_verified")):
+            lines.append(
+                f"The highest-ranked raw signal is `{top_opportunity.get('artist_name', '')}` in `{top_opportunity.get('scene_name', 'unmapped')}` with score `{float(top_opportunity.get('opportunity_score', 0.0) or 0.0):.3f}`, but its evidence posture is directional/watch rather than a confident immediate priority."
+            )
+        else:
+            lines.append(
+                f"The clearest near-term opportunity is `{top_opportunity.get('artist_name', '')}` in `{top_opportunity.get('scene_name', 'unmapped')}` with score `{float(top_opportunity.get('opportunity_score', 0.0) or 0.0):.3f}`."
+            )
     if release_whitespace:
         top_whitespace = release_whitespace[0]
         lines.append(
@@ -1106,11 +1593,25 @@ def _creator_brief_priority_shortlist(payload: dict[str, Any]) -> list[dict[str,
                 "artist_name": str(row.get("artist_name", "")),
                 "scene_name": str(row.get("scene_name", "")),
                 "opportunity_score": float(row.get("opportunity_score", 0.0) or 0.0),
-                "opportunity_band": str(row.get("opportunity_band", "")),
+                "opportunity_band": _public_opportunity_band(row),
                 "primary_driver": str(row.get("primary_driver", "")),
                 "connected_seed_artists": connected_seed_artists,
                 "dominant_release_labels": dominant_release_labels,
                 "why_now": str(row.get("why_now", "")),
+                **(
+                    {
+                        "raw_opportunity_band": str(
+                            row.get("raw_opportunity_band", row.get("opportunity_band", ""))
+                        ),
+                        "evidence_status": str(row.get("evidence_status", "")),
+                        "evidence_grade": str(row.get("evidence_grade", "")),
+                        "evidence_verified": bool(row.get("evidence_verified", False)),
+                        "evidence_public_posture": str(row.get("evidence_public_posture", "")),
+                        "evidence_passport_id": str(row.get("evidence_passport_id", "")),
+                    }
+                    if "evidence_status" in row
+                    else {}
+                ),
             }
         )
     return rows
@@ -1235,6 +1736,8 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             "multimodal_source": space_info,
             **intelligence_payload,
         }
+        creator_evidence_status = _load_creator_evidence_status(output_dir)
+        _apply_creator_evidence_to_payload(payload, creator_evidence_status)
         payload["executive_summary"] = _creator_brief_executive_summary(payload)
         payload["comparison_views"] = {
             "ranking_comparison": _creator_brief_ranking_comparison(payload),
@@ -1267,6 +1770,8 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             ],
             "reading_order": list(_CREATOR_REPORT_FAMILY_READING_ORDER),
         }
+        if creator_evidence_status is not None:
+            payload["report_family"]["creator_evidence_status"] = payload["creator_evidence_status"]
 
         markdown_lines = [
             "# Creator And Label Intelligence Brief",
@@ -1280,21 +1785,55 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             f"- Scenes: `{payload['graph_summary']['scene_count']}`",
             f"- Opportunities: `{payload['graph_summary']['opportunity_count']}`",
             "",
-            "## Executive Summary",
-            "",
         ]
+        if creator_evidence_status is not None:
+            evidence_metadata = payload["creator_evidence_status"]
+            markdown_lines.extend(
+                [
+                    "## Creator Evidence Status",
+                    "",
+                    f"- Overall status: `{evidence_metadata.get('status', '')}`",
+                    f"- Effective verified passports: `{evidence_metadata.get('verified_passport_count', 0)}` of `{evidence_metadata.get('passport_count', 0)}`",
+                    f"- Current opportunities matched: `{evidence_metadata.get('matched_opportunity_count', 0)}`",
+                    f"- Current opportunities evidence-qualified: `{evidence_metadata.get('verified_opportunity_count', 0)}`",
+                    f"- Contract status: `{evidence_metadata.get('contract_status', '')}`",
+                    f"- Freshness status: `{evidence_metadata.get('freshness_status', '')}`",
+                    f"- Artifact-path status: `{evidence_metadata.get('artifact_path_status', '')}`",
+                    f"- Source-artifact path status: `{evidence_metadata.get('source_artifact_path_status', '')}`",
+                    "",
+                    "Unverified, stale, missing, or suppressed rows remain raw ranking signals and are presented only as directional/watch evidence.",
+                    "",
+                ]
+            )
+        markdown_lines.extend(["## Executive Summary", ""])
         for line in payload["executive_summary"]:
             markdown_lines.append(f"- {line}")
         markdown_lines.extend(["", "## Ranking Rubric", ""])
         for label, weight in payload["ranking_rubric"]["weights"].items():
             markdown_lines.append(f"- {label}: weight `{float(weight):.2f}`")
-        markdown_lines.extend(["", "## Immediate Opportunity Shortlist", ""])
+        markdown_lines.extend(
+            [
+                "",
+                (
+                    "## Evidence-Qualified Opportunity Shortlist"
+                    if creator_evidence_status is not None
+                    else "## Immediate Opportunity Shortlist"
+                ),
+                "",
+            ]
+        )
         for row in payload["brief_views"]["priority_shortlist"]:
             seed_text = ", ".join(row["connected_seed_artists"][:2]) if row["connected_seed_artists"] else "current seeds"
             label_text = ", ".join(row["dominant_release_labels"][:2]) if row["dominant_release_labels"] else "n/a"
+            evidence_text = (
+                f", evidence `{row.get('evidence_status', '')}` / `{row.get('evidence_grade', '')}`"
+                if "evidence_status" in row
+                else ""
+            )
             markdown_lines.append(
                 f"- #{row['opportunity_rank']} {row['artist_name']} ({row['opportunity_band']}): score `{row['opportunity_score']:.3f}`, "
-                f"scene `{row['scene_name']}`, driver `{row['primary_driver']}`, seed bridges `{seed_text}`, labels `{label_text}`. {row['why_now']}"
+                f"scene `{row['scene_name']}`, driver `{row['primary_driver']}`, seed bridges `{seed_text}`, labels `{label_text}`"
+                f"{evidence_text}. {row['why_now']}"
             )
         markdown_lines.extend(["", "## Scene Comparison", ""])
         for row in payload["comparison_views"]["scene_comparison"][:10]:
@@ -1354,9 +1893,15 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             )
         markdown_lines.extend(["", "## Opportunity Scoreboard", ""])
         for row in payload["opportunities"][:10]:
+            public_band = _public_opportunity_band(row)
+            evidence_text = (
+                f", evidence `{row.get('evidence_status', '')}` / `{row.get('evidence_grade', '')}`"
+                if "evidence_status" in row
+                else ""
+            )
             markdown_lines.append(
                 f"- #{row['opportunity_rank']} {row['artist_name']}: score `{row['opportunity_score']}`, "
-                f"band `{row['opportunity_band']}`, reasons `{'; '.join(row['rationale'])}`, "
+                f"band `{public_band}`{evidence_text}, reasons `{'; '.join(row['rationale'])}`, "
                 f"components `adj={row['adjacency_component']:.3f}, mig={row['migration_component']:.3f}, "
                 f"rel={(float(row['freshness_component']) + float(row['whitespace_component'])):.3f}, "
                 f"scene={(float(row['scene_momentum_component']) + float(row['label_concentration_component'])):.3f}, "
@@ -1405,6 +1950,11 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                             f"adj `{row['adjacency_component']:.3f}`, mig `{row['migration_component']:.3f}`, "
                             f"release `{row['release_component']:.3f}`, scene `{row['scene_component']:.3f}`, "
                             f"gap `{row['gap_component']:.3f}`"
+                            + (
+                                f", evidence `{row.get('evidence_status', '')}` / `{row.get('evidence_grade', '')}`"
+                                if "evidence_status" in row
+                                else ""
+                            )
                         )
                         for row in payload["comparison_views"]["ranking_comparison"]
                     ],
@@ -1498,6 +2048,8 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             "brief_view_csv": {},
             "reading_order": list(payload["report_family"]["reading_order"]),
         }
+        if creator_evidence_status is not None:
+            family_manifest["creator_evidence_status"] = payload["creator_evidence_status"]
         brief_markdown_paths = {
             "scene_strategy_watch": _write_markdown_lines(
                 report_dir / f"{stem}_scene_strategy_watch.md",
@@ -1592,6 +2144,25 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
             else {}
         )
         anchor_views = packaging_metadata.get("anchor_views", {}) if isinstance(packaging_metadata, dict) else {}
+        family_evidence_raw = family_manifest.get("creator_evidence_status", {})
+        family_evidence: dict[str, Any] = (
+            dict(family_evidence_raw) if isinstance(family_evidence_raw, dict) else {}
+        )
+        evidence_index_lines = (
+            [
+                "",
+                "## Creator Evidence Status",
+                "",
+                f"- Overall: `{family_evidence.get('status', '')}`",
+                f"- Contract: `{family_evidence.get('contract_status', '')}`",
+                f"- Freshness: `{family_evidence.get('freshness_status', '')}`",
+                f"- Artifact paths: `{family_evidence.get('artifact_path_status', '')}`",
+                f"- Source-artifact paths: `{family_evidence.get('source_artifact_path_status', '')}`",
+                f"- Effective verified passports: `{family_evidence.get('verified_passport_count', 0)}` of `{family_evidence.get('passport_count', 0)}`",
+            ]
+            if family_evidence
+            else []
+        )
         family_manifest_md_path = _write_markdown_lines(
             report_dir / f"{stem}_report_family.md",
             [
@@ -1642,6 +2213,7 @@ def build_creator_label_intelligence_handler(deps: CreatorBriefHandlerDeps) -> C
                     for anchor_name, row in anchor_views.items()
                     if isinstance(row, dict)
                 ],
+                *evidence_index_lines,
             ],
         )
         family_manifest["artifact_index_markdown"] = str(family_manifest_md_path)

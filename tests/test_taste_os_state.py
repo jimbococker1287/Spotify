@@ -279,6 +279,14 @@ def test_taste_os_state_store_versions_and_deduplicates_live_session_events(tmp_
     assert store.active_session("taste-os-live")["version"] == 2
     assert store.feedback_store()["event_count"] == 1
     assert store.recent_feedback(limit=1)[0]["signal"] == "like"
+    assert [event["event_id"] for event in store.list_session_events(session_id="taste-os-live", limit=1)] == [
+        "event-3"
+    ]
+    assert [
+        event["event_id"]
+        for event in store.list_session_events(session_id="taste-os-live", limit=10_000)
+    ] == ["event-1", "event-3"]
+    assert store.list_session_events(session_id="taste-os-live", limit=0) == []
 
 
 def test_taste_os_state_store_adds_live_session_tables_to_existing_sqlite_database(tmp_path: Path) -> None:

@@ -35,6 +35,7 @@ RETRIEVAL_BACKTEST_MODEL_NAMES: tuple[str, ...] = (
 ENSEMBLE_BACKTEST_MODEL_NAMES: tuple[str, ...] = ("blended_ensemble",)
 
 BACKTEST_CACHE_SCHEMA_VERSION = "temporal-backtest-cache-v1"
+BACKTEST_MODEL_CACHE_SCHEMA_VERSION = "temporal-backtest-model-cache-v1"
 
 
 @dataclass
@@ -84,6 +85,13 @@ class TemporalBacktestCacheInspection:
     max_eval_samples: int
     cache_paths: TemporalBacktestCachePaths | None
     cache_payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _RetrievalBacktestFit:
+    baseline: object
+    reranker: object
+    fit_seconds: float
 
 
 def _safe_float(value) -> float:
@@ -479,6 +487,103 @@ def _save_temporal_backtest_result_to_cache(
         return None
 
 
+def _build_temporal_backtest_model_cache_payload(
+    *,
+    cache_payload: dict[str, object],
+    model_name: str,
+    classical_models: tuple[str, ...],
+    deep_models: tuple[str, ...],
+    retrieval_models: tuple[str, ...],
+    tuned_model_specs: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    common_keys = (
+        "prepared_fingerprint",
+        "random_seed",
+        "folds",
+        "max_train_samples",
+        "max_eval_samples",
+        "sequence_length",
+        "num_artists",
+        "num_ctx",
+        "total_rows",
+        "source_digest",
+    )
+    payload = {
+        "cache_schema_version": BACKTEST_MODEL_CACHE_SCHEMA_VERSION,
+        **{key: cache_payload[key] for key in common_keys if key in cache_payload},
+        "model_name": str(model_name),
+    }
+    if model_name in classical_models:
+        payload["model_group"] = "classical"
+        payload["tuned_model_specs"] = _serialize_tuned_model_specs(
+            {model_name: tuned_model_specs[model_name]} if model_name in tuned_model_specs else {}
+        )
+    elif model_name in deep_models:
+        payload["model_group"] = "deep"
+        payload["adaptation_mode"] = cache_payload.get("adaptation_mode", "cold")
+        payload["deep_runtime"] = cache_payload.get("deep_runtime", {})
+    else:
+        payload["model_group"] = "retrieval"
+        payload["retrieval_runtime"] = cache_payload.get("retrieval_runtime", {})
+        if model_name in ENSEMBLE_BACKTEST_MODEL_NAMES:
+            payload["candidate_model_names"] = [*classical_models, *retrieval_models]
+            payload["tuned_model_specs"] = _serialize_tuned_model_specs(tuned_model_specs)
+    return payload
+
+
+def _resolve_temporal_backtest_model_cache_path(
+    *,
+    cache_root: Path,
+    cache_fingerprint: str,
+    cache_payload: dict[str, object],
+) -> Path:
+    cache_key = _build_temporal_backtest_cache_key(cache_payload)
+    return (cache_root / cache_fingerprint / "models" / f"{cache_key}.json").resolve()
+
+
+def _read_cached_temporal_backtest_model_result(
+    *,
+    result_path: Path,
+    model_name: str,
+    expected_folds: tuple[int, ...],
+) -> list[BacktestFoldResult] | None:
+    payload = safe_read_json(result_path, default=None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_schema_version") != BACKTEST_MODEL_CACHE_SCHEMA_VERSION:
+        return None
+    rows_payload = payload.get("rows")
+    if not isinstance(rows_payload, list):
+        return None
+    rows = [_coerce_backtest_row(dict(row)) for row in rows_payload if isinstance(row, dict)]
+    if any(row.model_name != model_name for row in rows):
+        return None
+    if tuple(sorted(row.fold for row in rows)) != tuple(sorted(expected_folds)):
+        return None
+    return rows
+
+
+def _save_temporal_backtest_model_result(
+    *,
+    result_path: Path,
+    model_name: str,
+    results: list[BacktestFoldResult],
+) -> None:
+    try:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(
+            result_path,
+            {
+                "cache_schema_version": BACKTEST_MODEL_CACHE_SCHEMA_VERSION,
+                "model_name": model_name,
+                "rows": [asdict(row) for row in results],
+            },
+            sort_keys=True,
+        )
+    except Exception:
+        return None
+
+
 def _run_backtest_job(
     model_name: str,
     fold_idx: int,
@@ -737,6 +842,51 @@ def _fit_retrieval_backtest_models(
     return baseline, reranker, float(time.perf_counter() - started)
 
 
+def _get_retrieval_backtest_fit(
+    *,
+    fold_idx: int,
+    random_seed: int,
+    X_seq_train: np.ndarray,
+    X_ctx_train: np.ndarray,
+    y_train: np.ndarray,
+    X_seq_test: np.ndarray,
+    X_ctx_test: np.ndarray,
+    y_test: np.ndarray,
+    num_artists: int,
+    logger,
+    fit_cache: dict[int, _RetrievalBacktestFit] | None = None,
+    fit_stats: dict[str, int] | None = None,
+) -> tuple[_RetrievalBacktestFit, bool]:
+    cache_key = int(fold_idx)
+    if fit_cache is not None and cache_key in fit_cache:
+        if fit_stats is not None:
+            fit_stats["reuse_count"] = int(fit_stats.get("reuse_count", 0)) + 1
+        return fit_cache[cache_key], True
+
+    baseline, reranker, fit_seconds = _fit_retrieval_backtest_models(
+        fold_idx=fold_idx,
+        random_seed=random_seed,
+        X_seq_train=X_seq_train,
+        X_ctx_train=X_ctx_train,
+        y_train=y_train,
+        X_seq_test=X_seq_test,
+        X_ctx_test=X_ctx_test,
+        y_test=y_test,
+        num_artists=num_artists,
+        logger=logger,
+    )
+    fit = _RetrievalBacktestFit(
+        baseline=baseline,
+        reranker=reranker,
+        fit_seconds=float(fit_seconds),
+    )
+    if fit_cache is not None:
+        fit_cache[cache_key] = fit
+    if fit_stats is not None:
+        fit_stats["fit_count"] = int(fit_stats.get("fit_count", 0)) + 1
+    return fit, False
+
+
 def _run_retrieval_backtest_job(
     *,
     model_name: str,
@@ -750,8 +900,10 @@ def _run_retrieval_backtest_job(
     y_test: np.ndarray,
     num_artists: int,
     logger,
+    retrieval_fit_cache: dict[int, _RetrievalBacktestFit] | None = None,
+    retrieval_fit_stats: dict[str, int] | None = None,
 ) -> BacktestFoldResult:
-    baseline, reranker, fit_seconds = _fit_retrieval_backtest_models(
+    fit, _reused = _get_retrieval_backtest_fit(
         fold_idx=fold_idx,
         random_seed=random_seed,
         X_seq_train=X_seq_train,
@@ -762,7 +914,11 @@ def _run_retrieval_backtest_job(
         y_test=y_test,
         num_artists=num_artists,
         logger=logger,
+        fit_cache=retrieval_fit_cache,
+        fit_stats=retrieval_fit_stats,
     )
+    baseline = fit.baseline
+    reranker = fit.reranker
 
     if model_name == "retrieval_reranker":
         metrics = reranker.rerank_metrics_test
@@ -780,7 +936,7 @@ def _run_retrieval_backtest_job(
         fold=int(fold_idx),
         train_rows=len(np.asarray(X_seq_train)),
         test_rows=len(np.asarray(X_seq_test)),
-        fit_seconds=fit_seconds,
+        fit_seconds=float(fit.fit_seconds),
         top1=float(metrics.get("top1", float("nan"))),
         top5=float(metrics.get("top5", float("nan"))),
     )
@@ -895,6 +1051,8 @@ def _run_ensemble_backtest_job(
     logger,
     candidate_model_names: tuple[str, ...],
     tuned_model_specs: dict[str, dict[str, object]] | None = None,
+    retrieval_fit_cache: dict[int, _RetrievalBacktestFit] | None = None,
+    retrieval_fit_stats: dict[str, int] | None = None,
 ) -> BacktestFoldResult:
     from .ensemble import _apply_temperature, _blend_probabilities, _fit_temperature, _negative_log_likelihood
     from .retrieval_common import _softmax_rows
@@ -916,12 +1074,13 @@ def _run_ensemble_backtest_job(
     y_val_arr = y_train_arr[val_slice]
 
     candidate_rows: list[dict[str, object]] = []
+    shared_retrieval_fit_seconds = 0.0
     requested_names = tuple(
         name for name in candidate_model_names if name not in ENSEMBLE_BACKTEST_MODEL_NAMES
     )
     retrieval_names = tuple(name for name in requested_names if name in RETRIEVAL_BACKTEST_MODEL_NAMES)
     if retrieval_names:
-        baseline, reranker, _ = _fit_retrieval_backtest_models(
+        retrieval_fit, retrieval_fit_reused = _get_retrieval_backtest_fit(
             fold_idx=fold_idx,
             random_seed=random_seed,
             X_seq_train=train_seq_arr,
@@ -932,7 +1091,13 @@ def _run_ensemble_backtest_job(
             y_test=y_test_arr,
             num_artists=num_artists,
             logger=logger,
+            fit_cache=retrieval_fit_cache,
+            fit_stats=retrieval_fit_stats,
         )
+        baseline = retrieval_fit.baseline
+        reranker = retrieval_fit.reranker
+        if retrieval_fit_reused:
+            shared_retrieval_fit_seconds = float(retrieval_fit.fit_seconds)
         if "retrieval_dual_encoder" in retrieval_names:
             candidate_rows.append(
                 {
@@ -964,9 +1129,12 @@ def _run_ensemble_backtest_job(
                 }
             )
 
-    for candidate_name in requested_names:
-        if candidate_name in RETRIEVAL_BACKTEST_MODEL_NAMES:
-            continue
+    classical_candidate_names = tuple(
+        name for name in requested_names if name not in RETRIEVAL_BACKTEST_MODEL_NAMES
+    )
+    candidate_payloads: dict[str, dict[str, object]] = {}
+
+    def _fit_candidate(candidate_name: str) -> dict[str, object] | None:
         tuned_spec = dict((tuned_model_specs or {}).get(candidate_name, {}))
         estimator_model_name = str(tuned_spec.get("base_model_name", "")).strip() or None
         estimator_params = dict(tuned_spec.get("best_params", {})) if isinstance(tuned_spec.get("best_params"), dict) else None
@@ -977,7 +1145,7 @@ def _run_ensemble_backtest_job(
             candidate_train = train_seq_arr[fit_slice]
             candidate_val = train_seq_arr[val_slice]
             candidate_test = test_seq_arr
-        payload = _fit_classical_backtest_probabilities(
+        return _fit_classical_backtest_probabilities(
             model_name=candidate_name,
             fold_idx=fold_idx,
             random_seed=random_seed,
@@ -992,6 +1160,43 @@ def _run_ensemble_backtest_job(
             estimator_model_name=estimator_model_name,
             estimator_params=estimator_params,
         )
+
+    tuned_candidate_names = tuple(
+        name for name in classical_candidate_names if name in (tuned_model_specs or {})
+    )
+    for candidate_name in tuned_candidate_names:
+        payload = _fit_candidate(candidate_name)
+        if payload is not None:
+            candidate_payloads[candidate_name] = payload
+
+    tuned_payloads = [
+        payload
+        for payload in candidate_payloads.values()
+        if str(payload.get("model_type", "")).strip() == "classical_tuned"
+    ]
+    best_tuned_key = ""
+    if tuned_payloads:
+        best_tuned = max(
+            tuned_payloads,
+            key=lambda row: (
+                _safe_float(row.get("val_top1"))
+                if np.isfinite(_safe_float(row.get("val_top1")))
+                else float("-inf")
+            ),
+        )
+        best_tuned_key = _backtest_candidate_key(best_tuned)
+
+    for candidate_name in classical_candidate_names:
+        if candidate_name in candidate_payloads:
+            continue
+        if best_tuned_key and candidate_name == best_tuned_key:
+            continue
+        payload = _fit_candidate(candidate_name)
+        if payload is not None:
+            candidate_payloads[candidate_name] = payload
+
+    for candidate_name in classical_candidate_names:
+        payload = candidate_payloads.get(candidate_name)
         if payload is not None:
             candidate_rows.append(payload)
 
@@ -1064,7 +1269,7 @@ def _run_ensemble_backtest_job(
         fold=int(fold_idx),
         train_rows=len(train_seq_arr),
         test_rows=len(test_seq_arr),
-        fit_seconds=float(time.perf_counter() - started),
+        fit_seconds=float(time.perf_counter() - started + shared_retrieval_fit_seconds),
         top1=float(np.mean(np.argmax(test_calibrated, axis=1) == y_test_arr)),
         top5=_topk_accuracy_from_proba(test_calibrated, y_test_arr, k=5),
     )
@@ -1364,6 +1569,27 @@ def _plot_backtest(results: list[BacktestFoldResult], output_path: Path) -> None
     plt.close(fig)
 
 
+def _sort_backtest_results(
+    results: list[BacktestFoldResult],
+    *,
+    classical_models: tuple[str, ...],
+    retrieval_models: tuple[str, ...],
+    deep_models: tuple[str, ...],
+) -> list[BacktestFoldResult]:
+    model_ranks: dict[str, tuple[int, int]] = {}
+    for group_rank, model_names in enumerate((classical_models, retrieval_models, deep_models)):
+        for model_rank, model_name in enumerate(model_names):
+            model_ranks.setdefault(model_name, (group_rank, model_rank))
+    return sorted(
+        results,
+        key=lambda row: (
+            model_ranks.get(row.model_name, (len(model_ranks), len(model_ranks)))[0],
+            int(row.fold),
+            model_ranks.get(row.model_name, (len(model_ranks), len(model_ranks)))[1],
+        ),
+    )
+
+
 def run_temporal_backtest(
     data: PreparedData,
     output_dir: Path,
@@ -1382,6 +1608,7 @@ def run_temporal_backtest(
     cache_fingerprint: str = "",
     cache_stats_out: dict[str, object] | None = None,
 ) -> list[BacktestFoldResult]:
+    run_started = time.perf_counter()
     if folds <= 0:
         logger.info("Skipping temporal backtesting because folds <= 0.")
         return []
@@ -1426,6 +1653,13 @@ def run_temporal_backtest(
                 "cache_key": str(cache_inspection.cache_key),
                 "hit": bool(cached_results is not None),
                 "selected_models": [str(name) for name in selected_models],
+                "cache_scope": ("whole_run" if cached_results is not None else "miss"),
+                "model_cache_hit_names": ([str(name) for name in selected_models] if cached_results is not None else []),
+                "model_cache_miss_names": ([] if cached_results is not None else [str(name) for name in selected_models]),
+                "reused_row_count": int(len(cached_results or [])),
+                "retrieval_fit_count": 0,
+                "retrieval_fit_reuse_count": 0,
+                "wall_seconds": float(time.perf_counter() - run_started),
             }
         )
 
@@ -1507,14 +1741,57 @@ def run_temporal_backtest(
             axis=0,
         )
 
-    results: list[BacktestFoldResult] = []
+    expected_folds = tuple(window.fold for window in resolved_windows)
+    model_cache_paths: dict[str, Path] = {}
+    cached_model_results: dict[str, list[BacktestFoldResult]] = {}
+    if cache_enabled and cache_root is not None:
+        for model_name in selected_models:
+            model_payload = _build_temporal_backtest_model_cache_payload(
+                cache_payload=cache_payload,
+                model_name=model_name,
+                classical_models=classical_models,
+                deep_models=deep_models,
+                retrieval_models=retrieval_models,
+                tuned_model_specs=resolved_tuned_specs,
+            )
+            result_path = _resolve_temporal_backtest_model_cache_path(
+                cache_root=cache_root,
+                cache_fingerprint=cache_inspection.fingerprint,
+                cache_payload=model_payload,
+            )
+            model_cache_paths[model_name] = result_path
+            cached_rows = _read_cached_temporal_backtest_model_result(
+                result_path=result_path,
+                model_name=model_name,
+                expected_folds=expected_folds,
+            )
+            if cached_rows is not None:
+                cached_model_results[model_name] = cached_rows
+
+    model_cache_hit_names = tuple(name for name in selected_models if name in cached_model_results)
+    model_cache_miss_names = tuple(name for name in selected_models if name not in cached_model_results)
+    if model_cache_hit_names:
+        logger.info(
+            "Temporal backtest model cache: hits=%s misses=%s",
+            ",".join(model_cache_hit_names),
+            ",".join(model_cache_miss_names) or "none",
+        )
+
+    results: list[BacktestFoldResult] = [
+        row
+        for model_name in selected_models
+        for row in cached_model_results.get(model_name, [])
+    ]
+    classical_models_to_run = tuple(name for name in classical_models if name not in cached_model_results)
+    retrieval_models_to_run = tuple(name for name in retrieval_models if name not in cached_model_results)
+    deep_models_to_run = tuple(name for name in deep_models if name not in cached_model_results)
     jobs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str | None, dict[str, object] | None, str]] = []
     for window in resolved_windows:
         X_train_tab = X_all[window.train_slice]
         y_train = y_all[window.train_slice]
         X_test_tab = X_all[window.test_slice]
         y_test = y_all[window.test_slice]
-        for model_name in classical_models:
+        for model_name in classical_models_to_run:
             if model_name == "session_knn":
                 assert X_all_seq is not None
                 tuned_spec = resolved_tuned_specs.get(model_name, {})
@@ -1640,12 +1917,14 @@ def run_temporal_backtest(
                 f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
             )
 
-    if retrieval_models:
+    retrieval_fit_cache: dict[int, _RetrievalBacktestFit] = {}
+    retrieval_fit_stats: dict[str, int] = {"fit_count": 0, "reuse_count": 0}
+    if retrieval_models_to_run:
         assert X_all_seq is not None
         assert X_all_ctx is not None
         logger.info(
             "Retrieval/ensemble temporal backtesting: models=%s",
-            ",".join(retrieval_models),
+            ",".join(retrieval_models_to_run),
         )
         for window in resolved_windows:
             X_train_seq = X_all_seq[window.train_slice]
@@ -1656,7 +1935,7 @@ def run_temporal_backtest(
             y_test = y_all[window.test_slice]
             if len(X_train_seq) <= 1 or len(X_test_seq) == 0:
                 continue
-            for model_name in retrieval_models:
+            for model_name in retrieval_models_to_run:
                 try:
                     if model_name in ENSEMBLE_BACKTEST_MODEL_NAMES:
                         row = _run_ensemble_backtest_job(
@@ -1676,6 +1955,8 @@ def run_temporal_backtest(
                             logger=logger,
                             candidate_model_names=tuple((*classical_models, *retrieval_models)),
                             tuned_model_specs=resolved_tuned_specs,
+                            retrieval_fit_cache=retrieval_fit_cache,
+                            retrieval_fit_stats=retrieval_fit_stats,
                         )
                     else:
                         row = _run_retrieval_backtest_job(
@@ -1690,6 +1971,8 @@ def run_temporal_backtest(
                             y_test=y_test,
                             num_artists=data.num_artists,
                             logger=logger,
+                            retrieval_fit_cache=retrieval_fit_cache,
+                            retrieval_fit_stats=retrieval_fit_stats,
                         )
                 except Exception as exc:
                     logger.warning("Retrieval backtest fit failed for %s fold=%d: %s", model_name, window.fold, exc)
@@ -1704,7 +1987,7 @@ def run_temporal_backtest(
                     f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
                 )
 
-    if deep_models:
+    if deep_models_to_run:
         deep_runtime = _deep_backtest_runtime_config()
         deep_epochs = int(deep_runtime["epochs"])
         deep_batch_size = int(deep_runtime["batch_size"])
@@ -1712,12 +1995,12 @@ def run_temporal_backtest(
         resolved_strategy = _resolve_deep_strategy(strategy, logger)
         deep_builders = _resolve_deep_builders(
             data=data,
-            selected_models=deep_models,
+            selected_models=deep_models_to_run,
             deep_model_builders=deep_model_builders,
         )
         logger.info(
             "Deep temporal backtesting: models=%s epochs=%d batch_size=%d adaptation=%s",
-            ",".join(deep_models),
+            ",".join(deep_models_to_run),
             deep_epochs,
             deep_batch_size,
             resolved_adaptation_mode,
@@ -1746,7 +2029,7 @@ def run_temporal_backtest(
                 continue
             fit_slice, val_slice = split_slices
 
-            for model_name in deep_models:
+            for model_name in deep_models_to_run:
                 incremental_fit_seq = X_train_seq[fit_slice]
                 incremental_fit_ctx = X_train_ctx[fit_slice]
                 incremental_y = y_train[fit_slice]
@@ -1791,7 +2074,7 @@ def run_temporal_backtest(
                         adaptation_mode=resolved_adaptation_mode,
                     )
                 except Exception as exc:
-                    logger.warning("Deep backtest fit failed for %s fold=%d: %s", model_name, fold_idx, exc)
+                    logger.warning("Deep backtest fit failed for %s fold=%d: %s", model_name, window.fold, exc)
                     continue
                 if resolved_adaptation_mode in ("warm", "continual") and "weights" in weight_sink:
                     prior_weights[model_name] = weight_sink["weights"]
@@ -1806,6 +2089,13 @@ def run_temporal_backtest(
                     f"{row.top5:.4f}" if not np.isnan(row.top5) else "n/a",
                 )
             previous_test_end = window.raw_test_end
+
+    results = _sort_backtest_results(
+        results,
+        classical_models=classical_models,
+        retrieval_models=retrieval_models,
+        deep_models=deep_models,
+    )
 
     if results:
         runtime_by_model: dict[str, list[float]] = {}
@@ -1822,11 +2112,38 @@ def run_temporal_backtest(
 
     artifact_paths = write_temporal_backtest_artifacts([asdict(row) for row in results], output_dir=output_dir, metric_name="top1")
     if cache_enabled and cache_paths is not None:
+        for model_name in model_cache_miss_names:
+            model_rows = [row for row in results if row.model_name == model_name]
+            if tuple(sorted(row.fold for row in model_rows)) != tuple(sorted(expected_folds)):
+                continue
+            result_path = model_cache_paths.get(model_name)
+            if result_path is None:
+                continue
+            _save_temporal_backtest_model_result(
+                result_path=result_path,
+                model_name=model_name,
+                results=model_rows,
+            )
         _save_temporal_backtest_result_to_cache(
             cache_paths=cache_paths,
             cache_payload=cache_payload,
             results=results,
             artifact_paths=artifact_paths,
+        )
+
+    if cache_stats_out is not None:
+        all_models_reused = bool(selected_models) and len(model_cache_hit_names) == len(selected_models)
+        cache_stats_out.update(
+            {
+                "hit": bool(all_models_reused),
+                "cache_scope": ("model" if all_models_reused else "partial_model" if model_cache_hit_names else "miss"),
+                "model_cache_hit_names": [str(name) for name in model_cache_hit_names],
+                "model_cache_miss_names": [str(name) for name in model_cache_miss_names],
+                "reused_row_count": int(sum(len(rows) for rows in cached_model_results.values())),
+                "retrieval_fit_count": int(retrieval_fit_stats["fit_count"]),
+                "retrieval_fit_reuse_count": int(retrieval_fit_stats["reuse_count"]),
+                "wall_seconds": float(time.perf_counter() - run_started),
+            }
         )
 
     return results

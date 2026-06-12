@@ -13,8 +13,8 @@ import numpy as np
 
 from .data import PreparedData
 from .probability_bundles import align_proba_to_num_classes, save_prediction_bundle
-from .ranking import ranking_metrics_from_proba
-from .run_artifacts import copy_file_if_changed, materialize_cached_file, safe_read_json, write_json
+from .ranking import topk_indices_2d
+from .run_artifacts import materialize_cached_file, safe_read_json, write_json
 
 
 CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v1"
@@ -268,12 +268,12 @@ def _save_classical_result_to_cache(
         if result.estimator_artifact_path:
             source_estimator_path = Path(result.estimator_artifact_path).expanduser()
             if source_estimator_path.exists():
-                copy_file_if_changed(source_estimator_path, cache_paths.estimator_artifact_path)
+                materialize_cached_file(source_estimator_path, cache_paths.estimator_artifact_path)
 
         if result.prediction_bundle_path:
             source_bundle_path = Path(result.prediction_bundle_path).expanduser()
             if source_bundle_path.exists():
-                copy_file_if_changed(source_bundle_path, cache_paths.prediction_bundle_path)
+                materialize_cached_file(source_bundle_path, cache_paths.prediction_bundle_path)
 
         write_json(
             cache_paths.result_path,
@@ -311,8 +311,7 @@ def _topk_from_proba(
 ) -> float:
     if proba.ndim != 2:
         return float("nan")
-    kk = max(1, min(k, proba.shape[1]))
-    topk_idx = np.argpartition(proba, -kk, axis=1)[:, -kk:]
+    topk_idx = topk_indices_2d(proba, k)
     if class_labels is not None:
         labels = np.asarray(class_labels).reshape(-1)
         if labels.size == proba.shape[1]:
@@ -321,6 +320,65 @@ def _topk_from_proba(
             return float(np.mean(np.any(topk_values == y_values, axis=1)))
     y_idx = np.asarray(y_true).reshape(-1, 1)
     return float(np.mean(np.any(topk_idx == y_idx, axis=1)))
+
+
+def _empty_ranking_metrics() -> dict[str, float]:
+    return {
+        "ndcg_at5": float("nan"),
+        "mrr_at5": float("nan"),
+        "coverage_at5": float("nan"),
+        "diversity_at5": float("nan"),
+    }
+
+
+def _metrics_from_proba(
+    proba: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    class_labels: np.ndarray,
+) -> tuple[float, float, dict[str, float]]:
+    proba = np.asarray(proba)
+    y_true = np.asarray(y_true).reshape(-1)
+    if proba.ndim != 2 or proba.shape[0] != y_true.shape[0] or proba.shape[1] <= 0:
+        raise ValueError("Probability matrix shape does not match labels.")
+
+    labels = np.asarray(class_labels).reshape(-1)
+    pred_indices = np.argmax(proba, axis=1)
+    if labels.size == proba.shape[1]:
+        predictions = labels[pred_indices]
+    else:
+        predictions = pred_indices
+    top1 = float(np.mean(predictions == y_true))
+
+    topk = topk_indices_2d(proba, k=5)
+    if labels.size == proba.shape[1]:
+        top5_matches = labels[topk] == y_true.reshape(-1, 1)
+    else:
+        top5_matches = topk == y_true.reshape(-1, 1)
+    top5 = float(np.mean(np.any(top5_matches, axis=1)))
+
+    ranked_labels = _encode_labels_to_local_indices(y_true, labels if labels.size else None)
+    ranking_matches = topk == ranked_labels.reshape(-1, 1)
+    matched = np.any(ranking_matches, axis=1)
+    ranks = np.argmax(ranking_matches, axis=1) + 1
+    ndcg_scores = np.zeros(len(y_true), dtype="float64")
+    mrr_scores = np.zeros(len(y_true), dtype="float64")
+    ndcg_scores[matched] = 1.0 / np.log2(ranks[matched] + 1.0)
+    mrr_scores[matched] = 1.0 / ranks[matched]
+
+    num_items = int(proba.shape[1])
+    unique_items = int(np.unique(topk).size)
+    coverage = float(unique_items) / float(num_items)
+    counts = np.bincount(topk.reshape(-1).astype(int), minlength=max(1, num_items)).astype("float64")
+    frequencies = counts[counts > 0] / counts.sum()
+    diversity = float(1.0 - np.sum(np.square(frequencies)))
+    ranking = {
+        "ndcg_at5": float(np.mean(ndcg_scores)),
+        "mrr_at5": float(np.mean(mrr_scores)),
+        "coverage_at5": coverage,
+        "diversity_at5": diversity,
+    }
+    return top1, top5, ranking
 
 
 def sample_rows(
@@ -563,65 +621,34 @@ def evaluate_classical_estimator(
     y_val: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
+    *,
+    probabilities: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[float, float, float, float, dict[str, float], dict[str, float]]:
     val_top1 = float("nan")
     test_top1 = float("nan")
     val_top5 = float("nan")
     test_top5 = float("nan")
-    val_ranking = {
-        "ndcg_at5": float("nan"),
-        "mrr_at5": float("nan"),
-        "coverage_at5": float("nan"),
-        "diversity_at5": float("nan"),
-    }
-    test_ranking = {
-        "ndcg_at5": float("nan"),
-        "mrr_at5": float("nan"),
-        "coverage_at5": float("nan"),
-        "diversity_at5": float("nan"),
-    }
-    if hasattr(estimator, "predict_proba"):
+    val_ranking = _empty_ranking_metrics()
+    test_ranking = _empty_ranking_metrics()
+    if probabilities is not None or hasattr(estimator, "predict_proba"):
         try:
-            val_proba = np.asarray(estimator.predict_proba(X_val))
-            test_proba = np.asarray(estimator.predict_proba(X_test))
+            if probabilities is None:
+                probabilities = (
+                    np.asarray(estimator.predict_proba(X_val)),
+                    np.asarray(estimator.predict_proba(X_test)),
+                )
+            val_proba, test_proba = probabilities
             classes = np.asarray(getattr(estimator, "classes_", []))
-            if classes.size == val_proba.shape[1]:
-                val_pred = classes[np.argmax(val_proba, axis=1)]
-            else:
-                val_pred = np.argmax(val_proba, axis=1)
-            if classes.size == test_proba.shape[1]:
-                test_pred = classes[np.argmax(test_proba, axis=1)]
-            else:
-                test_pred = np.argmax(test_proba, axis=1)
-            val_top1 = float(np.mean(val_pred == y_val))
-            test_top1 = float(np.mean(test_pred == y_test))
-            val_top5 = _topk_from_proba(val_proba, y_val, k=5, class_labels=classes)
-            test_top5 = _topk_from_proba(test_proba, y_test, k=5, class_labels=classes)
-            val_class_count = int(val_proba.shape[1])
-            test_class_count = int(test_proba.shape[1])
-
-            val_y_rank = _encode_labels_to_local_indices(np.asarray(y_val), classes if classes.size else None)
-            test_y_rank = _encode_labels_to_local_indices(np.asarray(y_test), classes if classes.size else None)
-
-            val_extra = ranking_metrics_from_proba(val_proba, val_y_rank, num_items=val_class_count, k=5)
-            test_extra = ranking_metrics_from_proba(
-                test_proba,
-                test_y_rank,
-                num_items=test_class_count,
-                k=5,
+            val_top1, val_top5, val_ranking = _metrics_from_proba(
+                val_proba,
+                y_val,
+                class_labels=classes,
             )
-            val_ranking = {
-                "ndcg_at5": float(val_extra["ndcg_at_k"]),
-                "mrr_at5": float(val_extra["mrr_at_k"]),
-                "coverage_at5": float(val_extra["coverage_at_k"]),
-                "diversity_at5": float(val_extra["diversity_at_k"]),
-            }
-            test_ranking = {
-                "ndcg_at5": float(test_extra["ndcg_at_k"]),
-                "mrr_at5": float(test_extra["mrr_at_k"]),
-                "coverage_at5": float(test_extra["coverage_at_k"]),
-                "diversity_at5": float(test_extra["diversity_at_k"]),
-            }
+            test_top1, test_top5, test_ranking = _metrics_from_proba(
+                test_proba,
+                y_test,
+                class_labels=classes,
+            )
         except Exception:
             pass
     if np.isnan(val_top1) or np.isnan(test_top1):
@@ -632,20 +659,34 @@ def evaluate_classical_estimator(
     return val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking
 
 
+def _predict_probability_pair(
+    estimator,
+    X_val: np.ndarray,
+    X_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not hasattr(estimator, "predict_proba"):
+        return None
+    try:
+        return (
+            np.asarray(estimator.predict_proba(X_val)),
+            np.asarray(estimator.predict_proba(X_test)),
+        )
+    except Exception:
+        return None
+
+
 def collect_aligned_probabilities(
     estimator,
     X_val: np.ndarray,
     X_test: np.ndarray,
     *,
     num_classes: int,
+    probabilities: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    if not hasattr(estimator, "predict_proba"):
+    probabilities = probabilities or _predict_probability_pair(estimator, X_val, X_test)
+    if probabilities is None:
         return None
-    try:
-        val_proba = np.asarray(estimator.predict_proba(X_val))
-        test_proba = np.asarray(estimator.predict_proba(X_test))
-    except Exception:
-        return None
+    val_proba, test_proba = probabilities
     classes = np.asarray(getattr(estimator, "classes_", []))
     aligned_val = align_proba_to_num_classes(val_proba, classes if classes.size else None, num_classes)
     aligned_test = align_proba_to_num_classes(test_proba, classes if classes.size else None, num_classes)
@@ -664,6 +705,8 @@ def _fit_single_classical_model(
     y_test: np.ndarray,
     X_val_full: np.ndarray,
     X_test_full: np.ndarray,
+    val_eval_indices: np.ndarray | None,
+    test_eval_indices: np.ndarray | None,
     num_classes: int,
     prediction_output_dir: Path,
     estimator_output_dir: Path,
@@ -686,15 +729,32 @@ def _fit_single_classical_model(
         estimator_artifact_path = str(estimator_path)
     except Exception:
         estimator_artifact_path = ""
+    full_probabilities = _predict_probability_pair(estimator, X_val_full, X_test_full)
+    eval_probabilities = None
+    if full_probabilities is not None:
+        val_proba_full, test_proba_full = full_probabilities
+        eval_probabilities = (
+            val_proba_full if val_eval_indices is None else val_proba_full[val_eval_indices],
+            test_proba_full if test_eval_indices is None else test_proba_full[test_eval_indices],
+        )
     val_top1, val_top5, test_top1, test_top5, val_ranking, test_ranking = evaluate_classical_estimator(
         estimator,
         X_val,
         y_val,
         X_test,
         y_test,
+        probabilities=eval_probabilities,
     )
     prediction_bundle_path = ""
-    aligned_probs = collect_aligned_probabilities(estimator, X_val_full, X_test_full, num_classes=num_classes)
+    aligned_probs = None
+    if full_probabilities is not None:
+        aligned_probs = collect_aligned_probabilities(
+            estimator,
+            X_val_full,
+            X_test_full,
+            num_classes=num_classes,
+            probabilities=full_probabilities,
+        )
     if aligned_probs is not None:
         val_proba, test_proba = aligned_probs
         bundle_path = save_prediction_bundle(
@@ -804,26 +864,30 @@ def run_classical_benchmarks(
     y_train, y_val, y_test = bundle.y_train, bundle.y_val, bundle.y_test
     X_val_full = X_val
     X_test_full = X_test
-    X_train_seq = bundle.X_train_seq
-    X_val_seq = bundle.X_val_seq
-    X_test_seq = bundle.X_test_seq
-    X_val_seq_full = X_val_seq
-    X_test_seq_full = X_test_seq
 
     rng = np.random.default_rng(random_seed)
-    train_idx = sample_indices(len(X_train), max_train_samples, rng)
-    val_idx = sample_indices(len(X_val), max_eval_samples, rng)
-    test_idx = sample_indices(len(X_test), max_eval_samples, rng)
+    train_idx = sample_indices(len(X_train), max_train_samples, rng) if 0 < max_train_samples < len(X_train) else None
+    val_idx = sample_indices(len(X_val), max_eval_samples, rng) if 0 < max_eval_samples < len(X_val) else None
+    test_idx = sample_indices(len(X_test), max_eval_samples, rng) if 0 < max_eval_samples < len(X_test) else None
 
-    X_train = X_train[train_idx]
-    y_train = y_train[train_idx]
-    X_val = X_val[val_idx]
-    y_val = y_val[val_idx]
-    X_test = X_test[test_idx]
-    y_test = y_test[test_idx]
-    X_train_seq = X_train_seq[train_idx]
-    X_val_seq = X_val_seq[val_idx]
-    X_test_seq = X_test_seq[test_idx]
+    if train_idx is not None:
+        X_train = X_train[train_idx]
+        y_train = y_train[train_idx]
+    if val_idx is not None:
+        X_val = X_val[val_idx]
+        y_val = y_val[val_idx]
+    if test_idx is not None:
+        X_test = X_test[test_idx]
+        y_test = y_test[test_idx]
+
+    uses_session_features = "session_knn" in uncached_models
+    X_train_seq = None
+    X_val_seq = None
+    X_test_seq = None
+    if uses_session_features:
+        X_train_seq = bundle.X_train_seq if train_idx is None else bundle.X_train_seq[train_idx]
+        X_val_seq = bundle.X_val_seq if val_idx is None else bundle.X_val_seq[val_idx]
+        X_test_seq = bundle.X_test_seq if test_idx is None else bundle.X_test_seq[test_idx]
 
     logger.info(
         "Classical benchmark dataset sizes: train=%d, val=%d, test=%d",
@@ -863,8 +927,10 @@ def run_classical_benchmarks(
                     y_val,
                     X_test_seq if name == "session_knn" else X_test,
                     y_test,
-                    X_val_seq_full if name == "session_knn" else X_val_full,
-                    X_test_seq_full if name == "session_knn" else X_test_full,
+                    bundle.X_val_seq if name == "session_knn" else X_val_full,
+                    bundle.X_test_seq if name == "session_knn" else X_test_full,
+                    val_idx,
+                    test_idx,
                     data.num_artists,
                     prediction_output_dir,
                     estimator_output_dir,
@@ -896,8 +962,10 @@ def run_classical_benchmarks(
                 y_val=y_val,
                 X_test=(X_test_seq if name == "session_knn" else X_test),
                 y_test=y_test,
-                X_val_full=(X_val_seq_full if name == "session_knn" else X_val_full),
-                X_test_full=(X_test_seq_full if name == "session_knn" else X_test_full),
+                X_val_full=(bundle.X_val_seq if name == "session_knn" else X_val_full),
+                X_test_full=(bundle.X_test_seq if name == "session_knn" else X_test_full),
+                val_eval_indices=val_idx,
+                test_eval_indices=test_idx,
                 num_classes=data.num_artists,
                 prediction_output_dir=prediction_output_dir,
                 estimator_output_dir=estimator_output_dir,

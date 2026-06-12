@@ -23,6 +23,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
+DEFAULT_SESSION_EVENT_LIMIT = 20
+MAX_SESSION_EVENT_LIMIT = 100
+
 
 def _read_json_document(path: Path | None) -> dict[str, object]:
     if path is None or not path.exists():
@@ -577,6 +580,51 @@ class TasteOSStateStore:
             "response": self._decode_json_object(row["response_json"]),
             "durable_feedback": bool(row["durable_feedback"]),
         }
+
+    def list_session_events(
+        self,
+        *,
+        session_id: str,
+        limit: int = DEFAULT_SESSION_EVENT_LIMIT,
+    ) -> list[dict[str, object]]:
+        bounded_limit = min(MAX_SESSION_EVENT_LIMIT, max(0, int(limit)))
+        if bounded_limit <= 0:
+            return []
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    self.session_events.c.session_id,
+                    self.session_events.c.event_id,
+                    self.session_events.c.timestamp,
+                    self.session_events.c.event_type,
+                    self.session_events.c.artist_name,
+                    self.session_events.c.expected_version,
+                    self.session_events.c.resulting_version,
+                    self.session_events.c.response_json,
+                    self.session_events.c.durable_feedback,
+                )
+                .where(self.session_events.c.session_id == str(session_id).strip())
+                .order_by(self.session_events.c.id.desc())
+                .limit(bounded_limit)
+            ).mappings().all()
+
+        events: list[dict[str, object]] = []
+        for row in reversed(rows):
+            response = self._decode_json_object(row["response_json"])
+            events.append(
+                {
+                    "session_id": str(row["session_id"]),
+                    "event_id": str(row["event_id"]),
+                    "timestamp": str(row["timestamp"]),
+                    "event_type": str(row["event_type"]),
+                    "artist_name": str(row["artist_name"]),
+                    "expected_version": int(row["expected_version"]),
+                    "resulting_version": int(row["resulting_version"]),
+                    "durable_feedback": bool(row["durable_feedback"]),
+                    "why_this_changed": str(response.get("why_this_changed", "")),
+                }
+            )
+        return events
 
     def _record_feedback_in_transaction(
         self,

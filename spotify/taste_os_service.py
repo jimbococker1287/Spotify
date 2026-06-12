@@ -26,6 +26,7 @@ from .safe_policy import SafeBanditPolicyArtifact
 from .serving import load_predictor, resolve_model_row
 from .taste_os_state import (
     ActiveSessionNotFoundError,
+    DEFAULT_SESSION_EVENT_LIMIT,
     SessionEventConflictError,
     StaleSessionVersionError,
     TasteOSStateStore,
@@ -370,6 +371,51 @@ class TasteOSService:
             "feedback_memory": self._feedback_summary(limit=limit),
         }
 
+    def session_snapshot(
+        self,
+        session_id: str,
+        *,
+        event_limit: int = DEFAULT_SESSION_EVENT_LIMIT,
+    ) -> dict[str, object]:
+        try:
+            active_session = self.state_store.active_session(session_id)
+        except ActiveSessionNotFoundError as exc:
+            raise RequestValidationError(
+                status_code=404,
+                code="session_not_found",
+                message=str(exc),
+            ) from exc
+
+        adaptation = _mapping(active_session.get("adaptation", {}))
+        adaptation_events = adaptation.get("events", [])
+        event_count = len(adaptation_events) if isinstance(adaptation_events, list) else 0
+        latest_adaptation = (
+            _mapping(adaptation_events[-1])
+            if isinstance(adaptation_events, list) and adaptation_events
+            else {}
+        )
+        effective_recent_artists = adaptation.get("effective_recent_artists", [])
+        if not isinstance(effective_recent_artists, list):
+            effective_recent_artists = []
+        events = self.state_store.list_session_events(
+            session_id=str(active_session["session_id"]),
+            limit=event_limit,
+        )
+        return {
+            "session_id": str(active_session["session_id"]),
+            "created_at": str(active_session["created_at"]),
+            "updated_at": str(active_session["updated_at"]),
+            "version": _coerce_int(active_session.get("version", 0)),
+            "plan": _mapping(active_session.get("plan", {})),
+            "adaptation_summary": {
+                "effective_recent_artists": [str(item) for item in effective_recent_artists],
+                "event_count": event_count,
+                "latest_event_id": str(latest_adaptation.get("event_id", "")),
+                "latest_change": str(latest_adaptation.get("why_this_changed", "")),
+            },
+            "events": events,
+        }
+
     def record_feedback(
         self,
         *,
@@ -601,7 +647,7 @@ class TasteOSService:
                     event_type=event_type,
                     artist_name=artist_name,
                     expected_version=expected_version,
-                    request=event_request,
+                    request=dict(event_request),
                     response=result,
                     updated_request=updated_request,
                     adaptation=adaptation,

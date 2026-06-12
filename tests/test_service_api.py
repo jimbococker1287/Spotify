@@ -124,6 +124,60 @@ def _taste_context() -> PredictionInputContext:
     )
 
 
+def _taste_os_client(tmp_path: Path, monkeypatch, *, request_rate_limit: int = 50) -> TestClient:
+    run_dir = tmp_path / "outputs" / "runs" / "run_a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "feature_metadata.json").write_text(
+        json.dumps({"artist_labels": ["Artist A", "Artist B", "Artist C", "Artist D"], "sequence_length": 2}),
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "serving").mkdir(parents=True)
+    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
+
+    monkeypatch.setattr(
+        taste_os_service,
+        "resolve_model_row",
+        lambda run_dir, explicit_model_name, alias_model_name: {
+            "model_name": "dummy",
+            "model_type": "retrieval_reranker",
+        },
+    )
+    monkeypatch.setattr(taste_os_service, "load_predictor", lambda run_dir, row, artist_labels: _TasteStubPredictor())
+    monkeypatch.setattr(
+        taste_os_service,
+        "load_prediction_input_context",
+        lambda run_dir, data_dir, include_video, logger, **kwargs: _taste_context(),
+    )
+
+    logger = logging.getLogger(f"spotify.test.service_api.taste_os.{tmp_path.name}")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    service = TasteOSService(
+        run_dir=run_dir,
+        data_dir=None,
+        output_dir=tmp_path / "outputs" / "analysis" / "taste_os_service",
+        model_name="dummy",
+        include_video=False,
+        max_top_k=5,
+        auth_token=None,
+        logger=logger,
+        state_db_path=None,
+        state_database_url=(
+            f"sqlite:///{(tmp_path / 'outputs' / 'analysis' / 'taste_os_service' / 'taste_os_state.sqlite3').as_posix()}"
+        ),
+        require_serving_bundle=False,
+        digital_twin=_twin(),
+        multimodal_space=_space(),
+        safe_policy=_safe_policy(),
+    )
+    app = create_taste_os_app(
+        service=service,
+        logger=logger,
+        request_rate_limit=request_rate_limit,
+    )
+    return TestClient(app)
+
+
 def _write_project_deploy_templates(project_root: Path) -> None:
     k8s_root = project_root / "deploy" / "kubernetes"
     ecs_root = project_root / "deploy" / "ecs"
@@ -435,51 +489,7 @@ def test_prediction_api_supports_jwt_auth_with_scope_checks(tmp_path: Path, monk
 
 
 def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeypatch) -> None:
-    run_dir = tmp_path / "outputs" / "runs" / "run_a"
-    run_dir.mkdir(parents=True)
-    (run_dir / "feature_metadata.json").write_text(
-        json.dumps({"artist_labels": ["Artist A", "Artist B", "Artist C", "Artist D"], "sequence_length": 2}),
-        encoding="utf-8",
-    )
-    (run_dir / "analysis" / "serving").mkdir(parents=True)
-    (run_dir / "analysis" / "serving" / "prediction_input_context_audio.joblib").write_bytes(b"bundle")
-
-    monkeypatch.setattr(
-        taste_os_service,
-        "resolve_model_row",
-        lambda run_dir, explicit_model_name, alias_model_name: {"model_name": "dummy", "model_type": "retrieval_reranker"},
-    )
-    monkeypatch.setattr(taste_os_service, "load_predictor", lambda run_dir, row, artist_labels: _TasteStubPredictor())
-    monkeypatch.setattr(
-        taste_os_service,
-        "load_prediction_input_context",
-        lambda run_dir, data_dir, include_video, logger, **kwargs: _taste_context(),
-    )
-
-    logger = logging.getLogger("spotify.test.service_api.taste_os")
-    logger.handlers.clear()
-    logger.addHandler(logging.NullHandler())
-
-    service = TasteOSService(
-        run_dir=run_dir,
-        data_dir=None,
-        output_dir=tmp_path / "outputs" / "analysis" / "taste_os_service",
-        model_name="dummy",
-        include_video=False,
-        max_top_k=5,
-        auth_token=None,
-        logger=logger,
-        state_db_path=None,
-        state_database_url=(
-            f"sqlite:///{(tmp_path / 'outputs' / 'analysis' / 'taste_os_service' / 'taste_os_state.sqlite3').as_posix()}"
-        ),
-        require_serving_bundle=False,
-        digital_twin=_twin(),
-        multimodal_space=_space(),
-        safe_policy=_safe_policy(),
-    )
-    app = create_taste_os_app(service=service, logger=logger, request_rate_limit=10)
-    client = TestClient(app)
+    client = _taste_os_client(tmp_path, monkeypatch)
 
     page = client.get("/taste-os")
     assert page.status_code == 200
@@ -516,6 +526,93 @@ def test_taste_os_api_serves_ui_and_uses_durable_history(tmp_path: Path, monkeyp
     prometheus = client.get("/v1/metrics/prometheus")
     assert prometheus.status_code == 200
     assert "spotify_service_state_backend_reachable" in prometheus.text
+
+
+def test_taste_os_api_supports_resumable_live_sessions(tmp_path: Path, monkeypatch) -> None:
+    client = _taste_os_client(tmp_path, monkeypatch)
+    session = client.post(
+        "/v1/taste-os/session",
+        json={
+            "mode": "focus",
+            "scenario": "steady",
+            "top_k": 3,
+            "recent_artists": ["Artist A", "Artist B"],
+            "use_feedback_memory": False,
+        },
+    )
+    assert session.status_code == 200
+    session_id = session.json()["service"]["session_id"]
+
+    snapshot = client.get(f"/taste-os/session/{session_id}")
+    assert snapshot.status_code == 200
+    assert snapshot.headers["x-request-id"]
+    assert snapshot.json()["session_id"] == session_id
+    assert snapshot.json()["version"] == 0
+    assert snapshot.json()["plan"]["service"]["version"] == 0
+    assert snapshot.json()["events"] == []
+
+    event_payload = {
+        "session_id": session_id,
+        "event_id": "event-live-1",
+        "event_type": "skip",
+        "artist_name": "Artist C",
+        "expected_version": 0,
+    }
+    replanned = client.post("/v1/taste-os/session/event", json=event_payload)
+    assert replanned.status_code == 200
+    assert replanned.headers["x-request-id"]
+    assert replanned.json()["service"]["session_id"] == session_id
+    assert replanned.json()["service"]["version"] == 1
+    assert replanned.json()["session_event"]["idempotent_replay"] is False
+
+    replay = client.post("/taste-os/session/event", json=event_payload)
+    assert replay.status_code == 200
+    assert replay.json()["service"]["version"] == 1
+    assert replay.json()["session_event"]["idempotent_replay"] is True
+
+    resumed = client.get(f"/v1/taste-os/session/{session_id}")
+    assert resumed.status_code == 200
+    assert resumed.json()["version"] == 1
+    assert resumed.json()["plan"]["service"]["version"] == 1
+    assert [event["event_id"] for event in resumed.json()["events"]] == ["event-live-1"]
+
+    missing_snapshot = client.get("/v1/taste-os/session/taste-os-missing")
+    assert missing_snapshot.status_code == 404
+    assert missing_snapshot.headers["x-request-id"]
+    assert missing_snapshot.json()["error"]["code"] == "session_not_found"
+    assert missing_snapshot.json()["error"]["details"] == {}
+
+    missing_event = client.post(
+        "/v1/taste-os/session/event",
+        json={**event_payload, "session_id": "taste-os-missing", "event_id": "event-missing"},
+    )
+    assert missing_event.status_code == 404
+    assert missing_event.json()["error"]["code"] == "session_not_found"
+
+    stale = client.post(
+        "/v1/taste-os/session/event",
+        json={**event_payload, "event_id": "event-stale", "event_type": "repeat"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "stale_session_version"
+    assert stale.json()["error"]["details"] == {
+        "expected_version": 0,
+        "current_version": 1,
+    }
+
+    conflict = client.post(
+        "/v1/taste-os/session/event",
+        json={**event_payload, "artist_name": "Artist D"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "event_id_conflict"
+
+    invalid_version = client.post(
+        "/v1/taste-os/session/event",
+        json={**event_payload, "event_id": "event-invalid", "expected_version": True},
+    )
+    assert invalid_version.status_code == 422
+    assert invalid_version.json()["error"]["code"] == "invalid_request_body"
 
 
 def test_prediction_api_supports_redis_rate_limit_backend(tmp_path: Path, monkeypatch) -> None:

@@ -96,7 +96,7 @@ MLflow still records params, metrics, and lightweight reports by default, but it
 - `SPOTIFY_MLFLOW_ARTIFACT_MODE=metadata|all|off`
 - `SPOTIFY_MLFLOW_ARTIFACT_MAX_MB=25`
 - `PYTHONPATH=. .venv/bin/python scripts/prune_artifacts.py` to clean retained run artifacts plus mirrored MLflow artifacts
-- `PYTHONPATH=. .venv/bin/python scripts/storage_report.py --output-dir outputs` to report both `outputs/` and external MLflow artifact roots
+- `PYTHONPATH=. .venv/bin/python scripts/storage_report.py --output-dir outputs` to report both `outputs/` and external MLflow artifact roots, storage pressure, and conservative top-level transient candidates without deleting anything
 
 ## Profiles
 
@@ -307,6 +307,10 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `BACKTEST_MAX_EVAL_SAMPLES` (default `12000`)
 - `PYTHON_BIN` (override Python executable)
 - `SPOTIFY_FORCE_CPU` (default `0` in launcher; set `1` to force CPU-only)
+- `SPOTIFY_TF_DEVICE_MODE` (`auto`, `cpu`, or `gpu`; `SPOTIFY_FORCE_CPU=1` takes precedence)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TTL_SECONDS` (default `300`; reuses a package-version-aware GPU visibility check)
+- `SPOTIFY_RESOURCE_GPU_PROBE_TIMEOUT_SECONDS` (default `15`; bounds a cold TensorFlow device probe)
+- `SPOTIFY_RESOURCE_REFRESH_GPU_PROBE` (default `0`; set `1` to force a fresh GPU visibility check)
 - `SPOTIFY_MIXED_PRECISION` (`auto`, `on`, or `off`)
 - `SPOTIFY_RUN_EAGER` (default `0` in launcher for faster graph execution)
 - `SPOTIFY_STEPS_PER_EXECUTION` (default `64` in launcher)
@@ -357,6 +361,29 @@ The `scripts/run_everything.sh` launcher also supports environment overrides:
 - `SPOTIFY_ROBUSTNESS_GUARDRAIL_SEGMENT` (launcher default `repeat_from_prev`; named slice promoted into the robustness guardrail)
 - `SPOTIFY_ROBUSTNESS_GUARDRAIL_BUCKET` (launcher default `new`; bucket within the named robustness guardrail segment)
 
+Use the unified full-run launcher to detect the host and choose a bounded CPU or
+Apple Metal plan:
+
+```bash
+make train-everything                                      # auto-select CPU or Metal
+make train-everything-preflight RESOURCE_PROFILE=auto     # print the plan only
+make train-everything-dry-run RESOURCE_PROFILE=gpu        # print plan and command
+make train-everything RESOURCE_PROFILE=cpu                # explicit CPU pipeline
+make train-everything RESOURCE_PROFILE=gpu                # explicit Metal pipeline
+```
+
+The legacy `train-everything-cpu-boost`, `train-everything-gpu`, and
+`train-everything-hybrid` targets remain compatible. Explicit environment
+overrides still win over planner defaults. On 16 GB Apple Silicon, the Metal
+profile uses conservative TensorFlow threads, disables the in-memory
+`tf.data` cache, keeps CPU stages bounded, and uses float32 by default. Set
+`SPOTIFY_MIXED_PRECISION=on` to opt into mixed float16.
+
+TensorFlow is initialized only when uncached deep work requires it. It is
+released before CPU-only backtesting and is always cleaned up on failure.
+`SPOTIFY_TF_CLEANUP_GC=auto|off|full` controls the post-TensorFlow garbage
+collection pass; `auto` performs a lightweight generation-zero collection.
+
 The launcher still trains the full deep and classical slate, but it now backtests the lighter governance subset by default and runs lighter deep models first so progress appears sooner.
 
 For memory-constrained devices, keep the same model/training-set definitions but reduce peak RAM:
@@ -369,19 +396,23 @@ SPOTIFY_OPTUNA_JOBS=1 \
 bash scripts/run_everything.sh
 ```
 
-For machines where the classical / Optuna / backtest stages are underusing CPU, try:
+For machines where the classical, Optuna, or backtest stages are underusing CPU, use:
 
 ```bash
-bash scripts/run_everything_cpu_boost.sh
+bash scripts/run_everything.sh --resource-profile cpu
 ```
 
-That launcher raises the classical worker cap, gives Optuna and temporal backtesting more parallelism, and allows a slightly larger `tf.data` cache / threadpool budget.
-
-`bash scripts/run_everything_gpu.sh` now layers the Metal Python 3.11 environment on top of that same CPU-boost profile, skips SHAP by default, and adds a bit more memory headroom for unified-memory Macs, so it is the fastest full-run entrypoint on Apple Silicon when `.venv-metal` is available.
+The GPU profile uses the Metal Python 3.11 environment, skips SHAP by default,
+and preserves unified-memory headroom. It is the preferred full-run path on
+Apple Silicon when `.venv-metal` is available.
 
 ## Acceleration
 
-The default `.venv` on this machine is currently `Python 3.13` with `tensorflow 2.20.0`, and TensorFlow is not seeing any GPU devices. On Apple Silicon, `python scripts/check_acceleration.py` will print the active TensorFlow packages, visible GPU devices, and setup guidance.
+The default `.venv` on this machine is currently `Python 3.13` with
+`tensorflow 2.20.0` for CPU execution. The dedicated `.venv-metal` uses Python
+3.11 and exposes the Apple GPU. On Apple Silicon,
+`python scripts/check_acceleration.py` prints the active packages, visible
+devices, and setup guidance; add `--json` for machine-readable diagnostics.
 
 Local verification on this repo showed:
 
@@ -393,8 +424,9 @@ The easiest repo-local path is:
 
 ```bash
 bash scripts/setup_metal_venv.sh
-PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py
-bash scripts/run_everything_gpu.sh
+PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py --json
+bash scripts/run_everything.sh --resource-profile auto --preflight
+bash scripts/run_everything.sh --resource-profile auto
 ```
 
 If you want to build it manually, the working stack from local verification was:
@@ -516,7 +548,7 @@ make control-room
 
 The control room now ignores smoke/check runs for the main review lane, but once the newest production run has a manifest, gate, and full analysis pack it becomes the review anchor automatically instead of staying pinned to an older run with richer historical evidence.
 
-It also includes an automatic run tradeoff dossier comparing the selected run with its promoted baseline across quality, safety, runtime, phase regressions, and currently retained storage. Profile, workload, cache, or artifact mismatches are reported as explicit comparability blockers.
+It also includes an automatic run tradeoff dossier comparing the selected run with its promoted baseline across quality, safety, runtime, phase regressions, and currently retained storage. Profile, workload, cache, or artifact mismatches are reported as explicit comparability blockers. Dossier verdicts now produce classified review actions with quoted, read-only inspection commands in the control-room and triage artifacts.
 
 Build the local analytics SQL file and warehouse:
 
@@ -619,11 +651,14 @@ That service exposes a browser UI at `GET /taste-os`, plus:
 - `GET /health`
 - `GET /taste-os/catalog`
 - `GET /taste-os/history`
+- `GET /taste-os/session/<session_id>`
 - `POST /taste-os/session`
 - `POST /taste-os/session/event`
 - `POST /taste-os/feedback`
 
 `POST /taste-os/session/event` accepts an idempotent `event_id`, the current `expected_version`, and a `skip`, `repeat`, `like`, or `dislike` event. It returns a revised plan under the same session ID plus `why_this_changed`; the browser studio uses this path automatically. Likes and dislikes update durable taste memory, while skips and repeats only steer the active session.
+
+The session snapshot endpoint returns the current plan, version, adaptation summary, and a bounded chronological event history. Recent-session cards in the browser studio use it to resume live sessions without creating a replacement session.
 
 The service persists session artifacts under `outputs/analysis/taste_os_service/`, records recent session history, and stores feedback plus versioned active-session state in `taste_os_state.sqlite3` under the same output directory by default. You can also point it at a real SQL backend with `--state-db-url postgresql+psycopg://...`. The older JSON/JSONL files are still exported as compatibility snapshots.
 
@@ -647,7 +682,9 @@ The ASGI surface adds:
 - `GET /v1/metrics/prometheus`
 - `GET /v1/taste-os/catalog`
 - `GET /v1/taste-os/history`
+- `GET /v1/taste-os/session/<session_id>`
 - `POST /v1/taste-os/session`
+- `POST /v1/taste-os/session/event`
 - `POST /v1/taste-os/feedback`
 
 Useful production flags:

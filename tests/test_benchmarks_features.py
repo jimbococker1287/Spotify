@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -106,17 +107,27 @@ def test_run_classical_benchmarks_reuses_provided_feature_bundle(tmp_path, monke
     logger.addHandler(logging.NullHandler())
 
     class _TinyEstimator:
+        def __init__(self) -> None:
+            self.fit_X = None
+            self.predict_calls = 0
+            self.predict_proba_inputs: list[np.ndarray] = []
+
         def fit(self, X: np.ndarray, y: np.ndarray):
+            self.fit_X = X
             self.classes_ = np.unique(y)
             return self
 
         def predict(self, X: np.ndarray) -> np.ndarray:
+            self.predict_calls += 1
             return np.full(len(X), self.classes_[0], dtype=self.classes_.dtype)
 
         def predict_proba(self, X: np.ndarray) -> np.ndarray:
+            self.predict_proba_inputs.append(X)
             proba = np.zeros((len(X), len(self.classes_)), dtype="float32")
             proba[:, 0] = 1.0
             return proba
+
+    estimator = _TinyEstimator()
 
     def _fail_build(_data):
         raise AssertionError("bundle should be reused instead of rebuilding classical features")
@@ -127,22 +138,55 @@ def test_run_classical_benchmarks_reuses_provided_feature_bundle(tmp_path, monke
     monkeypatch.setattr(
         benchmarks,
         "build_classical_estimator",
-        lambda model_name, random_seed, params=None, estimator_n_jobs=-1: ("dummy", _TinyEstimator()),
+        lambda model_name, random_seed, params=None, estimator_n_jobs=-1: ("dummy", estimator),
+    )
+    monkeypatch.setattr(
+        joblib,
+        "dump",
+        lambda _estimator, path, compress=0: Path(path).write_bytes(b"classical-estimator"),
     )
 
+    cache_root = tmp_path / "cache"
+    cache_fingerprint = "prepared-bundle"
     results = run_classical_benchmarks(
         data=data,
         output_dir=tmp_path,
         selected_models=("dummy",),
         random_seed=7,
         max_train_samples=0,
-        max_eval_samples=0,
+        max_eval_samples=1,
         logger=logger,
         feature_bundle=bundle,
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
     )
 
     assert len(results) == 1
     assert results[0].model_name == "dummy"
+    assert estimator.fit_X is bundle.X_train
+    assert estimator.predict_calls == 0
+    assert len(estimator.predict_proba_inputs) == 2
+    assert estimator.predict_proba_inputs[0] is bundle.X_val
+    assert estimator.predict_proba_inputs[1] is bundle.X_test
+
+    cache_payload = benchmarks._build_classical_cache_payload(
+        cache_fingerprint=cache_fingerprint,
+        model_name="dummy",
+        random_seed=7,
+        max_train_samples=0,
+        max_eval_samples=1,
+        sequence_length=int(data.X_seq_train.shape[1]),
+        num_artists=int(data.num_artists),
+        num_ctx=int(data.num_ctx),
+    )
+    cache_paths = benchmarks._resolve_classical_model_cache_paths(
+        cache_root=cache_root,
+        cache_fingerprint=cache_fingerprint,
+        model_name="dummy",
+        cache_key=benchmarks._build_classical_cache_key(cache_payload),
+    )
+    assert Path(results[0].estimator_artifact_path).samefile(cache_paths.estimator_artifact_path)
+    assert Path(results[0].prediction_bundle_path).samefile(cache_paths.prediction_bundle_path)
 
 
 def test_run_classical_benchmarks_reuses_cached_results_without_refitting(tmp_path: Path, monkeypatch) -> None:

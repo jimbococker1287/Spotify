@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from spotify.public_insights import (
     _creator_brief_executive_summary,
     _creator_brief_migration_watch,
@@ -12,7 +15,11 @@ from spotify.public_insights import (
     _creator_brief_scene_seed_comparison,
     _creator_brief_seed_comparison,
 )
-from spotify.public_insights_creator_brief import normalize_creator_report_family_manifest
+from spotify.public_insights_creator_brief import (
+    _apply_creator_evidence_to_payload,
+    _load_creator_evidence_status,
+    normalize_creator_report_family_manifest,
+)
 
 
 def _payload() -> dict[str, object]:
@@ -206,6 +213,7 @@ def test_creator_brief_priority_shortlist_surfaces_rank_driver_and_seed_bridge()
     assert rows[0]["opportunity_rank"] == 1
     assert rows[0]["primary_driver"] == "seed_adjacency"
     assert rows[0]["connected_seed_artists"] == ["Artist B"]
+    assert "evidence_status" not in rows[0]
 
 
 def test_creator_brief_migration_watch_and_release_watch_surface_top_rows() -> None:
@@ -276,6 +284,7 @@ def test_normalize_creator_report_family_manifest_recovers_refreshable_anchor_vi
     assert packaging["view_inventory"]["opportunity_lane_comparison"]["legacy_markdown_filenames"] == [
         f"{stem}_opportunity_lane_comparison.md"
     ]
+    assert "creator_evidence_status" not in normalized
 
 
 def test_normalize_creator_report_family_manifest_reanchors_stale_workspace_paths(tmp_path) -> None:
@@ -341,3 +350,115 @@ def test_normalize_creator_report_family_manifest_reanchors_stale_workspace_path
     assert repair_summary["artifact_index_resolution_source"] == "basename_reanchor"
     assert repair_summary["reanchored_reference_count"] == 7
     assert repair_summary["conventional_recovery_count"] == 0
+
+
+def test_creator_brief_ingests_evidence_and_downgrades_unverified_rows_to_watch(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    evidence_root = output_dir / "analysis" / "creator_evidence_lab"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    source_ready = output_dir / "source_ready.json"
+    source_watch = output_dir / "source_watch.json"
+    source_ready.write_text("{}", encoding="utf-8")
+    source_watch.write_text("{}", encoding="utf-8")
+
+    passports_path = evidence_root / "creator_opportunity_evidence_passports.json"
+    csv_path = evidence_root / "creator_opportunity_evidence_passports.csv"
+    markdown_path = evidence_root / "creator_opportunity_evidence_passports.md"
+    manifest_path = evidence_root / "creator_evidence_manifest.json"
+    csv_path.write_text("passport_id\n", encoding="utf-8")
+    markdown_path.write_text("# Evidence\n", encoding="utf-8")
+    passports = [
+        {
+            "passport_id": "ready",
+            "artist_name": "Emerging E",
+            "market": "US",
+            "evidence_grade": "publishable",
+            "verified": True,
+            "contract_version": "2026-06-v1",
+            "claim": "Saved evidence is directional and not a forecast.",
+            "limitations": ["Observational only."],
+            "source_artifact_paths": [str(source_ready)],
+            "gates": [
+                {
+                    "key": "evidence_freshness",
+                    "status": "pass",
+                    "observed": {"latest_source_age_days": 2},
+                    "threshold": {"maximum_source_age_days": 90},
+                }
+            ],
+        },
+        {
+            "passport_id": "watch",
+            "artist_name": "Artist C",
+            "market": "US",
+            "evidence_grade": "watch_only",
+            "verified": False,
+            "contract_version": "2026-06-v1",
+            "claim": "Saved evidence is directional and not a forecast.",
+            "limitations": ["Recurrence is incomplete."],
+            "source_artifact_paths": [str(source_watch)],
+            "gates": [
+                {
+                    "key": "evidence_freshness",
+                    "status": "watch",
+                    "observed": {"latest_source_age_days": 20},
+                    "threshold": {"maximum_source_age_days": 90},
+                }
+            ],
+        },
+    ]
+    passports_path.write_text(json.dumps(passports), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "contract": {
+                    "contract_version": "2026-06-v1",
+                    "verified_grade": "publishable",
+                },
+                "passport_count": 2,
+                "grade_counts": {"publishable": 1, "watch_only": 1, "suppress": 0},
+                "artifact_paths": {
+                    "json": str(passports_path),
+                    "csv": str(csv_path),
+                    "markdown": str(markdown_path),
+                    "manifest": str(manifest_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence_status = _load_creator_evidence_status(output_dir)
+    payload = _payload()
+    payload["market"] = "US"
+    _apply_creator_evidence_to_payload(payload, evidence_status)
+
+    assert evidence_status is not None
+    assert evidence_status["contract_status"] == "ready"
+    assert evidence_status["artifact_path_status"] == "ready"
+    opportunities = {row["artist_name"]: row for row in payload["opportunities"]}
+    assert opportunities["Emerging E"]["evidence_verified"] is True
+    assert opportunities["Emerging E"]["evidence_adjusted_band"] == "priority_now"
+    assert opportunities["Artist C"]["evidence_status"] == "watch"
+    assert opportunities["Artist C"]["evidence_adjusted_band"] == "watchlist"
+    assert "Directional watch signal only" in opportunities["Artist C"]["why_now"]
+    assert opportunities["Artist D"]["evidence_status"] == "missing"
+    assert "not a confident immediate priority" in opportunities["Artist D"]["why_now"]
+
+    shortlist = _creator_brief_priority_shortlist(payload)
+    assert shortlist[0]["evidence_status"] == "verified"
+    assert shortlist[1]["opportunity_band"] == "watchlist"
+    directional_payload = dict(payload)
+    directional_payload["opportunities"] = [opportunities["Artist C"]]
+    executive_summary = _creator_brief_executive_summary(directional_payload)
+    assert any("directional/watch" in line for line in executive_summary)
+
+    report_dir = output_dir / "analysis" / "public_spotify" / "creator_label_intelligence"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    normalized = normalize_creator_report_family_manifest(
+        {},
+        report_dir=report_dir,
+        stem="creator_label_intelligence_evidence",
+    )
+    assert normalized["creator_evidence_status"]["contract_status"] == "ready"
+    assert normalized["packaging_metadata"]["creator_evidence"]["passport_count"] == 2

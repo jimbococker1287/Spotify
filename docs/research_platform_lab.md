@@ -21,7 +21,8 @@ Main outputs:
 - `run_research_registry.csv/json`: run-level view of benchmark protocol coverage, safety-platform contract coverage, portability signals, and whether the attached claim pack looks stale relative to newer run artifacts.
 - `benchmark_lock_atlas.csv/json`: benchmark-lock strength, readiness, blocker text, comparator status, and manifest freshness across saved locks.
 - `research_claim_registry.csv/json`: flattened claim pack with claim readiness, blocked status, evidence coverage, missing/stale supporting-artifact paths, and next gates.
-- `research_platform_maturity.json/md`: current anchor-run summary plus suggested next uses, with explicit counts for blocked claims, incomplete benchmark locks, and stale evidence references.
+- `creator_evidence_registry.csv/json`: creator passport grades, effective verification, contract status, freshness, and source-artifact path health.
+- `research_platform_maturity.json/md`: current anchor-run summary plus suggested next uses, with explicit counts for blocked claims, incomplete benchmark locks, stale evidence references, and creator passport readiness.
 - `research_next_experiments.json/md`: ranked planner output for blocked claims, with concrete experiment cards for deep-comparator benchmark coverage, risk/coverage tradeoff evidence, friction-counterfactual trustworthiness, and stale evidence repair.
 
 Truthfulness notes:
@@ -30,6 +31,7 @@ Truthfulness notes:
 - A benchmark lock is surfaced as `incomplete` whenever `comparison_ready` is false, and the atlas carries the first comparison blocker so the reason is visible without reopening the manifest.
 - Portability is only treated as `ready` when both `benchmark_protocol.json` and `safety_platform_contract.json` are present and the contract reports reusable API groups plus Spotify wrappers.
 - Freshness warnings are heuristic but deliberate: if a supporting artifact is newer than the saved claim pack, or a benchmark support file is newer than the saved manifest, the lab treats that reference as stale and asks for regeneration.
+- Creator passports are effectively verified only when their publishable grade, contract version, declared artifacts, source paths, and freshness checks all remain healthy.
 - The next-experiment planner only promotes blocked-claim work when the registries expose a concrete gap. It ranks repeated deep-comparator benchmark coverage ahead of risk/coverage and friction-counterfactual audits because those blockers decide whether ranking claims can become analysis-ready.
 
 Suggested use:

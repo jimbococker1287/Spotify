@@ -14,11 +14,17 @@ def main() -> int:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     report = build_storage_report(output_dir, top_n=max(1, int(args.top_n)))
-    json_path, md_path = write_storage_report(output_dir, top_n=max(1, int(args.top_n)))
+    json_path, md_path = write_storage_report(
+        output_dir,
+        top_n=max(1, int(args.top_n)),
+        report=report,
+    )
 
     print(f"Storage report written to {json_path}")
     print(f"Markdown summary written to {md_path}")
     print(f"Total outputs size: {report['human_size']}")
+    print(f"Storage pressure: {report['storage_pressure']['status']}")
+    print(f"Potential transient reclaim for review: {report['potential_reclaim_human_size']}")
     print("Top sections:")
     for row in report["section_totals"][:5]:
         print(f"- {row['section']}: {row['human_size']}")

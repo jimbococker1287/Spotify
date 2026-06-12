@@ -172,6 +172,63 @@ def test_control_room_guard_triage_includes_promotion_playbook(tmp_path: Path) -
     assert any("Compare the challenger" in step for step in promotion_item["inspect_steps"])
 
 
+def test_control_room_guard_triage_includes_tradeoff_playbook(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-03-20T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="retrieval_reranker",
+        model_type="retrieval_reranker",
+        val_top1=0.59,
+        test_top1=0.56,
+        regression=-0.01,
+        robustness_gap=0.09,
+        stress_skip_risk=0.22,
+    )
+    run_b = _write_run(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-03-22T20:00:00",
+        promoted=True,
+        status="pass",
+        model_name="blended_ensemble",
+        model_type="ensemble",
+        val_top1=0.61,
+        test_top1=0.58,
+        regression=-0.01,
+        robustness_gap=0.09,
+        stress_skip_risk=0.22,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--outputs-dir",
+            str(output_dir),
+            "--run-dir",
+            str(run_b),
+            "--allow-fail",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+
+    assert result.returncode == 0
+    triage_path = output_dir / "analytics" / "control_room_triage.json"
+    triage_payload = json.loads(triage_path.read_text(encoding="utf-8"))
+    tradeoff_item = next(item for item in triage_payload["triage_items"] if item["area"] == "tradeoff")
+    assert tradeoff_item["classification"] == "operational"
+    assert any("run_manifest.json" in path for path in tradeoff_item["inspect_files"])
+    assert any(command.startswith("diff -u ") for command in tradeoff_item["inspect_commands"])
+    assert any("does not execute them" in step for step in tradeoff_item["inspect_steps"])
+
+
 def test_control_room_guard_supports_slice_and_standing_benchmark_thresholds(tmp_path: Path) -> None:
     output_dir = tmp_path / "outputs"
     run_b = _write_run(

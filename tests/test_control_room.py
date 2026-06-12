@@ -668,6 +668,13 @@ def test_control_room_includes_run_tradeoff_dossier_and_history_snapshot(tmp_pat
     assert dossier["largest_phase_regressions"][0]["phase_name"] == "training"
     assert dossier["quality_safety_worse_count"] == 0
     assert dossier["verdict"] == "tradeoff_review"
+    tradeoff_action = next(action for action in report["review_actions"] if action["area"] == "tradeoff")
+    assert tradeoff_action["tradeoff_verdict"] == "tradeoff_review"
+    assert tradeoff_action["classification"] == "strategic"
+    assert any("run_phase_timings.json" in path for path in tradeoff_action["inspect"])
+    assert any(command.startswith("diff -u ") for command in tradeoff_action["commands"])
+    assert any(command.startswith("du -sh ") for command in tradeoff_action["commands"])
+    assert "tradeoff" in report["ops_health"]["strategic_areas"]
 
     json_path, md_path = write_control_room_report(output_dir, top_n=3)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -676,6 +683,13 @@ def test_control_room_includes_run_tradeoff_dossier_and_history_snapshot(tmp_pat
     assert "Run Tradeoff Dossier" in markdown
     assert "Largest Phase Regressions" in markdown
     assert "`training`" in markdown
+    assert "[STRATEGIC] Decide whether the selected run's resource cost is justified" in markdown
+
+    triage_payload = json.loads((output_dir / "analytics" / "control_room_triage.json").read_text(encoding="utf-8"))
+    tradeoff_item = next(item for item in triage_payload["triage_items"] if item["area"] == "tradeoff")
+    assert tradeoff_item["classification"] == "strategic"
+    assert any(command.startswith("diff -u ") for command in tradeoff_item["inspect_commands"])
+    assert any("dossier-derived selected and baseline paths" in step for step in tradeoff_item["inspect_steps"])
 
     history = pd.read_csv(output_dir / "analytics" / "control_room_history.csv")
     row = history.loc[history["run_id"].astype(str) == "run_b"].iloc[0]
@@ -683,6 +697,172 @@ def test_control_room_includes_run_tradeoff_dossier_and_history_snapshot(tmp_pat
     assert int(row["tradeoff_comparable"]) == 1
     assert float(row["tradeoff_runtime_delta_seconds"]) == 25.0
     assert int(row["tradeoff_phase_regression_count"]) == 2
+
+
+def test_control_room_makes_not_comparable_tradeoff_operational_and_actionable(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-06-01T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-06-02T20:00:00",
+        profile="fast",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+    phases = [{"phase_name": "training", "status": "ok", "duration_seconds": 60.0, "metadata": {}}]
+    _write_run_timing_fixture(output_dir, run_id="run_a", total_seconds=65.0, measured_seconds=60.0, phases=phases)
+    _write_run_timing_fixture(output_dir, run_id="run_b", total_seconds=65.0, measured_seconds=60.0, phases=phases)
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["run_tradeoffs"]["verdict"] == "not_comparable"
+    action = next(item for item in report["review_actions"] if item["area"] == "tradeoff")
+    assert action["classification"] == "operational"
+    assert action["tradeoff_verdict"] == "not_comparable"
+    assert str(output_dir / "runs" / "run_a" / "run_manifest.json") in action["inspect"]
+    assert str(output_dir / "runs" / "run_b" / "run_manifest.json") in action["inspect"]
+    assert any(command.startswith("diff -u ") and "run_manifest.json" in command for command in action["commands"])
+    assert "tradeoff" in report["ops_health"]["operational_areas"]
+
+
+def test_control_room_adds_baseline_preferred_action_when_regression_is_unexplained(tmp_path: Path) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-06-01T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-06-02T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.59,
+        test_top1=0.54,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["run_tradeoffs"]["verdict"] == "baseline_preferred"
+    action = next(item for item in report["review_actions"] if item["area"] == "tradeoff")
+    assert action["classification"] == "strategic"
+    assert action["tradeoff_verdict"] == "baseline_preferred"
+    assert "Best model test top1" in action["detail"]
+    assert str(output_dir / "runs" / "run_a" / "run_results.json") in action["inspect"]
+    assert str(output_dir / "runs" / "run_b" / "run_results.json") in action["inspect"]
+    assert any(command.startswith("diff -u ") and "run_results.json" in command for command in action["commands"])
+
+
+def test_control_room_deduplicates_tradeoff_when_promotion_and_robustness_explain_regressions(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "outputs"
+    _write_run_fixture(
+        output_dir,
+        run_id="run_a",
+        timestamp="2026-06-01T20:00:00",
+        profile="full",
+        promoted=True,
+        promotion_status="pass",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.60,
+        test_top1=0.58,
+        gate_regression=-0.01,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.10,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+    _write_run_fixture(
+        output_dir,
+        run_id="run_b",
+        timestamp="2026-06-02T20:00:00",
+        profile="full",
+        promoted=False,
+        promotion_status="fail",
+        best_model_name="retrieval_reranker",
+        best_model_type="retrieval_reranker",
+        val_top1=0.56,
+        test_top1=0.54,
+        gate_regression=0.02,
+        drift_jsd=0.10,
+        ece=0.05,
+        selective_risk=0.14,
+        abstention_rate=0.08,
+        robustness_gap=0.20,
+        stress_skip_risk=0.20,
+        stress_scenario="steady_evening",
+    )
+
+    report = build_control_room_report(output_dir, top_n=3)
+
+    assert report["run_tradeoffs"]["verdict"] == "baseline_preferred"
+    assert any(item["area"] == "promotion" for item in report["review_actions"])
+    assert any(item["area"] == "robustness" for item in report["review_actions"])
+    assert not any(item["area"] == "tradeoff" for item in report["review_actions"])
 
 
 def test_write_control_room_report_creates_json_and_markdown(tmp_path: Path) -> None:

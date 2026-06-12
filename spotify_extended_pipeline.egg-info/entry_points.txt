@@ -4,6 +4,7 @@ spotify-build-serving-bundle = spotify.serving_bundle:main
 spotify-claim-to-demo = spotify.claim_to_demo:main
 spotify-compare-public = spotify.compare_public:main
 spotify-control-room = spotify.control_room:main
+spotify-creator-evidence-lab = spotify.creator_evidence_lab:main
 spotify-creator-market-intelligence = spotify.creator_market_intelligence:main
 spotify-day-90-launch = spotify.day_90_launch:main
 spotify-deploy-release = spotify.deployment_registry:main

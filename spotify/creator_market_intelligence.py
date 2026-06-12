@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
 from datetime import timezone
+import hashlib
 import json
 import logging
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -54,6 +56,29 @@ _TREND_DELTA_COLUMNS = [
     "comparison_basis",
     "trend_note",
     "action_hint",
+]
+_STRATEGY_CARD_COLUMNS = [
+    "rank",
+    "card_id",
+    "card_type",
+    "card_name",
+    "priority",
+    "confidence",
+    "source_queue_rank",
+    "signal_key",
+    "scene_name",
+    "source_artist",
+    "target_artist",
+    "family_count",
+    "repeat_count",
+    "first_report_family_id",
+    "latest_report_family_id",
+    "why_now",
+    "evidence_metrics",
+    "source_artifact_references",
+    "recommended_action",
+    "validation_signal",
+    "ranking_score",
 ]
 _STALE_RELEASE_DAYS = 180.0
 
@@ -1253,6 +1278,455 @@ def _build_creator_market_trend_deltas(
     )
 
 
+def _strategy_card_id(card_type: str, signal_key: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", f"{card_type}-{signal_key}".casefold()).strip("-")
+    digest = hashlib.sha1(f"{card_type}\0{signal_key}".encode("utf-8")).hexdigest()[:8]
+    return f"creator-market-{normalized[:64] or card_type}-{digest}"
+
+
+def _strategy_int(value: object) -> int:
+    numeric = _safe_float(value)
+    return int(numeric) if math.isfinite(numeric) else 0
+
+
+def _strategy_metric(value: object) -> object:
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    numeric = _safe_float(value)
+    if math.isfinite(numeric):
+        return round(numeric, 6)
+    text = str(value or "").strip()
+    return text if text and text.casefold() not in {"nan", "none", "null"} else None
+
+
+def _strategy_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _strategy_atlas_row(frame: pd.DataFrame, **selectors: str) -> dict[str, object]:
+    if frame.empty:
+        return {}
+    matches = pd.Series(True, index=frame.index)
+    for column, expected in selectors.items():
+        if column not in frame.columns:
+            return {}
+        matches &= frame[column].fillna("").astype(str).str.strip().eq(str(expected).strip())
+    subset = frame.loc[matches]
+    return subset.iloc[0].to_dict() if not subset.empty else {}
+
+
+def _strategy_sources(*references: tuple[str, str]) -> str:
+    return _strategy_json(
+        [
+            {"artifact": artifact, "selector": selector}
+            for artifact, selector in references
+            if str(artifact).strip() and str(selector).strip()
+        ]
+    )
+
+
+def _strategy_confidence(
+    *,
+    family_count: int,
+    partial_report_family_count: int,
+    evidence_gap: bool = False,
+) -> str:
+    if evidence_gap:
+        return "evidence_gap"
+    if family_count < 2:
+        return "single_family_validation"
+    if partial_report_family_count > 0:
+        return "cross_family_partial"
+    return "cross_family"
+
+
+def _strategy_priority(*, severity: str, confidence: str) -> str:
+    if confidence == "evidence_gap":
+        return "medium"
+    if confidence == "single_family_validation":
+        return "low"
+    if severity == "high" and confidence == "cross_family":
+        return "high"
+    return "medium"
+
+
+def _strategy_card_json_records(strategy_cards: pd.DataFrame) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for row in strategy_cards.to_dict(orient="records"):
+        record = dict(row)
+        for key, fallback in [("evidence_metrics", {}), ("source_artifact_references", [])]:
+            try:
+                parsed = json.loads(str(record.get(key, "")))
+            except Exception:
+                parsed = fallback
+            record[key] = parsed
+        records.append(record)
+    return records
+
+
+def _build_strategy_card_markdown(strategy_cards: pd.DataFrame) -> list[str]:
+    lines = [
+        "# Creator Market Strategy Cards",
+        "",
+        f"- Ranked cards: `{len(strategy_cards.index)}`",
+        "- Ranking favors repeated cross-family evidence; single-family release gaps remain validation leads.",
+        "",
+    ]
+    if strategy_cards.empty:
+        lines.append("- No repeated, rising, or safely actionable fallback signal is available yet.")
+        return lines
+
+    for row in _strategy_card_json_records(strategy_cards):
+        lines.extend(
+            [
+                f"## {row.get('rank', '')}. {row.get('card_name', '')}",
+                "",
+                f"- Card ID: `{row.get('card_id', '')}`",
+                f"- Type: `{row.get('card_type', '')}`",
+                f"- Priority / confidence: `{row.get('priority', '')}` / `{row.get('confidence', '')}`",
+                f"- Why now: {row.get('why_now', '')}",
+            ]
+        )
+        metrics = row.get("evidence_metrics", {})
+        if isinstance(metrics, dict) and metrics:
+            metric_text = ", ".join(f"{key}=`{value}`" for key, value in metrics.items() if value is not None)
+            if metric_text:
+                lines.append(f"- Evidence: {metric_text}")
+        references = row.get("source_artifact_references", [])
+        if isinstance(references, list):
+            for reference in references:
+                if isinstance(reference, dict):
+                    lines.append(
+                        f"- Proof: `{reference.get('artifact', '')}` ({reference.get('selector', '')})"
+                    )
+        lines.extend(
+            [
+                f"- Recommended action: {row.get('recommended_action', '')}",
+                f"- Validation signal: {row.get('validation_signal', '')}",
+                "",
+            ]
+        )
+    return lines
+
+
+def _build_creator_market_strategy_cards(
+    *,
+    trend_deltas: pd.DataFrame,
+    scene_market_pulse: pd.DataFrame,
+    lane_atlas: pd.DataFrame,
+    migration_network: pd.DataFrame,
+    whitespace_atlas: pd.DataFrame,
+    partial_report_family_count: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    if trend_deltas.empty:
+        empty = pd.DataFrame(columns=_STRATEGY_CARD_COLUMNS)
+        return empty, _build_strategy_card_markdown(empty)
+
+    queue = trend_deltas.copy().reset_index(drop=True)
+    queue["source_queue_rank"] = np.arange(1, len(queue.index) + 1)
+    rows: list[dict[str, object]] = []
+    partial_note = (
+        " Source report families are partial, so treat this as a validation lead rather than a settled market conclusion."
+        if partial_report_family_count > 0
+        else ""
+    )
+
+    def add_card(
+        *,
+        trend: dict[str, object],
+        card_type: str,
+        card_name: str,
+        why_now: str,
+        metrics: dict[str, object],
+        sources: str,
+        recommended_action: str,
+        validation_signal: str,
+        evidence_gap: bool = False,
+    ) -> None:
+        family_count = _strategy_int(trend.get("family_count"))
+        confidence = _strategy_confidence(
+            family_count=family_count,
+            partial_report_family_count=partial_report_family_count,
+            evidence_gap=evidence_gap,
+        )
+        priority = _strategy_priority(
+            severity=str(trend.get("severity", "")).strip().lower(),
+            confidence=confidence,
+        )
+        priority_weight = {"high": 3.0, "medium": 2.0, "low": 1.0}[priority]
+        confidence_weight = {
+            "cross_family": 3.0,
+            "cross_family_partial": 2.0,
+            "single_family_validation": 1.0,
+            "evidence_gap": 0.5,
+        }[confidence]
+        type_weight = {
+            "scene_momentum": 0.4,
+            "opportunity_lane": 0.3,
+            "migration_route": 0.2,
+            "release_whitespace_gap": 0.1,
+            "release_whitespace_evidence": 0.0,
+        }[card_type]
+        queue_rank = _strategy_int(trend.get("source_queue_rank"))
+        trend_component = min(max(_safe_float(trend.get("trend_score")), 0.0), 1.0)
+        ranking_score = (
+            10.0 * priority_weight
+            + confidence_weight
+            + type_weight
+            + 0.5 * trend_component
+            + max(0.0, 0.1 - 0.001 * queue_rank)
+        )
+        signal_key = str(trend.get("signal_key", "")).strip()
+        rows.append(
+            {
+                "rank": 0,
+                "card_id": _strategy_card_id(card_type, signal_key),
+                "card_type": card_type,
+                "card_name": card_name,
+                "priority": priority,
+                "confidence": confidence,
+                "source_queue_rank": queue_rank,
+                "signal_key": signal_key,
+                "scene_name": str(trend.get("scene_name", "")).strip(),
+                "source_artist": str(trend.get("source_artist", "")).strip(),
+                "target_artist": str(trend.get("target_artist", "")).strip(),
+                "family_count": family_count,
+                "repeat_count": _strategy_int(trend.get("repeat_count")),
+                "first_report_family_id": str(trend.get("first_report_family_id", "")).strip(),
+                "latest_report_family_id": str(trend.get("latest_report_family_id", "")).strip(),
+                "why_now": f"{why_now}{partial_note}".strip(),
+                "evidence_metrics": _strategy_json(
+                    {key: _strategy_metric(value) for key, value in metrics.items()}
+                ),
+                "source_artifact_references": sources,
+                "recommended_action": recommended_action,
+                "validation_signal": validation_signal,
+                "ranking_score": round(ranking_score, 6),
+            }
+        )
+
+    for trend in queue.loc[queue["signal_type"].eq("rising_scene")].head(3).to_dict(orient="records"):
+        scene_name = str(trend.get("scene_name", "")).strip()
+        atlas = _strategy_atlas_row(scene_market_pulse, scene_name=scene_name)
+        current_opportunity = _safe_float(atlas.get("avg_opportunity_score"))
+        threshold = max(0.0, current_opportunity - 0.05) if math.isfinite(current_opportunity) else float("nan")
+        validation = (
+            f"The next saved report family keeps `{scene_name}` in the top three scenes with average opportunity score at least `{threshold:.3f}`."
+            if math.isfinite(threshold)
+            else f"The next saved report family repeats `{scene_name}` with a non-negative trend delta and at least one priority-now opportunity."
+        )
+        add_card(
+            trend=trend,
+            card_type="scene_momentum",
+            card_name=f"Lead the next creator brief with {scene_name}",
+            why_now=str(trend.get("trend_note", "")).strip(),
+            metrics={
+                "delta_value": trend.get("delta_value"),
+                "trend_score": trend.get("trend_score"),
+                "momentum_score": atlas.get("momentum_score"),
+                "avg_opportunity_score": atlas.get("avg_opportunity_score"),
+                "avg_scene_local_play_share": atlas.get("avg_scene_local_play_share"),
+            },
+            sources=_strategy_sources(
+                (
+                    "creator_market_trend_deltas.csv",
+                    f"signal_type=rising_scene;signal_key={trend.get('signal_key', '')}",
+                ),
+                ("scene_market_pulse.csv", f"scene_name={scene_name}"),
+            ),
+            recommended_action=(
+                f"Use `{scene_name}` as the lead scene for the next bounded creator brief, anchored on "
+                f"`{atlas.get('top_opportunity_artist', 'the top supported artist')}`."
+            ),
+            validation_signal=validation,
+        )
+
+    for trend in queue.loc[queue["signal_type"].eq("repeated_opportunity_lane")].head(3).to_dict(orient="records"):
+        scene_name = str(trend.get("scene_name", "")).strip()
+        primary_driver = str(trend.get("primary_driver", "")).strip()
+        atlas = _strategy_atlas_row(lane_atlas, scene_name=scene_name, primary_driver=primary_driver)
+        current_opportunity = _safe_float(atlas.get("avg_opportunity_score"))
+        threshold = max(0.0, current_opportunity - 0.05) if math.isfinite(current_opportunity) else float("nan")
+        validation = (
+            f"A new report family repeats `{scene_name} / {primary_driver}` with average opportunity score at least `{threshold:.3f}`."
+            if math.isfinite(threshold)
+            else f"A new report family repeats `{scene_name} / {primary_driver}` with at least one priority-now opportunity."
+        )
+        add_card(
+            trend=trend,
+            card_type="opportunity_lane",
+            card_name=f"Package {scene_name} / {primary_driver} as a repeatable lane",
+            why_now=str(trend.get("trend_note", "")).strip(),
+            metrics={
+                "trend_score": trend.get("trend_score"),
+                "delta_value": trend.get("delta_value"),
+                "lane_attractiveness_score": atlas.get("lane_attractiveness_score"),
+                "avg_opportunity_score": atlas.get("avg_opportunity_score"),
+                "priority_now_count": atlas.get("priority_now_count"),
+                "artist_count": atlas.get("artist_count"),
+            },
+            sources=_strategy_sources(
+                (
+                    "creator_market_trend_deltas.csv",
+                    f"signal_type=repeated_opportunity_lane;signal_key={trend.get('signal_key', '')}",
+                ),
+                (
+                    "opportunity_lane_atlas.csv",
+                    f"scene_name={scene_name};primary_driver={primary_driver}",
+                ),
+            ),
+            recommended_action=(
+                f"Build a small creator-market test around `{atlas.get('representative_artist', 'the representative artist')}` "
+                f"and the `{primary_driver}` playbook; keep the scope to one brief or outreach cohort."
+            ),
+            validation_signal=validation,
+        )
+
+    for trend in queue.loc[queue["signal_type"].eq("repeated_migration_route")].head(3).to_dict(orient="records"):
+        source_artist = str(trend.get("source_artist", "")).strip()
+        target_artist = str(trend.get("target_artist", "")).strip()
+        atlas = _strategy_atlas_row(
+            migration_network,
+            source_artist=source_artist,
+            target_artist=target_artist,
+        )
+        source_share = _safe_float(atlas.get("avg_source_out_share"))
+        target_share = _safe_float(atlas.get("avg_target_in_share"))
+        if math.isfinite(source_share) and math.isfinite(target_share):
+            validation = (
+                f"The next family repeats `{source_artist} -> {target_artist}` with source-out share at least "
+                f"`{max(0.0, source_share - 0.05):.3f}` and target-in share at least `{max(0.0, target_share - 0.05):.3f}`."
+            )
+        else:
+            validation = f"The next family repeats `{source_artist} -> {target_artist}` with a positive transition count."
+        add_card(
+            trend=trend,
+            card_type="migration_route",
+            card_name=f"Validate the {source_artist} to {target_artist} audience route",
+            why_now=str(trend.get("trend_note", "")).strip(),
+            metrics={
+                "trend_score": trend.get("trend_score"),
+                "delta_value": trend.get("delta_value"),
+                "route_strength_score": atlas.get("route_strength_score"),
+                "total_transition_count": atlas.get("total_transition_count"),
+                "avg_source_out_share": atlas.get("avg_source_out_share"),
+                "avg_target_in_share": atlas.get("avg_target_in_share"),
+            },
+            sources=_strategy_sources(
+                (
+                    "creator_market_trend_deltas.csv",
+                    f"signal_type=repeated_migration_route;signal_key={trend.get('signal_key', '')}",
+                ),
+                (
+                    "market_migration_network.csv",
+                    f"source_artist={source_artist};target_artist={target_artist}",
+                ),
+            ),
+            recommended_action=(
+                f"Design one editorial or creator-positioning test that starts with `{source_artist}` audience context "
+                f"and measures movement toward `{target_artist}`; do not generalize beyond this route yet."
+            ),
+            validation_signal=validation,
+        )
+
+    for trend in queue.loc[queue["signal_type"].eq("stale_release_whitespace")].head(3).to_dict(orient="records"):
+        artist_name = str(trend.get("signal_key", "")).strip()
+        scene_name = str(trend.get("scene_name", "")).strip()
+        atlas = _strategy_atlas_row(whitespace_atlas, artist_name=artist_name, scene_name=scene_name)
+        whitespace_score = _safe_float(atlas.get("avg_release_whitespace_score"))
+        score_threshold = max(0.0, whitespace_score - 0.05) if math.isfinite(whitespace_score) else 0.0
+        add_card(
+            trend=trend,
+            card_type="release_whitespace_gap",
+            card_name=f"Verify the release window around {artist_name}",
+            why_now=(
+                f"{str(trend.get('trend_note', '')).strip()} This is a release-calendar hypothesis, not proof of artist demand."
+            ),
+            metrics={
+                "max_days_since_latest_release": atlas.get(
+                    "max_days_since_latest_release",
+                    trend.get("latest_value"),
+                ),
+                "avg_release_whitespace_score": atlas.get("avg_release_whitespace_score"),
+                "avg_opportunity_score": atlas.get("avg_opportunity_score"),
+                "whitespace_signal_score": atlas.get("whitespace_signal_score"),
+                "coverage_ratio": trend.get("coverage_ratio"),
+            },
+            sources=_strategy_sources(
+                (
+                    "creator_market_trend_deltas.csv",
+                    f"signal_type=stale_release_whitespace;signal_key={artist_name}",
+                ),
+                (
+                    "release_whitespace_atlas.csv",
+                    f"artist_name={artist_name};scene_name={scene_name}",
+                ),
+            ),
+            recommended_action=(
+                f"Verify `{artist_name}` release dates and label context from public sources, then run one small outreach "
+                "or content-timing test only if the gap remains real."
+            ),
+            validation_signal=(
+                f"A second report family confirms at least `{int(_STALE_RELEASE_DAYS)}` days since release and "
+                f"release-whitespace score at least `{score_threshold:.3f}`."
+            ),
+        )
+
+    sparse_rows = queue.loc[queue["signal_type"].eq("sparse_release_whitespace_coverage")].head(1)
+    for trend in sparse_rows.to_dict(orient="records"):
+        add_card(
+            trend=trend,
+            card_type="release_whitespace_evidence",
+            card_name="Backfill release evidence before making whitespace bets",
+            why_now=str(trend.get("trend_note", "")).strip(),
+            metrics={
+                "coverage_ratio": trend.get("coverage_ratio"),
+                "metadata_row_count": trend.get("metadata_row_count"),
+                "opportunity_row_count": trend.get("opportunity_row_count"),
+                "delta_value": trend.get("delta_value"),
+            },
+            sources=_strategy_sources(
+                (
+                    "creator_market_trend_deltas.csv",
+                    "signal_type=sparse_release_whitespace_coverage;signal_key=release_metadata_coverage",
+                ),
+            ),
+            recommended_action=(
+                "Backfill public release dates, release-whitespace scores, and label metadata before ranking any artist-level gap."
+            ),
+            validation_signal=(
+                "Release metadata coverage reaches at least `0.750` across at least two report families before a whitespace gap is promoted."
+            ),
+            evidence_gap=True,
+        )
+
+    if not rows:
+        empty = pd.DataFrame(columns=_STRATEGY_CARD_COLUMNS)
+        return empty, _build_strategy_card_markdown(empty)
+
+    cards = pd.DataFrame(rows)
+    card_type_order = {
+        "scene_momentum": 0,
+        "opportunity_lane": 1,
+        "migration_route": 2,
+        "release_whitespace_gap": 3,
+        "release_whitespace_evidence": 4,
+    }
+    cards["_card_type_order"] = cards["card_type"].map(card_type_order).fillna(99).astype(int)
+    cards = (
+        cards.sort_values(
+            ["ranking_score", "_card_type_order", "source_queue_rank", "card_id"],
+            ascending=[False, True, True, True],
+        )
+        .drop_duplicates(subset=["card_id"], keep="first")
+        .head(12)
+        .reset_index(drop=True)
+    )
+    cards["rank"] = np.arange(1, len(cards.index) + 1)
+    cards = cards.drop(columns=["_card_type_order"])[_STRATEGY_CARD_COLUMNS]
+    return cards, _build_strategy_card_markdown(cards)
+
+
 def _build_market_brief(
     *,
     report_family_count: int,
@@ -1262,6 +1736,7 @@ def _build_market_brief(
     seed_bridge_atlas: pd.DataFrame,
     whitespace_atlas: pd.DataFrame,
     trend_deltas: pd.DataFrame,
+    strategy_cards: pd.DataFrame,
     evidence_summary: dict[str, object],
 ) -> tuple[dict[str, Any], list[str]]:
     top_scene = scene_market_pulse.iloc[0].to_dict() if not scene_market_pulse.empty else {}
@@ -1270,6 +1745,12 @@ def _build_market_brief(
     top_bridge = seed_bridge_atlas.iloc[0].to_dict() if not seed_bridge_atlas.empty else {}
     top_whitespace = whitespace_atlas.iloc[0].to_dict() if not whitespace_atlas.empty else {}
     top_trend = trend_deltas.iloc[0].to_dict() if not trend_deltas.empty else {}
+    top_strategy_cards = _strategy_card_json_records(strategy_cards.head(3))
+    strategy_card_type_counts = (
+        {str(key): int(value) for key, value in strategy_cards["card_type"].value_counts().to_dict().items()}
+        if not strategy_cards.empty
+        else {}
+    )
     trend_delta_counts = (
         {str(key): int(value) for key, value in trend_deltas["signal_type"].value_counts().to_dict().items()}
         if not trend_deltas.empty and "signal_type" in trend_deltas.columns
@@ -1305,6 +1786,13 @@ def _build_market_brief(
         summary.append(
             f"Trend deltas add `{len(trend_deltas.index)}` cross-family highlights, led by `{top_trend.get('signal_type', '')}` for `{top_trend.get('signal_key', '')}`."
         )
+    if top_strategy_cards:
+        summary.append(
+            f"Strategy cards rank `{len(strategy_cards.index)}` actions, led by `{top_strategy_cards[0].get('card_name', '')}` "
+            f"at `{top_strategy_cards[0].get('priority', '')}` priority."
+        )
+    else:
+        summary.append("No strategy card cleared the repeated-signal or conservative fallback rules yet.")
     summary.append(
         "Evidence passports verify "
         f"`{int(evidence_summary.get('verified_opportunity_count', 0) or 0)}` of "
@@ -1316,6 +1804,7 @@ def _build_market_brief(
         "Use the lane atlas when deciding whether to expand through adjacency, migration, or whitespace rather than treating every opportunity row the same.",
         "Use the migration network and scene-seed bridges as the default handoff into creator strategy and cultural-analysis work.",
         "Use trend deltas to separate repeated market patterns from signals that only appear in one report family.",
+        "Use strategy cards as the ranked action queue, and require each card's validation signal before scaling the play.",
     ]
     payload = {
         "report_family_count": int(report_family_count),
@@ -1326,6 +1815,9 @@ def _build_market_brief(
         "top_whitespace": top_whitespace,
         "top_trend_delta": top_trend,
         "trend_delta_counts": trend_delta_counts,
+        "strategy_card_count": int(len(strategy_cards.index)),
+        "strategy_card_type_counts": strategy_card_type_counts,
+        "top_strategy_cards": top_strategy_cards,
         "raw_opportunity_count": int(evidence_summary.get("raw_opportunity_count", 0) or 0),
         "verified_opportunity_count": int(evidence_summary.get("verified_opportunity_count", 0) or 0),
         "evidence_passport_count": int(evidence_summary.get("passport_count", 0) or 0),
@@ -1377,6 +1869,14 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         migration_df=migration_df,
         family_inventory=family_inventory,
     )
+    strategy_cards, strategy_card_markdown = _build_creator_market_strategy_cards(
+        trend_deltas=trend_deltas,
+        scene_market_pulse=scene_market_pulse,
+        lane_atlas=lane_atlas,
+        migration_network=migration_network,
+        whitespace_atlas=whitespace_atlas,
+        partial_report_family_count=int(family_counts["partial_report_family_count"]),
+    )
     evidence_result = build_creator_evidence_passports(output_dir=output_dir, logger=logger)
     evidence_summary = dict(evidence_result.get("manifest", {}))
     brief_payload, brief_markdown = _build_market_brief(
@@ -1387,6 +1887,7 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         seed_bridge_atlas=seed_bridge_atlas,
         whitespace_atlas=whitespace_atlas,
         trend_deltas=trend_deltas,
+        strategy_cards=strategy_cards,
         evidence_summary=evidence_summary,
     )
 
@@ -1506,6 +2007,13 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
         "verified_passport_count": int(evidence_summary.get("verified_passport_count", 0) or 0),
         "evidence_grade_counts": dict(evidence_summary.get("grade_counts", {})),
         "evidence_artifact_paths": dict(evidence_summary.get("artifact_paths", {})),
+        "strategy_card_count": int(len(strategy_cards.index)),
+        "strategy_card_type_counts": (
+            {str(key): int(value) for key, value in strategy_cards["card_type"].value_counts().to_dict().items()}
+            if not strategy_cards.empty
+            else {}
+        ),
+        "strategy_card_artifact_paths": {},
         "artifact_root": str(output_root),
         "tables": {},
     }
@@ -1518,6 +2026,33 @@ def build_creator_market_intelligence(*, output_dir: Path, logger) -> list[Path]
             "json_path": str(json_path),
         }
         paths.extend([csv_path, json_path])
+
+    strategy_cards_csv = _write_csv(
+        output_root / "creator_market_strategy_cards.csv",
+        _rows_for_columns(strategy_cards, _STRATEGY_CARD_COLUMNS),
+        _STRATEGY_CARD_COLUMNS,
+    )
+    strategy_cards_json = write_json(
+        output_root / "creator_market_strategy_cards.json",
+        _strategy_card_json_records(strategy_cards),
+    )
+    strategy_cards_md = write_markdown(
+        output_root / "creator_market_strategy_cards.md",
+        strategy_card_markdown,
+    )
+    strategy_card_paths = {
+        "csv": str(strategy_cards_csv),
+        "json": str(strategy_cards_json),
+        "markdown": str(strategy_cards_md),
+    }
+    manifest_payload["strategy_card_artifact_paths"] = strategy_card_paths
+    manifest_payload["tables"]["creator_market_strategy_cards"] = {
+        "row_count": int(len(strategy_cards.index)),
+        "csv_path": str(strategy_cards_csv),
+        "json_path": str(strategy_cards_json),
+        "markdown_path": str(strategy_cards_md),
+    }
+    paths.extend([strategy_cards_csv, strategy_cards_json, strategy_cards_md])
 
     trend_delta_md = write_markdown(output_root / "creator_market_trend_deltas.md", trend_delta_markdown)
     if "creator_market_trend_deltas" in manifest_payload["tables"]:

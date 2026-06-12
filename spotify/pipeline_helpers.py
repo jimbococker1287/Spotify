@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import gc
+import inspect
 import json
+import os
 import re
+import time
 
 import numpy as np
 
@@ -246,20 +250,96 @@ def _load_current_risk_metrics(
     return metrics
 
 
-def _release_deep_runtime_resources(tf_module, logger) -> None:
-    import gc
+def _resolve_deep_cleanup_gc_policy(raw_policy: str | None = None) -> tuple[str, str]:
+    raw = str(raw_policy or os.getenv("SPOTIFY_TF_CLEANUP_GC", "auto")).strip().lower()
+    if raw in ("", "auto", "default", "young", "generation0", "gen0"):
+        return "young", raw or "auto"
+    if raw in ("0", "false", "no", "off", "none", "disabled"):
+        return "off", raw
+    if raw in ("1", "true", "yes", "on", "full", "generation2", "gen2"):
+        return "full", raw
+    return "young", raw
 
-    gc.collect()
-    if tf_module is None:
-        logger.info("Released Python memory after deep-model stage.")
-        return
 
+def _clear_tensorflow_session(tf_module) -> tuple[bool, bool | None, str]:
+    clear_session = tf_module.keras.backend.clear_session
     try:
-        tf_module.keras.backend.clear_session()
+        signature = inspect.signature(clear_session)
+    except (TypeError, ValueError):
+        supports_free_memory = False
+    else:
+        supports_free_memory = "free_memory" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    if supports_free_memory:
+        clear_session(free_memory=False)
+        return True, False, ""
+    clear_session()
+    return True, None, ""
+
+
+def _release_deep_runtime_resources(
+    tf_module,
+    logger,
+    *,
+    gc_policy: str | None = None,
+) -> dict[str, object]:
+    resolved_gc_policy, configured_gc_policy = _resolve_deep_cleanup_gc_policy(gc_policy)
+    cleanup_started = time.perf_counter()
+    clear_session_started = cleanup_started
+    clear_session_succeeded = False
+    clear_session_free_memory: bool | None = None
+    clear_session_error = ""
+
+    if tf_module is not None:
+        try:
+            clear_session_succeeded, clear_session_free_memory, clear_session_error = (
+                _clear_tensorflow_session(tf_module)
+            )
+        except Exception as exc:
+            clear_session_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("TensorFlow session cleanup encountered a non-fatal error: %s", exc)
+    clear_session_seconds = time.perf_counter() - clear_session_started
+
+    gc_started = time.perf_counter()
+    gc_collected_objects = 0
+    gc_error = ""
+    try:
+        if resolved_gc_policy == "young":
+            gc_collected_objects = int(gc.collect(0))
+        elif resolved_gc_policy == "full":
+            gc_collected_objects = int(gc.collect())
     except Exception as exc:
-        logger.warning("TensorFlow session cleanup encountered a non-fatal error: %s", exc)
-    gc.collect()
-    logger.info("Released TensorFlow and Python memory after deep-model stage.")
+        gc_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Python garbage collection encountered a non-fatal error: %s", exc)
+    gc_seconds = time.perf_counter() - gc_started
+
+    if tf_module is None:
+        logger.info("Released Python memory after deep-model stage with %s GC.", resolved_gc_policy)
+    else:
+        logger.info(
+            "Released TensorFlow runtime state with %s GC in %.3fs.",
+            resolved_gc_policy,
+            time.perf_counter() - cleanup_started,
+        )
+    return {
+        "tensorflow_loaded": tf_module is not None,
+        "clear_session_attempted": tf_module is not None,
+        "clear_session_succeeded": clear_session_succeeded,
+        "clear_session_free_memory": clear_session_free_memory,
+        "clear_session_error": clear_session_error,
+        "clear_session_seconds": round(clear_session_seconds, 6),
+        "gc_policy": resolved_gc_policy,
+        "gc_policy_configured": configured_gc_policy,
+        "gc_generation": 0 if resolved_gc_policy == "young" else (2 if resolved_gc_policy == "full" else None),
+        "gc_collection_count": 0 if resolved_gc_policy == "off" else 1,
+        "gc_collected_objects": gc_collected_objects,
+        "gc_error": gc_error,
+        "gc_seconds": round(gc_seconds, 6),
+        "cleanup_seconds": round(time.perf_counter() - cleanup_started, 6),
+    }
 
 
 __all__ = [

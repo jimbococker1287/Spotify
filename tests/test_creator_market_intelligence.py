@@ -506,14 +506,24 @@ def test_build_creator_market_intelligence_writes_multi_family_trend_deltas(tmp_
     trend_csv = output_root / "creator_market_trend_deltas.csv"
     trend_json = output_root / "creator_market_trend_deltas.json"
     trend_md = output_root / "creator_market_trend_deltas.md"
+    strategy_csv = output_root / "creator_market_strategy_cards.csv"
+    strategy_json = output_root / "creator_market_strategy_cards.json"
+    strategy_md = output_root / "creator_market_strategy_cards.md"
     trend_deltas = pd.read_csv(trend_csv)
+    strategy_cards = pd.read_csv(strategy_csv)
+    strategy_payload = json.loads(strategy_json.read_text(encoding="utf-8"))
     manifest_payload = json.loads((output_root / "creator_market_manifest.json").read_text(encoding="utf-8"))
     brief_payload = json.loads((output_root / "creator_market_brief.json").read_text(encoding="utf-8"))
+    brief_markdown = (output_root / "creator_market_brief.md").read_text(encoding="utf-8")
     markdown_text = trend_md.read_text(encoding="utf-8")
+    strategy_markdown = strategy_md.read_text(encoding="utf-8")
 
     assert trend_csv in paths
     assert trend_json in paths
     assert trend_md in paths
+    assert strategy_csv in paths
+    assert strategy_json in paths
+    assert strategy_md in paths
     assert set(trend_deltas["signal_type"]) >= {
         "rising_scene",
         "repeated_opportunity_lane",
@@ -544,6 +554,62 @@ def test_build_creator_market_intelligence_writes_multi_family_trend_deltas(tmp_
     assert brief_payload["trend_delta_counts"]["rising_scene"] == 1
     assert "Rising Scenes" in markdown_text
     assert "Repeated Migration Routes" in markdown_text
+
+    assert set(strategy_cards["card_type"]) == {
+        "scene_momentum",
+        "opportunity_lane",
+        "migration_route",
+        "release_whitespace_gap",
+    }
+    assert strategy_cards["rank"].tolist() == list(range(1, len(strategy_cards.index) + 1))
+    assert strategy_cards["card_id"].is_unique
+    assert strategy_cards.iloc[0]["card_type"] == "scene_momentum"
+    repeated_cards = strategy_cards.loc[
+        strategy_cards["card_type"].isin(["scene_momentum", "opportunity_lane", "migration_route"])
+    ]
+    assert set(repeated_cards["confidence"]) == {"cross_family_partial"}
+    assert set(repeated_cards["priority"]) == {"medium"}
+    whitespace_card = strategy_cards.loc[strategy_cards["card_type"].eq("release_whitespace_gap")].iloc[0]
+    assert whitespace_card["confidence"] == "single_family_validation"
+    assert whitespace_card["priority"] == "low"
+    assert "Verify" in whitespace_card["card_name"]
+
+    assert len(strategy_payload) == len(strategy_cards.index)
+    assert all(isinstance(card["evidence_metrics"], dict) and card["evidence_metrics"] for card in strategy_payload)
+    assert all(card["source_artifact_references"] for card in strategy_payload)
+    assert all(
+        reference["artifact"].endswith(".csv") and reference["selector"]
+        for card in strategy_payload
+        for reference in card["source_artifact_references"]
+    )
+    assert all(
+        (output_root / reference["artifact"]).exists()
+        for card in strategy_payload
+        for reference in card["source_artifact_references"]
+    )
+    assert any(
+        reference["artifact"] == "market_migration_network.csv"
+        for card in strategy_payload
+        for reference in card["source_artifact_references"]
+    )
+    assert manifest_payload["strategy_card_count"] == len(strategy_cards.index)
+    assert manifest_payload["tables"]["creator_market_strategy_cards"]["row_count"] == len(strategy_cards.index)
+    assert manifest_payload["strategy_card_artifact_paths"] == {
+        "csv": str(strategy_csv),
+        "json": str(strategy_json),
+        "markdown": str(strategy_md),
+    }
+    assert brief_payload["strategy_card_count"] == len(strategy_cards.index)
+    assert brief_payload["top_strategy_cards"][0]["card_id"] == strategy_payload[0]["card_id"]
+    assert "Strategy cards rank" in " ".join(brief_payload["summary"])
+    assert strategy_payload[0]["card_name"] in brief_markdown
+    assert "Creator Market Strategy Cards" in strategy_markdown
+    assert "Validation signal" in strategy_markdown
+
+    first_ranking = strategy_cards[["rank", "card_id", "card_type"]].to_dict(orient="records")
+    build_creator_market_intelligence(output_dir=tmp_path / "outputs", logger=logger)
+    reranked_cards = pd.read_csv(strategy_csv)
+    assert reranked_cards[["rank", "card_id", "card_type"]].to_dict(orient="records") == first_ranking
 
 
 def test_build_creator_market_intelligence_flags_sparse_release_metadata(tmp_path: Path) -> None:
@@ -595,6 +661,10 @@ def test_build_creator_market_intelligence_flags_sparse_release_metadata(tmp_pat
     output_root = tmp_path / "outputs" / "analysis" / "creator_market_intelligence"
     trend_deltas = pd.read_csv(output_root / "creator_market_trend_deltas.csv")
     whitespace_atlas = pd.read_csv(output_root / "release_whitespace_atlas.csv")
+    strategy_cards = pd.read_csv(output_root / "creator_market_strategy_cards.csv")
+    strategy_payload = json.loads(
+        (output_root / "creator_market_strategy_cards.json").read_text(encoding="utf-8")
+    )
     markdown_text = (output_root / "creator_market_trend_deltas.md").read_text(encoding="utf-8")
 
     sparse_rows = trend_deltas.loc[trend_deltas["signal_type"].eq("sparse_release_whitespace_coverage")]
@@ -607,3 +677,24 @@ def test_build_creator_market_intelligence_flags_sparse_release_metadata(tmp_pat
     assert sparse_row["severity"] == "high"
     assert whitespace_atlas.empty
     assert "coverage `0.000`" in markdown_text
+    assert "release_whitespace_gap" not in set(strategy_cards["card_type"])
+    evidence_card = strategy_cards.loc[
+        strategy_cards["card_type"].eq("release_whitespace_evidence")
+    ].iloc[0]
+    assert evidence_card["confidence"] == "evidence_gap"
+    assert evidence_card["priority"] == "medium"
+    assert "Backfill release evidence" in evidence_card["card_name"]
+    assert "0.750" in evidence_card["validation_signal"]
+    evidence_payload = next(
+        card for card in strategy_payload if card["card_type"] == "release_whitespace_evidence"
+    )
+    assert evidence_payload["evidence_metrics"]["coverage_ratio"] == 0.0
+    assert evidence_payload["source_artifact_references"] == [
+        {
+            "artifact": "creator_market_trend_deltas.csv",
+            "selector": (
+                "signal_type=sparse_release_whitespace_coverage;"
+                "signal_key=release_metadata_coverage"
+            ),
+        }
+    ]

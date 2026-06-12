@@ -6,6 +6,7 @@ PROFILE ?= dev
 MODE ?= fast
 RUN_NAME ?=
 EXTRA_ARGS ?=
+RESOURCE_PROFILE ?= auto
 
 ifeq ($(wildcard $(VENV_PY)),)
 RUN_PY := $(PYTHON)
@@ -13,7 +14,7 @@ else
 RUN_PY := $(VENV_PY)
 endif
 
-.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-deep-benchmark-low-ram deep-benchmark-finalize train-elite train-everything train-everything-cpu-boost train-everything-gpu check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release release-readiness production-smoke control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence creator-evidence-lab research-platform-lab scope-expansion-lab project-health athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
+.PHONY: setup setup-metal train train-fast train-full train-core train-experimental train-classical train-deep train-deep-benchmark-low-ram deep-benchmark-finalize train-elite train-everything train-everything-preflight train-everything-dry-run train-everything-cpu-boost train-everything-gpu train-everything-hybrid check-acceleration refresh-backtest benchmark-lock research-claims claim-to-demo front-door branch-portfolio outward-package day-90-launch show-ready-backfill show-ready-maintenance regression-guard regression-alert refresh-champion-gate deploy-release release-readiness production-smoke control-room-guard analytics-db analytics-warehouse listener-archetypes quant-decision-lab creator-market-intelligence creator-evidence-lab research-platform-lab scope-expansion-lab project-health athena-export compare-public public-insights prune-artifacts storage-report control-room taste-os-demo taste-os-showcase serve-taste-os predict-next serve-predict build-serving-bundle serve-api serve-api-predict serve-api-taste-os schedule-run lint typecheck qa test clean clean-all
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -68,7 +69,13 @@ train-elite:
 
 train-everything:
 	mkdir -p outputs
-	bash scripts/run_everything.sh $(RUN_NAME) $(EXTRA_ARGS)
+	bash scripts/run_everything.sh --resource-profile $(RESOURCE_PROFILE) $(RUN_NAME) $(EXTRA_ARGS)
+
+train-everything-preflight:
+	bash scripts/run_everything.sh --resource-profile $(RESOURCE_PROFILE) --preflight $(EXTRA_ARGS)
+
+train-everything-dry-run:
+	bash scripts/run_everything.sh --resource-profile $(RESOURCE_PROFILE) --dry-run $(RUN_NAME) $(EXTRA_ARGS)
 
 train-everything-cpu-boost:
 	mkdir -p outputs
@@ -78,8 +85,14 @@ train-everything-gpu:
 	mkdir -p outputs
 	bash scripts/run_everything_gpu.sh $(RUN_NAME) $(EXTRA_ARGS)
 
+train-everything-hybrid: train-everything-gpu
+
 check-acceleration:
-	$(RUN_PY) scripts/check_acceleration.py $(EXTRA_ARGS)
+	@if [ -x .venv-metal/bin/python ]; then \
+		PYTHONNOUSERSITE=1 .venv-metal/bin/python scripts/check_acceleration.py $(EXTRA_ARGS); \
+	else \
+		$(RUN_PY) scripts/check_acceleration.py $(EXTRA_ARGS); \
+	fi
 
 refresh-backtest:
 	mkdir -p outputs

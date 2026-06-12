@@ -18,6 +18,15 @@ def init_tensorflow_runtime(
     tf = None
     strategy = None
     selected_deep_backtest_models = list(getattr(deep_backtest_cache_inspection, "deep_models", ()))
+    if needs_tf_for_deep_training and needs_tf_for_deep_backtest:
+        initialization_reason = "deep_training_and_deep_backtest"
+        planned_release_point = "after_temporal_backtest"
+    elif needs_tf_for_deep_training:
+        initialization_reason = "deep_training"
+        planned_release_point = "before_temporal_backtest"
+    else:
+        initialization_reason = "deep_backtest"
+        planned_release_point = "after_temporal_backtest"
     if needs_tf_for_deep_training or needs_tf_for_deep_backtest:
         with context.phase_recorder.phase(
             "tensorflow_runtime_init",
@@ -29,6 +38,14 @@ def init_tensorflow_runtime(
             backtest_cache_enabled=bool(getattr(deep_backtest_cache_inspection, "enabled", False)),
             backtest_cache_hit=bool(getattr(deep_backtest_cache_inspection, "hit", False)),
             backtest_cache_key=str(getattr(deep_backtest_cache_inspection, "cache_key", "")),
+            initialization_reason=initialization_reason,
+            planned_release_point=planned_release_point,
+            pre_tensorflow_stages_completed=[
+                "classical_benchmarks",
+                "optuna_tuning",
+                "retrieval_stack",
+                "backtest_stage_planning",
+            ],
         ) as phase:
             configure_process_env()
             tf = load_tensorflow_runtime(context.logger)
@@ -43,8 +60,10 @@ def init_tensorflow_runtime(
             context.logger.info("Number of devices: %s", device_count)
         return tf, strategy
 
-    if selected_deep_backtest_models:
+    if selected_deep_backtest_models and context.run_deep_models:
         skip_reason = "deep_training_fully_cached_and_deep_backtest_cached"
+    elif selected_deep_backtest_models:
+        skip_reason = "deep_training_not_requested_and_deep_backtest_cached"
     elif context.run_deep_models:
         skip_reason = "deep_training_fully_cached_and_deep_backtest_not_requested"
     else:
@@ -56,17 +75,40 @@ def init_tensorflow_runtime(
         backtest_cache_enabled=bool(getattr(deep_backtest_cache_inspection, "enabled", False)),
         backtest_cache_hit=bool(getattr(deep_backtest_cache_inspection, "hit", False)),
         backtest_cache_key=str(getattr(deep_backtest_cache_inspection, "cache_key", "")),
+        tensorflow_required=False,
+        deep_training_requires_tensorflow=bool(needs_tf_for_deep_training),
+        deep_backtest_requires_tensorflow=bool(needs_tf_for_deep_backtest),
+        deep_cache_hit_models=list(deep_cache_stats.get("hit_model_names", [])),
+        deep_cache_miss_models=list(deep_cache_stats.get("miss_model_names", [])),
     )
     return None, None
 
 
-def release_deep_runtime_resources(*, context: PipelineExperimentContext, tf) -> None:
+def release_deep_runtime_resources(
+    *,
+    context: PipelineExperimentContext,
+    tf,
+    release_point: str,
+    next_stage: str | None,
+    deep_backtest_required: bool,
+) -> None:
     if tf is not None:
-        with context.phase_recorder.phase("release_deep_runtime_resources") as phase:
-            _release_deep_runtime_resources(tf, context.logger)
-            phase["tensorflow_loaded"] = True
+        with context.phase_recorder.phase(
+            "release_deep_runtime_resources",
+            release_point=release_point,
+            next_stage=next_stage or "",
+            deep_backtest_required=deep_backtest_required,
+            cleanup_gc_env_var="SPOTIFY_TF_CLEANUP_GC",
+        ) as phase:
+            phase.update(_release_deep_runtime_resources(tf, context.logger))
     else:
-        context.phase_recorder.skip("release_deep_runtime_resources", reason="tensorflow_not_initialized")
+        context.phase_recorder.skip(
+            "release_deep_runtime_resources",
+            reason="tensorflow_not_initialized",
+            release_point=release_point,
+            next_stage=next_stage or "",
+            deep_backtest_required=deep_backtest_required,
+        )
 
 
 __all__ = ["init_tensorflow_runtime", "release_deep_runtime_resources"]

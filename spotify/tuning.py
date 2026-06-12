@@ -23,7 +23,7 @@ from .benchmarks import (
 )
 from .data import PreparedData
 from .probability_bundles import save_prediction_bundle
-from .run_artifacts import copy_file_if_changed, safe_read_json, write_json
+from .run_artifacts import copy_file_if_changed, materialize_cached_file, safe_read_json, write_json
 
 
 OPTUNA_CACHE_SCHEMA_VERSION = "optuna-tuning-cache-v1"
@@ -148,6 +148,14 @@ def _parse_positive_int(raw: str | None, fallback: int) -> int:
         return fallback
 
 
+def _parse_nonnegative_int(raw: str | None, fallback: int) -> int:
+    try:
+        value = int(str(raw).strip())
+        return value if value >= 0 else fallback
+    except Exception:
+        return fallback
+
+
 def _parse_model_timeout_overrides(raw: str | None) -> dict[str, int]:
     if not raw:
         return {}
@@ -162,7 +170,7 @@ def _parse_model_timeout_overrides(raw: str | None) -> dict[str, int]:
             timeout_val = int(value.strip())
         except Exception:
             continue
-        if key and timeout_val > 0:
+        if key and timeout_val >= 0:
             out[key] = timeout_val
     return out
 
@@ -195,14 +203,14 @@ def _resolve_optuna_pruner_name(raw: str | None) -> str:
     return "median"
 
 
-def _build_pruner(optuna):
-    pruner_name = _resolve_optuna_pruner_name(os.getenv("SPOTIFY_OPTUNA_PRUNER", "median"))
+def _build_pruner(optuna, pruner_name: str | None = None):
+    pruner_name = pruner_name or _resolve_optuna_pruner_name(os.getenv("SPOTIFY_OPTUNA_PRUNER", "median"))
     if pruner_name == "none":
         return optuna.pruners.NopPruner(), "none"
     if pruner_name == "successive_halving":
         return optuna.pruners.SuccessiveHalvingPruner(min_resource=1, reduction_factor=2), "successive_halving"
-    startup_trials = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
-    warmup_steps = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
+    startup_trials = _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
+    warmup_steps = _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
     return (
         optuna.pruners.MedianPruner(
             n_startup_trials=startup_trials,
@@ -218,10 +226,51 @@ def _resolve_optuna_worker_plan(
     requested_model_workers: int,
 ) -> tuple[int, int]:
     trial_jobs = max(1, requested_trial_jobs)
-    model_workers = max(1, min(max(1, model_count), requested_model_workers))
+    model_workers = max(1, min(max(1, model_count), requested_model_workers, trial_jobs))
     if model_workers <= 1:
         return 1, trial_jobs
     return model_workers, max(1, trial_jobs // model_workers)
+
+
+def _resolve_effective_fidelity_schedule(
+    fidelity_schedule: tuple[float, ...],
+    pruner_name: str,
+) -> tuple[float, ...]:
+    if pruner_name == "none":
+        return (1.0,)
+    return fidelity_schedule
+
+
+def _sample_aligned_rows(
+    arrays: tuple[np.ndarray, ...],
+    *,
+    max_rows: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, ...]:
+    if not arrays:
+        return ()
+    row_count = len(arrays[0])
+    if max_rows <= 0 or row_count <= max_rows:
+        return arrays
+    indices = sample_indices(row_count, max_rows, rng)
+    return tuple(array[indices] for array in arrays)
+
+
+def _resolve_tuning_timeout_reason(
+    *,
+    now: float,
+    trial_started: float,
+    study_started: float,
+    per_trial_timeout_seconds: int,
+    model_timeout_seconds: int,
+) -> str:
+    trial_elapsed = now - trial_started
+    if per_trial_timeout_seconds > 0 and trial_elapsed >= float(per_trial_timeout_seconds):
+        return f"trial timeout exceeded ({trial_elapsed:.1f}s)"
+    study_elapsed = now - study_started
+    if model_timeout_seconds > 0 and study_elapsed >= float(model_timeout_seconds):
+        return f"model timeout exceeded ({study_elapsed:.1f}s)"
+    return ""
 
 
 def _build_optuna_cache_payload(
@@ -249,10 +298,10 @@ def _build_optuna_cache_payload(
         "per_trial_timeout_seconds": int(per_trial_timeout_seconds),
         "fidelity_schedule": [float(value) for value in fidelity_schedule],
         "pruner_name": pruner_name,
-        "median_startup_trials": _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
+        "median_startup_trials": _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_STARTUP_TRIALS"), 5)
         if pruner_name == "median"
         else 0,
-        "median_warmup_steps": _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
+        "median_warmup_steps": _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_WARMUP_STEPS"), 1)
         if pruner_name == "median"
         else 0,
     }
@@ -285,7 +334,7 @@ def _resolve_optuna_model_cache_paths(
 def _copy_optional_artifact(source: Path, destination: Path) -> str:
     if not source.exists():
         return ""
-    return str(copy_file_if_changed(source, destination))
+    return str(materialize_cached_file(source, destination))
 
 
 def _find_optuna_warm_start_candidate(
@@ -296,9 +345,6 @@ def _find_optuna_warm_start_candidate(
     model_name: str,
     max_train_samples: int,
     max_eval_samples: int,
-    per_trial_timeout_seconds: int,
-    fidelity_schedule: tuple[float, ...],
-    pruner_name: str,
 ) -> OptunaWarmStartCandidate | None:
     if cache_root is None or not cache_root.exists() or not _optuna_warm_start_enabled_from_env():
         return None
@@ -315,13 +361,6 @@ def _find_optuna_warm_start_candidate(
         if int(payload.get("max_train_samples", -1)) != int(max_train_samples):
             continue
         if int(payload.get("max_eval_samples", -1)) != int(max_eval_samples):
-            continue
-        if int(payload.get("per_trial_timeout_seconds", -1)) != int(per_trial_timeout_seconds):
-            continue
-        payload_schedule = tuple(float(value) for value in payload.get("fidelity_schedule", []) or [])
-        if payload_schedule != tuple(float(value) for value in fidelity_schedule):
-            continue
-        if str(payload.get("pruner_name", "")) != str(pruner_name):
             continue
 
         candidate_cache_key = str(payload.get("cache_key", "")).strip() or meta_path.parent.name
@@ -400,9 +439,9 @@ def _load_cached_optuna_result(
 
     try:
         if cache_paths.trial_log_path.exists():
-            copy_file_if_changed(cache_paths.trial_log_path, output_dir / f"optuna_trials_{model_name}.csv")
+            materialize_cached_file(cache_paths.trial_log_path, output_dir / f"optuna_trials_{model_name}.csv")
         if cache_paths.history_plot_path.exists():
-            copy_file_if_changed(cache_paths.history_plot_path, output_dir / f"optuna_history_{model_name}.png")
+            materialize_cached_file(cache_paths.history_plot_path, output_dir / f"optuna_history_{model_name}.png")
         estimator_artifact_path = _copy_optional_artifact(
             cache_paths.estimator_artifact_path,
             output_dir / "estimators" / f"classical_tuned_{model_name}.joblib",
@@ -528,19 +567,19 @@ def run_optuna_tuning(
         logger.info("Skipping Optuna tuning because trials <= 0.")
         return []
 
-    validate_classical_models(selected_models, random_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_models = tuple(selected_models)
 
-    per_trial_timeout_seconds = _parse_positive_int(os.getenv("SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS"), 0)
+    per_trial_timeout_seconds = _parse_nonnegative_int(os.getenv("SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS"), 0)
     model_timeout_default = timeout_seconds if timeout_seconds > 0 else 0
-    model_timeout_default = _parse_positive_int(
+    model_timeout_default = _parse_nonnegative_int(
         os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUT_SECONDS"),
         model_timeout_default,
     )
     model_timeout_overrides = _parse_model_timeout_overrides(os.getenv("SPOTIFY_OPTUNA_MODEL_TIMEOUTS"))
     fidelity_schedule = _parse_fidelity_schedule(os.getenv("SPOTIFY_OPTUNA_PRUNING_FIDELITIES"))
     pruner_name = _resolve_optuna_pruner_name(os.getenv("SPOTIFY_OPTUNA_PRUNER", "median"))
+    fidelity_schedule = _resolve_effective_fidelity_schedule(fidelity_schedule, pruner_name)
 
     cache_enabled = _optuna_cache_enabled_from_env() and cache_root is not None and bool(str(cache_fingerprint).strip())
     cache_contexts: dict[str, tuple[OptunaModelCachePaths, dict[str, object]]] = {}
@@ -589,9 +628,6 @@ def run_optuna_tuning(
             model_name=model_name,
             max_train_samples=max_train_samples,
             max_eval_samples=max_eval_samples,
-            per_trial_timeout_seconds=per_trial_timeout_seconds,
-            fidelity_schedule=fidelity_schedule,
-            pruner_name=pruner_name,
         )
         for model_name in uncached_models
     }
@@ -625,6 +661,7 @@ def run_optuna_tuning(
         write_json(output_dir / "optuna_results.json", [asdict(result) for result in ordered_results])
         return ordered_results
 
+    validate_classical_models(tuple(uncached_models), random_seed)
     optuna = _load_optuna()
     if optuna is None:
         logger.warning(
@@ -647,19 +684,21 @@ def run_optuna_tuning(
     X_test_seq_full = X_test_seq
 
     rng = np.random.default_rng(random_seed)
-    train_idx = sample_indices(len(X_train), max_train_samples, rng)
-    val_idx = sample_indices(len(X_val), max_eval_samples, rng)
-    test_idx = sample_indices(len(X_test), max_eval_samples, rng)
-
-    X_train = X_train[train_idx]
-    y_train = y_train[train_idx]
-    X_val = X_val[val_idx]
-    y_val = y_val[val_idx]
-    X_test = X_test[test_idx]
-    y_test = y_test[test_idx]
-    X_train_seq = X_train_seq[train_idx]
-    X_val_seq = X_val_seq[val_idx]
-    X_test_seq = X_test_seq[test_idx]
+    X_train, y_train, X_train_seq = _sample_aligned_rows(
+        (X_train, y_train, X_train_seq),
+        max_rows=max_train_samples,
+        rng=rng,
+    )
+    X_val, y_val, X_val_seq = _sample_aligned_rows(
+        (X_val, y_val, X_val_seq),
+        max_rows=max_eval_samples,
+        rng=rng,
+    )
+    X_test, y_test, X_test_seq = _sample_aligned_rows(
+        (X_test, y_test, X_test_seq),
+        max_rows=max_eval_samples,
+        rng=rng,
+    )
 
     logger.info(
         "Optuna tuning dataset sizes: train=%d, val=%d, test=%d",
@@ -682,7 +721,7 @@ def run_optuna_tuning(
     )
     if optuna_jobs > 1 or model_workers > 1:
         estimator_n_jobs = 1
-    pruner, pruner_name = _build_pruner(optuna)
+    pruner, pruner_name = _build_pruner(optuna, pruner_name)
 
     logger.info(
         "Optuna parallelism: model_workers=%d trial_jobs=%d requested_trial_jobs=%d estimator_n_jobs=%d (classical_workers=%d) pruner=%s fidelity=%s trial_timeout_s=%d",
@@ -702,6 +741,7 @@ def run_optuna_tuning(
         effective_trials = int(trials)
         if warm_start_candidate is not None:
             effective_trials = min(int(trials), _resolve_optuna_warm_start_trials(trials))
+        study_started = time.perf_counter()
         logger.info(
             "Running Optuna tuning for %s (%d trials, timeout_s=%s warm_start=%s)",
             model_name,
@@ -735,10 +775,15 @@ def run_optuna_tuning(
             X_train_model = X_train_seq if model_name == "session_knn" else X_train
             X_val_model = X_val_seq if model_name == "session_knn" else X_val
             for step_idx, fraction in enumerate(fidelity_schedule, start=1):
-                if per_trial_timeout_seconds > 0:
-                    elapsed = time.perf_counter() - trial_started
-                    if elapsed > float(per_trial_timeout_seconds):
-                        raise optuna.TrialPruned(f"trial timeout exceeded ({elapsed:.1f}s)")
+                timeout_reason = _resolve_tuning_timeout_reason(
+                    now=time.perf_counter(),
+                    trial_started=trial_started,
+                    study_started=study_started,
+                    per_trial_timeout_seconds=per_trial_timeout_seconds,
+                    model_timeout_seconds=model_timeout,
+                )
+                if timeout_reason:
+                    raise optuna.TrialPruned(timeout_reason)
 
                 stage_rows = max(512, min(len(X_train_model), int(round(len(X_train_model) * fraction))))
                 if stage_rows >= len(X_train_model):
@@ -766,7 +811,25 @@ def run_optuna_tuning(
                     if "least populated classes" in msg or "minimum number of groups" in msg:
                         raise optuna.TrialPruned(f"insufficient class support in sampled stage: {exc}") from exc
                     raise
+                timeout_reason = _resolve_tuning_timeout_reason(
+                    now=time.perf_counter(),
+                    trial_started=trial_started,
+                    study_started=study_started,
+                    per_trial_timeout_seconds=per_trial_timeout_seconds,
+                    model_timeout_seconds=model_timeout,
+                )
+                if timeout_reason:
+                    raise optuna.TrialPruned(timeout_reason)
                 val_pred = estimator.predict(X_val_model)
+                timeout_reason = _resolve_tuning_timeout_reason(
+                    now=time.perf_counter(),
+                    trial_started=trial_started,
+                    study_started=study_started,
+                    per_trial_timeout_seconds=per_trial_timeout_seconds,
+                    model_timeout_seconds=model_timeout,
+                )
+                if timeout_reason:
+                    raise optuna.TrialPruned(timeout_reason)
                 last_score = float(np.mean(val_pred == y_val))
                 trial.report(last_score, step=step_idx)
                 if step_idx < len(fidelity_schedule) and trial.should_prune():

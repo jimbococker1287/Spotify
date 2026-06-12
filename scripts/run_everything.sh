@@ -4,6 +4,49 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+RESOURCE_PROFILE="${SPOTIFY_RESOURCE_PROFILE:-auto}"
+DRY_RUN=0
+PREFLIGHT=0
+pipeline_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resource-profile)
+      if [[ $# -lt 2 ]]; then
+        echo "--resource-profile requires auto, cpu, or gpu." >&2
+        exit 2
+      fi
+      RESOURCE_PROFILE="$2"
+      shift 2
+      ;;
+    --resource-profile=*)
+      RESOURCE_PROFILE="${1#*=}"
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --preflight)
+      PREFLIGHT=1
+      shift
+      ;;
+    --)
+      shift
+      pipeline_args+=("$@")
+      break
+      ;;
+    *)
+      pipeline_args+=("$1")
+      shift
+      ;;
+  esac
+done
+if (( ${#pipeline_args[@]} > 0 )); then
+  set -- "${pipeline_args[@]}"
+else
+  set --
+fi
+
 if [[ $# -gt 0 && "$1" != --* ]]; then
   RUN_NAME="$1"
   shift
@@ -11,55 +54,24 @@ else
   RUN_NAME="everything-$(date +%Y%m%d-%H%M%S)"
 fi
 
-_python_is_ge_313() {
-  "$1" - <<'PY' >/dev/null 2>&1
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 13) else 1)
-PY
-}
-
-_python_has_tensorflow() {
-  "$1" - <<'PY' >/dev/null 2>&1
-import importlib.util
-raise SystemExit(0 if importlib.util.find_spec("tensorflow") else 1)
-PY
-}
-
-_resolve_python_cmd() {
-  if [[ -n "${PYTHON_BIN:-}" ]]; then
-    PYTHON_CMD="$PYTHON_BIN"
-    return
-  fi
-  if [[ -x ".venv/bin/python" ]]; then
-    PYTHON_CMD=".venv/bin/python"
-  else
-    PYTHON_CMD="python3"
-  fi
-
-  case "$(printf '%s' "${SPOTIFY_AUTO_ROUTE_TF_PYTHON:-auto}" | tr '[:upper:]' '[:lower:]')" in
-    0|false|no|off)
-      return
-      ;;
-  esac
-  if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-    return
-  fi
-  if [[ ! -x ".venv-metal/bin/python" ]]; then
-    return
-  fi
-  if ! _python_is_ge_313 "$PYTHON_CMD"; then
-    return
-  fi
-  if ! _python_has_tensorflow ".venv-metal/bin/python"; then
-    return
-  fi
-
-  PYTHON_CMD=".venv-metal/bin/python"
-  export SPOTIFY_TF_COMPAT_VENV_ROUTED="${SPOTIFY_TF_COMPAT_VENV_ROUTED:-1}"
-  echo "Auto-routing deep runtime to ${PYTHON_CMD} to avoid Apple Silicon Python 3.13 TensorFlow instability." >&2
-}
-
-_resolve_python_cmd
+if [[ -x ".venv/bin/python" ]]; then
+  PLANNER_PYTHON=".venv/bin/python"
+else
+  PLANNER_PYTHON="python3"
+fi
+plan_exports="$(
+  PYTHONPATH="$ROOT_DIR" "$PLANNER_PYTHON" -m spotify.resource_planning \
+    --root-dir "$ROOT_DIR" \
+    --profile "$RESOURCE_PROFILE" \
+    --format shell
+)"
+eval "$plan_exports"
+PYTHON_CMD="$PYTHON_BIN"
+if [[ "$PREFLIGHT" == "1" || "$DRY_RUN" == "1" ]]; then
+  printf '%s\n' "$SPOTIFY_RESOURCE_PLAN_REPORT"
+else
+  printf '%s\n' "$SPOTIFY_RESOURCE_PLAN_SUMMARY"
+fi
 
 CLASSICAL_ALL="${CLASSICAL_ALL:-logreg,extra_trees,knn,gaussian_nb,mlp}"
 OPTUNA_MODELS="${OPTUNA_MODELS:-logreg,mlp}"
@@ -83,18 +95,8 @@ CLASSICAL_MAX_EVAL_SAMPLES="${CLASSICAL_MAX_EVAL_SAMPLES:-25000}"
 BACKTEST_MAX_TRAIN_SAMPLES="${BACKTEST_MAX_TRAIN_SAMPLES:-30000}"
 BACKTEST_MAX_EVAL_SAMPLES="${BACKTEST_MAX_EVAL_SAMPLES:-12000}"
 
-export SPOTIFY_FORCE_CPU="${SPOTIFY_FORCE_CPU:-0}"
 export SPOTIFY_RUN_EAGER="${SPOTIFY_RUN_EAGER:-0}"
-export SPOTIFY_STEPS_PER_EXECUTION="${SPOTIFY_STEPS_PER_EXECUTION:-64}"
 export SPOTIFY_BATCH_LOG_INTERVAL="${SPOTIFY_BATCH_LOG_INTERVAL:-100}"
-export SPOTIFY_CACHE_PREPARED="${SPOTIFY_CACHE_PREPARED:-1}"
-export SPOTIFY_CACHE_BACKTEST="${SPOTIFY_CACHE_BACKTEST:-1}"
-export SPOTIFY_CACHE_CLASSICAL="${SPOTIFY_CACHE_CLASSICAL:-1}"
-export SPOTIFY_CACHE_DEEP="${SPOTIFY_CACHE_DEEP:-1}"
-export SPOTIFY_CACHE_DEEP_REPORTING="${SPOTIFY_CACHE_DEEP_REPORTING:-1}"
-export SPOTIFY_CACHE_OPTUNA="${SPOTIFY_CACHE_OPTUNA:-1}"
-export SPOTIFY_CACHE_RETRIEVAL="${SPOTIFY_CACHE_RETRIEVAL:-1}"
-export SPOTIFY_CACHE_SHAP="${SPOTIFY_CACHE_SHAP:-1}"
 export SPOTIFY_WARM_START_DEEP="${SPOTIFY_WARM_START_DEEP:-1}"
 export SPOTIFY_WARM_START_OPTUNA="${SPOTIFY_WARM_START_OPTUNA:-1}"
 export SPOTIFY_DEEP_SCREENING="${SPOTIFY_DEEP_SCREENING:-auto}"
@@ -130,131 +132,58 @@ export SPOTIFY_CHAMPION_GATE_MATCH_PROFILE="${SPOTIFY_CHAMPION_GATE_MATCH_PROFIL
 export SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK="${SPOTIFY_CHAMPION_GATE_MAX_SELECTIVE_RISK:-0.50}"
 export SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE="${SPOTIFY_CHAMPION_GATE_MAX_ABSTENTION_RATE:-0.30}"
 export SPOTIFY_CHAMPION_GATE_STRICT="${SPOTIFY_CHAMPION_GATE_STRICT:-0}"
-export SPOTIFY_TF_DATA_CACHE="${SPOTIFY_TF_DATA_CACHE:-auto}"
-export SPOTIFY_TF_DATA_CACHE_FRACTION="${SPOTIFY_TF_DATA_CACHE_FRACTION:-0.40}"
-export SPOTIFY_TF_PREFETCH="${SPOTIFY_TF_PREFETCH:-auto}"
 export SPOTIFY_DISTRIBUTION_STRATEGY="${SPOTIFY_DISTRIBUTION_STRATEGY:-auto}"
-export SPOTIFY_MIXED_PRECISION="${SPOTIFY_MIXED_PRECISION:-auto}"
-export SPOTIFY_ISOLATE_MPL_CACHE="${SPOTIFY_ISOLATE_MPL_CACHE:-0}"
-export SPOTIFY_FULL_DEEP_MODE_POLICY="${SPOTIFY_FULL_DEEP_MODE_POLICY:-auto}"
 export SPOTIFY_FAIL_FAST_PY313_DEEP="${SPOTIFY_FAIL_FAST_PY313_DEEP:-1}"
 
-LOGICAL_CPUS="$("$PYTHON_CMD" - <<'PY'
-import os
-print(os.cpu_count() or 1)
-PY
-)"
-
-TOTAL_RAM_GB="$("$PYTHON_CMD" - <<'PY'
-try:
-    import psutil  # type: ignore
-    total = int(psutil.virtual_memory().total // (1024 ** 3))
-except Exception:
-    total = 0
-print(total)
-PY
-)"
-
-if [[ -z "${TF_NUM_INTRAOP_THREADS:-}" ]]; then
-  export TF_NUM_INTRAOP_THREADS="$LOGICAL_CPUS"
-fi
-if [[ -z "${TF_NUM_INTEROP_THREADS:-}" ]]; then
-  if (( LOGICAL_CPUS > 8 )); then
-    export TF_NUM_INTEROP_THREADS="4"
-  elif (( LOGICAL_CPUS > 2 )); then
-    export TF_NUM_INTEROP_THREADS="2"
-  else
-    export TF_NUM_INTEROP_THREADS="1"
-  fi
+enable_shap_raw="$(printf '%s' "${SPOTIFY_ENABLE_SHAP:-0}" | tr '[:upper:]' '[:lower:]')"
+shap_flag_present=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-shap|--shap)
+      shap_flag_present=1
+      ;;
+  esac
+done
+if [[ "$SPOTIFY_RESOURCE_PROFILE_RESOLVED" == "gpu" && "$shap_flag_present" == "0" ]]; then
+  case "$enable_shap_raw" in
+    1|true|yes|on) ;;
+    *) set -- "$@" --no-shap ;;
+  esac
 fi
 
-if [[ -z "${SPOTIFY_CLASSICAL_MODEL_WORKERS:-}" ]]; then
-  cpu_based_workers=1
-  if (( LOGICAL_CPUS >= 12 )); then
-    cpu_based_workers=8
-  elif (( LOGICAL_CPUS >= 8 )); then
-    cpu_based_workers=6
-  elif (( LOGICAL_CPUS >= 4 )); then
-    cpu_based_workers=2
-  fi
-
-  mem_cap_workers=4
-  if (( TOTAL_RAM_GB > 0 )); then
-    if (( TOTAL_RAM_GB < 12 )); then
-      mem_cap_workers=1
-    elif (( TOTAL_RAM_GB < 18 )); then
-      mem_cap_workers=2
-    elif (( TOTAL_RAM_GB < 26 )); then
-      mem_cap_workers=3
-    else
-      mem_cap_workers=4
-    fi
-  fi
-
-  if (( cpu_based_workers < mem_cap_workers )); then
-    export SPOTIFY_CLASSICAL_MODEL_WORKERS="$cpu_based_workers"
-  else
-    export SPOTIFY_CLASSICAL_MODEL_WORKERS="$mem_cap_workers"
-  fi
-fi
-
-if [[ -z "${SPOTIFY_BACKTEST_WORKERS:-}" ]]; then
-  if (( LOGICAL_CPUS >= 10 )) && (( TOTAL_RAM_GB >= 24 )) && (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 2 )); then
-    export SPOTIFY_BACKTEST_WORKERS="3"
-  elif (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 2 )); then
-    export SPOTIFY_BACKTEST_WORKERS="2"
-  else
-    export SPOTIFY_BACKTEST_WORKERS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
-  fi
-fi
-
-if [[ -z "${SPOTIFY_OPTUNA_JOBS:-}" ]]; then
-  if (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 2 )); then
-    export SPOTIFY_OPTUNA_JOBS="2"
-  else
-    export SPOTIFY_OPTUNA_JOBS="$SPOTIFY_CLASSICAL_MODEL_WORKERS"
-  fi
-fi
-
-if [[ -z "${SPOTIFY_OPTUNA_MODEL_WORKERS:-}" ]]; then
-  if (( LOGICAL_CPUS >= 8 )) && (( TOTAL_RAM_GB >= 24 )); then
-    export SPOTIFY_OPTUNA_MODEL_WORKERS="2"
-  else
-    export SPOTIFY_OPTUNA_MODEL_WORKERS="1"
-  fi
-fi
-
-# Avoid nested BLAS thread oversubscription when many sklearn jobs run in parallel.
-if (( SPOTIFY_CLASSICAL_MODEL_WORKERS > 1 )); then
-  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-  export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-  export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
-  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-fi
-
-export LOKY_MAX_CPU_COUNT="${LOKY_MAX_CPU_COUNT:-$LOGICAL_CPUS}"
-
-batch_args=()
+command=(
+  "$PYTHON_CMD" -m spotify
+  --profile full
+  --run-name "$RUN_NAME"
+  --epochs "$EPOCHS"
+)
 if [[ -n "$BATCH_SIZE" ]]; then
-  batch_args=(--batch "$BATCH_SIZE")
+  command+=(--batch "$BATCH_SIZE")
+fi
+command+=(
+  --models "$DEEP_ALL"
+  --mlflow
+  --optuna
+  --optuna-trials "$OPTUNA_TRIALS"
+  --optuna-timeout-seconds "$OPTUNA_TIMEOUT_SECONDS"
+  --temporal-backtest
+  --backtest-folds "$BACKTEST_FOLDS"
+  --classical-max-train-samples "$CLASSICAL_MAX_TRAIN_SAMPLES"
+  --classical-max-eval-samples "$CLASSICAL_MAX_EVAL_SAMPLES"
+  --classical-models "$CLASSICAL_ALL"
+  --optuna-models "$OPTUNA_MODELS"
+  --backtest-models "$BACKTEST_MODELS"
+  "$@"
+)
+
+if [[ "$PREFLIGHT" == "1" ]]; then
+  exit 0
+fi
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf 'Command:'
+  printf ' %q' "${command[@]}"
+  printf '\n'
+  exit 0
 fi
 
-exec "$PYTHON_CMD" -m spotify \
-  --profile full \
-  --run-name "$RUN_NAME" \
-  --epochs "$EPOCHS" \
-  "${batch_args[@]}" \
-  --models "$DEEP_ALL" \
-  --mlflow \
-  --optuna \
-  --optuna-trials "$OPTUNA_TRIALS" \
-  --optuna-timeout-seconds "$OPTUNA_TIMEOUT_SECONDS" \
-  --temporal-backtest \
-  --backtest-folds "$BACKTEST_FOLDS" \
-  --classical-max-train-samples "$CLASSICAL_MAX_TRAIN_SAMPLES" \
-  --classical-max-eval-samples "$CLASSICAL_MAX_EVAL_SAMPLES" \
-  --classical-models "$CLASSICAL_ALL" \
-  --optuna-models "$OPTUNA_MODELS" \
-  --backtest-models "$BACKTEST_MODELS" \
-  "$@"
+exec "${command[@]}"

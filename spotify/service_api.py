@@ -35,6 +35,7 @@ from .taste_os_http import (
     RequestValidationError as TasteOSRequestValidationError,
     normalize_taste_os_feedback_payload,
     normalize_taste_os_payload,
+    normalize_taste_os_session_event_payload,
 )
 from .taste_os_page import render_taste_os_page_html
 from .taste_os_service import TasteOSService
@@ -300,6 +301,16 @@ class TasteOSFeedbackRequest(BaseModel):
     artist_name: str
     signal: str
     notes: str | None = None
+
+
+class TasteOSSessionEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    session_id: str
+    event_id: str
+    event_type: str
+    artist_name: str
+    expected_version: int
 
 
 def _request_identity(request: Request) -> str:
@@ -1309,6 +1320,17 @@ def create_taste_os_app(
     async def history(limit: int = DEFAULT_HISTORY_LIMIT) -> dict[str, object]:
         return service.history_snapshot(limit=max(1, int(limit)))
 
+    @app.get("/taste-os/session/{session_id}")
+    @app.get("/v1/taste-os/session/{session_id}")
+    async def session_snapshot(session_id: str, request: Request) -> dict[str, object]:
+        try:
+            return service.session_snapshot(session_id)
+        except TasteOSRequestValidationError as exc:
+            raise HTTPException(
+                status_code=int(exc.status_code),
+                detail={"code": exc.code, "message": exc.message, "details": exc.details},
+            ) from exc
+
     @app.get("/taste-os/artifacts/{relative_path:path}")
     @app.get("/v1/taste-os/artifacts/{relative_path:path}")
     async def artifact(relative_path: str) -> FileResponse:
@@ -1345,6 +1367,31 @@ def create_taste_os_app(
             )
         except (RuntimeError, ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=422, detail={"code": "taste_os_input_error", "message": str(exc)}) from exc
+
+    @app.post("/taste-os/session/event")
+    @app.post("/v1/taste-os/session/event")
+    async def session_event(payload: TasteOSSessionEventRequest, request: Request) -> dict[str, object]:
+        try:
+            normalized = normalize_taste_os_session_event_payload(payload.model_dump())
+        except TasteOSRequestValidationError as exc:
+            raise HTTPException(
+                status_code=int(exc.status_code),
+                detail={"code": exc.code, "message": exc.message, "details": exc.details},
+            ) from exc
+
+        try:
+            return service.apply_session_event(
+                session_id=normalized["session_id"],
+                event_id=normalized["event_id"],
+                event_type=normalized["event_type"],
+                artist_name=normalized["artist_name"],
+                expected_version=normalized["expected_version"],
+            )
+        except TasteOSRequestValidationError as exc:
+            raise HTTPException(
+                status_code=int(exc.status_code),
+                detail={"code": exc.code, "message": exc.message, "details": exc.details},
+            ) from exc
 
     @app.post("/taste-os/feedback")
     @app.post("/v1/taste-os/feedback")

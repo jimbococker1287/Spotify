@@ -7,8 +7,8 @@ import os
 import secrets
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Callable, TypedDict
-from urllib.parse import unquote
+from typing import Any, Callable, TypedDict, cast
+from urllib.parse import unquote, urlsplit
 
 from .taste_os_demo import MODE_CONFIGS, SCENARIOS
 
@@ -583,7 +583,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
             service.logger.info("HTTP %s - %s", self.address_string(), fmt % args)
 
         def do_GET(self) -> None:  # noqa: N802
-            path = self.path.rstrip("/")
+            path = urlsplit(self.path).path.rstrip("/")
             if path in {"", "/", "/taste-os"}:
                 self._send_html(200, page_renderer(service))
                 return
@@ -620,6 +620,28 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
             if path == "/taste-os/history":
                 self._send_json(200, service.history_snapshot())
                 return
+            if path.startswith("/taste-os/session/"):
+                session_id = unquote(path.removeprefix("/taste-os/session/")).strip()
+                if not session_id:
+                    self._send_error(404, code="not_found", message="Resource not found.")
+                    return
+                try:
+                    self._send_json(200, service.session_snapshot(session_id))
+                except RequestValidationError as exc:
+                    self._send_error(
+                        exc.status_code,
+                        code=exc.code,
+                        message=exc.message,
+                        details=exc.details,
+                    )
+                except Exception:
+                    service.logger.exception("Unhandled Taste OS session snapshot failure")
+                    self._send_error(
+                        500,
+                        code="internal_error",
+                        message="Taste OS session snapshot failed due to an internal server error.",
+                    )
+                return
             self._send_error(404, code="not_found", message="Resource not found.")
 
         def do_POST(self) -> None:  # noqa: N802
@@ -639,6 +661,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
 
             try:
                 payload = read_json_payload(self)
+                normalized: TasteOSRequestPayload | TasteOSSessionEventPayload | TasteOSFeedbackPayload
                 if request_path == "/taste-os/session":
                     normalized = normalize_taste_os_payload(
                         payload,
@@ -660,8 +683,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
 
             try:
                 if request_path == "/taste-os/session":
-                    session_request = normalized
-                    assert isinstance(session_request, dict)
+                    session_request = cast(TasteOSRequestPayload, normalized)
                     result = service.plan_session(
                         mode=str(session_request["mode"]),
                         scenario=str(session_request["scenario"]),
@@ -672,8 +694,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                         use_feedback_memory=bool(session_request["use_feedback_memory"]),
                     )
                 elif request_path == "/taste-os/session/event":
-                    event_request = normalized
-                    assert isinstance(event_request, dict)
+                    event_request = cast(TasteOSSessionEventPayload, normalized)
                     result = service.apply_session_event(
                         session_id=str(event_request["session_id"]),
                         event_id=str(event_request["event_id"]),
@@ -682,8 +703,7 @@ def build_taste_os_handler(service: Any, *, page_renderer: Callable[[Any], str])
                         expected_version=int(event_request["expected_version"]),
                     )
                 else:
-                    feedback_request = normalized
-                    assert isinstance(feedback_request, dict)
+                    feedback_request = cast(TasteOSFeedbackPayload, normalized)
                     result = service.record_feedback(
                         session_id=str(feedback_request["session_id"]),
                         artist_name=str(feedback_request["artist_name"]),

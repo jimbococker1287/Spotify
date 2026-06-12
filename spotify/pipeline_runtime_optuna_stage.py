@@ -21,6 +21,11 @@ def run_optuna_tuning(
     )
     tuned_backtest_specs: dict[str, dict[str, object]] = {}
 
+    if context.run_classical_models and context.config.enable_optuna and not selected_optuna_model_names:
+        context.phase_recorder.skip("optuna_tuning", reason="no_models_selected")
+        context.logger.info("Skipping Optuna tuning because no models were selected.")
+        return selected_backtest_model_names, tuned_backtest_specs
+
     if context.run_classical_models and context.config.enable_optuna:
         optuna_dir = context.run_dir / "optuna"
         with context.phase_recorder.phase(

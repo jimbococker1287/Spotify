@@ -498,6 +498,19 @@ def test_taste_os_service_rescues_live_session_idempotently_and_rejects_stale_ve
     assert service.state_store.feedback_store()["event_count"] == 1
     assert service.state_store.recent_feedback(limit=1)[0]["signal"] == "like"
 
+    snapshot = service.session_snapshot(session_id)
+    assert snapshot["session_id"] == session_id
+    assert snapshot["version"] == 2
+    assert snapshot["plan"] == liked
+    assert snapshot["adaptation_summary"]["event_count"] == 2
+    assert snapshot["adaptation_summary"]["latest_event_id"] == "event-like"
+    assert [event["event_id"] for event in snapshot["events"]] == ["event-skip", "event-like"]
+
+    with pytest.raises(RequestValidationError) as exc:
+        service.session_snapshot("taste-os-missing")
+    assert exc.value.status_code == 404
+    assert exc.value.code == "session_not_found"
+
 
 def test_taste_os_service_page_html_exposes_browser_surface(tmp_path: Path, monkeypatch) -> None:
     run_dir = tmp_path / "outputs" / "runs" / "run_a"
@@ -558,3 +571,7 @@ def test_taste_os_service_page_html_exposes_browser_surface(tmp_path: Path, monk
     assert "/taste-os/history" in html
     assert "Generate Session" in html
     assert "Seed from feedback memory" in html
+    assert "data-resume-session" in html
+    assert "async function resumeSession" in html
+    assert 'fetch(`/taste-os/session/${encodeURIComponent(sessionId)}`)' in html
+    assert ">Resume</button>" in html

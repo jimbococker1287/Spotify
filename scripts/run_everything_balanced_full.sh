@@ -88,6 +88,15 @@ export OPTUNA_TIMEOUT_SECONDS="${OPTUNA_TIMEOUT_SECONDS:-1200}"
 export SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS="${SPOTIFY_OPTUNA_TRIAL_TIMEOUT_SECONDS:-120}"
 export EPOCHS="${EPOCHS:-10}"
 
+PLAN_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|--preflight)
+      PLAN_ONLY=1
+      ;;
+  esac
+done
+
 echo "Using PYTHON_BIN=$PYTHON_BIN"
 echo "Run name: $RUN_NAME"
 echo "Log file: $LOG_FILE"
@@ -99,6 +108,10 @@ bash scripts/run_everything.sh "$RUN_NAME" \
   --moonshot-lab \
   "$@" \
   2>&1 | tee "$LOG_FILE"
+
+if [[ "$PLAN_ONLY" == "1" ]]; then
+  exit 0
+fi
 
 LATEST_RUN_DIR="$("$PYTHON_BIN" - <<'PY'
 from pathlib import Path

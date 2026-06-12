@@ -27,10 +27,12 @@ The control room now includes:
 - a recommended next scheduled command
 - an async handoff section with the headline, share pack, and next step
 - a run tradeoff dossier covering quality, safety, runtime, phase regressions, and currently retained storage against the promoted baseline
+- dossier-backed review actions classified as operational or strategic, with quoted read-only commands for comparing manifests, timings, results, and retained storage
 
 ## Triage Flow
 
 - Promotion failure: compare the latest run to the last strong baseline before retraining.
+- Run tradeoff: open the selected and baseline dossier paths, review the listed comparison commands, and keep the promoted baseline until comparability or regression questions have an explicit owner.
 - Drift warning: inspect `analysis/data_drift_summary.json` before interpreting regressions as model issues.
 - Robustness or stress failure: use the triage artifact to isolate the failing slice or scenario, then re-run the fast lane.
 - Instrumentation gap: backfill analysis artifacts before trusting guard thresholds or async review.

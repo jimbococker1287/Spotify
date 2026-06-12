@@ -337,6 +337,19 @@ def render_taste_os_page_html(service: Any) -> str:
       border-color: rgba(182, 79, 47, 0.35);
       color: var(--accent-deep);
     }}
+    .resume-button {{
+      margin-top: 8px;
+      border: 1px solid rgba(182, 79, 47, 0.28);
+      border-radius: 999px;
+      padding: 7px 11px;
+      background: var(--accent-soft);
+      color: var(--accent-deep);
+      cursor: pointer;
+      font: 700 12px/1 var(--mono);
+    }}
+    .resume-button:hover {{
+      border-color: rgba(182, 79, 47, 0.55);
+    }}
     .metric-line {{
       color: var(--muted);
       font-size: 0.86rem;
@@ -581,12 +594,18 @@ def render_taste_os_page_html(service: Any) -> str:
                 <li>
                   <strong>${{escapeHtml(row.mode)}} / ${{escapeHtml(row.scenario)}}</strong>
                   <div class="metric-line">top=${{escapeHtml(row.top_artist || "n/a")}} | replans=${{escapeHtml(row.adaptive_replans ?? 0)}}</div>
+                  <button class="resume-button" type="button" data-resume-session="${{escapeHtml(row.session_id || "")}}">Resume</button>
                 </li>
               `).join("") || "<li>No sessions recorded yet.</li>"
             }}
           </ol>
         </section>
       `;
+      historyGrid.querySelectorAll("[data-resume-session]").forEach((node) => {{
+        node.addEventListener("click", async () => {{
+          await resumeSession(node.dataset.resumeSession || "");
+        }});
+      }});
     }}
 
     function renderResults(payload) {{
@@ -743,6 +762,29 @@ def render_taste_os_page_html(service: Any) -> str:
       }}
       state.history = await response.json();
       renderHistory(state.history);
+    }}
+
+    async function resumeSession(sessionId) {{
+      if (!sessionId) {{
+        setStatus("This session cannot be resumed because its id is missing.", true);
+        return;
+      }}
+      setStatus(`Loading latest plan for ${{sessionId}}...`);
+      try {{
+        const response = await fetch(`/taste-os/session/${{encodeURIComponent(sessionId)}}`);
+        const snapshot = await response.json();
+        if (!response.ok) {{
+          const message = snapshot?.error?.message || `Session resume failed with status ${{response.status}}`;
+          throw new Error(message);
+        }}
+        const plan = snapshot.plan || {{}};
+        state.payload = plan;
+        renderSummary(plan);
+        renderResults(plan);
+        setStatus(`Resumed ${{sessionId}} at version ${{snapshot.version ?? 0}}.`);
+      }} catch (error) {{
+        setStatus(error.message || "Session resume failed.", true);
+      }}
     }}
 
     async function submitFeedback(sessionId, artistName, signal) {{
