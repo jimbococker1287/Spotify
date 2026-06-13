@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,30 +30,30 @@ def _runtime(path: str, *, gpu_count: int = 0, metal: bool = False) -> PythonRun
     )
 
 
-def _cached_gpu_environment(tmp_path: Path) -> dict[str, str]:
-    cache_path = tmp_path / "gpu_probe.json"
-    runtime = resource_planning._probe_metadata(str(ROOT_DIR / ".venv-metal/bin/python"))
-    resource_planning._save_gpu_probe_cache(
-        PythonRuntime(
-            executable=runtime.executable,
-            available=runtime.available,
-            version=runtime.version,
-            has_tensorflow=runtime.has_tensorflow,
-            has_tensorflow_metal=runtime.has_tensorflow_metal,
-            tensorflow_version=runtime.tensorflow_version,
-            tensorflow_metal_version=runtime.tensorflow_metal_version,
-            gpu_count=1,
-        ),
-        cache_path=cache_path,
-        environ={"PYTHONNOUSERSITE": "1"},
+def _gpu_environment(tmp_path: Path) -> dict[str, str]:
+    fake_python = tmp_path / "fake_gpu_python"
+    fake_python.write_text(
+        f"""#!{sys.executable}
+import os
+import sys
+
+code = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "-c" else ""
+if "importlib.metadata" in code:
+    print('{{"version":"3.11.13","tensorflow":true,"tensorflow_version":"2.16.2","tensorflow_metal_version":null}}')
+elif "list_logical_devices" in code:
+    print('{{"gpu_count":1}}')
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
     )
+    fake_python.chmod(0o755)
     environment = {
         **os.environ,
         "PYTHONNOUSERSITE": "1",
-        "SPOTIFY_RESOURCE_GPU_PROBE_CACHE_PATH": str(cache_path),
+        "PYTHON_BIN": str(fake_python),
     }
     for key in (
-        "PYTHON_BIN",
         "SPOTIFY_AUTO_ROUTE_TF_PYTHON",
         "SPOTIFY_FORCE_CPU",
         "SPOTIFY_RESOURCE_REFRESH_GPU_PROBE",
@@ -286,10 +287,9 @@ def test_gpu_probe_cache_invalidates_when_tensorflow_version_changes(
 
 
 def test_cpu_launcher_dry_run_reports_overrides_and_command() -> None:
-    python_bin = ROOT_DIR / ".venv/bin/python"
     environment = {
         **os.environ,
-        "PYTHON_BIN": str(python_bin),
+        "PYTHON_BIN": sys.executable,
         "SPOTIFY_CLASSICAL_MODEL_WORKERS": "3",
         "SPOTIFY_TF_DATA_CACHE": "off",
     }
@@ -329,7 +329,7 @@ def test_gpu_dry_run_does_not_duplicate_explicit_no_shap(tmp_path: Path) -> None
             "--no-shap",
         ],
         cwd=ROOT_DIR,
-        env=_cached_gpu_environment(tmp_path),
+        env=_gpu_environment(tmp_path),
         check=True,
         capture_output=True,
         text=True,
@@ -351,7 +351,7 @@ def test_auto_profile_applies_gpu_shap_default_after_resolution(tmp_path: Path) 
             "planner-auto-test",
         ],
         cwd=ROOT_DIR,
-        env=_cached_gpu_environment(tmp_path),
+        env=_gpu_environment(tmp_path),
         check=True,
         capture_output=True,
         text=True,
@@ -373,7 +373,7 @@ def test_auto_profile_applies_gpu_shap_default_after_resolution(tmp_path: Path) 
 def test_specialized_full_launchers_stop_after_preflight(launcher: str) -> None:
     environment = {
         **os.environ,
-        "PYTHON_BIN": str(ROOT_DIR / ".venv/bin/python"),
+        "PYTHON_BIN": sys.executable,
         "SPOTIFY_FORCE_CPU": "1",
     }
 
