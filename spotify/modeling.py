@@ -3,6 +3,73 @@ from __future__ import annotations
 from typing import Callable
 
 
+_CUSTOM_OBJECTS: dict[str, object] | None = None
+
+
+def get_modeling_custom_objects() -> dict[str, object]:
+    global _CUSTOM_OBJECTS
+    if _CUSTOM_OBJECTS is not None:
+        return dict(_CUSTOM_OBJECTS)
+
+    import tensorflow as tf
+
+    @tf.keras.utils.register_keras_serializable(package="spotify")
+    class MemoryLayer(tf.keras.layers.Layer):
+        def __init__(self, slots: int, dim: int, **kwargs):
+            super().__init__(**kwargs)
+            self.slots = int(slots)
+            self.dim = int(dim)
+
+        def build(self, input_shape):
+            self.memory = self.add_weight(
+                shape=(self.slots, self.dim),
+                initializer="random_normal",
+                trainable=True,
+                name="memory",
+            )
+
+        def call(self, inputs):
+            batch_size = tf.shape(inputs)[0]
+            return tf.tile(tf.expand_dims(self.memory, 0), [batch_size, 1, 1])
+
+        def get_config(self):
+            return {**super().get_config(), "slots": self.slots, "dim": self.dim}
+
+    @tf.keras.utils.register_keras_serializable(package="spotify")
+    class ExpandDims(tf.keras.layers.Layer):
+        def __init__(self, axis: int, **kwargs):
+            super().__init__(**kwargs)
+            self.axis = int(axis)
+
+        def call(self, inputs):
+            return tf.expand_dims(inputs, axis=self.axis)
+
+        def get_config(self):
+            return {**super().get_config(), "axis": self.axis}
+
+    @tf.keras.utils.register_keras_serializable(package="spotify")
+    class SelectTimestep(tf.keras.layers.Layer):
+        def __init__(self, index: int, **kwargs):
+            super().__init__(**kwargs)
+            self.index = int(index)
+
+        def call(self, inputs):
+            return inputs[:, self.index, :]
+
+        def get_config(self):
+            return {**super().get_config(), "index": self.index}
+
+    _CUSTOM_OBJECTS = {
+        "MemoryLayer": MemoryLayer,
+        "ExpandDims": ExpandDims,
+        "SelectTimestep": SelectTimestep,
+        "spotify>MemoryLayer": MemoryLayer,
+        "spotify>ExpandDims": ExpandDims,
+        "spotify>SelectTimestep": SelectTimestep,
+    }
+    return dict(_CUSTOM_OBJECTS)
+
+
 def build_model_builders(
     sequence_length: int,
     num_artists: int,
@@ -28,7 +95,6 @@ def build_model_builders(
         Embedding,
         GRU,
         GlobalAveragePooling1D,
-        Lambda,
         LayerNormalization,
         LSTM,
         MaxPooling1D,
@@ -46,23 +112,10 @@ def build_model_builders(
         x_ff = Dense(dim)(x_ff)
         return LayerNormalization()(x_ff + x)
 
-    class MemoryLayer(tf.keras.layers.Layer):
-        def __init__(self, slots, dim):
-            super().__init__()
-            self.slots = slots
-            self.dim = dim
-
-        def build(self, input_shape):
-            self.memory = self.add_weight(
-                shape=(self.slots, self.dim),
-                initializer="random_normal",
-                trainable=True,
-                name="memory",
-            )
-
-        def call(self, inputs):
-            batch_size = tf.shape(inputs)[0]
-            return tf.tile(tf.expand_dims(self.memory, 0), [batch_size, 1, 1])
+    custom_objects = get_modeling_custom_objects()
+    MemoryLayer = custom_objects["MemoryLayer"]
+    ExpandDims = custom_objects["ExpandDims"]
+    SelectTimestep = custom_objects["SelectTimestep"]
 
     def build_transformer():
         seq_in = Input(shape=(sequence_length,), name="seq_input")
@@ -192,8 +245,8 @@ def build_model_builders(
         x = Embedding(input_dim=num_artists, output_dim=128)(seq_in)
         x = Bidirectional(LSTM(64, return_sequences=True))(x)
 
-        last = Lambda(lambda t: t[:, -1, :])(x)
-        query = Lambda(lambda t: tf.expand_dims(t, axis=1))(last)
+        last = SelectTimestep(-1)(x)
+        query = ExpandDims(1)(last)
         attn_out = AdditiveAttention()([query, x])
         context_vec = GlobalAveragePooling1D(name="context_vec")(attn_out)
 
@@ -249,9 +302,9 @@ def build_model_builders(
         x = Bidirectional(LSTM(64))(x)
 
         mem = MemoryLayer(slots=10, dim=128)(x)
-        query = Lambda(lambda t: K.expand_dims(t, axis=1))(x)
+        query = ExpandDims(1)(x)
         attn_mem = AdditiveAttention()([query, mem])
-        mem_vec = Lambda(lambda t: t[:, 0, :])(attn_mem)
+        mem_vec = SelectTimestep(0)(attn_mem)
 
         ctx_in = Input(shape=(num_ctx,), name="ctx_input")
         c = Dense(64, activation="relu")(ctx_in)
@@ -268,9 +321,9 @@ def build_model_builders(
         x = Bidirectional(LSTM(128, return_sequences=False, dropout=0.1))(x)
 
         mem = MemoryLayer(slots=16, dim=256)(x)
-        query = Lambda(lambda t: K.expand_dims(t, axis=1))(x)
+        query = ExpandDims(1)(x)
         attn_mem = AdditiveAttention()([query, mem])
-        mem_vec = Lambda(lambda t: t[:, 0, :])(attn_mem)
+        mem_vec = SelectTimestep(0)(attn_mem)
 
         ctx_in = Input(shape=(num_ctx,), name="ctx_input")
         c = Dense(128, activation="relu", kernel_regularizer=regularizers.l2(1e-5))(ctx_in)

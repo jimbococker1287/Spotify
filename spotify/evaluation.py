@@ -582,14 +582,12 @@ def run_extended_evaluation(
                     model_path = run_dir / f"best_{deep_name}.keras"
                     if not model_path.exists():
                         raise FileNotFoundError(f"Deep model checkpoint not found: {model_path}")
-                    import tensorflow as tf
+                    from .model_loading import load_trusted_keras_model
 
-                    from .model_loading import keras_custom_objects_for_model
-
-                    model = tf.keras.models.load_model(
+                    model = load_trusted_keras_model(
                         model_path,
+                        model_name=deep_name,
                         compile=False,
-                        custom_objects=keras_custom_objects_for_model(deep_name),
                     )
                     val_pred = model.predict((data.X_seq_val, data.X_ctx_val), verbose=0)
                     test_pred = model.predict((data.X_seq_test, data.X_ctx_test), verbose=0)

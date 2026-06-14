@@ -71,10 +71,12 @@ def run_classical_benchmarks(
                     "epochs": "",
                     "prediction_bundle_path": row.prediction_bundle_path,
                     "estimator_artifact_path": row.estimator_artifact_path,
+                    "native_importance_artifact_path": row.native_importance_artifact_path,
                 }
             )
             _append_existing_artifact_path(context.artifact_paths, row.prediction_bundle_path)
             _append_existing_artifact_path(context.artifact_paths, row.estimator_artifact_path)
+            _append_existing_artifact_path(context.artifact_paths, row.native_importance_artifact_path)
         phase["model_count"] = int(len(classical_results))
         phase["cache_enabled"] = bool(classical_cache_stats.get("enabled", False))
         phase["cache_fingerprint"] = str(classical_cache_stats.get("fingerprint", ""))

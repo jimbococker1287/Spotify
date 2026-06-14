@@ -174,13 +174,23 @@ def run_deep_model_training(
 
         context.artifact_paths.append(sqlite_path)
 
-        context.logger.info("Final Validation Artist Accuracy (Top-1 / Top-5):")
-        for name, history in artifacts.histories.items():
-            val_key = deps.VAL_KEY if deps.VAL_KEY in history.history else "val_sparse_categorical_accuracy"
-            top1 = history.history[val_key][-1]
-            top5_key = "val_artist_output_top_5" if "val_artist_output_top_5" in history.history else "val_top_5"
-            top5 = history.history.get(top5_key, [np.nan])[-1]
-            context.logger.info("%s: Top-1=%.4f | Top-5=%.4f", name, top1, top5)
+        context.logger.info(
+            "Final checkpoint artist-balanced accuracy "
+            "(validation Top-1 / Top-5 | test Top-1 / Top-5):"
+        )
+        for name, _history in artifacts.histories.items():
+            val_top1 = float(artifacts.val_metrics.get(name, {}).get("top1", np.nan))
+            val_top5 = float(artifacts.val_metrics.get(name, {}).get("top5", np.nan))
+            test_top1 = float(artifacts.test_metrics.get(name, {}).get("top1", np.nan))
+            test_top5 = float(artifacts.test_metrics.get(name, {}).get("top5", np.nan))
+            context.logger.info(
+                "%s: val Top-1=%.4f | val Top-5=%.4f | test Top-1=%.4f | test Top-5=%.4f",
+                name,
+                val_top1,
+                val_top5,
+                test_top1,
+                test_top5,
+            )
 
             context.result_rows.append(
                 {
@@ -200,7 +210,7 @@ def run_deep_model_training(
                     "test_coverage_at5": float(artifacts.test_metrics.get(name, {}).get("coverage_at5", np.nan)),
                     "test_diversity_at5": float(artifacts.test_metrics.get(name, {}).get("diversity_at5", np.nan)),
                     "fit_seconds": float(artifacts.fit_seconds.get(name, np.nan)),
-                    "epochs": len(history.history.get("loss", [])),
+                    "epochs": len(_history.history.get("loss", [])),
                     "prediction_bundle_path": str(artifacts.prediction_bundle_paths.get(name, "")),
                 }
             )

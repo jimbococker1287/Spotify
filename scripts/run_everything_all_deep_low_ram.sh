@@ -15,6 +15,20 @@ export DEEP_ALL="${DEEP_ALL:-sasrec,bert4rec,srgnn,dense,gru,transformer,lstm,cn
 export BATCH_SIZE="${BATCH_SIZE:-256}"
 export EPOCHS="${EPOCHS:-10}"
 
+if [[ "$(uname -s)" == "Darwin" && ",$DEEP_ALL," == *,srgnn,* ]]; then
+  force_cpu_raw="$(printf '%s' "${SPOTIFY_FORCE_CPU:-0}" | tr '[:upper:]' '[:lower:]')"
+  unsafe_metal_raw="$(printf '%s' "${SPOTIFY_ALLOW_UNSAFE_SRGNN_METAL:-0}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$force_cpu_raw" != "1" && "$force_cpu_raw" != "true" && "$force_cpu_raw" != "yes" && "$force_cpu_raw" != "on" \
+    && "$unsafe_metal_raw" != "1" && "$unsafe_metal_raw" != "true" && "$unsafe_metal_raw" != "yes" && "$unsafe_metal_raw" != "on" ]]; then
+    cat >&2 <<'EOF'
+SR-GNN is not safe on TensorFlow Metal: Apple MPSGraph can abort the process during training.
+Run the Metal sweep without srgnn, then run srgnn separately with --resource-profile cpu.
+Set SPOTIFY_ALLOW_UNSAFE_SRGNN_METAL=1 only to bypass this fail-fast guard.
+EOF
+    exit 2
+  fi
+fi
+
 # Keep TensorFlow input memory conservative. This may run much longer.
 export SPOTIFY_TF_DATA_CACHE="${SPOTIFY_TF_DATA_CACHE:-off}"
 export SPOTIFY_TF_DATA_CACHE_FRACTION="${SPOTIFY_TF_DATA_CACHE_FRACTION:-0.10}"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import sys
 from typing import Sequence
 
 import numpy as np
@@ -60,6 +62,16 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
 _CUSTOM_LAYER_TYPES: dict[str, object] | None = None
 
 
+def resolve_srgnn_device() -> str | None:
+    """Keep the graph kernels off Metal, where MPSGraph can abort the process."""
+    configured = os.getenv("SPOTIFY_SRGNN_DEVICE", "").strip()
+    if configured.lower() in {"auto", "default"}:
+        return None
+    if configured:
+        return configured
+    return "/CPU:0" if sys.platform == "darwin" else None
+
+
 def get_srgnn_custom_objects() -> dict[str, object]:
     """Return lazily defined custom layers for loading saved SR-GNN models."""
     global _CUSTOM_LAYER_TYPES
@@ -81,47 +93,48 @@ def get_srgnn_custom_objects() -> dict[str, object]:
             self.candidate = Dense(self.units, activation="tanh", name="candidate_state")
 
         def call(self, inputs):
-            sequence_ids, position_embeddings = inputs
-            seq_len = tf.shape(sequence_ids)[1]
+            with tf.device(resolve_srgnn_device()):
+                sequence_ids, position_embeddings = inputs
+                seq_len = tf.shape(sequence_ids)[1]
 
-            equality = tf.equal(sequence_ids[:, :, None], sequence_ids[:, None, :])
-            earlier = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=tf.bool), -1, 0)
-            earlier = tf.linalg.set_diag(earlier, tf.zeros((seq_len,), dtype=tf.bool))
-            node_mask = tf.logical_not(tf.reduce_any(equality & earlier[None, :, :], axis=2))
+                equality = tf.equal(sequence_ids[:, :, None], sequence_ids[:, None, :])
+                positions = tf.range(seq_len)
+                earlier = positions[None, :] < positions[:, None]
+                node_mask = tf.logical_not(tf.reduce_any(equality & earlier[None, :, :], axis=2))
 
-            representative_matches = equality & node_mask[:, None, :]
-            alias_inputs = tf.argmax(
-                tf.cast(representative_matches, tf.int32),
-                axis=2,
-                output_type=tf.int32,
-            )
+                representative_matches = equality & node_mask[:, None, :]
+                alias_inputs = tf.argmax(
+                    tf.cast(representative_matches, tf.int32),
+                    axis=2,
+                    output_type=tf.int32,
+                )
 
-            node_states = position_embeddings * tf.cast(node_mask[:, :, None], position_embeddings.dtype)
-            source = tf.one_hot(alias_inputs[:, :-1], depth=seq_len, dtype=position_embeddings.dtype)
-            destination = tf.one_hot(alias_inputs[:, 1:], depth=seq_len, dtype=position_embeddings.dtype)
-            transition_counts = tf.einsum("bti,btj->bij", source, destination)
+                node_states = position_embeddings * tf.cast(node_mask[:, :, None], position_embeddings.dtype)
+                source = tf.one_hot(alias_inputs[:, :-1], depth=seq_len, dtype=position_embeddings.dtype)
+                destination = tf.one_hot(alias_inputs[:, 1:], depth=seq_len, dtype=position_embeddings.dtype)
+                transition_counts = tf.matmul(source, destination, transpose_a=True)
 
-            adjacency_out = tf.math.divide_no_nan(
-                transition_counts,
-                tf.reduce_sum(transition_counts, axis=2, keepdims=True),
-            )
-            incoming_counts = tf.transpose(transition_counts, perm=(0, 2, 1))
-            adjacency_in = tf.math.divide_no_nan(
-                incoming_counts,
-                tf.reduce_sum(incoming_counts, axis=2, keepdims=True),
-            )
+                adjacency_out = tf.math.divide_no_nan(
+                    transition_counts,
+                    tf.reduce_sum(transition_counts, axis=2, keepdims=True),
+                )
+                incoming_counts = tf.transpose(transition_counts, perm=(0, 2, 1))
+                adjacency_in = tf.math.divide_no_nan(
+                    incoming_counts,
+                    tf.reduce_sum(incoming_counts, axis=2, keepdims=True),
+                )
 
-            incoming = tf.matmul(adjacency_in, self.in_projection(node_states))
-            outgoing = tf.matmul(adjacency_out, self.out_projection(node_states))
-            message = tf.concat((incoming, outgoing), axis=-1)
+                incoming = tf.matmul(adjacency_in, self.in_projection(node_states))
+                outgoing = tf.matmul(adjacency_out, self.out_projection(node_states))
+                message = tf.concat((incoming, outgoing), axis=-1)
 
-            gate_inputs = tf.concat((message, node_states), axis=-1)
-            update = self.update_gate(gate_inputs)
-            reset = self.reset_gate(gate_inputs)
-            candidate = self.candidate(tf.concat((message, reset * node_states), axis=-1))
-            updated_nodes = (1.0 - update) * node_states + update * candidate
-            updated_nodes *= tf.cast(node_mask[:, :, None], updated_nodes.dtype)
-            return tf.gather(updated_nodes, alias_inputs, axis=1, batch_dims=1)
+                gate_inputs = tf.concat((message, node_states), axis=-1)
+                update = self.update_gate(gate_inputs)
+                reset = self.reset_gate(gate_inputs)
+                candidate = self.candidate(tf.concat((message, reset * node_states), axis=-1))
+                updated_nodes = (1.0 - update) * node_states + update * candidate
+                updated_nodes *= tf.cast(node_mask[:, :, None], updated_nodes.dtype)
+                return tf.gather(updated_nodes, alias_inputs, axis=1, batch_dims=1)
 
         def get_config(self):
             return {**super().get_config(), "units": self.units}
@@ -137,13 +150,14 @@ def get_srgnn_custom_objects() -> dict[str, object]:
             self.preference_projection = Dense(self.units, activation="tanh", name="preference_projection")
 
         def call(self, session_states):
-            local_preference = session_states[:, -1, :]
-            query = self.local_projection(local_preference)[:, None, :]
-            keys = self.global_projection(session_states)
-            logits = self.attention_score(tf.nn.sigmoid(query + keys))
-            weights = tf.nn.softmax(logits, axis=1)
-            global_preference = tf.reduce_sum(weights * session_states, axis=1)
-            return self.preference_projection(tf.concat((local_preference, global_preference), axis=-1))
+            with tf.device(resolve_srgnn_device()):
+                local_preference = session_states[:, -1, :]
+                query = self.local_projection(local_preference)[:, None, :]
+                keys = self.global_projection(session_states)
+                logits = self.attention_score(tf.nn.sigmoid(query + keys))
+                weights = tf.nn.softmax(logits, axis=1)
+                global_preference = tf.reduce_sum(weights * session_states, axis=1)
+                return self.preference_projection(tf.concat((local_preference, global_preference), axis=-1))
 
         def get_config(self):
             return {**super().get_config(), "units": self.units}
@@ -182,32 +196,35 @@ def build_srgnn_model(
     context_dim = int(params.get("context_dim", 64))
     fusion_dim = int(params.get("fusion_dim", 192))
 
-    seq_input = Input(shape=(sequence_length,), dtype="int32", name="seq_input")
-    ctx_input = Input(shape=(num_ctx,), dtype="float32", name="ctx_input")
+    import tensorflow as tf
 
-    item_embeddings = Embedding(
-        input_dim=num_artists,
-        output_dim=embedding_dim,
-        name="artist_embedding",
-    )(seq_input)
-    session_states = SessionGraphMessagePassing(
-        embedding_dim,
-        name="session_graph_message_passing",
-    )((seq_input, item_embeddings))
-    session_preference = SessionPreference(
-        embedding_dim,
-        name="session_preference_attention",
-    )(session_states)
+    with tf.device(resolve_srgnn_device()):
+        seq_input = Input(shape=(sequence_length,), dtype="int32", name="seq_input")
+        ctx_input = Input(shape=(num_ctx,), dtype="float32", name="ctx_input")
 
-    context = Dense(context_dim, activation="relu", name="context_projection")(ctx_input)
-    fused = Concatenate(name="session_context_fusion")((session_preference, context))
-    fused = Dense(fusion_dim, activation="relu", name="fusion_projection")(fused)
-    artist_output = Dense(
-        num_artists,
-        activation="softmax",
-        dtype="float32",
-        name="artist_output",
-    )(fused)
+        item_embeddings = Embedding(
+            input_dim=num_artists,
+            output_dim=embedding_dim,
+            name="artist_embedding",
+        )(seq_input)
+        session_states = SessionGraphMessagePassing(
+            embedding_dim,
+            name="session_graph_message_passing",
+        )((seq_input, item_embeddings))
+        session_preference = SessionPreference(
+            embedding_dim,
+            name="session_preference_attention",
+        )(session_states)
+
+        context = Dense(context_dim, activation="relu", name="context_projection")(ctx_input)
+        fused = Concatenate(name="session_context_fusion")((session_preference, context))
+        fused = Dense(fusion_dim, activation="relu", name="fusion_projection")(fused)
+        artist_output = Dense(
+            num_artists,
+            activation="softmax",
+            dtype="float32",
+            name="artist_output",
+        )(fused)
     return Model(
         inputs=[seq_input, ctx_input],
         outputs=artist_output,
@@ -220,4 +237,5 @@ __all__ = [
     "build_session_graph",
     "build_srgnn_model",
     "get_srgnn_custom_objects",
+    "resolve_srgnn_device",
 ]

@@ -76,6 +76,27 @@ fi
 CLASSICAL_ALL="${CLASSICAL_ALL:-logreg,extra_trees,knn,gaussian_nb,mlp}"
 OPTUNA_MODELS="${OPTUNA_MODELS:-logreg,mlp}"
 BACKTEST_MODELS="${BACKTEST_MODELS:-logreg,extra_trees,mlp,retrieval_reranker,blended_ensemble}"
+required_modules=()
+case ",$CLASSICAL_ALL,$OPTUNA_MODELS,$BACKTEST_MODELS," in
+  *,lightgbm,*) required_modules+=(lightgbm) ;;
+esac
+case ",$CLASSICAL_ALL,$OPTUNA_MODELS,$BACKTEST_MODELS," in
+  *,xgboost,*) required_modules+=(xgboost) ;;
+esac
+if (( ${#required_modules[@]} > 0 )); then
+  "$PYTHON_CMD" - "${required_modules[@]}" <<'PY'
+import importlib.util
+import sys
+
+missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
+if missing:
+    names = ", ".join(missing)
+    raise SystemExit(
+        f"Missing selected model dependencies in {sys.executable}: {names}. "
+        f"Run '{sys.executable} -m pip install -e .' before starting the pipeline."
+    )
+PY
+fi
 DEEP_CORE_DEFAULT="dense,gru,transformer"
 DEEP_RESEARCH_DEFAULT="sasrec,bert4rec,srgnn,lstm,cnn,tcn,cnn_lstm,attention_rnn,tft,transformer_xl,memory_net,graph_seq,gru_artist,memory_net_artist"
 if [[ -z "${DEEP_ALL:-}" ]]; then

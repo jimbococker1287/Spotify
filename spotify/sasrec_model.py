@@ -1,6 +1,46 @@
 from __future__ import annotations
 
 
+_CUSTOM_OBJECTS: dict[str, object] | None = None
+
+
+def get_sasrec_custom_objects() -> dict[str, object]:
+    global _CUSTOM_OBJECTS
+    if _CUSTOM_OBJECTS is not None:
+        return dict(_CUSTOM_OBJECTS)
+
+    import tensorflow as tf
+
+    @tf.keras.utils.register_keras_serializable(package="spotify")
+    class PositionIndices(tf.keras.layers.Layer):
+        def __init__(self, sequence_length: int, **kwargs):
+            super().__init__(**kwargs)
+            self.sequence_length = int(sequence_length)
+
+        def call(self, token_ids):
+            positions = tf.range(self.sequence_length, dtype=tf.int32)[tf.newaxis, :]
+            return tf.tile(positions, [tf.shape(token_ids)[0], 1])
+
+        def get_config(self):
+            return {
+                **super().get_config(),
+                "sequence_length": self.sequence_length,
+            }
+
+    @tf.keras.utils.register_keras_serializable(package="spotify")
+    class LastPosition(tf.keras.layers.Layer):
+        def call(self, encoded_sequence):
+            return encoded_sequence[:, -1, :]
+
+    _CUSTOM_OBJECTS = {
+        "PositionIndices": PositionIndices,
+        "LastPosition": LastPosition,
+        "spotify>PositionIndices": PositionIndices,
+        "spotify>LastPosition": LastPosition,
+    }
+    return dict(_CUSTOM_OBJECTS)
+
+
 def build_sasrec_model(
     sequence_length: int,
     num_artists: int,
@@ -15,7 +55,6 @@ def build_sasrec_model(
     if num_ctx <= 0:
         raise ValueError("num_ctx must be positive")
 
-    import tensorflow as tf
     from tensorflow.keras import Model, layers
 
     params = params or {}
@@ -31,12 +70,11 @@ def build_sasrec_model(
         output_dim=embedding_dim,
         name="item_embedding",
     )(seq_input)
-    position_indices = layers.Lambda(
-        lambda token_ids: tf.tile(
-            tf.range(sequence_length, dtype=tf.int32)[tf.newaxis, :],
-            [tf.shape(token_ids)[0], 1],
-        ),
-        output_shape=(sequence_length,),
+    custom_objects = get_sasrec_custom_objects()
+    PositionIndices = custom_objects["PositionIndices"]
+    LastPosition = custom_objects["LastPosition"]
+    position_indices = PositionIndices(
+        sequence_length,
         name="position_indices",
     )(seq_input)
     position_embeddings = layers.Embedding(
@@ -83,11 +121,7 @@ def build_sasrec_model(
         )(layers.Add(name=f"feed_forward_residual_{block_number}")([x, feed_forward]))
 
     sequence_output = layers.Activation("linear", name="sasrec_sequence_output")(x)
-    last_position = layers.Lambda(
-        lambda encoded_sequence: encoded_sequence[:, -1, :],
-        output_shape=(embedding_dim,),
-        name="last_position",
-    )(sequence_output)
+    last_position = LastPosition(name="last_position")(sequence_output)
 
     ctx_input = layers.Input(shape=(num_ctx,), dtype="float32", name="ctx_input")
     context = layers.Dense(64, activation="relu", name="context_projection")(ctx_input)

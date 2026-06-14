@@ -17,7 +17,7 @@ from .ranking import topk_indices_2d
 from .run_artifacts import materialize_cached_file, safe_read_json, write_json
 
 
-CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v1"
+CLASSICAL_BENCHMARK_CACHE_SCHEMA_VERSION = "classical-benchmark-cache-v2"
 CLASSICAL_SEQUENCE_FEATURE_NAMES: tuple[str, ...] = (
     "sequence_last_artist_id",
     "sequence_previous_artist_id",
@@ -50,6 +50,7 @@ class ClassicalBenchmarkResult:
     test_diversity_at5: float
     prediction_bundle_path: str = ""
     estimator_artifact_path: str = ""
+    native_importance_artifact_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class ClassicalBenchmarkCachePaths:
     metadata_path: Path
     estimator_artifact_path: Path
     prediction_bundle_path: Path
+    native_importance_artifact_path: Path
 
 
 def _sequence_feature_block(seq: np.ndarray) -> np.ndarray:
@@ -226,6 +228,7 @@ def _resolve_classical_model_cache_paths(
         metadata_path=cache_dir / "cache_meta.json",
         estimator_artifact_path=cache_dir / "estimators" / f"classical_{model_name}.joblib",
         prediction_bundle_path=cache_dir / "prediction_bundles" / f"classical_{model_name}.npz",
+        native_importance_artifact_path=cache_dir / "estimators" / f"classical_{model_name}_native_importance.npy",
     )
 
 
@@ -248,6 +251,7 @@ def _load_cached_classical_result(
 
         estimator_output_path = output_dir / "estimators" / f"classical_{model_name}.joblib"
         prediction_output_path = output_dir / "prediction_bundles" / f"classical_{model_name}.npz"
+        native_importance_output_path = output_dir / "estimators" / f"classical_{model_name}_native_importance.npy"
 
         if result_payload.get("estimator_artifact_path"):
             if not cache_paths.estimator_artifact_path.exists():
@@ -264,6 +268,14 @@ def _load_cached_classical_result(
             result_payload["prediction_bundle_path"] = str(prediction_output_path.resolve())
         else:
             result_payload["prediction_bundle_path"] = ""
+
+        if result_payload.get("native_importance_artifact_path"):
+            if not cache_paths.native_importance_artifact_path.exists():
+                return None
+            materialize_cached_file(cache_paths.native_importance_artifact_path, native_importance_output_path)
+            result_payload["native_importance_artifact_path"] = str(native_importance_output_path.resolve())
+        else:
+            result_payload["native_importance_artifact_path"] = ""
 
         return ClassicalBenchmarkResult(**result_payload)
     except Exception as exc:
@@ -289,6 +301,11 @@ def _save_classical_result_to_cache(
             source_bundle_path = Path(result.prediction_bundle_path).expanduser()
             if source_bundle_path.exists():
                 materialize_cached_file(source_bundle_path, cache_paths.prediction_bundle_path)
+
+        if result.native_importance_artifact_path:
+            source_importance_path = Path(result.native_importance_artifact_path).expanduser()
+            if source_importance_path.exists():
+                materialize_cached_file(source_importance_path, cache_paths.native_importance_artifact_path)
 
         write_json(
             cache_paths.result_path,
@@ -752,6 +769,27 @@ def _fit_single_classical_model(
     start = time.perf_counter()
     estimator.fit(X_train, y_train)
     fit_seconds = time.perf_counter() - start
+    native_importance_artifact_path = ""
+    final_estimator = estimator
+    if hasattr(estimator, "steps") and getattr(estimator, "steps", None):
+        final_estimator = estimator.steps[-1][1]
+    if final_estimator.__class__.__name__ == "LabelEncodedXGBoostClassifier":
+        final_estimator = final_estimator.estimator
+    native_importance = None
+    if hasattr(final_estimator, "feature_importances_"):
+        native_importance = np.asarray(final_estimator.feature_importances_, dtype="float64").reshape(-1)
+    elif hasattr(final_estimator, "coef_"):
+        coefficients = np.asarray(final_estimator.coef_, dtype="float64")
+        native_importance = (
+            np.mean(np.abs(coefficients), axis=0)
+            if coefficients.ndim > 1
+            else np.abs(coefficients)
+        )
+    if native_importance is not None:
+        native_importance_path = estimator_output_dir / f"classical_{model_name}_native_importance.npy"
+        estimator_output_dir.mkdir(parents=True, exist_ok=True)
+        np.save(native_importance_path, native_importance)
+        native_importance_artifact_path = str(native_importance_path)
     estimator_artifact_path = ""
     try:
         import joblib
@@ -814,6 +852,7 @@ def _fit_single_classical_model(
         test_diversity_at5=float(test_ranking["diversity_at5"]),
         prediction_bundle_path=prediction_bundle_path,
         estimator_artifact_path=estimator_artifact_path,
+        native_importance_artifact_path=native_importance_artifact_path,
     )
 
 

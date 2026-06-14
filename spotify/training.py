@@ -906,11 +906,9 @@ def train_and_evaluate_models(
         train_y_artist = data.y_train[train_selector]
         train_y_skip = data.y_skip_train[train_selector]
         val_y_artist = data.y_val[val_selector]
-        val_y_skip = data.y_skip_val[val_selector]
         train_artist_weights = weights.artist_train[train_selector]
         train_skip_weights = weights.skip_train[train_selector]
         val_artist_weights = weights.artist_val[val_selector]
-        val_skip_weights = weights.skip_val[val_selector]
         probe_batch_size = min(batch_size, max(32, len(train_selector)))
 
         logger.info(
@@ -944,8 +942,6 @@ def train_and_evaluate_models(
                         )
                         train_y_payload = train_y_artist
                         train_weight_payload = train_artist_weights
-                        val_y_payload = val_y_artist
-                        val_weight_payload = val_artist_weights
                     else:
                         model.compile(
                             optimizer="adam",
@@ -964,35 +960,28 @@ def train_and_evaluate_models(
                             run_eagerly=True,
                             steps_per_execution=1,
                         )
-                        train_y_payload = {
-                            "artist_output": train_y_artist,
-                            "skip_output": train_y_skip,
-                        }
-                        train_weight_payload = {
-                            "artist_output": train_artist_weights,
-                            "skip_output": train_skip_weights,
-                        }
-                        val_y_payload = {
-                            "artist_output": val_y_artist,
-                            "skip_output": val_y_skip,
-                        }
-                        val_weight_payload = {
-                            "artist_output": val_artist_weights,
-                            "skip_output": val_skip_weights,
-                        }
+                        # These models expose a positional output list. Keras 3
+                        # expects targets and weights with the same structure.
+                        train_y_payload = (train_y_artist, train_y_skip)
+                        train_weight_payload = (train_artist_weights, train_skip_weights)
 
                     warm_started = _load_warm_start_weights(model, name)
-                    model.fit(
-                        train_x,
-                        train_y_payload,
-                        sample_weight=train_weight_payload,
-                        validation_data=(val_x, val_y_payload, val_weight_payload),
-                        epochs=probe_epochs,
-                        batch_size=probe_batch_size,
-                        verbose=0,
-                    )
-                    val_pred = model.predict(val_x, batch_size=probe_batch_size, verbose=0)
-                    val_proba = _extract_artist_proba(val_pred)
+                    probe_rng = np.random.default_rng(random_seed + 101)
+                    for _epoch in range(probe_epochs):
+                        order = probe_rng.permutation(len(train_y_artist))
+                        for start in range(0, len(order), probe_batch_size):
+                            selector = order[start : start + probe_batch_size]
+                            model.train_on_batch(
+                                _slice_payload(train_x, selector),
+                                _slice_payload(train_y_payload, selector),
+                                sample_weight=_slice_payload(train_weight_payload, selector),
+                            )
+                    val_batches = []
+                    for start in range(0, len(val_y_artist), probe_batch_size):
+                        selector = slice(start, min(start + probe_batch_size, len(val_y_artist)))
+                        val_prediction = model(_slice_payload(val_x, selector), training=False)
+                        val_batches.append(_extract_artist_proba(val_prediction))
+                    val_proba = np.concatenate(val_batches, axis=0)
                     probe_scores[name] = {
                         "val_top1": _weighted_top1_accuracy_from_proba(val_proba, val_y_artist, val_artist_weights),
                         "val_top5": _weighted_topk_accuracy_from_proba(val_proba, val_y_artist, val_artist_weights, k=5),
@@ -1000,7 +989,12 @@ def train_and_evaluate_models(
                         "warm_started": float(1.0 if warm_started else 0.0),
                     }
             except Exception as exc:
-                logger.warning("[%s] Deep screening probe failed (%s); deprioritizing this model.", name, exc)
+                logger.warning(
+                    "[%s] Deep screening probe failed (%s: %r); deprioritizing this model.",
+                    name,
+                    type(exc).__name__,
+                    exc,
+                )
                 probe_scores[name] = {
                     "val_top1": float("-inf"),
                     "val_top5": float("-inf"),
@@ -1559,6 +1553,12 @@ def train_and_evaluate_models(
                 verbose=2,
                 callbacks=cbs,
             )
+            if checkpoint_path.exists():
+                model.load_weights(checkpoint_path)
+                logger.info(
+                    "[%s] Restored monitored best checkpoint before evaluation.",
+                    name,
+                )
             val_pred = model.predict(val_predict_dataset, verbose=0)
             test_pred = model.predict(test_predict_dataset, verbose=0)
         else:

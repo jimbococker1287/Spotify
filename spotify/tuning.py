@@ -827,27 +827,19 @@ def run_optuna_tuning(
                     if "least populated classes" in msg or "minimum number of groups" in msg:
                         raise optuna.TrialPruned(f"insufficient class support in sampled stage: {exc}") from exc
                     raise
-                timeout_reason = _resolve_tuning_timeout_reason(
-                    now=time.perf_counter(),
-                    trial_started=trial_started,
-                    study_started=study_started,
-                    per_trial_timeout_seconds=per_trial_timeout_seconds,
-                    model_timeout_seconds=model_timeout,
-                )
-                if timeout_reason:
-                    raise optuna.TrialPruned(timeout_reason)
                 val_pred = estimator.predict(X_val_model)
-                timeout_reason = _resolve_tuning_timeout_reason(
-                    now=time.perf_counter(),
-                    trial_started=trial_started,
-                    study_started=study_started,
-                    per_trial_timeout_seconds=per_trial_timeout_seconds,
-                    model_timeout_seconds=model_timeout,
-                )
-                if timeout_reason:
-                    raise optuna.TrialPruned(timeout_reason)
                 last_score = float(np.mean(val_pred == y_val))
                 trial.report(last_score, step=step_idx)
+                timeout_reason = _resolve_tuning_timeout_reason(
+                    now=time.perf_counter(),
+                    trial_started=trial_started,
+                    study_started=study_started,
+                    per_trial_timeout_seconds=per_trial_timeout_seconds,
+                    model_timeout_seconds=model_timeout,
+                )
+                if timeout_reason:
+                    trial.set_user_attr("stopped_after_completed_stage", timeout_reason)
+                    break
                 if step_idx < len(fidelity_schedule) and trial.should_prune():
                     raise optuna.TrialPruned(f"pruned at step={step_idx} score={last_score:.4f}")
             return last_score

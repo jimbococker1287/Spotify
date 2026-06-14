@@ -145,14 +145,13 @@ class LoadedPredictor:
 
 class _DeepPredictorImpl:
     def __init__(self, run_dir: Path, model_name: str):
-        import tensorflow as tf
-        from .model_loading import keras_custom_objects_for_model
+        from .model_loading import load_trusted_keras_model
 
         model_path = run_dir / f"best_{model_name}.keras"
-        self.model = tf.keras.models.load_model(
+        self.model = load_trusted_keras_model(
             model_path,
+            model_name=model_name,
             compile=False,
-            custom_objects=keras_custom_objects_for_model(model_name),
         )
 
     def predict_proba(self, seq_batch: np.ndarray, ctx_batch: np.ndarray) -> np.ndarray:

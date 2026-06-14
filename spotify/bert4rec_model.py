@@ -3,6 +3,76 @@ from __future__ import annotations
 from typing import NamedTuple
 
 
+_CUSTOM_OBJECTS: dict[str, object] | None = None
+
+
+def get_bert4rec_custom_objects(mask_token_id: int | None = None) -> dict[str, object]:
+    global _CUSTOM_OBJECTS
+    if _CUSTOM_OBJECTS is None:
+        import tensorflow as tf
+
+        @tf.keras.utils.register_keras_serializable(package="spotify")
+        class PositionIndices(tf.keras.layers.Layer):
+            def call(self, tokens):
+                return tf.broadcast_to(
+                    tf.range(tf.shape(tokens)[1])[tf.newaxis, :],
+                    tf.shape(tokens),
+                )
+
+        @tf.keras.utils.register_keras_serializable(package="spotify")
+        class MaskedPositionPooling(tf.keras.layers.Layer):
+            def __init__(self, mask_token_id: int, **kwargs):
+                super().__init__(**kwargs)
+                self.mask_token_id = int(mask_token_id)
+
+            def call(self, inputs):
+                token_states, token_ids = inputs
+                weights = tf.cast(tf.equal(token_ids, self.mask_token_id), token_states.dtype)
+                has_mask = tf.reduce_any(tf.cast(weights, tf.bool), axis=1, keepdims=True)
+                fallback = tf.one_hot(
+                    tf.fill([tf.shape(token_ids)[0]], tf.shape(token_ids)[1] - 1),
+                    depth=tf.shape(token_ids)[1],
+                    dtype=token_states.dtype,
+                )
+                weights = tf.where(has_mask, weights, fallback)[..., tf.newaxis]
+                return tf.math.divide_no_nan(
+                    tf.reduce_sum(token_states * weights, axis=1),
+                    tf.reduce_sum(weights, axis=1),
+                )
+
+            def get_config(self):
+                return {**super().get_config(), "mask_token_id": self.mask_token_id}
+
+        _CUSTOM_OBJECTS = {
+            "PositionIndices": PositionIndices,
+            "MaskedPositionPooling": MaskedPositionPooling,
+            "spotify>PositionIndices": PositionIndices,
+            "spotify>MaskedPositionPooling": MaskedPositionPooling,
+        }
+
+    objects = dict(_CUSTOM_OBJECTS)
+    if mask_token_id is not None:
+        import tensorflow as tf
+
+        def pool_masked_positions(inputs):
+            token_states, token_ids = inputs
+            weights = tf.cast(tf.equal(token_ids, int(mask_token_id)), token_states.dtype)
+            has_mask = tf.reduce_any(tf.cast(weights, tf.bool), axis=1, keepdims=True)
+            fallback = tf.one_hot(
+                tf.fill([tf.shape(token_ids)[0]], tf.shape(token_ids)[1] - 1),
+                depth=tf.shape(token_ids)[1],
+                dtype=token_states.dtype,
+            )
+            weights = tf.where(has_mask, weights, fallback)[..., tf.newaxis]
+            return tf.math.divide_no_nan(
+                tf.reduce_sum(token_states * weights, axis=1),
+                tf.reduce_sum(weights, axis=1),
+            )
+
+        objects["pool_masked_positions"] = pool_masked_positions
+    return objects
+
+
 class ClozePretrainingBatch(NamedTuple):
     """Arrays for fitting BERT4Rec with one masked artist per example."""
 
@@ -99,7 +169,6 @@ def build_bert4rec_model(
     mask_token_id = bert4rec_mask_token_id(num_artists)
     vocabulary_size = bert4rec_vocabulary_size(num_artists)
 
-    import tensorflow as tf
     from tensorflow.keras import Input, Model
     from tensorflow.keras.layers import (
         Add,
@@ -107,7 +176,6 @@ def build_bert4rec_model(
         Dense,
         Dropout,
         Embedding,
-        Lambda,
         LayerNormalization,
         MultiHeadAttention,
     )
@@ -127,14 +195,10 @@ def build_bert4rec_model(
         output_dim=embedding_dim,
         name="item_embedding",
     )(seq_input)
-    positions = Lambda(
-        lambda tokens: tf.broadcast_to(
-            tf.range(tf.shape(tokens)[1])[tf.newaxis, :],
-            tf.shape(tokens),
-        ),
-        output_shape=(sequence_length,),
-        name="position_indices",
-    )(seq_input)
+    custom_objects = get_bert4rec_custom_objects()
+    PositionIndices = custom_objects["PositionIndices"]
+    MaskedPositionPooling = custom_objects["MaskedPositionPooling"]
+    positions = PositionIndices(name="position_indices")(seq_input)
     position_embeddings = Embedding(
         input_dim=sequence_length,
         output_dim=embedding_dim,
@@ -172,25 +236,8 @@ def build_bert4rec_model(
             name=f"feed_forward_norm_{block_index + 1}",
         )(encoded + feed_forward)
 
-    def pool_masked_positions(inputs):
-        token_states, token_ids = inputs
-        weights = tf.cast(tf.equal(token_ids, mask_token_id), token_states.dtype)
-        has_mask = tf.reduce_any(tf.cast(weights, tf.bool), axis=1, keepdims=True)
-        fallback = tf.one_hot(
-            tf.fill([tf.shape(token_ids)[0]], tf.shape(token_ids)[1] - 1),
-            depth=tf.shape(token_ids)[1],
-            dtype=token_states.dtype,
-        )
-        weights = tf.where(has_mask, weights, fallback)
-        weights = weights[..., tf.newaxis]
-        return tf.math.divide_no_nan(
-            tf.reduce_sum(token_states * weights, axis=1),
-            tf.reduce_sum(weights, axis=1),
-        )
-
-    masked_state = Lambda(
-        pool_masked_positions,
-        output_shape=(embedding_dim,),
+    masked_state = MaskedPositionPooling(
+        mask_token_id=mask_token_id,
         name="masked_position_pooling",
     )([encoded, seq_input])
     context_state = Dense(64, activation="relu", name="context_projection")(ctx_input)

@@ -69,6 +69,39 @@ The current system already includes:
 - Robustness slice evaluation across friction, repeat, platform, and session regimes
 - Semi-synthetic policy simulation for offline policy comparison
 - Benchmark protocol, experiment registry, ablation, and significance artifacts
+
+## Track-Level Recommender Expansion
+
+The expansion lane preserves the existing artist benchmark while adding a
+long-tail, track-level research path with:
+
+- leakage-safe next-track examples and multi-task labels
+- popularity, session co-occurrence, EASE, and BPR-ready retrieval baselines
+- DCN-V2 contextual reranking
+- MMoE/PLE multi-task prediction
+- MEANTIME-style temporal attention
+- S3-Rec/DuoRec-style pretraining utilities
+- governed public-dataset adapters and multimodal cold-start fusion
+- model-family explainability routing and Optuna search contracts
+
+Build or refresh the real-data expansion manifest:
+
+```bash
+make recommender-expansion-lab
+```
+
+Run the bounded EASE, session co-occurrence, MEANTIME, MMoE, and PLE training
+pass:
+
+```bash
+make train-recommender-expansion
+```
+
+The durable handoff is written to
+`outputs/analysis/recommender_expansion/CONTINUE_HERE.md`. Architecture and
+public-data governance are documented in
+`docs/recommender_expansion_architecture.md` and
+`docs/public_training_datasets.md`.
 - Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, group Auto-DJ planning, and stress tests
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving
