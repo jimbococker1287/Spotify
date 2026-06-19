@@ -164,3 +164,51 @@ def test_lab_carries_completed_training_into_handoff(tmp_path: Path) -> None:
     assert "Latest Training Pass" in continuation
     assert "`ease`: Recall@5 `0.200000`" in continuation
     assert "Train DCN-V2" in continuation
+
+
+def test_lab_carries_next_pass_status_into_handoff(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    output_dir = tmp_path / "outputs"
+    _write_history(raw_dir)
+    next_pass_dir = (
+        output_dir / "analysis" / "recommender_expansion" / "next_pass"
+    )
+    next_pass_dir.mkdir(parents=True)
+    (next_pass_dir / "next_pass_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "partial",
+                "stages": {
+                    "candidate_dataset": {"status": "complete"},
+                    "dcn_training": {"status": "complete"},
+                    "optuna_tuning": {"status": "complete"},
+                    "public_pretraining": {
+                        "status": "blocked",
+                        "reason": "No approved manifest.",
+                    },
+                    "promotion_gates": {"status": "complete"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    build_recommender_expansion_lab(
+        config=ExpansionRunConfig(
+            raw_data_dir=raw_dir,
+            output_dir=output_dir,
+            max_history=16,
+            evaluation_k=5,
+            evaluation_limit=100,
+        ),
+        logger=_logger(),
+    )
+
+    root = output_dir / "analysis" / "recommender_expansion"
+    manifest = json.loads((root / "expansion_manifest.json").read_text(encoding="utf-8"))
+    continuation = (root / "CONTINUE_HERE.md").read_text(encoding="utf-8")
+
+    assert manifest["next_pass"]["status"] == "partial"
+    assert "Latest Next Pass" in continuation
+    assert "`public_pretraining`: `blocked` - No approved manifest." in continuation
+    assert "Review `next_pass/stages/promotion_gates" in continuation

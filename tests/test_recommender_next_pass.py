@@ -234,3 +234,24 @@ def test_lazy_adapter_imports_on_invocation_and_adapts_named_arguments(
         "artifact_dir": tmp_path / "stage",
         "epochs": 3,
     }
+
+
+def test_initial_checkpoint_lists_first_not_yet_run_stage(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def inspect_initial_checkpoint(request: StageRequest) -> dict[str, object]:
+        continuation = (
+            request.config.artifact_root / "CONTINUE_NEXT_PASS.md"
+        ).read_text(encoding="utf-8")
+        assert "first unresolved stage: `candidate_dataset`" in continuation
+        return _complete("candidates", calls)(request)
+
+    run_recommender_next_pass(
+        config=NextPassConfig(output_dir=tmp_path),
+        adapters=NextPassAdapters(
+            candidate_dataset_builder=inspect_initial_checkpoint,
+            dcn_trainer=_complete("dcn", calls),
+            optuna_tuners={"all": _complete("tune", calls)},
+            promotion_gates=_complete("promotion", calls),
+        ),
+    )

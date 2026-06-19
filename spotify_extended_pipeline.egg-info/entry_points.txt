@@ -33,3 +33,4 @@ spotify-taste-os-demo = spotify.taste_os_demo:main
 spotify-taste-os-serve = spotify.taste_os_service:main
 spotify-taste-os-showcase = spotify.taste_os_showcase:main
 spotify-track-expansion-training = spotify.track_expansion_training:main
+spotify-track-next-pass = spotify.track_next_pass:main

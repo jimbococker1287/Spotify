@@ -149,7 +149,7 @@ EXPANSION_MODEL_REGISTRY: Mapping[str, ExpansionModelSpec] = MappingProxyType(
                 notes="Tune on candidate recall before reranker metrics.",
             ),
             readiness="component_ready",
-            blockers=("Wire the track-level dataset into the main experiment launcher.",),
+            blockers=("Clear temporal, explainability, calibration, and drift promotion gates.",),
             governance_requirements=_RANKING_GOVERNANCE,
         ),
         "dcn_v2_reranker": ExpansionModelSpec(
@@ -157,7 +157,12 @@ EXPANSION_MODEL_REGISTRY: Mapping[str, ExpansionModelSpec] = MappingProxyType(
             family="contextual_reranking",
             stage="reranking",
             summary="DCN-V2 feature-cross reranker over candidate, session, and context features.",
-            implementation_modules=("spotify.dcn_v2_model", "spotify.retrieval_reranking"),
+            implementation_modules=(
+                "spotify.dcn_v2_model",
+                "spotify.track_reranking_data",
+                "spotify.track_dcn_training",
+                "spotify.track_next_pass",
+            ),
             required_data=("candidate_ids", "retrieval_scores", "context_features", "ranking_labels"),
             optional_data=("item_features", "time_gap_features", "technical_friction_features"),
             primary_metrics=("ndcg_at_10", "mrr_at_10", "hit_rate_at_10"),
@@ -177,7 +182,7 @@ EXPANSION_MODEL_REGISTRY: Mapping[str, ExpansionModelSpec] = MappingProxyType(
                 ),
             ),
             readiness="component_ready",
-            blockers=("Add candidate-list training and end-to-end retrieval/reranking evaluation.",),
+            blockers=("Run broader Optuna budgets and clear every promotion gate.",),
             governance_requirements=_RANKING_GOVERNANCE,
         ),
         "multitask_mmoe_ple": ExpansionModelSpec(
@@ -317,7 +322,9 @@ EXPANSION_MODEL_REGISTRY: Mapping[str, ExpansionModelSpec] = MappingProxyType(
                 ),
             ),
             readiness="integration_pending",
-            blockers=("Acquire approved local datasets, validate manifests, and implement LightGCN/RecVAE trainers.",),
+            blockers=(
+                "Acquire approved local datasets and validate their manifests before enabling training.",
+            ),
             governance_requirements=_RANKING_GOVERNANCE + _PUBLIC_DATA_GOVERNANCE,
             references=("LFM-1b", "Million Song Taste Profile"),
         ),

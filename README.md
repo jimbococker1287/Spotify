@@ -56,6 +56,19 @@ pass:
 make train-recommender-expansion
 ```
 
+Run the next bounded development pass with leakage-safe candidate lists,
+DCN-V2 reranking, resumable Optuna studies, SHAP/calibration/drift evidence,
+public-data governance checks, and deterministic promotion gates:
+
+```bash
+make train-recommender-next-pass
+```
+
+The default next pass runs one trial for each supported model family. Increase
+the total resumable budget with
+`EXTRA_ARGS="--tuning-trials 5"`. Public pretraining remains blocked unless both
+`--public-manifest` and `--public-records` point to approved local artifacts.
+
 The durable handoff is written to
 `outputs/analysis/recommender_expansion/CONTINUE_HERE.md`. Architecture and
 public-data governance are documented in

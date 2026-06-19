@@ -378,7 +378,10 @@ def _stream_retrieval_metrics(
     *,
     k: int,
     limit: int,
+    history_window: int | None = None,
 ) -> dict[str, object]:
+    if history_window is not None and history_window < 1:
+        raise ValueError("history_window must be positive or None")
     selected = _bounded_examples(examples, limit)
     catalog = set(retriever.catalog)
     hits = 0
@@ -389,8 +392,11 @@ def _stream_retrieval_metrics(
     unique_candidates: set[object] = set()
     candidate_counts: list[int] = []
     for example in selected:
+        history = example.history_track_uris
+        if history_window is not None:
+            history = history[-history_window:]
         candidates = retriever.recommend(
-            example.history_track_uris,
+            history,
             k=k,
             exclude_seen=False,
         )
@@ -644,10 +650,39 @@ def _train_meantime(
     *,
     config: TrackTrainingConfig,
     checkpoint_dir: Path,
+    model_params: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     import tensorflow as tf
 
     from .meantime_model import build_meantime_model
+
+    params = {
+        "embedding_dim": 32,
+        "num_heads": 2,
+        "feed_forward_dim": 64,
+        "dropout_rate": 0.1,
+        "num_blocks": 1,
+        "num_time_buckets": 32,
+        "context_dim": 32,
+        **dict(model_params or {}),
+    }
+    batch_size = params.pop("batch_size", config.batch_size)
+    learning_rate = params.pop("learning_rate", 1e-3)
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, (int, np.integer))
+        or int(batch_size) <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0.0
+    ):
+        raise ValueError("learning_rate must be a positive finite number")
+    batch_size = int(batch_size)
+    learning_rate = float(learning_rate)
 
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(config.random_seed)
@@ -655,18 +690,10 @@ def _train_meantime(
         sequence_length=config.sequence_length,
         vocabulary_size=data.vocabulary.vocabulary_size,
         num_ctx=len(CONTEXT_FEATURE_NAMES),
-        params={
-            "embedding_dim": 32,
-            "num_heads": 2,
-            "feed_forward_dim": 64,
-            "dropout_rate": 0.1,
-            "num_blocks": 1,
-            "num_time_buckets": 32,
-            "context_dim": 32,
-        },
+        params=params,
     )
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
+        optimizer=tf.keras.optimizers.Adam(learning_rate),
         loss=tf.keras.losses.SparseCategoricalCrossentropy(),
         run_eagerly=True,
     )
@@ -676,7 +703,7 @@ def _train_meantime(
     for _epoch in range(config.epochs):
         for selector in _batch_indices(
             len(data.train),
-            batch_size=config.batch_size,
+            batch_size=batch_size,
             rng=rng,
         ):
             final_loss = float(
@@ -697,14 +724,14 @@ def _train_meantime(
         model,
         data.validation,
         model_name="meantime",
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         k=config.evaluation_k,
     )
     test_topk, _ = _predict_topk(
         model,
         data.test,
         model_name="meantime",
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         k=config.evaluation_k,
     )
     return {
@@ -735,10 +762,36 @@ def _train_multitask(
     architecture: str,
     config: TrackTrainingConfig,
     checkpoint_dir: Path,
+    model_params: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     import tensorflow as tf
 
     from .multitask_model import build_multitask_recommender
+
+    params = {
+        "architecture": architecture,
+        "sequence_encoder": "average",
+        "embedding_dim": 32,
+        "sequence_dim": 32,
+        "context_dim": 24,
+        "fusion_dim": 64,
+        "num_experts": 3,
+        "task_experts": 2,
+        "expert_units": 48,
+        "tower_units": 24,
+        "dropout_rate": 0.1,
+        "learning_rate": 1e-3,
+        **dict(model_params or {}),
+    }
+    batch_size = params.pop("batch_size", config.batch_size)
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, (int, np.integer))
+        or int(batch_size) <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    batch_size = int(batch_size)
+    params["architecture"] = architecture
 
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(config.random_seed)
@@ -746,20 +799,7 @@ def _train_multitask(
         sequence_length=config.sequence_length,
         num_items=data.vocabulary.vocabulary_size,
         num_ctx=len(CONTEXT_FEATURE_NAMES),
-        params={
-            "architecture": architecture,
-            "sequence_encoder": "average",
-            "embedding_dim": 32,
-            "sequence_dim": 32,
-            "context_dim": 24,
-            "fusion_dim": 64,
-            "num_experts": 3,
-            "task_experts": 2,
-            "expert_units": 48,
-            "tower_units": 24,
-            "dropout_rate": 0.1,
-            "learning_rate": 1e-3,
-        },
+        params=params,
     )
     started = time.perf_counter()
     rng = np.random.default_rng(config.random_seed)
@@ -767,7 +807,7 @@ def _train_multitask(
     for _epoch in range(config.epochs):
         for selector in _batch_indices(
             len(data.train),
-            batch_size=config.batch_size,
+            batch_size=batch_size,
             rng=rng,
         ):
             ordered_targets = [
@@ -793,14 +833,14 @@ def _train_multitask(
         model,
         data.validation,
         model_name=architecture,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         k=config.evaluation_k,
     )
     test_topk, test_aux = _predict_topk(
         model,
         data.test,
         model_name=architecture,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         k=config.evaluation_k,
     )
     return {

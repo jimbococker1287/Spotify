@@ -424,11 +424,8 @@ def _continuation_lines(manifest: Mapping[str, object]) -> list[str]:
     incomplete = [
         name
         for name in STAGE_ORDER
-        if (
-            isinstance(stage_records.get(name), Mapping)
-            and stage_records[name].get("status")
-            not in SUCCESS_STATUSES
-        )
+        if not isinstance(stage_records.get(name), Mapping)
+        or stage_records[name].get("status") not in SUCCESS_STATUSES
     ]
     lines.extend(["", "## Continue", ""])
     if incomplete:

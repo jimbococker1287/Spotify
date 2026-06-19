@@ -83,6 +83,7 @@ spotify-research-platform-lab = "spotify.research_platform_lab:main"
 spotify-scope-expansion-lab = "spotify.scope_expansion_lab:main"
 spotify-recommender-expansion-lab = "spotify.recommender_expansion_lab:main"
 spotify-track-expansion-training = "spotify.track_expansion_training:main"
+spotify-track-next-pass = "spotify.track_next_pass:main"
 spotify-project-health = "spotify.project_health:main"
 
 [tool.setuptools]

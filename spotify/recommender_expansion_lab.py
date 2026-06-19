@@ -151,6 +151,7 @@ def _continuation_markdown(
     baseline: dict[str, object],
     capabilities: list[dict[str, object]],
     training: dict[str, object] | None = None,
+    next_pass: dict[str, object] | None = None,
 ) -> list[str]:
     lines = [
         "# Recommender Expansion Lab",
@@ -219,6 +220,26 @@ def _continuation_markdown(
             ]
         )
 
+    if next_pass and next_pass.get("status") in {"complete", "partial", "blocked"}:
+        lines.extend(["", "## Latest Next Pass", ""])
+        lines.append(f"- Overall status: `{next_pass.get('status')}`.")
+        stages = next_pass.get("stages", {})
+        if isinstance(stages, dict):
+            for name in (
+                "candidate_dataset",
+                "dcn_training",
+                "optuna_tuning",
+                "public_pretraining",
+                "promotion_gates",
+            ):
+                row = stages.get(name, {})
+                if not isinstance(row, dict):
+                    continue
+                detail = row.get("reason")
+                suffix = f" - {detail}" if detail else ""
+                lines.append(f"- `{name}`: `{row.get('status', 'unknown')}`{suffix}")
+        lines.append("- Full evidence: `next_pass/next_pass_manifest.json`.")
+
     lines.extend(
         [
             "",
@@ -226,7 +247,16 @@ def _continuation_markdown(
             "",
         ]
     )
-    if training and training.get("status") == "complete":
+    if next_pass and next_pass.get("status") in {"complete", "partial"}:
+        lines.extend(
+            [
+                "1. Review `next_pass/stages/promotion_gates/promotion_gate_report.md` and resolve blocking evidence.",
+                "2. Increase resumable Optuna budgets only after reviewing trial runtime and validation stability.",
+                "3. Add public-data pretraining only after an approved source manifest and canonical local records are available.",
+                "4. Promote only models whose temporal, calibration, SHAP, drift, and reproducibility gates pass.",
+            ]
+        )
+    elif training and training.get("status") == "complete":
         lines.extend(
             [
                 "1. Train DCN-V2 on retrieved candidates using context, item, and multimodal features.",
@@ -290,6 +320,11 @@ def build_recommender_expansion_lab(
         default={},
     )
     training = training_payload if isinstance(training_payload, dict) else {}
+    next_pass_payload = safe_read_json(
+        root / "next_pass" / "next_pass_manifest.json",
+        default={},
+    )
+    next_pass = next_pass_payload if isinstance(next_pass_payload, dict) else {}
     config_payload = {
         **asdict(config),
         "raw_data_dir": str(config.raw_data_dir.resolve()),
@@ -304,6 +339,7 @@ def build_recommender_expansion_lab(
         "capability_count": len(capabilities),
         "capabilities": capabilities,
         "training": training,
+        "next_pass": next_pass,
     }
 
     paths = [
@@ -327,7 +363,13 @@ def build_recommender_expansion_lab(
         ),
         write_markdown(
             root / "CONTINUE_HERE.md",
-            _continuation_markdown(summary, baseline, capabilities, training),
+            _continuation_markdown(
+                summary,
+                baseline,
+                capabilities,
+                training,
+                next_pass,
+            ),
         ),
     ]
     logger.info(

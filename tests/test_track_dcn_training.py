@@ -198,6 +198,7 @@ def test_runner_trains_with_empty_validation_and_writes_loadable_artifacts(
         candidate_ids=["i", "j", "k", "l"],
         event_times=[20, 20, 21, 21],
     )
+    observed: list[tuple[object, DCNTemporalDataset]] = []
     result = train_dcn_v2_reranker(
         DCNTemporalDataset(train=train, validation=_empty_split(), test=test),
         DCNTrainingConfig(
@@ -213,6 +214,9 @@ def test_runner_trains_with_empty_validation_and_writes_loadable_artifacts(
                 "dropout_rate": 0.0,
             },
         ),
+        trained_model_callback=lambda model, bounded: observed.append(
+            (model, bounded)
+        ),
     )
 
     checkpoint = tmp_path / "dcn_v2.keras"
@@ -222,6 +226,8 @@ def test_runner_trains_with_empty_validation_and_writes_loadable_artifacts(
     assert result["input_split_summaries"]["train"]["row_count"] == 8
     assert result["metrics"]["validation"]["status"] == "unavailable"
     assert result["metrics"]["test"]["ranking"]["query_count"] == 2
+    assert len(observed) == 1
+    assert len(observed[0][1].train) == len(train)
     assert checkpoint.exists()
     assert json.loads(result_path.read_text())["model_name"] == "dcn_v2"
 

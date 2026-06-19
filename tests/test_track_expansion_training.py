@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
+import spotify.track_expansion_training as training
 from spotify.track_expansion_training import (
     OOV_ITEM_ID,
+    TrackTrainingConfig,
     encode_track_examples,
     fit_track_vocabulary,
     prepare_track_model_data,
@@ -140,3 +145,202 @@ def test_prepare_track_model_data_validates_item_budget() -> None:
             max_validation_examples=10,
             max_test_examples=10,
         )
+
+
+def test_stream_retrieval_metrics_applies_history_window() -> None:
+    example = _dataset(3).examples[2]
+    observed: list[tuple[str, ...]] = []
+
+    class Retriever:
+        catalog = ("spotify:track:3",)
+
+        def recommend(self, history, *, k, exclude_seen):
+            observed.append(tuple(history))
+            return []
+
+    training._stream_retrieval_metrics(
+        Retriever(),
+        [example],
+        k=10,
+        limit=1,
+        history_window=2,
+    )
+
+    assert observed == [example.history_track_uris[-2:]]
+
+
+class _FakeMeantimeModel:
+    def __init__(self, vocabulary_size: int) -> None:
+        self.vocabulary_size = vocabulary_size
+        self.batch_sizes: list[int] = []
+        self.optimizer = None
+
+    def compile(self, *, optimizer, **_kwargs) -> None:
+        self.optimizer = optimizer
+
+    def train_on_batch(self, inputs, _targets, **_kwargs) -> float:
+        self.batch_sizes.append(len(inputs[0]))
+        return 0.25
+
+    def save(self, _path: Path) -> None:
+        return None
+
+    def __call__(self, inputs, *, training: bool):
+        assert training is False
+        return np.ones((len(inputs[0]), self.vocabulary_size), dtype="float32")
+
+
+class _FakeMultitaskModel:
+    output_names = [
+        "next_item_output",
+        "skip_output",
+        "dwell_output",
+        "session_end_output",
+        "explicit_positive_output",
+        "repeat_output",
+    ]
+
+    def __init__(self, vocabulary_size: int) -> None:
+        self.vocabulary_size = vocabulary_size
+        self.batch_sizes: list[int] = []
+
+    def train_on_batch(self, inputs, _targets, **_kwargs) -> dict[str, float]:
+        self.batch_sizes.append(len(inputs[0]))
+        return {"loss": 0.5}
+
+    def save(self, _path: Path) -> None:
+        return None
+
+    def __call__(self, inputs, *, training: bool):
+        assert training is False
+        row_count = len(inputs[0])
+        return [
+            np.ones((row_count, self.vocabulary_size), dtype="float32"),
+            *[
+                np.full((row_count, 1), 0.5, dtype="float32")
+                for _name in self.output_names[1:]
+            ],
+        ]
+
+
+def _training_data_and_config(tmp_path: Path):
+    dataset = _dataset(12)
+    splits = split_track_level_examples(dataset)
+    config = TrackTrainingConfig(
+        raw_data_dir=tmp_path,
+        output_dir=tmp_path,
+        sequence_length=6,
+        evaluation_k=3,
+        neural_max_items=8,
+        max_train_examples=100,
+        max_validation_examples=100,
+        max_test_examples=100,
+        epochs=1,
+        batch_size=7,
+    )
+    data = prepare_track_model_data(
+        splits.train,
+        splits.validation,
+        splits.test,
+        max_items=config.neural_max_items,
+        sequence_length=config.sequence_length,
+        max_train_examples=config.max_train_examples,
+        max_validation_examples=config.max_validation_examples,
+        max_test_examples=config.max_test_examples,
+    )
+    return data, config
+
+
+def test_train_meantime_merges_optuna_params_and_preserves_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data, config = _training_data_and_config(tmp_path)
+    builder_calls: list[dict[str, object]] = []
+    models: list[_FakeMeantimeModel] = []
+
+    def fake_builder(**kwargs):
+        builder_calls.append(dict(kwargs["params"]))
+        model = _FakeMeantimeModel(int(kwargs["vocabulary_size"]))
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(
+        "spotify.meantime_model.build_meantime_model",
+        fake_builder,
+    )
+
+    training._train_meantime(
+        data,
+        config=config,
+        checkpoint_dir=tmp_path,
+        model_params={
+            "embedding_dim": 64,
+            "learning_rate": 2e-4,
+            "batch_size": 2,
+        },
+    )
+    training._train_meantime(
+        data,
+        config=replace(config, batch_size=5),
+        checkpoint_dir=tmp_path,
+    )
+
+    assert builder_calls[0]["embedding_dim"] == 64
+    assert builder_calls[0]["num_heads"] == 2
+    assert "learning_rate" not in builder_calls[0]
+    assert "batch_size" not in builder_calls[0]
+    assert max(models[0].batch_sizes) <= 2
+    assert float(models[0].optimizer.learning_rate.numpy()) == pytest.approx(2e-4)
+    assert builder_calls[1]["embedding_dim"] == 32
+    assert max(models[1].batch_sizes) <= 5
+    assert float(models[1].optimizer.learning_rate.numpy()) == pytest.approx(1e-3)
+
+
+def test_train_multitask_merges_optuna_params_and_preserves_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data, config = _training_data_and_config(tmp_path)
+    builder_calls: list[dict[str, object]] = []
+    models: list[_FakeMultitaskModel] = []
+
+    def fake_builder(**kwargs):
+        builder_calls.append(dict(kwargs["params"]))
+        model = _FakeMultitaskModel(int(kwargs["num_items"]))
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(
+        "spotify.multitask_model.build_multitask_recommender",
+        fake_builder,
+    )
+
+    training._train_multitask(
+        data,
+        architecture="ple",
+        config=config,
+        checkpoint_dir=tmp_path,
+        model_params={
+            "architecture": "mmoe",
+            "num_experts": 5,
+            "learning_rate": 3e-4,
+            "batch_size": 2,
+        },
+    )
+    training._train_multitask(
+        data,
+        architecture="mmoe",
+        config=replace(config, batch_size=5),
+        checkpoint_dir=tmp_path,
+    )
+
+    assert builder_calls[0]["architecture"] == "ple"
+    assert builder_calls[0]["num_experts"] == 5
+    assert builder_calls[0]["learning_rate"] == pytest.approx(3e-4)
+    assert builder_calls[0]["sequence_encoder"] == "average"
+    assert "batch_size" not in builder_calls[0]
+    assert max(models[0].batch_sizes) <= 2
+    assert builder_calls[1]["architecture"] == "mmoe"
+    assert builder_calls[1]["learning_rate"] == pytest.approx(1e-3)
+    assert max(models[1].batch_sizes) <= 5

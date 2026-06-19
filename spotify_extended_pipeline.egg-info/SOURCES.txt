@@ -217,6 +217,7 @@ spotify/track_expansion_gates.py
 spotify/track_expansion_training.py
 spotify/track_expansion_tuning.py
 spotify/track_level_data.py
+spotify/track_next_pass.py
 spotify/track_public_pretraining.py
 spotify/track_reranking_data.py
 spotify/track_retrieval.py
@@ -366,6 +367,7 @@ tests/test_track_expansion_gates.py
 tests/test_track_expansion_training.py
 tests/test_track_expansion_tuning.py
 tests/test_track_level_data.py
+tests/test_track_next_pass.py
 tests/test_track_public_pretraining.py
 tests/test_track_reranking_data.py
 tests/test_track_retrieval.py

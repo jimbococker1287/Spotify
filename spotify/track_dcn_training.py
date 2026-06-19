@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -560,6 +560,8 @@ def _split_summary(split: DCNCandidateSplit) -> dict[str, object]:
 def train_dcn_v2_reranker(
     dataset: DCNTemporalDataset,
     config: DCNTrainingConfig,
+    *,
+    trained_model_callback: Callable[[object, DCNTemporalDataset], None] | None = None,
 ) -> dict[str, object]:
     """Train, evaluate, and persist a bounded pointwise DCN-V2 reranker."""
     dataset.validate()
@@ -689,6 +691,9 @@ def train_dcn_v2_reranker(
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / config.checkpoint_filename
     model.save(checkpoint_path)
+
+    if trained_model_callback is not None:
+        trained_model_callback(model, bounded)
 
     metrics = {
         name: evaluate_dcn_scores(
