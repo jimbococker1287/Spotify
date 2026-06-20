@@ -72,8 +72,9 @@ the total resumable budget with
 The durable handoff is written to
 `outputs/analysis/recommender_expansion/CONTINUE_HERE.md`. Architecture and
 public-data governance are documented in
-`docs/recommender_expansion_architecture.md` and
-`docs/public_training_datasets.md`.
+`docs/recommender_expansion_architecture.md`,
+`docs/public_training_datasets.md`, and
+`docs/recommender_model_dataset_use_case_catalog.md`.
 - Moonshot lab with multimodal artist space, listener digital twin, causal skip decomposition, journey planning, safe policy routing, group Auto-DJ planning, and stress tests
 - Pre-train data quality gate with fail-fast checks
 - Champion aliasing (`outputs/models/champion/alias.json`) for no-run-id serving

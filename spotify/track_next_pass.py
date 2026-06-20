@@ -21,12 +21,24 @@ from .recommender_next_pass import (
     run_recommender_next_pass,
 )
 from .run_artifacts import safe_read_json, write_json, write_markdown
+from .public_pretraining_preflight import run_public_pretraining_preflight
+from .track_calibration import CalibrationConfig, calibrate_validation_test
+from .track_dcn_drift_mitigation import (
+    TrackDCNDriftMitigationConfig,
+    apply_track_dcn_drift_mitigation,
+    build_track_dcn_drift_mitigation_plan,
+    save_track_dcn_drift_mitigation_plan,
+)
 from .track_dcn_training import (
     DCNCandidateSplit,
     DCNTemporalDataset,
     DCNTrainingConfig,
     evaluate_dcn_scores,
     train_dcn_v2_reranker,
+)
+from .track_drift_evidence import (
+    TrackDriftEvidenceConfig,
+    build_track_drift_evidence,
 )
 from .track_expansion_gates import PromotionPolicy, evaluate_track_expansion_gates
 from .track_expansion_training import (
@@ -54,12 +66,24 @@ from .track_level_data import (
 from .track_public_pretraining import PublicPretrainingConfig, run_public_pretraining
 from .track_reranking_data import (
     CANDIDATE_FEATURE_NAMES,
+    CONTEXT_FEATURE_NAMES,
     TrackRerankingConfig,
     TrackRerankingData,
     TrackRerankingSplit,
     build_track_reranking_data,
     save_track_reranking_data,
 )
+from .track_model_promotion_evidence import (
+    PromotionEvidenceConfig,
+    build_track_model_promotion_evidence,
+    write_track_model_promotion_evidence,
+)
+from .track_temporal_reweighting import (
+    DCNTemporalReweightingConfig,
+    apply_temporal_reweighting,
+    compute_normalized_recency_weights,
+)
+from .track_tuning_plan import write_track_tuning_plan
 from .track_retrieval import EASERetriever, SessionCooccurrenceRetriever
 
 
@@ -88,6 +112,15 @@ class TrackNextPassConfig:
     max_test_queries: int = 750
     dcn_epochs: int = 2
     dcn_batch_size: int = 256
+    dcn_low_drift_mask: bool = False
+    dcn_recency_reweight: bool = False
+    dcn_recency_min_weight: float = 0.5
+    dcn_recency_max_weight: float = 2.0
+    dcn_recency_half_life: float | None = None
+    dcn_recency_strength: float = 1.0
+    dcn_recency_fallback: str = "auto"
+    dcn_drop_context_features: tuple[str, ...] = ()
+    dcn_drop_item_features: tuple[str, ...] = ()
     tuning_models: tuple[str, ...] = SUPPORTED_TUNING_MODELS
     tuning_trials: int = 1
     tuning_max_train_examples: int = 2_000
@@ -120,6 +153,20 @@ class TrackNextPassConfig:
             raise ValueError("retrieval_pool_size must be at least candidate_count")
         if self.tuning_trials < 0:
             raise ValueError("tuning_trials cannot be negative")
+        if self.dcn_recency_reweight:
+            DCNTemporalReweightingConfig(
+                min_weight=self.dcn_recency_min_weight,
+                max_weight=self.dcn_recency_max_weight,
+                half_life=self.dcn_recency_half_life,
+                strength=self.dcn_recency_strength,
+                fallback=self.dcn_recency_fallback,  # type: ignore[arg-type]
+            ).validate()
+        unknown_context_drops = sorted(set(self.dcn_drop_context_features) - set(CONTEXT_FEATURE_NAMES))
+        if unknown_context_drops:
+            raise ValueError(f"Unknown DCN context drop features: {', '.join(unknown_context_drops)}")
+        unknown_item_drops = sorted(set(self.dcn_drop_item_features) - set(CANDIDATE_FEATURE_NAMES))
+        if unknown_item_drops:
+            raise ValueError(f"Unknown DCN item drop features: {', '.join(unknown_item_drops)}")
         unknown = sorted(set(self.tuning_models) - set(SUPPORTED_TUNING_MODELS))
         if unknown:
             raise ValueError(f"Unknown tuning models: {', '.join(unknown)}")
@@ -253,6 +300,355 @@ def _standardized_mean_drift(
     train_scale = np.std(train_values, axis=0)
     train_scale = np.where(train_scale < 1e-6, 1.0, train_scale)
     return float(np.max(np.abs(np.mean(evaluation_values, axis=0) - train_mean) / train_scale))
+
+
+def _json_number(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _dcn_calibration_payload(
+    *,
+    validation_labels: np.ndarray,
+    validation_scores: np.ndarray,
+    test_labels: np.ndarray,
+    test_scores: np.ndarray,
+) -> dict[str, object]:
+    if not len(validation_scores) or not len(test_scores):
+        return {
+            "status": "unavailable",
+            "method": "temperature_scaling",
+            "reason": "Validation and test scores are required for calibration.",
+            "validation_ece": None,
+            "test_ece": None,
+            "ece": None,
+        }
+
+    summary = calibrate_validation_test(
+        validation_scores,
+        np.asarray(validation_labels, dtype="float32").reshape(-1),
+        test_scores,
+        np.asarray(test_labels, dtype="float32").reshape(-1),
+        config=CalibrationConfig(
+            input_type="probability",
+            n_bins=10,
+            temperature_candidates=101,
+        ),
+    )
+    payload = summary.to_dict()
+    validation_ece = _json_number(payload.get("validation_ece_after"))
+    test_ece = _json_number(payload.get("test_ece_after"))
+    return {
+        **payload,
+        "validation_ece": validation_ece,
+        "test_ece": test_ece,
+        "ece": test_ece,
+        "expected_calibration_error": test_ece,
+        "raw_validation_ece": _json_number(payload.get("validation_ece_before")),
+        "raw_test_ece": _json_number(payload.get("test_ece_before")),
+    }
+
+
+def _max_drift_score_for_split(
+    report_payload: Mapping[str, object],
+    split_name: str,
+) -> float | None:
+    groups = report_payload.get("groups", ())
+    values: list[float] = []
+    if isinstance(groups, Sequence) and not isinstance(groups, (str, bytes)):
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            if str(group.get("comparison_split")) != split_name:
+                continue
+            value = _json_number(group.get("max_drift_score"))
+            if value is not None:
+                values.append(value)
+    return max(values) if values else None
+
+
+def _dcn_drift_payload(
+    *,
+    dataset: DCNTemporalDataset,
+    output_dir: Path,
+    context_feature_names: Sequence[str] = CONTEXT_FEATURE_NAMES,
+    item_feature_names: Sequence[str] = CANDIDATE_FEATURE_NAMES,
+) -> dict[str, object]:
+    try:
+        report = build_track_drift_evidence(
+            reference_split=dataset.train,
+            comparison_splits={
+                "validation": dataset.validation,
+                "test": dataset.test,
+            },
+            context_feature_names=context_feature_names,
+            item_feature_names=item_feature_names,
+            config=TrackDriftEvidenceConfig(
+                max_abs_standardized_mean_shift=0.20,
+                max_js_distance=0.20,
+                histogram_bins=20,
+                top_feature_count=10,
+            ),
+        )
+        artifact = output_dir / "drift" / "dcn_v2_drift_evidence.json"
+        payload = report.to_dict()
+        validation_score = _max_drift_score_for_split(payload, "validation")
+        test_score = _max_drift_score_for_split(payload, "test")
+        enriched_payload = {
+            **payload,
+            "artifact": str(artifact.resolve()),
+            "artifact_present": True,
+            "validation_drift_score": validation_score,
+            "test_drift_score": test_score,
+            "drift_score": test_score,
+        }
+        write_json(artifact, enriched_payload, sort_keys=True)
+        return enriched_payload
+    except Exception as exc:
+        validation_score = max(
+            _standardized_mean_drift(
+                dataset.train.context_features,
+                dataset.validation.context_features,
+            ),
+            _standardized_mean_drift(
+                dataset.train.item_features,
+                dataset.validation.item_features,
+            ),
+        )
+        test_score = max(
+            _standardized_mean_drift(
+                dataset.train.context_features,
+                dataset.test.context_features,
+            ),
+            _standardized_mean_drift(
+                dataset.train.item_features,
+                dataset.test.item_features,
+            ),
+        )
+        return {
+            "status": "complete",
+            "method": "standardized_mean_drift_fallback",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "artifact_present": False,
+            "validation_drift_score": validation_score,
+            "test_drift_score": test_score,
+            "drift_score": test_score,
+        }
+
+
+def _recency_config_from_next_pass(config: TrackNextPassConfig) -> DCNTemporalReweightingConfig:
+    return DCNTemporalReweightingConfig(
+        min_weight=config.dcn_recency_min_weight,
+        max_weight=config.dcn_recency_max_weight,
+        half_life=config.dcn_recency_half_life,
+        strength=config.dcn_recency_strength,
+        fallback=config.dcn_recency_fallback,  # type: ignore[arg-type]
+    )
+
+
+def _csv_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    )
+
+
+def _compact_recency_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    compact = dict(payload)
+    weights = compact.pop("weights", ())
+    if isinstance(weights, Sequence) and not isinstance(weights, (str, bytes)):
+        values = [float(value) for value in weights]
+        compact["weight_count"] = len(values)
+        compact["weight_preview"] = {
+            "first": values[:5],
+            "last": values[-5:] if len(values) > 5 else values[:],
+        }
+    return compact
+
+
+def _mask_split_features(
+    split: DCNCandidateSplit,
+    *,
+    context_mask: np.ndarray,
+    item_mask: np.ndarray,
+) -> DCNCandidateSplit:
+    return DCNCandidateSplit(
+        context_features=np.asarray(split.context_features)[:, context_mask].copy(),
+        item_features=np.asarray(split.item_features)[:, item_mask].copy(),
+        labels=np.asarray(split.labels).reshape(-1).copy(),
+        query_ids=np.asarray(split.query_ids).reshape(-1).copy(),
+        candidate_ids=(
+            None
+            if split.candidate_ids is None
+            else np.asarray(split.candidate_ids).reshape(-1).copy()
+        ),
+        event_times=(
+            None
+            if split.event_times is None
+            else np.asarray(split.event_times).reshape(-1).copy()
+        ),
+        sample_weights=(
+            None
+            if split.sample_weights is None
+            else np.asarray(split.sample_weights).reshape(-1).copy()
+        ),
+    )
+
+
+def _apply_manual_dcn_feature_drops(
+    *,
+    dataset: DCNTemporalDataset,
+    context_feature_names: Sequence[str],
+    item_feature_names: Sequence[str],
+    drop_context_features: Sequence[str],
+    drop_item_features: Sequence[str],
+    output_dir: Path,
+) -> tuple[DCNTemporalDataset, tuple[str, ...], tuple[str, ...], dict[str, object] | None]:
+    context_drop = tuple(dict.fromkeys(str(name) for name in drop_context_features if str(name)))
+    item_drop = tuple(dict.fromkeys(str(name) for name in drop_item_features if str(name)))
+    if not context_drop and not item_drop:
+        return dataset, tuple(context_feature_names), tuple(item_feature_names), None
+
+    context_names = tuple(context_feature_names)
+    item_names = tuple(item_feature_names)
+    missing_context = sorted(set(context_drop) - set(context_names))
+    if missing_context:
+        raise ValueError(
+            "Manual DCN context drops are not present after earlier masks: "
+            + ", ".join(missing_context)
+        )
+    missing_item = sorted(set(item_drop) - set(item_names))
+    if missing_item:
+        raise ValueError(
+            "Manual DCN item drops are not present after earlier masks: "
+            + ", ".join(missing_item)
+        )
+
+    context_mask = np.asarray([name not in context_drop for name in context_names], dtype=bool)
+    item_mask = np.asarray([name not in item_drop for name in item_names], dtype=bool)
+    if not np.any(context_mask):
+        raise ValueError("Manual DCN context feature drops would remove every context feature")
+    if not np.any(item_mask):
+        raise ValueError("Manual DCN item feature drops would remove every item feature")
+
+    masked = DCNTemporalDataset(
+        train=_mask_split_features(dataset.train, context_mask=context_mask, item_mask=item_mask),
+        validation=_mask_split_features(dataset.validation, context_mask=context_mask, item_mask=item_mask),
+        test=_mask_split_features(dataset.test, context_mask=context_mask, item_mask=item_mask),
+    )
+    masked.validate()
+    retained_context = tuple(name for name, keep in zip(context_names, context_mask) if keep)
+    retained_item = tuple(name for name, keep in zip(item_names, item_mask) if keep)
+    payload: dict[str, object] = {
+        "status": "ready",
+        "method": "manual_feature_drop",
+        "promotion_decision": "not_evaluated",
+        "dropped_context_features": list(context_drop),
+        "dropped_item_features": list(item_drop),
+        "retained_context_features": list(retained_context),
+        "retained_item_features": list(retained_item),
+        "context_feature_count": len(retained_context),
+        "item_feature_count": len(retained_item),
+    }
+    artifact = write_json(
+        output_dir / "drift_mitigation" / "dcn_v2_manual_feature_drop_plan.json",
+        payload,
+        sort_keys=True,
+    )
+    payload["artifact"] = str(artifact.resolve())
+    payload["artifact_present"] = True
+    write_json(artifact, payload, sort_keys=True)
+    return masked, retained_context, retained_item, payload
+
+
+def _prepare_dcn_training_dataset(
+    *,
+    dataset: DCNTemporalDataset,
+    config: TrackNextPassConfig,
+    output_dir: Path,
+) -> tuple[DCNTemporalDataset, tuple[str, ...], tuple[str, ...], dict[str, object]]:
+    prepared = dataset
+    context_names = tuple(CONTEXT_FEATURE_NAMES)
+    item_names = tuple(CANDIDATE_FEATURE_NAMES)
+    mitigation: dict[str, object] = {}
+    artifact_dir = output_dir / "drift_mitigation"
+
+    if config.dcn_low_drift_mask:
+        validation_report = build_track_drift_evidence(
+            reference_split=prepared.train,
+            comparison_splits={"validation": prepared.validation},
+            context_feature_names=context_names,
+            item_feature_names=item_names,
+            config=TrackDriftEvidenceConfig(
+                max_abs_standardized_mean_shift=0.20,
+                max_js_distance=0.20,
+                histogram_bins=20,
+                top_feature_count=10,
+            ),
+        )
+        plan = build_track_dcn_drift_mitigation_plan(
+            validation_report,
+            config=TrackDCNDriftMitigationConfig(),
+        )
+        plan_path = save_track_dcn_drift_mitigation_plan(
+            plan,
+            artifact_dir / "dcn_v2_low_drift_feature_mask_plan.json",
+        )
+        prepared = apply_track_dcn_drift_mitigation(prepared, plan)
+        context_names = tuple(plan.context.retained_features)
+        item_names = tuple(plan.item.retained_features)
+        mitigation["low_drift_feature_mask"] = {
+            **plan.to_dict(),
+            "artifact": str(plan_path.resolve()),
+            "artifact_present": True,
+            "selection_split": "validation",
+        }
+
+    (
+        prepared,
+        context_names,
+        item_names,
+        manual_drop_payload,
+    ) = _apply_manual_dcn_feature_drops(
+        dataset=prepared,
+        context_feature_names=context_names,
+        item_feature_names=item_names,
+        drop_context_features=config.dcn_drop_context_features,
+        drop_item_features=config.dcn_drop_item_features,
+        output_dir=output_dir,
+    )
+    if manual_drop_payload is not None:
+        mitigation["manual_feature_drop"] = manual_drop_payload
+
+    if config.dcn_recency_reweight:
+        recency_config = _recency_config_from_next_pass(config)
+        recency = compute_normalized_recency_weights(
+            prepared.train.event_times,
+            row_count=len(prepared.train),
+            query_ids=prepared.train.query_ids,
+            config=recency_config,
+        )
+        recency_payload = _compact_recency_payload(recency.to_dict())
+        recency_path = write_json(
+            artifact_dir / "dcn_v2_temporal_reweighting.json",
+            recency_payload,
+            sort_keys=True,
+        )
+        prepared = apply_temporal_reweighting(prepared, recency_config)
+        mitigation["temporal_reweighting"] = {
+            **recency_payload,
+            "artifact": str(recency_path.resolve()),
+            "artifact_present": True,
+        }
+
+    return prepared, context_names, item_names, mitigation
 
 
 def _ranking_value(
@@ -429,19 +825,18 @@ def _collect_dcn_evidence(
     dataset: DCNTemporalDataset,
     output_dir: Path,
     random_seed: int,
+    context_feature_names: Sequence[str] = CONTEXT_FEATURE_NAMES,
+    item_feature_names: Sequence[str] = CANDIDATE_FEATURE_NAMES,
 ) -> dict[str, object]:
     validation_scores = _predict_dcn(model, dataset.validation, batch_size=512)
     test_scores = _predict_dcn(model, dataset.test, batch_size=512)
-    validation_ece = (
-        expected_calibration_error(dataset.validation.labels, validation_scores)
-        if len(validation_scores)
-        else None
+    calibration = _dcn_calibration_payload(
+        validation_labels=dataset.validation.labels,
+        validation_scores=validation_scores,
+        test_labels=dataset.test.labels,
+        test_scores=test_scores,
     )
-    test_ece = (
-        expected_calibration_error(dataset.test.labels, test_scores)
-        if len(test_scores)
-        else None
-    )
+    write_json(output_dir / "calibration" / "dcn_v2_calibration.json", calibration)
     explanation = _write_dcn_shap(
         model=model,
         dataset=dataset,
@@ -449,38 +844,17 @@ def _collect_dcn_evidence(
         random_seed=random_seed,
     )
     popularity = _popularity_candidate_baseline(reranking, dataset)
+    drift = _dcn_drift_payload(
+        dataset=dataset,
+        output_dir=output_dir,
+        context_feature_names=context_feature_names,
+        item_feature_names=item_feature_names,
+    )
     return {
         "popularity_baseline": popularity,
-        "calibration": {
-            "status": "complete" if test_ece is not None else "unavailable",
-            "validation_ece": validation_ece,
-            "test_ece": test_ece,
-            "ece": test_ece,
-        },
+        "calibration": calibration,
         "explainability": explanation,
-        "drift": {
-            "status": "complete",
-            "validation_drift_score": max(
-                _standardized_mean_drift(
-                    dataset.train.context_features,
-                    dataset.validation.context_features,
-                ),
-                _standardized_mean_drift(
-                    dataset.train.item_features,
-                    dataset.validation.item_features,
-                ),
-            ),
-            "test_drift_score": max(
-                _standardized_mean_drift(
-                    dataset.train.context_features,
-                    dataset.test.context_features,
-                ),
-                _standardized_mean_drift(
-                    dataset.train.item_features,
-                    dataset.test.item_features,
-                ),
-            ),
-        },
+        "drift": drift,
     }
 
 
@@ -833,7 +1207,17 @@ def run_track_next_pass(
         _dataset, _splits = ensure_data()
         if state.reranking is None:
             raise RuntimeError("Candidate data must be built before DCN training")
-        state.dcn_dataset = reranking_data_to_dcn(state.reranking)
+        base_dcn_dataset = reranking_data_to_dcn(state.reranking)
+        (
+            state.dcn_dataset,
+            dcn_context_feature_names,
+            dcn_item_feature_names,
+            dcn_mitigation,
+        ) = _prepare_dcn_training_dataset(
+            dataset=base_dcn_dataset,
+            config=config,
+            output_dir=request.artifact_dir,
+        )
         evidence_rows: list[tuple[dict[str, object], DCNTemporalDataset]] = []
 
         def collect_evidence(model: object, bounded: DCNTemporalDataset) -> None:
@@ -845,6 +1229,8 @@ def run_track_next_pass(
                         dataset=bounded,
                         output_dir=request.artifact_dir,
                         random_seed=config.random_seed,
+                        context_feature_names=dcn_context_feature_names,
+                        item_feature_names=dcn_item_feature_names,
                     ),
                     bounded,
                 )
@@ -871,6 +1257,15 @@ def run_track_next_pass(
             ),
             trained_model_callback=collect_evidence,
         )
+        if dcn_mitigation:
+            result = {
+                **result,
+                "drift_mitigation": dcn_mitigation,
+                "feature_names": {
+                    "context": list(dcn_context_feature_names),
+                    "item": list(dcn_item_feature_names),
+                },
+            }
         if not evidence_rows:
             raise RuntimeError("DCN training did not produce evidence")
         evidence, evidence_dataset = evidence_rows[0]
@@ -909,6 +1304,17 @@ def run_track_next_pass(
             ),
         )
         state.tuning_result = summary.to_dict()
+        tuning_plan_path = request.artifact_dir / "track_tuning_plan.json"
+        tuning_plan = write_track_tuning_plan(
+            tuning_plan_path,
+            next_pass_manifest_path=request.manifest_path,
+            optuna_summary_path=request.artifact_dir / "track_expansion_optuna_summary.json",
+        )
+        state.tuning_result = {
+            **state.tuning_result,
+            "tuning_plan": tuning_plan.to_dict(),
+            "tuning_plan_path": str(tuning_plan_path.resolve()),
+        }
         return state.tuning_result
 
     def public_stage(request: StageRequest) -> dict[str, object]:
@@ -921,14 +1327,38 @@ def run_track_next_pass(
                 ),
             }
         else:
-            result = run_public_pretraining(
-                config.public_manifest,
-                record_loader=lambda _manifest: _read_canonical_records(
-                    config.public_records
-                ),
-                config=PublicPretrainingConfig(seed=config.random_seed),
+            preflight_path = request.artifact_dir / "public_pretraining_preflight.json"
+            preflight = run_public_pretraining_preflight(
+                search_roots=(),
+                manifest_paths=(config.public_manifest,),
+                records_by_manifest={
+                    str(config.public_manifest): (config.public_records,),
+                    str(config.public_manifest.expanduser().resolve()): (config.public_records,),
+                    config.public_manifest.name: (config.public_records,),
+                },
+                output_path=preflight_path,
             )
-            payload = result.to_dict()
+            if preflight.status != "ready":
+                payload = {
+                    "status": "blocked",
+                    "stage": "governance",
+                    "reason": "Public pretraining preflight did not pass.",
+                    "preflight_path": str(preflight_path.resolve()),
+                    "preflight": preflight.to_dict(),
+                }
+            else:
+                result = run_public_pretraining(
+                    config.public_manifest,
+                    record_loader=lambda _manifest: _read_canonical_records(
+                        config.public_records
+                    ),
+                    config=PublicPretrainingConfig(seed=config.random_seed),
+                )
+                payload = {
+                    **result.to_dict(),
+                    "preflight_path": str(preflight_path.resolve()),
+                    "preflight": preflight.to_dict(),
+                }
         write_json(request.artifact_dir / "public_pretraining_result.json", payload)
         return payload
 
@@ -942,7 +1372,37 @@ def run_track_next_pass(
             root / "training" / "training_manifest.json",
             default={},
         )
-        tuning = _tuning_gate_manifest(state.tuning_result or {})
+        raw_tuning = state.tuning_result or {}
+        track_evidence = build_track_model_promotion_evidence(
+            training_manifest=training if isinstance(training, Mapping) else {},
+            baseline_manifest=baseline if isinstance(baseline, Mapping) else {},
+            tuning_manifest=raw_tuning,
+            config=PromotionEvidenceConfig(
+                artifact_base_dir=config.output_dir,
+                code_version=_code_version(),
+                dataset_fingerprint=dataset_fingerprint or None,
+            ),
+        )
+        evidence_json_path, evidence_md_path = write_track_model_promotion_evidence(
+            track_evidence,
+            request.artifact_dir,
+        )
+        public_preflight_path = request.artifact_dir / "public_pretraining_preflight.json"
+        if config.public_manifest is not None and config.public_records is not None:
+            public_preflight = run_public_pretraining_preflight(
+                search_roots=(),
+                manifest_paths=(config.public_manifest,),
+                records_by_manifest={
+                    str(config.public_manifest): (config.public_records,),
+                    str(config.public_manifest.expanduser().resolve()): (config.public_records,),
+                    config.public_manifest.name: (config.public_records,),
+                },
+                output_path=public_preflight_path,
+            )
+        else:
+            public_preflight = run_public_pretraining_preflight(
+                output_path=public_preflight_path,
+            )
         public_output = request.upstream.get("public_pretraining", {})
         public_manifest = (
             public_output.get("output")
@@ -950,9 +1410,9 @@ def run_track_next_pass(
             else None
         )
         report = evaluate_track_expansion_gates(
-            baseline_manifest=baseline if isinstance(baseline, Mapping) else {},
-            training_manifest=training if isinstance(training, Mapping) else None,
-            tuning_manifest=tuning,
+            baseline_manifest=track_evidence.baseline_manifest,
+            training_manifest=track_evidence.gate_training_manifest,
+            tuning_manifest=track_evidence.gate_tuning_manifest,
             dcn_manifest=state.dcn_result,
             public_pretraining_manifest=(
                 public_manifest if isinstance(public_manifest, Mapping) else None
@@ -972,6 +1432,10 @@ def run_track_next_pass(
             "report_path": str(
                 (request.artifact_dir / "promotion_gate_report.json").resolve()
             ),
+            "track_model_promotion_evidence_path": str(evidence_json_path.resolve()),
+            "track_model_promotion_evidence_markdown_path": str(evidence_md_path.resolve()),
+            "public_pretraining_preflight_path": str(public_preflight_path.resolve()),
+            "public_pretraining_preflight": public_preflight.to_dict(),
             **payload,
         }
 
@@ -1014,6 +1478,27 @@ def main() -> int:
     parser.add_argument("--max-test-queries", type=int, default=750)
     parser.add_argument("--dcn-epochs", type=int, default=2)
     parser.add_argument("--dcn-batch-size", type=int, default=256)
+    parser.add_argument("--dcn-low-drift-mask", action="store_true")
+    parser.add_argument("--dcn-recency-reweight", action="store_true")
+    parser.add_argument("--dcn-recency-min-weight", type=float, default=0.5)
+    parser.add_argument("--dcn-recency-max-weight", type=float, default=2.0)
+    parser.add_argument("--dcn-recency-half-life", type=float)
+    parser.add_argument("--dcn-recency-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--dcn-recency-fallback",
+        choices=("auto", "row_order", "query_order"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--dcn-drop-context-features",
+        default="",
+        help="Comma-separated DCN context feature names to drop after automatic masks.",
+    )
+    parser.add_argument(
+        "--dcn-drop-item-features",
+        default="",
+        help="Comma-separated DCN item feature names to drop after automatic masks.",
+    )
     parser.add_argument("--tuning-models", default=",".join(SUPPORTED_TUNING_MODELS))
     parser.add_argument("--tuning-trials", type=int, default=1)
     parser.add_argument("--tuning-max-train-examples", type=int, default=2_000)
@@ -1041,6 +1526,15 @@ def main() -> int:
             max_test_queries=args.max_test_queries,
             dcn_epochs=args.dcn_epochs,
             dcn_batch_size=args.dcn_batch_size,
+            dcn_low_drift_mask=args.dcn_low_drift_mask,
+            dcn_recency_reweight=args.dcn_recency_reweight,
+            dcn_recency_min_weight=args.dcn_recency_min_weight,
+            dcn_recency_max_weight=args.dcn_recency_max_weight,
+            dcn_recency_half_life=args.dcn_recency_half_life,
+            dcn_recency_strength=args.dcn_recency_strength,
+            dcn_recency_fallback=args.dcn_recency_fallback,
+            dcn_drop_context_features=_csv_tuple(args.dcn_drop_context_features),
+            dcn_drop_item_features=_csv_tuple(args.dcn_drop_item_features),
             tuning_models=tuple(
                 value.strip()
                 for value in str(args.tuning_models).split(",")
